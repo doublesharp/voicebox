@@ -381,6 +381,8 @@
     "editTranscription": "Edit transcription",
     "deleteSample": "Delete sample",
     "addSample": "Add Sample",
+    "exportAudio": "Export audio",
+    "exportFormat": "Export {{format}}",
     "note": "Note: A single 30-second sample is the sweet spot. Quality may decrease with multiple samples. In a future update samples might be interchangeable and tagged for varying styles of the same voice.",
     "deleteDialog": {
       "title": "Delete Sample",
@@ -401,7 +403,8 @@
       "updated": "Sample updated",
       "updatedDescription": "Reference text has been updated successfully.",
       "updateFailed": "Update failed",
-      "updateFailedFallback": "Failed to update sample"
+      "updateFailedFallback": "Failed to update sample",
+      "exportFailed": "Audio export failed"
     }
   },
   "profiles": {

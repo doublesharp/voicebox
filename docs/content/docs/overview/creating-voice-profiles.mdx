@@ -263,6 +263,14 @@ For Qwen CustomVoice presets, use the **instruct** field instead of relying on s
 - **Language tags** — Mark the primary language
 - **Archive unused** — Keep profile list manageable
 
+### Export Recordings for Comparison
+
+Open a cloned voice profile and choose **Export audio → Export MP3** on a saved sample card to save the microphone recording outside Voicebox. **Export WAV** saves the lossless stored recording. These exports use the saved reference sample after Voicebox's upload processing.
+
+To compare it with generated speech, open **History**, use the generation's menu, and choose **Export Audio (MP3)** (or WAV). Sample filenames begin with `sample-` and include transcription text and a sample ID so you can distinguish them from generated audio.
+
+MP3 export requires ffmpeg on the backend machine. If it is missing, the app shows installation instructions; WAV export works without ffmpeg.
+
 ### Export / Import
 
 - **Export** profiles to share or backup
