@@ -11,6 +11,7 @@ export interface FileFilter {
 export type SaveFileResult = { status: 'saved' | 'cancelled' | 'download_started'; path?: string };
 
 export interface PlatformFilesystem {
+  // biome-ignore lint/suspicious/noConfusingVoidType: Existing adapters may return Promise<void>.
   saveFile(filename: string, blob: Blob, filters?: FileFilter[]): Promise<SaveFileResult | void>;
   saveFromUrl?(filename: string, url: string, filters?: FileFilter[]): Promise<SaveFileResult>;
   openPath(path: string): Promise<void>;
