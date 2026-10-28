@@ -36,7 +36,7 @@ from ..database import (
     VoiceProfile as DBVoiceProfile,
 )
 from .history import _get_versions_for_generation
-from ..utils.audio import load_audio, save_audio
+from ..utils.audio import load_audio, protect_audio_peak, save_audio
 import numpy as np
 
 
@@ -997,9 +997,8 @@ async def export_story_audio(
     if not items:
         return None
 
-    # Load all audio files and calculate total duration
+    # Retain source rates and channels until a common mix format is known.
     audio_data = []
-    sample_rate = 24000  # Default sample rate
 
     for item, generation in items:
         # Resolve audio path: use pinned version if set, otherwise generation default
@@ -1016,20 +1015,18 @@ async def export_story_audio(
             continue
 
         try:
-            audio, sr = load_audio(str(audio_path), sample_rate=sample_rate)
-            sample_rate = sr  # Use actual sample rate from first file
+            audio, sr = await asyncio.to_thread(load_audio, str(audio_path), sample_rate=None, mono=False)
+            # librosa uses (channels, frames), while soundfile writes
+            # (frames, channels). Mono is kept as a single channel here.
+            audio = audio[:, np.newaxis] if audio.ndim == 1 else audio.T
 
             # Get trim values
             trim_start_ms = getattr(item, "trim_start_ms", 0)
             trim_end_ms = getattr(item, "trim_end_ms", 0)
 
-            # Calculate effective duration
-            original_duration_ms = int(generation.duration * 1000)
-            effective_duration_ms = original_duration_ms - trim_start_ms - trim_end_ms
-
             # Slice audio based on trim values
-            trim_start_sample = int((trim_start_ms / 1000.0) * sample_rate)
-            trim_end_sample = int((trim_end_ms / 1000.0) * sample_rate)
+            trim_start_sample = int((trim_start_ms / 1000.0) * sr)
+            trim_end_sample = int((trim_end_ms / 1000.0) * sr)
 
             # Extract the trimmed portion
             if trim_end_ms > 0:
@@ -1038,9 +1035,12 @@ async def export_story_audio(
                 )
             else:
                 trimmed_audio = audio[trim_start_sample:]
+            if len(trimmed_audio) == 0:
+                continue
 
             # Apply per-clip volume to the export mix.
-            volume = float(getattr(item, "volume", 1.0) or 1.0)
+            stored_volume = getattr(item, "volume", None)
+            volume = 1.0 if stored_volume is None else float(stored_volume)
             if volume != 1.0:
                 trimmed_audio = trimmed_audio * volume
 
@@ -1050,8 +1050,9 @@ async def export_story_audio(
             audio_data.append(
                 {
                     "audio": trimmed_audio,
+                    "sample_rate": sr,
                     "start_time_ms": start_time_ms,
-                    "duration_ms": effective_duration_ms,
+                    "duration_ms": len(trimmed_audio) / sr * 1000,
                     "text": generation.text,
                 }
             )
@@ -1062,14 +1063,34 @@ async def export_story_audio(
     if not audio_data:
         return None
 
-    # Calculate total duration: max(start_time_ms + duration_ms)
-    max_end_time_ms = max((data["start_time_ms"] + data["duration_ms"] for data in audio_data), default=0)
+    sample_rate = max(data["sample_rate"] for data in audio_data)
+    channels = max(data["audio"].shape[1] for data in audio_data)
+    for data in audio_data:
+        audio = data["audio"]
+        if data["sample_rate"] != sample_rate:
+            from librosa import resample
 
-    # Convert to samples
-    total_samples = int((max_end_time_ms / 1000.0) * sample_rate)
+            audio = await asyncio.to_thread(
+                resample, audio, orig_sr=data["sample_rate"], target_sr=sample_rate, axis=0
+            )
+        if audio.shape[1] == 1 and channels > 1:
+            audio = np.repeat(audio, channels, axis=1)
+        elif audio.shape[1] < channels:
+            audio = np.pad(audio, ((0, 0), (0, channels - audio.shape[1])))
+        data["audio"] = audio
+        data["duration_ms"] = len(audio) / sample_rate * 1000
+
+    # Selected versions may include longer effects tails than generation
+    # metadata. Allocate from the actual rendered samples, including trims.
+    total_samples = max(
+        int(data["start_time_ms"] / 1000 * sample_rate) + len(data["audio"]) for data in audio_data
+    )
+    if total_samples <= 0:
+        return None
+    max_end_time_ms = int(np.ceil(total_samples / sample_rate * 1000))
 
     # Create output buffer initialized to zeros
-    final_audio = np.zeros(total_samples, dtype=np.float32)
+    final_audio = np.zeros((total_samples, channels), dtype=np.float32)
 
     # Mix each audio segment at its timecode position
     for data in audio_data:
@@ -1091,10 +1112,9 @@ async def export_story_audio(
             # Normalize to prevent clipping (simple approach: divide by max)
             final_audio[start_sample:end_sample] += audio_to_mix
 
-    # Normalize to prevent clipping
-    max_val = np.abs(final_audio).max()
-    if max_val > 1.0:
-        final_audio = final_audio / max_val
+    final_audio = protect_audio_peak(final_audio)
+    if channels == 1:
+        final_audio = final_audio[:, 0]
 
     fmt = (fmt or "wav").lower()
     if fmt not in ("wav", "m4b", "mp3"):

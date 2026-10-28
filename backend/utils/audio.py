@@ -14,7 +14,7 @@ def normalize_audio(
     peak_limit: float = 0.85,
 ) -> np.ndarray:
     """
-    Normalize audio to target loudness with peak limiting.
+    Normalize RMS with a single gain capped by available peak headroom.
     
     Args:
         audio: Input audio array
@@ -24,29 +24,46 @@ def normalize_audio(
     Returns:
         Normalized audio array
     """
-    # Convert to float32
-    audio = audio.astype(np.float32)
-    
-    # Calculate current RMS
-    rms = np.sqrt(np.mean(audio**2))
-    
-    # Calculate target RMS
-    target_rms = 10**(target_db / 20)
-    
-    # Apply gain
-    if rms > 0:
-        gain = target_rms / rms
-        audio = audio * gain
-    
-    # Peak limiting
-    audio = np.clip(audio, -peak_limit, peak_limit)
-    
-    return audio
+    audio = np.asarray(audio, dtype=np.float32)
+    if not np.isfinite(audio).all():
+        raise ValueError("Audio samples must be finite")
+    if not np.isfinite(target_db) or not 0 < peak_limit <= 1:
+        raise ValueError("Normalization requires a finite target and a peak limit in (0, 1]")
+    if audio.size == 0:
+        return audio.copy()
+
+    peak = float(np.abs(audio).max())
+    if peak == 0:
+        return audio.copy()
+
+    # Scale before squaring to avoid overflowing on otherwise finite inputs.
+    relative_rms = float(np.sqrt(np.mean((audio / peak) ** 2, dtype=np.float64)))
+    target_rms = 10 ** (target_db / 20)
+    gain = min(target_rms / (peak * relative_rms), peak_limit / peak)
+    return audio * gain
+
+
+def protect_audio_peak(audio: np.ndarray, peak_limit: float = 0.999) -> np.ndarray:
+    """Attenuate hot output before PCM encoding without flattening its peaks.
+
+    This is a single linear gain, not a compressor or perceptual loudness
+    normalizer. Quiet audio is left at its requested level, including when
+    output normalization is disabled.
+    """
+    audio = np.asarray(audio, dtype=np.float32)
+    if not np.isfinite(audio).all():
+        raise ValueError("Audio samples must be finite")
+    if not 0 < peak_limit <= 1:
+        raise ValueError("Peak limit must be in (0, 1]")
+    if audio.size == 0:
+        return audio.copy()
+    peak = float(np.abs(audio).max())
+    return audio * (peak_limit / peak) if peak > peak_limit else audio.copy()
 
 
 def load_audio(
     path: str,
-    sample_rate: int = 24000,
+    sample_rate: Optional[int] = 24000,
     mono: bool = True,
 ) -> Tuple[np.ndarray, int]:
     """
@@ -54,7 +71,7 @@ def load_audio(
     
     Args:
         path: Path to audio file
-        sample_rate: Target sample rate
+        sample_rate: Target sample rate, or None to preserve the source rate
         mono: Convert to mono
         
     Returns:

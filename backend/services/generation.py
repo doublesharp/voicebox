@@ -74,7 +74,8 @@ async def run_generation(
         load_engine_model,
     )
     from ..utils.chunked_tts import generate_chunked
-    from ..utils.audio import has_tts_runaway, normalize_audio, save_audio, trim_tts_output
+    from ..utils.audio import has_tts_runaway, save_audio, trim_tts_output
+    from ..utils.audio_processing import effects_chain_from_config, process_generated_audio
 
     task_manager = get_task_manager()
     bg_db = next(get_db())
@@ -114,17 +115,26 @@ async def run_generation(
 
         audio, sample_rate = await generate_chunked(tts_model, text, voice_prompt, **gen_kwargs)
 
-        # --- Normalize (generate and regenerate always; retry skips) -----
-        if normalize or mode == "regenerate":
-            audio = normalize_audio(audio)
+        effects_chain = effects_chain_from_config(effects_chain)
+        if effects_chain:
+            from ..utils.effects import validate_effects_chain
 
-        duration = len(audio) / sample_rate
+            error = validate_effects_chain(effects_chain)
+            if error:
+                logging.getLogger(__name__).warning("invalid effects chain, skipping: %s", error)
+                effects_chain = None
+        clean_audio, processed_audio = await asyncio.to_thread(
+            process_generated_audio, audio, sample_rate,
+            normalize=normalize or mode == "regenerate", effects_chain=effects_chain,
+        )
+        duration = len(processed_audio) / sample_rate
 
         # --- Persist audio and update status -----------------------------
         if mode == "generate":
             final_path = _save_generate(
                 generation_id=generation_id,
-                audio=audio,
+                audio=clean_audio,
+                processed_audio=processed_audio,
                 sample_rate=sample_rate,
                 effects_chain=effects_chain,
                 save_audio=save_audio,
@@ -133,7 +143,7 @@ async def run_generation(
         elif mode == "retry":
             final_path = _save_retry(
                 generation_id=generation_id,
-                audio=audio,
+                audio=processed_audio,
                 sample_rate=sample_rate,
                 save_audio=save_audio,
             )
@@ -141,7 +151,7 @@ async def run_generation(
             final_path = _save_regenerate(
                 generation_id=generation_id,
                 version_id=version_id,
-                audio=audio,
+                audio=processed_audio,
                 sample_rate=sample_rate,
                 save_audio=save_audio,
                 db=bg_db,
@@ -198,6 +208,7 @@ def _save_generate(
     *,
     generation_id: str,
     audio,
+    processed_audio,
     sample_rate: int,
     effects_chain: Optional[list],
     save_audio,
@@ -227,30 +238,17 @@ def _save_generate(
     final_audio_path = str(clean_audio_path)
 
     if has_effects:
-        from ..utils.effects import apply_effects, validate_effects_chain
-
-        assert effects_chain is not None
-
-        error_msg = validate_effects_chain(effects_chain)
-        if error_msg:
-            import logging
-            logging.getLogger(__name__).warning("invalid effects chain, skipping: %s", error_msg)
-            versions_mod.set_default_version(
-                versions_mod.list_versions(generation_id, db)[0].id, db
-            )
-        else:
-            processed_audio = apply_effects(audio, sample_rate, effects_chain)
-            processed_path = config.get_generations_dir() / f"{generation_id}_processed.wav"
-            save_audio(processed_audio, str(processed_path), sample_rate)
-            final_audio_path = str(processed_path)
-            versions_mod.create_version(
-                generation_id=generation_id,
-                label="version-2",
-                audio_path=config.to_storage_path(processed_path),
-                db=db,
-                effects_chain=effects_chain,
-                is_default=True,
-            )
+        processed_path = config.get_generations_dir() / f"{generation_id}_processed.wav"
+        save_audio(processed_audio, str(processed_path), sample_rate)
+        final_audio_path = str(processed_path)
+        versions_mod.create_version(
+            generation_id=generation_id,
+            label="version-2",
+            audio_path=config.to_storage_path(processed_path),
+            db=db,
+            effects_chain=effects_chain,
+            is_default=True,
+        )
 
     return config.to_storage_path(final_audio_path)
 
@@ -284,6 +282,7 @@ async def generate_audio_sync(
     normalize: bool = True,
     max_chunk_chars: Optional[int] = None,
     crossfade_ms: Optional[int] = None,
+    effects_chain: Optional[list] = None,
 ) -> bytes:
     """Run a TTS generation synchronously and return the resulting wav bytes.
 
@@ -304,7 +303,8 @@ async def generate_audio_sync(
         load_engine_model,
     )
     from ..utils.chunked_tts import generate_chunked
-    from ..utils.audio import has_tts_runaway, normalize_audio, trim_tts_output
+    from ..utils.audio import has_tts_runaway, trim_tts_output
+    from ..utils.audio_processing import effects_chain_from_config, process_generated_audio
     from . import tts
 
     bg_db = next(get_db())
@@ -320,6 +320,9 @@ async def generate_audio_sync(
             use_cache=True,
             engine=engine,
         )
+        if effects_chain is None:
+            profile = await profiles.get_profile(profile_id, bg_db)
+            effects_chain = effects_chain_from_config(profile.effects_chain if profile else None)
     finally:
         bg_db.close()
 
@@ -343,10 +346,10 @@ async def generate_audio_sync(
             tts_model, text, voice_prompt, **gen_kwargs
         )
 
-        if normalize:
-            audio = normalize_audio(audio)
-
-        return tts.audio_to_wav_bytes(audio, sample_rate)
+        _, processed_audio = await asyncio.to_thread(
+            process_generated_audio, audio, sample_rate, normalize=normalize, effects_chain=effects_chain
+        )
+        return tts.audio_to_wav_bytes(processed_audio, sample_rate)
     finally:
         release_generation_memory(tts_model)
 

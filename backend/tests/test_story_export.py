@@ -167,4 +167,6 @@ class TestFFmpegEncodeIntegration:
         )
         probed = json.loads(probe.stdout)["chapters"]
         assert [c["tags"]["title"] for c in probed] == ["Opening", "Closing"]
-        assert [(c["start"], c["end"]) for c in probed] == [(0, 4000), (4000, 12000)]
+        # MP4 chapter ticks may use the audio track's time base, rather than
+        # the input metadata's millisecond time base. Compare actual times.
+        assert [(float(c["start_time"]), float(c["end_time"])) for c in probed] == [(0.0, 4.0), (4.0, 12.0)]

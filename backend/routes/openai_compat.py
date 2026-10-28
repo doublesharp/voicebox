@@ -32,6 +32,7 @@ so SDK exceptions carry a readable message.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import shutil
 import subprocess
@@ -387,23 +388,15 @@ async def _create_speech(request: Request, db: Session) -> Response:
     finally:
         release_generation_memory(tts_model)
 
-    if profile.effects_chain:
-        import json
+    from ..utils.audio import protect_audio_peak
+    from ..utils.audio_processing import effects_chain_from_config, process_generated_audio
 
-        from ..utils.effects import apply_effects
-
-        try:
-            effects_chain = json.loads(profile.effects_chain)
-        except ValueError:
-            effects_chain = None
-        if effects_chain:
-            audio = apply_effects(audio, sample_rate, effects_chain)
-
-    from ..utils.audio import normalize_audio
-
-    audio = normalize_audio(audio)
-    audio = apply_speed(audio, sample_rate, data.speed)
-    content, media_type = encode_audio(audio, sample_rate, data.response_format)
+    _, audio = await asyncio.to_thread(
+        process_generated_audio, audio, sample_rate, effects_chain=effects_chain_from_config(profile.effects_chain)
+    )
+    # Time stretching may overshoot even when its input has safe peaks.
+    audio = protect_audio_peak(await asyncio.to_thread(apply_speed, audio, sample_rate, data.speed))
+    content, media_type = await asyncio.to_thread(encode_audio, audio, sample_rate, data.response_format)
 
     logger.info(
         "OpenAI-compat speech: profile=%s engine=%s format=%s %.1fs audio in %.1fs",

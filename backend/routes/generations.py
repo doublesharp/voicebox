@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
-from ..services.inference_scheduler import check_inference_cancelled, serialized_inference
+from ..services.inference_scheduler import check_inference_cancelled, run_serialized_inference, serialized_inference
 from .. import config, models
 from ..services import history, personality, profiles, tts
 from ..database import Generation as DBGeneration, VoiceProfile as DBVoiceProfile, get_db
@@ -317,10 +317,91 @@ async def get_generation_status(generation_id: str, db: Session = Depends(get_db
 
 
 @router.post("/generate/stream")
-@serialized_inference
 async def stream_speech(
     data: models.GenerationRequest,
     db: Session = Depends(get_db),
+    incremental: bool = False,
+):
+    """Return mastered WAV, or opt into bounded incremental preview delivery.
+
+    ``incremental=true`` requires ``normalize=false`` and no enabled effects.
+    Preview uses text groups of at most 240 characters and an unknown-length
+    PCM WAV header; buffered mode preserves full-file processing and headers.
+    """
+    if incremental:
+        return await _incremental_speech(data, db)
+    return await _buffered_speech(data, db)
+
+
+async def _incremental_speech(data: models.GenerationRequest, db: Session):
+    from ..backends import (
+        engine_needs_trim, engine_retries_runaway, ensure_model_cached_or_raise,
+        get_tts_backend_for_engine, load_engine_model,
+    )
+    from ..utils.audio import has_tts_runaway, trim_tts_output
+    from ..utils.audio_processing import effects_chain_from_config
+    from ..utils.streaming_audio import iter_speech_audio, pcm16_bytes, serialized_byte_stream, streaming_wav_header
+
+    profile = await profiles.get_profile(data.profile_id, db)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    chain = (
+        [effect.model_dump() for effect in data.effects_chain]
+        if data.effects_chain is not None else effects_chain_from_config(profile.effects_chain)
+    )
+    if data.normalize or any(effect.get("enabled", True) for effect in chain or []):
+        raise HTTPException(
+            status_code=400,
+            detail="Incremental preview requires normalize=false and no enabled effects; use effects_chain=[] "
+                   "to override profile effects. Buffered mode supports whole-file mastering.",
+        )
+    engine = _resolve_generation_engine(data, profile)
+    try:
+        profiles.validate_profile_engine(profile, engine)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    model_size = data.model_size or "1.7B"
+    await ensure_model_cached_or_raise(engine, model_size)
+    # Own a session for the response lifetime, independently of FastAPI's
+    # dependency teardown policy while waiting for another inference request.
+    bind = db.get_bind()
+
+    async def produce(send):
+        backend = get_tts_backend_for_engine(engine)
+        try:
+            await load_engine_model(engine, model_size)
+            check_inference_cancelled()
+            with Session(bind=bind) as stream_db:
+                prompt = await profiles.create_voice_prompt_for_profile(data.profile_id, stream_db, engine=engine)
+            first = True
+            async for audio, rate in iter_speech_audio(
+                backend, data.text, prompt, language=data.language, seed=data.seed,
+                instruct=data.instruct, max_chunk_chars=min(data.max_chunk_chars, 240),
+                crossfade_ms=data.crossfade_ms,
+                trim_fn=trim_tts_output if engine_needs_trim(engine) else None,
+                runaway_detector=has_tts_runaway if engine_retries_runaway(engine) else None,
+            ):
+                if first:
+                    await send(streaming_wav_header(rate))
+                    first = False
+                await send(pcm16_bytes(audio))
+        finally:
+            release_generation_memory(backend)
+
+    return StreamingResponse(
+        serialized_byte_stream(produce), media_type="audio/wav",
+        headers={
+            "Content-Disposition": 'inline; filename="speech-preview.wav"',
+            "Cache-Control": "no-store", "X-Accel-Buffering": "no",
+            "X-Voicebox-Audio-Mode": "incremental-preview",
+        },
+    )
+
+
+@serialized_inference
+async def _buffered_speech(
+    data: models.GenerationRequest,
+    db: Session,
 ):
     """Generate speech and stream the WAV audio directly without saving to disk."""
     from ..backends import (
@@ -382,26 +463,17 @@ async def stream_speech(
     finally:
         release_generation_memory(tts_model)
 
+    from ..utils.audio_processing import effects_chain_from_config, process_generated_audio
+
     effects_chain_config = None
     if data.effects_chain is not None:
         effects_chain_config = [e.model_dump() for e in data.effects_chain]
-    elif profile.effects_chain:
-        import json as _json
+    else:
+        effects_chain_config = effects_chain_from_config(profile.effects_chain)
 
-        try:
-            effects_chain_config = _json.loads(profile.effects_chain)
-        except Exception:
-            effects_chain_config = None
-
-    if effects_chain_config:
-        from ..utils.effects import apply_effects
-
-        audio = apply_effects(audio, sample_rate, effects_chain_config)
-
-    if data.normalize:
-        from ..utils.audio import normalize_audio
-
-        audio = normalize_audio(audio)
+    _, audio = await asyncio.to_thread(
+        process_generated_audio, audio, sample_rate, normalize=data.normalize, effects_chain=effects_chain_config
+    )
 
     wav_bytes = tts.audio_to_wav_bytes(audio, sample_rate)
 
