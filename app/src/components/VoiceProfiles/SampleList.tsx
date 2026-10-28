@@ -1,4 +1,15 @@
-import { Check, Edit, Pause, Play, Plus, Trash2, Volume2, X } from 'lucide-react';
+import {
+  Check,
+  Download,
+  Edit,
+  Loader2,
+  Pause,
+  Play,
+  Plus,
+  Trash2,
+  Volume2,
+  X,
+} from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
@@ -11,11 +22,22 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import { Slider } from '@/components/ui/slider';
 import { Textarea } from '@/components/ui/textarea';
 import { useToast } from '@/components/ui/use-toast';
 import { apiClient } from '@/lib/api/client';
-import { useDeleteSample, useProfileSamples, useUpdateSample } from '@/lib/hooks/useProfiles';
+import {
+  useDeleteSample,
+  useExportSampleAudio,
+  useProfileSamples,
+  useUpdateSample,
+} from '@/lib/hooks/useProfiles';
 import { formatAudioDuration } from '@/lib/utils/audio';
 import { cn } from '@/lib/utils/cn';
 import { SampleUpload } from './SampleUpload';
@@ -154,6 +176,7 @@ export function SampleList({ profileId }: SampleListProps) {
   const { data: samples, isLoading } = useProfileSamples(profileId);
   const deleteSample = useDeleteSample();
   const updateSample = useUpdateSample();
+  const exportSample = useExportSampleAudio();
   const { toast } = useToast();
   const [uploadOpen, setUploadOpen] = useState(false);
   const [editingSampleId, setEditingSampleId] = useState<string | null>(null);
@@ -307,6 +330,52 @@ export function SampleList({ profileId }: SampleListProps) {
 
                     {/* Mini Player - Always visible */}
                     <MiniSamplePlayer audioUrl={apiClient.getSampleUrl(sample.id)} />
+                    <div className="flex justify-end px-3 py-2">
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            disabled={exportSample.isPending}
+                          >
+                            {exportSample.isPending &&
+                            exportSample.variables?.sampleId === sample.id ? (
+                              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                            ) : (
+                              <Download className="mr-2 h-4 w-4" />
+                            )}
+                            {t('sampleList.exportAudio')}
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end">
+                          {(['mp3', 'wav'] as const).map((format) => (
+                            <DropdownMenuItem
+                              key={format}
+                              onSelect={() =>
+                                exportSample.mutate(
+                                  {
+                                    sampleId: sample.id,
+                                    referenceText: sample.reference_text,
+                                    format,
+                                  },
+                                  {
+                                    onError: (error) =>
+                                      toast({
+                                        title: t('sampleList.toast.exportFailed'),
+                                        description: error.message,
+                                        variant: 'destructive',
+                                      }),
+                                  },
+                                )
+                              }
+                            >
+                              {t('sampleList.exportFormat', { format: format.toUpperCase() })}
+                            </DropdownMenuItem>
+                          ))}
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    </div>
                   </>
                 )}
               </div>

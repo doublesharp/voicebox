@@ -120,6 +120,33 @@ export function useUpdateSample() {
   });
 }
 
+export function useExportSampleAudio() {
+  const platform = usePlatform();
+
+  return useMutation({
+    mutationFn: async ({
+      sampleId,
+      referenceText,
+      format,
+    }: {
+      sampleId: string;
+      referenceText: string;
+      format: 'mp3' | 'wav';
+    }) => {
+      const blob = await apiClient.exportSampleAudio(sampleId, format);
+      const safeText = referenceText
+        .substring(0, 30)
+        .replace(/[^a-z0-9]/gi, '-')
+        .toLowerCase();
+      await platform.filesystem.saveFile(
+        `sample-${safeText || 'recording'}-${sampleId.substring(0, 8)}.${format}`,
+        blob,
+        [{ name: 'Audio File', extensions: [format] }],
+      );
+    },
+  });
+}
+
 export function useExportProfile() {
   const platform = usePlatform();
 

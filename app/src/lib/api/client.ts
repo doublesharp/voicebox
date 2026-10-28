@@ -193,6 +193,16 @@ class ApiClient {
     });
   }
 
+  async exportSampleAudio(sampleId: string, format: 'mp3' | 'wav' = 'mp3'): Promise<Blob> {
+    const url = `${this.getBaseUrl()}/samples/${encodeURIComponent(sampleId)}/export-audio?format=${format}`;
+    const response = await fetch(url);
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({ detail: response.statusText }));
+      throw new Error(formatErrorDetail(error.detail, `HTTP error! status: ${response.status}`));
+    }
+    return response.blob();
+  }
+
   async exportProfile(profileId: string): Promise<Blob> {
     const url = `${this.getBaseUrl()}/profiles/${profileId}/export`;
     const response = await fetch(url);
