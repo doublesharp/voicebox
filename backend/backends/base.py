@@ -276,19 +276,18 @@ async def combine_voice_prompts(
         reference_texts: Corresponding transcripts.
         sample_rate: If set, resample audio to this rate during loading.
     """
-    combined_audio = []
+    import asyncio
 
-    for path in audio_paths:
-        kwargs = {"sample_rate": sample_rate} if sample_rate else {}
-        audio, _sr = load_audio(path, **kwargs)
-        audio = normalize_audio(audio)
-        combined_audio.append(audio)
+    def _combine():
+        combined_audio = []
+        for path in audio_paths:
+            kwargs = {"sample_rate": sample_rate} if sample_rate else {}
+            audio, _sr = load_audio(path, **kwargs)
+            combined_audio.append(normalize_audio(audio))
+        mixed = normalize_audio(np.concatenate(combined_audio))
+        return mixed, " ".join(reference_texts)
 
-    mixed = np.concatenate(combined_audio)
-    mixed = normalize_audio(mixed)
-    combined_text = " ".join(reference_texts)
-
-    return mixed, combined_text
+    return await asyncio.to_thread(_combine)
 
 
 @contextmanager

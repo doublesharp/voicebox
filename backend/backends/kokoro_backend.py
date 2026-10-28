@@ -181,7 +181,8 @@ class KokoroTTSBackend:
 
     def _get_pipeline(self, lang_code: str):
         """Get or create a KPipeline for the given language code."""
-        kokoro_lang = LANG_CODE_MAP.get(lang_code, "a")
+        # English callers may select the British phonemizer from their voice.
+        kokoro_lang = "b" if lang_code == "en-gb" else LANG_CODE_MAP.get(lang_code, "a")
 
         if kokoro_lang not in self._pipelines:
             from kokoro import KPipeline
@@ -272,7 +273,8 @@ class KokoroTTSBackend:
                 if torch.cuda.is_available():
                     torch.cuda.manual_seed(seed)
 
-            pipeline = self._get_pipeline(language)
+            pipeline_language = "en-gb" if language == "en" and voice_name.startswith(("bf_", "bm_")) else language
+            pipeline = self._get_pipeline(pipeline_language)
 
             # Generate all chunks and concatenate
             audio_chunks = []
