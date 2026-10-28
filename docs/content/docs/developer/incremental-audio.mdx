@@ -25,7 +25,9 @@ seekable finalized WAV should use buffered mode. Engines still generate one
 text chunk at a time; this does not claim token streaming or a particular
 latency improvement for short inputs.
 
-Disconnecting cancels further chunks. An in-progress synchronous engine call is
+Disconnecting cancels further chunks. A connected client that stops reading
+for 30 seconds also ends preview generation, so it cannot monopolize speech
+inference indefinitely. An in-progress synchronous engine call is
 drained before another request can use the inference resource. A synthesis error
 after headers have been sent ends the stream; the client must treat incomplete
 playback as a failed preview, rather than a completed export.

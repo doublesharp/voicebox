@@ -103,3 +103,21 @@ def test_effect_tail_render_has_a_fixed_budget_at_high_feedback():
     processed = apply_effects(source, 24000, effects)
     assert len(processed) <= len(source) + 10 * 24000
     assert np.isfinite(processed).all()
+
+
+def test_atomic_audio_save_does_not_publish_a_partial_prepared_reference(tmp_path, monkeypatch):
+    from pathlib import Path
+    from backend.utils import audio as audio_utils
+
+    final = tmp_path / "combined-reference.wav"
+    final.write_bytes(b"existing-complete-reference")
+
+    def fail_write(path, *args, **kwargs):
+        Path(path).write_bytes(b"partial")
+        raise OSError("simulated full disk")
+
+    monkeypatch.setattr(audio_utils.sf, "write", fail_write)
+    with pytest.raises(OSError, match="simulated full disk"):
+        audio_utils.save_audio(np.zeros(240), str(final), 24000)
+    assert final.read_bytes() == b"existing-complete-reference"
+    assert not Path(f"{final}.tmp").exists()
