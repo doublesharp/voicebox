@@ -6,6 +6,7 @@ import {
   FileArchive,
   Loader2,
   MoreHorizontal,
+  Pencil,
   Play,
   RotateCcw,
   Square,
@@ -86,6 +87,10 @@ export function HistoryTable() {
   const [effectsSourceVersionId, setEffectsSourceVersionId] = useState<string | null>(null);
   const [effectsChain, setEffectsChain] = useState<EffectConfig[]>([]);
   const [applyingEffects, setApplyingEffects] = useState(false);
+  const [editingVersion, setEditingVersion] = useState<GenerationVersionResponse | null>(null);
+  const [versionToDelete, setVersionToDelete] = useState<GenerationVersionResponse | null>(null);
+  const [deletingVersion, setDeletingVersion] = useState(false);
+  const versionMutationRef = useRef(false);
   const [expandedVersionsId, setExpandedVersionsId] = useState<string | null>(null);
   const limit = 20;
   const { toast } = useToast();
@@ -316,43 +321,135 @@ export function HistoryTable() {
     const cleanVersion = versions.find((v) => !v.effects_chain || v.effects_chain.length === 0);
     setEffectsSourceVersionId(cleanVersion?.id ?? null);
     setEffectsChain([]);
+    setEditingVersion(null);
     setEffectsDialogOpen(true);
   };
 
+  const handleEditVersion = (generationId: string, version: GenerationVersionResponse) => {
+    setEffectsTargetId(generationId);
+    setEditingVersion(version);
+    setEffectsChain(structuredClone(version.effects_chain ?? []));
+    setEffectsDialogOpen(true);
+  };
+
+  const updateVersions = (generationId: string, versions: GenerationVersionResponse[]) => {
+    const active = versions.find((version) => version.is_default);
+    // Update accumulated pages too: invalidating only the current page leaves
+    // versions on earlier pages stale until History is reopened.
+    setAllHistory((previous) =>
+      previous.map((generation) =>
+        generation.id === generationId
+          ? { ...generation, versions, audio_path: active?.audio_path ?? generation.audio_path }
+          : generation,
+      ),
+    );
+    queryClient.invalidateQueries({ queryKey: ['history'] });
+    queryClient.invalidateQueries({ queryKey: ['stories'] });
+  };
+
+  const handleDeleteVersionConfirm = async () => {
+    if (!versionToDelete || versionMutationRef.current) return;
+    versionMutationRef.current = true;
+    setDeletingVersion(true);
+    const target = versionToDelete;
+    const player = usePlayerStore.getState();
+    const wasSelected = player.audioId === target.generation_id;
+    // Release the media file before deletion, particularly on Windows.
+    if (wasSelected) player.reset();
+    try {
+      const versions = await apiClient.deleteGenerationVersion(target.generation_id, target.id);
+      updateVersions(target.generation_id, versions);
+      const active = versions.find((version) => version.is_default);
+      if (wasSelected && active && !usePlayerStore.getState().audioId) {
+        usePlayerStore
+          .getState()
+          .setAudio(
+            apiClient.getVersionAudioUrl(active.id, active.audio_path),
+            target.generation_id,
+            player.profileId,
+            player.title ?? undefined,
+          );
+      }
+      setVersionToDelete(null);
+      toast({ title: t('history.versions.deleted') });
+    } catch (error) {
+      if (wasSelected && player.audioUrl && !usePlayerStore.getState().audioId) {
+        usePlayerStore
+          .getState()
+          .setAudio(
+            player.audioUrl,
+            target.generation_id,
+            player.profileId,
+            player.title ?? undefined,
+          );
+      }
+      toast({
+        title: t('history.versions.deleteFailed'),
+        description: error instanceof Error ? error.message : t('common.unknownError'),
+        variant: 'destructive',
+      });
+    } finally {
+      versionMutationRef.current = false;
+      setDeletingVersion(false);
+    }
+  };
+
   const handleApplyEffectsConfirm = async () => {
-    if (!effectsTargetId || effectsChain.length === 0) return;
+    if (
+      !effectsTargetId ||
+      (!editingVersion && effectsChain.length === 0) ||
+      versionMutationRef.current
+    )
+      return;
+    versionMutationRef.current = true;
     setApplyingEffects(true);
     try {
-      const newVersion = await apiClient.applyEffectsToGeneration(effectsTargetId, {
-        effects_chain: effectsChain,
-        source_version_id: effectsSourceVersionId ?? undefined,
-        set_as_default: true,
-      });
-      queryClient.invalidateQueries({ queryKey: ['history'] });
+      const newVersion = editingVersion
+        ? await apiClient.updateGenerationVersion(effectsTargetId, editingVersion.id, {
+            effects_chain: effectsChain,
+          })
+        : await apiClient.applyEffectsToGeneration(effectsTargetId, {
+            effects_chain: effectsChain,
+            source_version_id: effectsSourceVersionId ?? undefined,
+            set_as_default: true,
+          });
+      const generation = allHistory.find((item) => item.id === effectsTargetId);
+      const versions = generation?.versions ?? [];
+      updateVersions(
+        effectsTargetId,
+        editingVersion
+          ? versions.map((version) => (version.id === newVersion.id ? newVersion : version))
+          : [...versions.map((version) => ({ ...version, is_default: false })), newVersion],
+      );
 
       // If the player is currently on this generation, reload with the new version audio
-      if (currentAudioId === effectsTargetId) {
+      const player = usePlayerStore.getState();
+      const isEditedAudio = player.audioUrl?.includes(`/audio/version/${editingVersion?.id}`);
+      if (
+        player.audioId === effectsTargetId &&
+        (!editingVersion || newVersion.is_default || isEditedAudio)
+      ) {
         const gen = allHistory.find((g) => g.id === effectsTargetId);
         if (gen) {
-          const versionUrl = apiClient.getVersionAudioUrl(newVersion.id);
-          setAudioWithAutoPlay(
-            versionUrl,
-            effectsTargetId,
-            gen.profile_id,
-            gen.text.substring(0, 50),
-          );
+          const versionUrl = apiClient.getVersionAudioUrl(newVersion.id, newVersion.audio_path);
+          const setAudio = player.isPlaying ? player.setAudioWithAutoPlay : player.setAudio;
+          setAudio(versionUrl, effectsTargetId, gen.profile_id, gen.text.substring(0, 50));
         }
       }
 
       setEffectsDialogOpen(false);
-      toast({ title: 'Effects applied', description: 'A new version has been created.' });
+      toast({
+        title: editingVersion ? t('history.versions.updated') : 'Effects applied',
+        description: editingVersion ? undefined : 'A new version has been created.',
+      });
     } catch (error) {
       toast({
-        title: 'Failed to apply effects',
+        title: editingVersion ? t('history.versions.updateFailed') : 'Failed to apply effects',
         description: error instanceof Error ? error.message : 'Unknown error',
         variant: 'destructive',
       });
     } finally {
+      versionMutationRef.current = false;
       setApplyingEffects(false);
     }
   };
@@ -376,7 +473,10 @@ export function HistoryTable() {
     text: string,
     profileId: string,
   ) => {
-    const audioUrl = apiClient.getVersionAudioUrl(versionId);
+    const version = allHistory
+      .find((gen) => gen.id === generationId)
+      ?.versions?.find((v) => v.id === versionId);
+    const audioUrl = apiClient.getVersionAudioUrl(versionId, version?.audio_path);
     setAudioWithAutoPlay(audioUrl, generationId, profileId, text.substring(0, 50));
   };
 
@@ -491,8 +591,10 @@ export function HistoryTable() {
                   )}
                 >
                   {/* Main row */}
+                  {/* biome-ignore lint/a11y/useSemanticElements: The row contains a transcript and action buttons, which cannot be nested inside a native button. */}
                   <div
-                    role={isPlayable ? 'button' : undefined}
+                    role="button"
+                    aria-disabled={!isPlayable}
                     tabIndex={isPlayable ? 0 : undefined}
                     className={cn(
                       'flex items-stretch gap-4 h-26 p-3 outline-none',
@@ -511,7 +613,10 @@ export function HistoryTable() {
                     onMouseDown={(e) => {
                       if (!isPlayable) return;
                       const target = e.target as HTMLElement;
-                      if (target.closest('textarea') || window.getSelection()?.toString()) {
+                      if (
+                        target.closest('textarea, button, [role="menuitem"]') ||
+                        window.getSelection()?.toString()
+                      ) {
                         return;
                       }
                       handlePlay(gen.id, gen.text, gen.profile_id);
@@ -573,11 +678,7 @@ export function HistoryTable() {
                     </div>
 
                     {/* Far right - Actions */}
-                    <div
-                      className="shrink-0 flex flex-col justify-center items-center gap-0.5"
-                      onMouseDown={(e) => e.stopPropagation()}
-                      onClick={(e) => e.stopPropagation()}
-                    >
+                    <div className="shrink-0 flex flex-col justify-center items-center gap-0.5">
                       <Button
                         variant="ghost"
                         size="icon"
@@ -724,42 +825,96 @@ export function HistoryTable() {
                               const sourceVersion = v.source_version_id
                                 ? gen.versions?.find((sv) => sv.id === v.source_version_id)
                                 : null;
-                              const showSource =
-                                sourceVersion &&
-                                sourceVersion.effects_chain &&
-                                sourceVersion.effects_chain.length > 0;
+                              const showSource = (sourceVersion?.effects_chain?.length ?? 0) > 0;
+                              const original = gen.versions?.find(
+                                (version) => !version.effects_chain && !version.source_version_id,
+                              );
+                              const isOriginal = v.id === original?.id;
+                              const hasDerivedVersions = gen.versions?.some(
+                                (version) => version.source_version_id === v.id,
+                              );
+                              const canEdit =
+                                !isOriginal && (!!v.effects_chain || !!v.source_version_id);
 
                               return (
-                                <button
+                                <div
                                   key={v.id}
-                                  type="button"
-                                  className="flex items-center gap-2 w-full h-9 px-3 text-left hover:bg-muted/50 transition-colors"
-                                  onClick={() => {
-                                    handlePlayVersion(gen.id, v.id, gen.text, gen.profile_id);
-                                    if (!v.is_default) {
-                                      handleSwitchVersion(gen.id, v.id);
-                                    }
-                                  }}
+                                  className="flex items-center pr-2 hover:bg-muted/50 transition-colors"
                                 >
-                                  <AudioLines className="h-3 w-3 shrink-0 text-muted-foreground" />
-                                  <span className="truncate text-xs font-medium">{v.label}</span>
-                                  {v.effects_chain && v.effects_chain.length > 0 && (
-                                    <span className="text-[10px] text-muted-foreground truncate">
-                                      {v.effects_chain.map((e) => e.type).join(' → ')}
-                                    </span>
+                                  <button
+                                    type="button"
+                                    className="flex items-center gap-2 flex-1 min-w-0 h-9 px-3 text-left"
+                                    disabled={applyingEffects || deletingVersion}
+                                    onClick={() => {
+                                      handlePlayVersion(gen.id, v.id, gen.text, gen.profile_id);
+                                      if (!v.is_default) {
+                                        handleSwitchVersion(gen.id, v.id);
+                                      }
+                                    }}
+                                  >
+                                    <AudioLines className="h-3 w-3 shrink-0 text-muted-foreground" />
+                                    <span className="truncate text-xs font-medium">{v.label}</span>
+                                    {v.effects_chain && v.effects_chain.length > 0 && (
+                                      <span className="text-[10px] text-muted-foreground truncate">
+                                        {v.effects_chain.map((e) => e.type).join(' → ')}
+                                      </span>
+                                    )}
+                                    {showSource && (
+                                      <span className="text-[10px] text-muted-foreground/60 truncate">
+                                        from {sourceVersion?.label}
+                                      </span>
+                                    )}
+                                    <span className="flex-1" />
+                                    {v.is_default && (
+                                      <span className="text-[10px] bg-accent/15 text-accent px-1.5 py-0.5 rounded-full">
+                                        active
+                                      </span>
+                                    )}
+                                  </button>
+                                  {!isOriginal && (
+                                    <DropdownMenu>
+                                      <DropdownMenuTrigger asChild>
+                                        <Button
+                                          variant="ghost"
+                                          size="icon"
+                                          className="h-7 w-7 shrink-0 text-muted-foreground"
+                                          aria-label={t('history.versions.actions', {
+                                            name: v.label,
+                                          })}
+                                          disabled={applyingEffects || deletingVersion}
+                                        >
+                                          <MoreHorizontal className="h-3.5 w-3.5" />
+                                        </Button>
+                                      </DropdownMenuTrigger>
+                                      <DropdownMenuContent align="end">
+                                        {canEdit && (
+                                          <DropdownMenuItem
+                                            disabled={hasDerivedVersions}
+                                            onSelect={() => handleEditVersion(gen.id, v)}
+                                          >
+                                            <Pencil className="mr-2 h-4 w-4" />
+                                            {t('history.versions.edit')}
+                                          </DropdownMenuItem>
+                                        )}
+                                        <DropdownMenuItem
+                                          className="text-destructive focus:text-destructive"
+                                          disabled={
+                                            hasDerivedVersions || (gen.versions?.length ?? 0) <= 1
+                                          }
+                                          onSelect={() => setVersionToDelete(v)}
+                                        >
+                                          <Trash2 className="mr-2 h-4 w-4" />
+                                          {t('history.versions.delete')}
+                                        </DropdownMenuItem>
+                                        {hasDerivedVersions && (
+                                          <p className="max-w-56 px-2 py-1.5 text-xs text-muted-foreground">
+                                            {t('history.versions.usedAsSource')}
+                                          </p>
+                                        )}
+                                      </DropdownMenuContent>
+                                    </DropdownMenu>
                                   )}
-                                  {showSource && (
-                                    <span className="text-[10px] text-muted-foreground/60 truncate">
-                                      from {sourceVersion.label}
-                                    </span>
-                                  )}
-                                  <span className="flex-1" />
-                                  {v.is_default && (
-                                    <span className="text-[10px] bg-accent/15 text-accent px-1.5 py-0.5 rounded-full">
-                                      active
-                                    </span>
-                                  )}
-                                </button>
+                                </div>
                               );
                             })}
                           </div>
@@ -875,22 +1030,69 @@ export function HistoryTable() {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={effectsDialogOpen} onOpenChange={setEffectsDialogOpen}>
+      <Dialog
+        open={!!versionToDelete}
+        onOpenChange={(open) => {
+          if (!open && !deletingVersion) setVersionToDelete(null);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t('history.versions.delete')}</DialogTitle>
+            <DialogDescription>
+              {t('history.versions.deleteBody', { name: versionToDelete?.label })}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              disabled={deletingVersion}
+              onClick={() => setVersionToDelete(null)}
+            >
+              {t('common.cancel')}
+            </Button>
+            <Button
+              variant="destructive"
+              disabled={deletingVersion}
+              onClick={handleDeleteVersionConfirm}
+            >
+              {deletingVersion ? t('history.deleteDialog.deleting') : t('common.delete')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={effectsDialogOpen}
+        onOpenChange={(open) => {
+          if (!applyingEffects) setEffectsDialogOpen(open);
+        }}
+      >
         <DialogContent className="max-w-md">
           <DialogHeader>
-            <DialogTitle>{t('history.effectsDialog.title')}</DialogTitle>
-            <DialogDescription>{t('history.effectsDialog.body')}</DialogDescription>
+            <DialogTitle>
+              {editingVersion
+                ? t('history.versions.editTitle', { name: editingVersion.label })
+                : t('history.effectsDialog.title')}
+            </DialogTitle>
+            <DialogDescription>
+              {editingVersion ? t('history.versions.editBody') : t('history.effectsDialog.body')}
+            </DialogDescription>
           </DialogHeader>
-          {effectsTargetVersions.length > 1 && (
+          {!editingVersion && effectsTargetVersions.length > 1 && (
             <div className="space-y-1.5">
-              <label className="text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="history-effects-source"
+                className="text-xs font-medium text-muted-foreground"
+              >
                 {t('history.effectsDialog.sourceLabel')}
               </label>
               <Select
+                disabled={applyingEffects}
                 value={effectsSourceVersionId ?? ''}
                 onValueChange={(val) => setEffectsSourceVersionId(val || null)}
               >
-                <SelectTrigger className="h-8 text-xs">
+                <SelectTrigger id="history-effects-source" className="h-8 text-xs">
                   <SelectValue placeholder={t('history.effectsDialog.sourcePlaceholder')} />
                 </SelectTrigger>
                 <SelectContent>
@@ -908,20 +1110,26 @@ export function HistoryTable() {
               </Select>
             </div>
           )}
-          <div className="py-2 max-h-80 overflow-y-auto">
+          <fieldset disabled={applyingEffects} className="py-2 max-h-80 overflow-y-auto">
             <EffectsChainEditor value={effectsChain} onChange={setEffectsChain} />
-          </div>
+          </fieldset>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setEffectsDialogOpen(false)}>
+            <Button
+              variant="outline"
+              disabled={applyingEffects}
+              onClick={() => setEffectsDialogOpen(false)}
+            >
               {t('common.cancel')}
             </Button>
             <Button
               onClick={handleApplyEffectsConfirm}
-              disabled={applyingEffects || effectsChain.length === 0}
+              disabled={applyingEffects || (!editingVersion && effectsChain.length === 0)}
             >
               {applyingEffects
                 ? t('history.effectsDialog.applying')
-                : t('history.effectsDialog.apply')}
+                : editingVersion
+                  ? t('common.save')
+                  : t('history.effectsDialog.apply')}
             </Button>
           </DialogFooter>
         </DialogContent>
