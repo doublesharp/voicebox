@@ -372,3 +372,22 @@ test('removing the final clip from the selected playing story stops its audio', 
   expect(useStoryStore.getState().isPlaying).toBe(false);
   expect(context.sources[0].stops).toBe(1);
 });
+
+
+test('a failed story clip is skipped with a visible playback notice instead of pausing the story', async () => {
+  const clips = [item('missing-clip'), item('working-clip', 'working-clip', 1000)];
+  const fetcher = mock(async (url: string) => ({
+    ok: !url.includes('missing-clip'), status: url.includes('missing-clip') ? 404 : 200,
+    arrayBuffer: async () => new ArrayBuffer(4),
+  }));
+  globalThis.fetch = fetcher as unknown as typeof fetch;
+  await act(async () => { renderer = create(<Harness items={clips} />); await flush(); });
+  await act(async () => { useStoryStore.getState().play('story', clips); await flush(); });
+  expect(useStoryStore.getState().isPlaying).toBe(true);
+  const context = FakeContext.instances.find((candidate) => candidate.sources.length > 0);
+  expect(context?.sources).toHaveLength(1);
+  expect(useStoryStore.getState().playbackError?.message).toContain('skipped');
+  const count = fetcher.mock.calls.filter(([url]) => url.includes('missing-clip')).length;
+  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 120)); });
+  expect(fetcher.mock.calls.filter(([url]) => url.includes('missing-clip'))).toHaveLength(count);
+});

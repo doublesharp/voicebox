@@ -22,6 +22,7 @@ interface ActiveSource {
 interface PlaybackSession {
   items: StoryItemDetail[];
   scheduled: Set<string>;
+  failed: Set<string>;
   anchorContextTime: number | null;
   anchorStoryTime: number;
   stopped: boolean;
@@ -93,7 +94,10 @@ export function useStoryPlayback(items: StoryItemDetail[] | undefined) {
     const wanted = new Map(
       itemList
         .filter(
-          (item) => endTime(item) > position && item.start_time_ms <= position + PRELOAD_WINDOW_MS,
+          (item) =>
+            endTime(item) > position &&
+            item.start_time_ms <= position + PRELOAD_WINDOW_MS &&
+            !sessionRef.current?.failed.has(storyAudioSource(item).key),
         )
         .map((item) => {
           const source = storyAudioSource(item);
@@ -109,12 +113,30 @@ export function useStoryPlayback(items: StoryItemDetail[] | undefined) {
     for (const [key, source] of wanted) {
       if (!retainedRef.current.has(key)) {
         const lease = storyAudioCache.retain(source);
-        // A failed preview is retried at the next playback start.
-        void lease.promise.catch(() => {
-          if (retainedRef.current.get(key) === lease) {
-            lease.release();
-            retainedRef.current.delete(key);
+        // Failed clips are skipped once per playback session, rather than
+        // re-requested every scheduler tick or trapping playback at a seek.
+        void lease.promise.catch((error) => {
+          if (retainedRef.current.get(key) !== lease) return;
+          lease.release();
+          retainedRef.current.delete(key);
+          const session = sessionRef.current;
+          if (
+            !session ||
+            session.stopped ||
+            (error instanceof DOMException && error.name === 'AbortError')
+          ) {
+            return;
           }
+          session.failed.add(key);
+          for (const item of session.items) {
+            if (storyAudioSource(item).key === key) session.scheduled.add(item.id);
+          }
+          useStoryStore.setState({
+            playbackError: {
+              storyId: session.items[0].story_id,
+              message: 'One or more audio clips could not be loaded and were skipped.',
+            },
+          });
         });
         retainedRef.current.set(key, lease);
       }
@@ -248,6 +270,7 @@ export function useStoryPlayback(items: StoryItemDetail[] | undefined) {
       const session: PlaybackSession = {
         items: [...state.playbackItems].sort((a, b) => a.start_time_ms - b.start_time_ms),
         scheduled: new Set(),
+        failed: new Set(),
         anchorContextTime: null,
         anchorStoryTime: state.currentTimeMs,
         stopped: false,
@@ -259,8 +282,8 @@ export function useStoryPlayback(items: StoryItemDetail[] | undefined) {
         session.stopped || sessionRef.current !== session || context.state === 'closed';
       void (async () => {
         try {
-          // The clock stays still until the first window can play in full.
-          await Promise.all(leases.map((lease) => lease.promise));
+          // Keep the clock still while the first window loads or fails.
+          await Promise.allSettled(leases.map((lease) => lease.promise));
           if (stale()) return;
           if (context.state === 'suspended') await context.resume();
           if (stale()) return;
@@ -306,6 +329,12 @@ export function useStoryPlayback(items: StoryItemDetail[] | undefined) {
         } catch (error) {
           if (session.stopped || sessionRef.current !== session) return;
           console.error('[StoryPlayback] Audio could not be prepared:', error);
+          useStoryStore.setState({
+            playbackError: {
+              storyId: session.items[0].story_id,
+              message: 'Playback could not start. Try playing the story again.',
+            },
+          });
           useStoryStore.getState().pause();
         }
       })();
