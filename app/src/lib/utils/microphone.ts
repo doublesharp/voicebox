@@ -1,15 +1,18 @@
+export type MicrophoneProcessing = 'processed' | 'clean';
+
 /** Open an explicit input, falling back to the system default if it is unavailable. */
 export async function requestMicrophone(
   mediaDevices: Pick<MediaDevices, 'getUserMedia'>,
   deviceId: string | null,
   signal?: AbortSignal,
   onFallback?: () => void,
+  processing: MicrophoneProcessing = 'processed',
 ): Promise<MediaStream> {
   signal?.throwIfAborted();
   const audio: MediaTrackConstraints = {
-    echoCancellation: true,
-    noiseSuppression: true,
-    autoGainControl: true,
+    echoCancellation: processing !== 'clean',
+    noiseSuppression: processing !== 'clean',
+    autoGainControl: processing !== 'clean',
   };
   let stream: MediaStream;
   let usedFallback = false;

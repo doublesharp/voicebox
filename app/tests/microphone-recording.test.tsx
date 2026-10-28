@@ -62,20 +62,26 @@ let renderer: ReactTestRenderer | null = null;
 let recording!: ReturnType<typeof useAudioRecording>;
 let preview!: ReturnType<typeof useMicrophonePreview>;
 
-function RecordingProbe({ deviceId }: { deviceId?: string | null }) {
-  recording = useAudioRecording({ deviceId });
+function RecordingProbe({
+  deviceId,
+  processing,
+}: {
+  deviceId?: string | null;
+  processing?: 'processed' | 'clean';
+}) {
+  recording = useAudioRecording({ deviceId, processing });
   return null;
 }
-function PreviewProbe() {
-  preview = useMicrophonePreview(true);
+function PreviewProbe({ processing }: { processing?: 'processed' | 'clean' }) {
+  preview = useMicrophonePreview(true, processing);
   return null;
 }
 
-function mountRecording(deviceId?: string | null) {
+function mountRecording(deviceId?: string | null, processing?: 'processed' | 'clean') {
   act(() => {
     renderer = create(
       <PlatformProvider platform={{ metadata: { isTauri: true } } as Platform}>
-        <RecordingProbe deviceId={deviceId} />
+        <RecordingProbe deviceId={deviceId} processing={processing} />
       </PlatformProvider>,
     );
   });
@@ -87,6 +93,7 @@ function useDevices(getUserMedia: (constraints: MediaStreamConstraints) => Promi
 
 beforeEach(() => {
   useMicrophoneStore.getState().setMicrophone('shure-usb', 'Shure USB');
+  useMicrophoneStore.getState().setCleanReferenceAudio(false);
 });
 afterEach(async () => {
   await act(async () => {
@@ -96,6 +103,71 @@ afterEach(async () => {
 });
 
 describe('recording input lifecycle', () => {
+  test('clean reference choice persists independently of the selected input', () => {
+    useMicrophoneStore.getState().setCleanReferenceAudio(true);
+    const persisted = JSON.parse(storage.getItem('voicebox-microphone')!);
+    expect(persisted.state.cleanReferenceAudio).toBe(true);
+    expect(persisted.state.deviceId).toBe('shure-usb');
+    useMicrophoneStore.getState().setMicrophone(null, null);
+    expect(useMicrophoneStore.getState().cleanReferenceAudio).toBe(true);
+  });
+
+  test('reference preview follows processing changes and releases the old input', async () => {
+    const first = microphone('shure-usb');
+    const second = microphone('shure-usb');
+    let calls = 0;
+    const acquire = mock(async (_constraints: MediaStreamConstraints) =>
+      ++calls === 1 ? first.stream : second.stream,
+    );
+    useDevices(acquire);
+    await act(async () => {
+      renderer = create(<PreviewProbe />);
+    });
+    await act(async () => {
+      renderer?.update(<PreviewProbe processing="clean" />);
+    });
+    expect(first.stop).toHaveBeenCalled();
+    expect(preview.stream).toBe(second.stream);
+    expect(acquire.mock.calls[1][0].audio).toMatchObject({
+      echoCancellation: false,
+      noiseSuppression: false,
+      autoGainControl: false,
+    });
+  });
+
+  test('reference recording passes clean processing without changing the saved input', async () => {
+    const { stream } = microphone('shure-usb');
+    const acquire = mock(async (_constraints: MediaStreamConstraints) => stream);
+    useDevices(acquire);
+    mountRecording(undefined, 'clean');
+    await act(async () => {
+      await recording.startRecording();
+    });
+    expect(acquire.mock.calls[0][0].audio).toMatchObject({
+      echoCancellation: false,
+      noiseSuppression: false,
+      autoGainControl: false,
+      deviceId: { exact: 'shure-usb' },
+    });
+    expect(useMicrophoneStore.getState().deviceId).toBe('shure-usb');
+  });
+
+  test('dictation keeps processed defaults even with clean references enabled', async () => {
+    useMicrophoneStore.setState({ cleanReferenceAudio: true });
+    const { stream } = microphone('shure-usb');
+    const acquire = mock(async (_constraints: MediaStreamConstraints) => stream);
+    useDevices(acquire);
+    mountRecording();
+    await act(async () => {
+      await recording.startRecording();
+    });
+    expect(acquire.mock.calls[0][0].audio).toMatchObject({
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+    });
+  });
+
   test('an input override changes only this recording, leaving the saved choice intact', async () => {
     const { stream } = microphone('other-usb');
     const acquire = mock(async (_constraints: MediaStreamConstraints) => stream);

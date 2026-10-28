@@ -1,12 +1,14 @@
 import { Mic, Pause, Play, Square } from 'lucide-react';
-import { memo } from 'react';
+import { memo, useId } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Visualizer } from 'react-sound-visualizer';
-import { Button } from '@/components/ui/button';
 import { MicrophoneSelector } from '@/components/MicrophoneSelector/MicrophoneSelector';
-import { useMicrophonePreview } from '@/lib/hooks/useMicrophonePreview';
+import { Button } from '@/components/ui/button';
+import { Checkbox } from '@/components/ui/checkbox';
 import { FormControl, FormItem, FormMessage } from '@/components/ui/form';
+import { useMicrophonePreview } from '@/lib/hooks/useMicrophonePreview';
 import { formatAudioDuration } from '@/lib/utils/audio';
+import { useMicrophoneStore } from '@/stores/microphoneStore';
 
 const MemoizedWaveform = memo(function MemoizedWaveform({
   audioStream,
@@ -58,7 +60,13 @@ export function AudioSampleRecording({
   showWaveform = true,
 }: AudioSampleRecordingProps) {
   const { t } = useTranslation();
-  const preview = useMicrophonePreview(showWaveform && !file && !isRecording && !isStarting);
+  const cleanReferenceAudio = useMicrophoneStore((state) => state.cleanReferenceAudio);
+  const setCleanReferenceAudio = useMicrophoneStore((state) => state.setCleanReferenceAudio);
+  const processingId = useId();
+  const preview = useMicrophonePreview(
+    showWaveform && !file && !isRecording && !isStarting,
+    cleanReferenceAudio ? 'clean' : 'processed',
+  );
   const audioStream = isRecording ? recordingStream : preview.stream;
 
   return (
@@ -66,6 +74,25 @@ export function AudioSampleRecording({
       <FormControl>
         <div className="space-y-4">
           <MicrophoneSelector disabled={isRecording || isStarting} />
+          {!file && (
+            <div className="space-y-1">
+              <label htmlFor={processingId} className="flex items-center gap-2 text-sm">
+                <Checkbox
+                  id={processingId}
+                  checked={cleanReferenceAudio}
+                  onCheckedChange={setCleanReferenceAudio}
+                  disabled={isRecording || isStarting}
+                />
+                {t('audioSample.disableProcessing', 'Disable browser audio processing')}
+              </label>
+              <p className="text-xs text-muted-foreground">
+                {t(
+                  'audioSample.disableProcessingHint',
+                  'For reference recordings only. Requests no noise suppression, echo cancellation, or automatic gain. Recordings may still use compressed audio.',
+                )}
+              </p>
+            </div>
+          )}
           {(usingDefaultMicrophone || preview.usingDefaultMicrophone) && (
             <output className="block text-sm text-muted-foreground">
               {t('microphone.fallbackNotice')}

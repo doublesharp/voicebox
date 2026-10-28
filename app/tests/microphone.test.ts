@@ -12,6 +12,34 @@ function microphone(deviceId = 'shure-usb') {
 }
 
 describe('microphone acquisition', () => {
+  test('clean reference capture requests no browser microphone processing', async () => {
+    const { stream } = microphone();
+    const getUserMedia = mock(async (_constraints: MediaStreamConstraints) => stream);
+    await requestMicrophone({ getUserMedia }, 'shure-usb', undefined, undefined, 'clean');
+    expect(getUserMedia).toHaveBeenCalledWith({
+      audio: {
+        deviceId: { exact: 'shure-usb' },
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+      },
+    });
+  });
+
+  test('fallback retains explicitly chosen clean reference processing', async () => {
+    const { stream } = microphone('built-in');
+    const getUserMedia = mock(async (constraints: MediaStreamConstraints) => {
+      if ((constraints.audio as MediaTrackConstraints).deviceId) {
+        throw new DOMException('Selected mic unavailable', 'NotFoundError');
+      }
+      return stream;
+    });
+    await requestMicrophone({ getUserMedia }, 'missing-usb', undefined, undefined, 'clean');
+    expect(getUserMedia.mock.calls[1][0]).toEqual({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+    });
+  });
+
   test('requests the selected USB microphone instead of the system default', async () => {
     const { stream } = microphone();
     const getUserMedia = mock(async (_constraints: MediaStreamConstraints) => stream);
