@@ -11,12 +11,21 @@ interface MicrophoneStore {
 
 const storageKey = 'voicebox-microphone';
 
+function earlierCleanReferencePreference(): boolean {
+  try {
+    const saved = JSON.parse(localStorage.getItem('voicebox-reference-capture') ?? 'null');
+    return saved?.state?.cleanReferenceAudio === true;
+  } catch {
+    return false;
+  }
+}
+
 export const useMicrophoneStore = create<MicrophoneStore>()(
   persist(
     (set) => ({
       deviceId: null,
       deviceLabel: null,
-      cleanReferenceAudio: false,
+      cleanReferenceAudio: earlierCleanReferencePreference(),
       setMicrophone: (deviceId, deviceLabel) => set({ deviceId, deviceLabel }),
       setCleanReferenceAudio: (cleanReferenceAudio) => set({ cleanReferenceAudio }),
     }),

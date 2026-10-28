@@ -125,7 +125,9 @@ export function useAudioRecording({
           ? (Date.now() - startTimeRef.current) / 1000
           : undefined;
 
-        const webmBlob = new Blob(chunksRef.current, { type: 'audio/webm' });
+        const webmBlob = new Blob(chunksRef.current, {
+          type: mediaRecorder.mimeType || options.mimeType || 'audio/webm',
+        });
 
         // Stop all tracks now that we have the data
         stream.getTracks().forEach((track) => {
