@@ -1,8 +1,9 @@
 """Snapshot legacy voice metadata and copy reference audio into studio storage."""
 
 from .. import config
-from ..database import VoiceProfile, ProfileSample, get_db
+from ..database import ProfileSample, VoiceProfile, get_db
 from ..services.profiles import default_engine_for_profile, validate_profile_engine
+from .capabilities import capability_for_config
 from .storage import NotFound
 
 
@@ -41,6 +42,7 @@ def snapshot_voice(store, project_id, profile_id, model_size=None):
         else:
             selected = next((cfg for cfg in variants if _ready(cfg)), variants[0])
         snapshot["model_size"] = selected.model_size
+        snapshot["capabilities"] = capability_for_config(selected)
         snapshot["samples"] = []
         if snapshot["voice_type"] == "cloned":
             samples = db.query(ProfileSample).filter_by(profile_id=profile_id).all()
@@ -57,22 +59,14 @@ def snapshot_voice(store, project_id, profile_id, model_size=None):
         db.close()
 
 
-def engines():
+def engines(commercial_only=False):
+    """Return registered variants; commercial_only excludes unknown and restricted terms."""
     from ..backends import get_tts_model_configs
 
     result = []
     for cfg in get_tts_model_configs():
-        result.append(
-            dict(
-                id=cfg.engine,
-                name=cfg.display_name,
-                model_size=cfg.model_size,
-                languages=cfg.languages,
-                supports_instruct=cfg.supports_instruct,
-                supports_seed=False,
-                expressive_tags=[],
-                ready=_ready(cfg),
-                commercial_use="restricted" if cfg.engine == "omnivoice" else "unknown",
-            )
-        )
+        caps = capability_for_config(cfg)
+        if commercial_only and caps["commercial_use"] != "allowed":
+            continue
+        result.append(dict(id=cfg.engine, name=cfg.display_name, model_size=cfg.model_size, ready=_ready(cfg), **caps))
     return result

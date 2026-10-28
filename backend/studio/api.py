@@ -49,15 +49,18 @@ class Generate(BaseModel):
     passage_ids: list[str]
     count: int = Field(ge=1, le=3)
     adopt: bool
+    commercial_only: bool = False
 
 
 def make_router(store, jobs=None):
     router = APIRouter(prefix="/studio/v1")
     from .preview import make_preview_router
     from .waveforms import make_waveform_router
+    from .audition import make_audition_router
 
     router.include_router(make_preview_router(store))
     router.include_router(make_waveform_router(store))
+    router.include_router(make_audition_router(store))
     jobs = jobs or StudioJobs(store)
 
     def get_delivery():
@@ -100,14 +103,19 @@ def make_router(store, jobs=None):
         return call(store.approve, project_id, **body.model_dump())
 
     @router.get("/engines")
-    def get_engines():
+    def get_engines(commercial_only: bool = False):
         from .voices import engines
 
-        return {"items": engines()}
+        return {"items": engines(commercial_only=commercial_only)}
 
     @router.post("/projects/{project_id}/generation-jobs", status_code=202)
     async def generate(project_id: str, body: Generate):
-        return {"jobs": call(jobs.submit, project_id, body.idempotency_key, body.passage_ids, body.count, body.adopt)}
+        return {
+            "jobs": call(
+                jobs.submit, project_id, body.idempotency_key, body.passage_ids, body.count, body.adopt,
+                commercial_only=body.commercial_only,
+            )
+        }
 
     @router.get("/jobs/{job_id}")
     def get_job(job_id: str):

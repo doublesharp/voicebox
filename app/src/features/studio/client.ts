@@ -1,4 +1,5 @@
 import type {
+  AuditionLevel,
   StudioAsset,
   StudioCommand,
   StudioEngine,
@@ -105,7 +106,13 @@ export class StudioClient implements StudioTransport {
   }
   generate(
     id: string,
-    input: { idempotency_key: string; passage_ids: string[]; count: 1 | 2 | 3; adopt: boolean },
+    input: {
+      idempotency_key: string;
+      passage_ids: string[];
+      count: 1 | 2 | 3;
+      adopt: boolean;
+      commercial_only?: boolean;
+    },
   ) {
     return this.post<{ jobs: StudioJob[] }>(
       `/projects/${encodeURIComponent(id)}/generation-jobs`,
@@ -135,6 +142,11 @@ export class StudioClient implements StudioTransport {
   }
   assetAudio(id: string) {
     return this.url(`/assets/${encodeURIComponent(id)}/audio`);
+  }
+  auditionLevel(id: string, signal?: AbortSignal) {
+    return this.request<AuditionLevel>(`/assets/${encodeURIComponent(id)}/audition-level`, {
+      signal,
+    });
   }
   deliverableAudio(id: string) {
     return this.url(`/deliverables/${encodeURIComponent(id)}/audio`);

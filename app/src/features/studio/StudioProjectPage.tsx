@@ -778,7 +778,7 @@ function ProjectWorkspace({
                   <div className="studio-job" key={job.id}>
                     <div>
                       <strong>{job.kind}</strong>
-                      <span>{job.status}</span>
+                      <span>{job.phase?.replace(/_/g, ' ') ?? job.status}</span>
                       {job.error && <p className="studio-error">{job.error}</p>}
                     </div>
                     {isJobActive(job.status) && (

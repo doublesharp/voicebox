@@ -10,6 +10,10 @@ from backend.studio.storage import StudioStore
 from backend.studio.jobs import StudioJobs
 
 
+def fixture_capabilities(voice):
+    return {"languages": ["en"], "expressive_tags": [], "supports_instruct": False, "supports_seed": False}
+
+
 def setup(tmp_path, script="One"):
     def voice(store, project_id, profile_id):
         return {"engine": "fixture", "voice_type": "preset", "preset_engine": "fixture", "preset_voice_id": profile_id}
@@ -25,7 +29,9 @@ async def generate(store, project, ids, adopt=True):
     async def synth(request):
         return np.full(100, 0.1, dtype="float32"), 1000
 
-    jobs = StudioJobs(store, synth=synth, enqueue=lambda ident, coro: pending.append(coro))
+    jobs = StudioJobs(
+        store, synth=synth, capability_resolver=fixture_capabilities, enqueue=lambda ident, coro: pending.append(coro)
+    )
     jobs.submit(project["id"], "generate", ids, 1, adopt)
     for coro in pending:
         await coro
@@ -63,7 +69,9 @@ async def test_deleted_restored_passage_never_reuses_adoption_intent(tmp_path):
     async def synth(request):
         return np.full(100, 0.1, dtype="float32"), 1000
 
-    jobs = StudioJobs(store, synth=synth, enqueue=lambda ident, coro: pending.append(coro))
+    jobs = StudioJobs(
+        store, synth=synth, capability_resolver=fixture_capabilities, enqueue=lambda ident, coro: pending.append(coro)
+    )
     jobs.submit(p["id"], "job", [pid], 1, True)
     p = store.command(p["id"], "delete", p["revision"], "delete_passage", {"passage_id": pid})
     store.command(p["id"], "restore2", p["revision"], "restore_revision", {"revision_id": rid})
@@ -219,7 +227,9 @@ async def test_replacing_linked_clip_routes_the_new_frozen_voice_atomically(tmp_
     async def synth(request):
         return np.full(100, 0.2, dtype="float32"), 1000
 
-    jobs = StudioJobs(store, synth=synth, enqueue=lambda ident, coro: pending.append(coro))
+    jobs = StudioJobs(
+        store, synth=synth, capability_resolver=fixture_capabilities, enqueue=lambda ident, coro: pending.append(coro)
+    )
     jobs.submit(p["id"], "bob-take", [ids[0]], 1, True)
     await pending.pop()
     p = store.get_project(p["id"])

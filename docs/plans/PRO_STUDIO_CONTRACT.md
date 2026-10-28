@@ -4,10 +4,7 @@ Date: 2026-10-28. Implements [the specification](PRO_STUDIO_SPEC.md) after the u
 
 ## Parallel ownership
 
-- Storage/API/generation worker: `backend/studio/` except `rendering.py` and `archive.py`; `backend/tests/test_studio_storage.py`, `test_studio_jobs.py`, `test_studio_api.py`; narrowly scoped shared generation-arbitration integration.
-- Frontend worker: `app/src/features/studio/`, `app/tests/studio*.test.*`, and studio route/navigation integration in `app/src/router.tsx` and `app/src/components/Sidebar.tsx`.
-- Rendering/archive worker: `backend/studio/rendering.py`, `backend/studio/archive.py`, `backend/tests/test_studio_rendering.py`, `backend/tests/test_studio_archive.py` only.
-- Root: backend registration/lifecycle integration, cross-domain integration checks, source/build qualification, documentation and Coordinate status. Root resolves cross-boundary defects.
+Current task-specific file ownership and parallel workstreams live in local Coordinate. Preparation tasks own their assigned feature files; only root integrates and pushes Git branches. Reserving the same integration target for multiple preparation tasks unnecessarily serializes them. Root owns backend registration, central contract changes, cross-domain checks and the final merge.
 
 Workers share this checkout with strict ownership to preserve the existing uncommitted branding and playback work. No worker resets, checks out, commits, stages, or rewrites another owner's files. Dependencies, model caches, and native identities remain unchanged. No new framework or package installation is planned.
 
@@ -50,6 +47,7 @@ Document:
     trim_start_sample: number; trim_end_sample: number;
     gain: number; fade_in_samples: number; fade_out_samples: number;
   }>;
+  take_annotations?: Record<string, {name: string; note: string}>;
   mix: {target_lufs: number; max_true_peak_dbtp: number; normalize: boolean};
 }
 ```
@@ -70,7 +68,8 @@ S1 documents and imported checkpoints require a 48 kHz stereo working format. Na
 | assign_voice | `{passage_ids: string[], profile_id: string, model_size?:string}`; backend validates and freezes the exact compatible variant and copied references |
 | delete_passage | `{passage_id}`; remove related clips through one command, retain takes/assets/history |
 | reorder_passages | `{passage_ids: string[]}`; exact existing passage set |
-| select_take | `{passage_id, take_id, replace_clips?: boolean}` |
+| select_take | `{passage_id, take_id, replace_clips?: boolean, reset_trims?:boolean}`; explicit reset requires replacement, preserves starts/gains, and clears source trims and any fades that cannot fit |
+| annotate_take | `{take_id, name?, note?}`; at least one annotation field, name up to 120 characters and note up to 4000; ordinary revision/idempotency/undo semantics |
 | set_lock | `{passage_id, locked: boolean}` |
 | insert_passages | `{passage_ids: string[], start_sample?: number, gap_ms?: number}`; append by default |
 | insert_asset | `{asset_id, start_sample?: number, track_id?: string, kind?: 'music'|'sfx'|'voice', name?:string}`; create a track when absent; undo retains the immutable source |
@@ -84,9 +83,13 @@ S1 documents and imported checkpoints require a 48 kHz stereo working format. Na
 
 Checkpoints: `POST /projects/{id}/revisions` accepts `{operation_id, expected_revision, name}`. Local approval: `POST /projects/{id}/approvals` accepts `{operation_id, revision_id, note?}`. Both return a complete project. Immutable revisions contain `{id, name, created_at, document, project_revision}`.
 
-`GET /engines` returns `{items: Array<{id, name, model_size?, languages: string[], supports_instruct: boolean, supports_seed: boolean, expressive_tags: string[], ready: boolean, commercial_use: 'allowed'|'restricted'|'unknown'}>}`. Use actual registry/platform capabilities; no universal emotion sliders or automatic model downloads.
+`GET /engines?commercial_only=false` returns `{items: StudioEngine[]}`. Each engine advertises `id`, `name`, `model_size`, `languages`, `supports_instruct`, `supports_seed`, `supports_voice_design`, `expressive_tags`, `recognized_tags`, `supported_attributes`, `attribute_vocabulary`, `limits`, `ready`, `commercial_use`, `registry_identity` and `registry_revision`. `streaming.qualified` and `performance_conversion.qualified` are explicit qualification flags, not inferred from an adapter signature.
 
-Generation: `POST /projects/{id}/generation-jobs` accepts `{idempotency_key, passage_ids: string[], count: 1|2|3, adopt: boolean}` and returns `202 {jobs: StudioJob[]}`. Snapshot inputs at submission, persist before response, compare passage/selection intent before adoption. `GET /jobs/{id}`, `POST /jobs/{id}/cancel`, and `POST /jobs/{id}/retry` expose durable status. `GET /projects/{id}` includes recent jobs and completed takes, supporting polling without SSE.
+`registry_identity` records the selected engine/model repositories, actual per-engine adapter and available source hash, relevant runtime/engine package versions, platform and Python identity. Unknown weights revision or unavailable bundled Python source remains `null`. `registry_revision` hashes this identity and declared semantics; it is not a claim that model weights or native execution have been qualified. Base Qwen delivery instructions remain unsupported; CustomVoice/VoiceDesign declarations follow their own configuration. Commercial filtering admits only `commercial_use:'allowed'`; restricted and unknown terms are excluded and the filtered list may be empty. The UI consumes backend tag vocabulary rather than maintaining an independent emotion list.
+
+Generation: `POST /projects/{id}/generation-jobs` accepts `{idempotency_key, passage_ids: string[], count: 1|2|3, adopt: boolean, commercial_only?:boolean}` and returns `202 {jobs: StudioJob[]}`. Validate every passage before committing any jobs. Default/false commercial mode preserves the previous request replay identity; true mode requires every model's commercial suitability to be allowed. Snapshot capabilities and effective direction before queueing, retain inactive direction in the saved passage, and exclude unsupported instruction/seed settings from synthesis. Recognized unsupported expressive tokens require an actionable resolution; ordinary bracketed prose is not automatically treated as a stage tag. Inputs never silently re-read mutable voice defaults. Adoption still compares passage/selection intent.
+
+`GET /jobs/{id}`, `POST /jobs/{id}/cancel`, and `POST /jobs/{id}/retry` expose durable status. Both the job reader and project job arrays include `phase` and `attempts` with ordered phase events and errors. Generation phases include loading_model, generating and processing; injected custom adapters do not fabricate model-loading phases. Retry retains the logical job and records a new attempt. Takes record `creation_job_id`, `creation_attempt`, capability/runtime identity and effective direction in their frozen request. Render jobs retain generic status until render lifecycle instrumentation is implemented.
 
 Take minimum fields: `{id, passage_id, asset_id, text, engine, model_size, created_at, request}`. Asset minimum fields: `{id, hash, sample_rate, channels, frames, duration, size_bytes}`. Job minimum fields: `{id, kind, status, passage_id?, error?, result?, created_at, updated_at}`. Asset audio: `GET /assets/{id}/audio`.
 
@@ -96,7 +99,11 @@ Every narration passage needs a selected take and audible pinned timeline audio.
 
 Preview: `GET /assets/{id}/preview?start_sample=N&frames=N` returns only the requested range as a standalone 48 kHz WAV; the maximum range is 240000 samples. Timeline playback reads sequential two-second windows with bounded lookahead and fails visibly on underrun. `GET /assets/{id}/waveform?bins=512` returns native `{sample_rate,frames,channels,peaks:[[min,max],...]}`; bins range from 32 to 2048. Peaks are read in bounded blocks and cached by immutable source hash with a 64 MiB disk limit. Waveforms are source-derived; live meters report sample peaks, not LUFS or true peak.
 
-Archives: `GET /projects/{id}/archive` returns a complete managed ZIP, staged/validated before streaming. `POST /imports/archive` accepts multipart `file` and returns a new complete project. `POST /imports/story/{story_id}` creates a studio-owned copy, preserving legacy data. `POST /projects/{id}/assets` accepts multipart audio `file`; returns asset metadata, allowing a later clip insertion command when implemented.
+Take comparison: `GET /assets/{id}/audition-level` returns `{method:'sample_rms_v1',status:'measured'|'silence',rms,peak,frames,measured_frames,sample_rate,channels}`. It samples at most five native windows with a 240000-frame total ceiling and bounded reads, cached by source hash/method with a 4 MiB disk limit. This is a sampled listening estimate, not integrated LUFS or full-file true peak. Matching only attenuates temporary audition, never sources, arrangement gain or delivery mastering. Silence, incompatible layouts and unavailable measurements remain explicit; ordinary audition stays available.
+
+Annotation keystrokes enter the same session recovery/conflict boundary as script edits. Journal version 2 includes `takeDrafts`; version 1 remains readable. Inspector navigation preserves drafts, polling cannot rebase their original revision, and acknowledgements preserve newer typing. Older clients treat version 2 as an unreadable/exportable recovery record rather than silently dropping its annotation data.
+
+Archives: `GET /projects/{id}/archive` returns a complete managed ZIP, staged/validated before streaming. `POST /imports/archive` accepts multipart `file` and returns a new complete project. `POST /imports/story/{story_id}` creates a studio-owned copy, preserving legacy data. `POST /projects/{id}/assets` accepts multipart audio `file`; returned metadata can be placed with `insert_asset`. Annotation maps are validated against project takes; imports remap only their take-ID keys and preserve note text.
 
 ## Pure rendering and archive module interfaces
 

@@ -62,6 +62,8 @@ def import_archive(store, archive_path):
             return value
 
         def document(value):
+            if "take_annotations" in value:
+                value["take_annotations"] = {ref(key): item for key, item in value["take_annotations"].items()}
             for item in value["passages"]:
                 passage(item)
             for track in value["tracks"]:

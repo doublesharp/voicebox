@@ -1,0 +1,20 @@
+.studio-take-workflow,
+.studio-comparison-source {
+  min-width: 0;
+}
+.studio-take-workflow pre {
+  max-width: 100%;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.studio-take-workflow .studio-take-title,
+.studio-take-workflow .studio-action-row {
+  flex-wrap: wrap;
+}
+.studio-take-workflow strong,
+.studio-take-workflow .studio-take-script {
+  overflow-wrap: anywhere;
+}
+.studio-comparison-source {
+  margin-block: 0.75rem;
+}

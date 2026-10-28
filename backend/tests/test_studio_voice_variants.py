@@ -27,6 +27,8 @@ def test_qwen_snapshot_uses_available_variant_and_freezes_explicit_choice(tmp_pa
     p = store.create_project("Voice")
     snapshot = voices.snapshot_voice(store, p["id"], "voice")
     assert snapshot["model_size"] == "0.6B"
+    assert snapshot["capabilities"]["registry_identity"]["model_size"] == "0.6B"
+    assert snapshot["capabilities"]["supports_instruct"] is False
     explicit = voices.snapshot_voice(store, p["id"], "voice", model_size="1.7B")
     assert explicit["model_size"] == "1.7B"
     with pytest.raises(ValueError, match="variant"):

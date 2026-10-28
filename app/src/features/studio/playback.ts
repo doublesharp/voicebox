@@ -81,11 +81,13 @@ export class StudioPlayback {
       return false;
     }
   }
-  async audition(url: string, label: string) {
+  async audition(url: string, label: string, temporaryGain = 1) {
     this.stop();
     const token = this.epoch;
     if (!(await this.acquire(token))) return;
     const audio = new Audio();
+    // Each source owns its listening gain. It never changes clips, assets or renders.
+    audio.volume = Number.isFinite(temporaryGain) ? Math.max(0, Math.min(1, temporaryGain)) : 1;
     audio.crossOrigin = 'anonymous';
     audio.src = url;
     this.audio = audio;
