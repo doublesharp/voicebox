@@ -1,26 +1,15 @@
-import type { FileFilter, PlatformFilesystem } from '@/platform/types';
+import type { FileFilter, PlatformFilesystem, SaveFileResult } from '@/platform/types';
 
 export const tauriFilesystem: PlatformFilesystem = {
   async saveFile(filename: string, blob: Blob, filters?: FileFilter[]) {
-    const { save } = await import('@tauri-apps/plugin-dialog');
-    const { writeFile } = await import('@tauri-apps/plugin-fs');
+    const { invoke } = await import('@tauri-apps/api/core');
+    const bytes = Array.from(new Uint8Array(await blob.arrayBuffer()));
+    return invoke<SaveFileResult>('publish_file_bytes', { filename, filters: filters || [], bytes });
+  },
 
-    const filePath = await save({
-      defaultPath: filename,
-      filters: filters || [],
-    });
-
-    if (!filePath) return; // User cancelled the dialog
-
-    const resolvedPath =
-      typeof filePath === 'string' ? filePath : (filePath as { path: string }).path;
-
-    if (!resolvedPath) {
-      throw new Error('Failed to resolve save path from dialog');
-    }
-
-    const arrayBuffer = await blob.arrayBuffer();
-    await writeFile(resolvedPath, new Uint8Array(arrayBuffer));
+  async saveFromUrl(filename: string, url: string, filters?: FileFilter[]) {
+    const { invoke } = await import('@tauri-apps/api/core');
+    return invoke<SaveFileResult>('publish_file_url', { filename, url, filters: filters || [] });
   },
 
   async openPath(path: string) {

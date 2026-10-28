@@ -8,8 +8,11 @@ export interface FileFilter {
   extensions: string[];
 }
 
+export type SaveFileResult = { status: 'saved' | 'cancelled' | 'download_started'; path?: string };
+
 export interface PlatformFilesystem {
-  saveFile(filename: string, blob: Blob, filters?: FileFilter[]): Promise<void>;
+  saveFile(filename: string, blob: Blob, filters?: FileFilter[]): Promise<SaveFileResult | void>;
+  saveFromUrl?(filename: string, url: string, filters?: FileFilter[]): Promise<SaveFileResult>;
   openPath(path: string): Promise<void>;
   pickDirectory(title: string): Promise<string | null>;
 }
