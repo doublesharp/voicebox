@@ -41,6 +41,17 @@ import { cn } from '@/lib/utils/cn';
 import { useGenerationStore } from '@/stores/generationStore';
 import { useStoryStore } from '@/stores/storyStore';
 
+function StoryPlaybackNotice({ storyId }: { storyId: string }) {
+  const error = useStoryStore((state) =>
+    state.playbackError?.storyId === storyId ? state.playbackError.message : null,
+  );
+  return error ? (
+    <p role="alert" className="text-sm text-destructive px-4 py-2">
+      {error}
+    </p>
+  ) : null;
+}
+
 function StoryTimeReadout({
   storyId,
   totalDurationMs,
@@ -1030,6 +1041,7 @@ export const StoryTrackEditor = memo(function StoryTrackEditor({
           <GripHorizontal className="h-3 w-3 text-muted-foreground/50 group-hover:text-muted-foreground" />
         </button>
 
+        <StoryPlaybackNotice storyId={storyId} />
         {/* Toolbar */}
         <div className="flex items-center justify-between px-3 py-2 border-b bg-muted/30 mt-2">
           {/* Play controls - left side */}
