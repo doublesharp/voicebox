@@ -1,499 +1,200 @@
-name: Release
+name: DoubleSharp builds
+run-name: DoubleSharp ${{ inputs.platforms }} build
 
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - "v*"
+    inputs:
+      platforms:
+        description: Platforms to package from the doublesharp branch
+        type: choice
+        required: true
+        default: both
+        options:
+          - both
+          - macos
+          - windows
+
+permissions:
+  contents: read
+
+concurrency:
+  group: doublesharp-manual-build
+  cancel-in-progress: true
 
 jobs:
-  release:
-    permissions:
-      contents: write
+  build:
+    # This workflow keeps the existing release.yml entry point so it can be
+    # dispatched on doublesharp without changing the repository's default branch.
+    # There are deliberately no push, pull_request, tag, or scheduled triggers.
+    if: github.ref == 'refs/heads/doublesharp'
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - platform: "macos-latest"
-            args: "--target aarch64-apple-darwin"
-            python-version: "3.12"
-            backend: "mlx"
-          - platform: "macos-15-intel"
-            args: "--target x86_64-apple-darwin"
-            python-version: "3.12"
-            backend: "pytorch"
-          - platform: "windows-latest"
-            args: ""
-            python-version: "3.12"
-            backend: "pytorch"
-
-    runs-on: ${{ matrix.platform }}
+        include: ${{ fromJSON(inputs.platforms == 'windows' && '[{"os":"windows-latest","target":"x86_64-pc-windows-msvc","python_arch":"x64","artifact":"windows-cuda"}]' || inputs.platforms == 'macos' && '[{"os":"macos-latest","target":"aarch64-apple-darwin","python_arch":"arm64","artifact":"macos-arm64"}]' || '[{"os":"macos-latest","target":"aarch64-apple-darwin","python_arch":"arm64","artifact":"macos-arm64"},{"os":"windows-latest","target":"x86_64-pc-windows-msvc","python_arch":"x64","artifact":"windows-cuda"}]') }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "4"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
     steps:
       - uses: actions/checkout@v4
 
-      # Ubuntu runners ship with ~14 GB free; pip + PyInstaller + torch can
-      # peak well above that during the build. Reclaim ~25 GB by pruning
-      # preinstalled toolchains we don't use. This is what likely tripped
-      # the March 2026 Linux release attempts (see commit 103e98b
-      # "github runners suck") — not a code issue, a disk-pressure one.
-      - name: Free up disk space (ubuntu)
-        if: contains(matrix.platform, 'ubuntu') || contains(matrix.platform, 'namespace')
-        # Pinned to v1.3.1 (SHA) — this job runs with contents: write and
-        # handles signing secrets later, so we don't want a floating ref.
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
+      - name: Fingerprint backend inputs
+        id: source
+        run: |
+          echo "backend=${{ hashFiles('backend/*.py', 'backend/backends/**', 'backend/services/**', 'backend/routes/**', 'backend/utils/**', 'backend/database/**', 'backend/vendor/**', 'backend/mcp_server/**', 'backend/requirements*.txt') }}" >> "$GITHUB_OUTPUT"
+
+      - name: Reuse unchanged CPU and MCP binaries
+        id: server-cache
+        uses: actions/cache@v4
         with:
-          tool-cache: false
-          android: true
-          dotnet: true
-          haskell: true
-          # large-packages: true would `apt-get remove '^llvm-.*'`, which
-          # cascade-removes reverse deps that won't be pulled back in by the
-          # `llvm-dev` install below. The other flags already free ~20 GB,
-          # enough for the Python + torch + PyInstaller build.
-          large-packages: false
-          swap-storage: true
+          path: tauri/src-tauri/binaries
+          key: fork-sidecars-v1-${{ matrix.target }}-py312-${{ steps.source.outputs.backend }}
 
-      - name: Install dependencies (ubuntu only)
-        if: contains(matrix.platform, 'ubuntu') || contains(matrix.platform, 'namespace')
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf llvm-dev libasound2-dev
-
-      - name: Install LLVM (macOS)
-        if: matrix.platform == 'macos-latest' || matrix.platform == 'macos-15-intel'
-        run: |
-          brew install llvm@20
-          echo "$(brew --prefix llvm@20)/bin" >> $GITHUB_PATH
-          echo "LLVM_CONFIG=$(brew --prefix llvm@20)/bin/llvm-config" >> $GITHUB_ENV
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - name: Reuse unchanged CUDA backend
+        if: runner.os == 'Windows'
+        id: cuda-cache
+        uses: actions/cache@v4
         with:
-          python-version: ${{ matrix.python-version }}
-          cache: "pip"
+          path: backend/dist/voicebox-server-cuda
+          key: fork-cuda-v1-cu128-${{ matrix.target }}-py312-${{ steps.source.outputs.backend }}
 
-      - name: Install CPU-only PyTorch (Linux)
-        if: contains(matrix.platform, 'ubuntu') || contains(matrix.platform, 'namespace')
-        run: |
-          pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: ${{ matrix.python_arch }}
+          # Avoid restoring a multi-GB wheel cache when all binaries were reused.
+          cache: ${{ (steps.server-cache.outputs.cache-hit != 'true' || (runner.os == 'Windows' && steps.cuda-cache.outputs.cache-hit != 'true')) && 'pip' || '' }}
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-mlx.txt
 
-      - name: Install Python dependencies
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.8"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tauri/src-tauri -> target
+          shared-key: fork-${{ matrix.target }}
+
+      - name: Install backend dependencies when a binary needs rebuilding
+        if: steps.server-cache.outputs.cache-hit != 'true' || (runner.os == 'Windows' && steps.cuda-cache.outputs.cache-hit != 'true')
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller
-          pip install -r backend/requirements.txt
-          pip install --no-deps chatterbox-tts
-          pip install --no-deps hume-tada
-          pip install --no-deps omnivoice
-
-      - name: Install MLX dependencies (Apple Silicon only)
-        if: matrix.backend == 'mlx'
-        run: |
-          pip install -r backend/requirements-mlx.txt
-          # mlx-audio>=0.3.1 and mlx-lm>=0.31.1 both declare transformers>=5.x,
-          # which conflicts with our 4.57.x cap. The runtime APIs we use work
-          # fine on transformers 4.57.x in practice (verified in dev), so install
-          # them --no-deps. mlx-audio's other runtime deps (huggingface_hub,
-          # librosa, numpy, numba, pyloudnorm) are already in requirements.txt;
-          # miniaudio is in requirements-mlx.txt (needed by mlx_audio.stt,
-          # not transitively pulled by anything else — see issue #505); the
-          # rest (sounddevice, protobuf, sentencepiece, pyyaml, jinja2) are
-          # pulled in by other engines.
-          pip install --no-deps mlx-lm==0.31.1
-          pip install --no-deps mlx-audio==0.4.1
-
-      - name: Build Python server (Linux/macOS)
-        if: matrix.platform != 'windows-latest'
-        run: |
-          chmod +x scripts/build-server.sh
-          ./scripts/build-server.sh
-
-      - name: Build Python server (Windows)
-        if: matrix.platform == 'windows-latest'
-        shell: bash
-        run: |
-          cd backend
-          python build_binary.py
-          python build_binary.py --shim
-
-          # Get platform tuple
-          PLATFORM=$(rustc --print host-tuple)
-
-          # Create binaries directory
-          mkdir -p ../tauri/src-tauri/binaries
-
-          # Copy with platform suffix
-          cp dist/voicebox-server.exe ../tauri/src-tauri/binaries/voicebox-server-${PLATFORM}.exe
-          cp dist/voicebox-mcp.exe ../tauri/src-tauri/binaries/voicebox-mcp-${PLATFORM}.exe
-          echo "Built voicebox-server-${PLATFORM}.exe"
-          echo "Built voicebox-mcp-${PLATFORM}.exe"
-
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ (matrix.platform == 'macos-latest' && 'aarch64-apple-darwin') || (matrix.platform == 'macos-15-intel' && 'x86_64-apple-darwin') || '' }}
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: "./tauri/src-tauri -> target"
-
-      - name: Install dependencies
-        run: bun install
-
-      - name: Install Apple API key
-        if: matrix.platform == 'macos-latest' || matrix.platform == 'macos-15-intel'
-        run: |
-          mkdir -p ~/.appstoreconnect/private_keys/
-          cd ~/.appstoreconnect/private_keys/
-          echo ${{ secrets.APPLE_API_KEY_BASE64 }} >> AuthKey_${{ secrets.APPLE_API_KEY }}.p8.base64
-          base64 --decode -i AuthKey_${{ secrets.APPLE_API_KEY }}.p8.base64 -o AuthKey_${{ secrets.APPLE_API_KEY }}.p8
-          rm AuthKey_${{ secrets.APPLE_API_KEY }}.p8.base64
-
-      - name: Install Codesigning Certificate
-        if: matrix.platform == 'macos-latest' || matrix.platform == 'macos-15-intel'
-        uses: apple-actions/import-codesign-certs@v3
-        with:
-          p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
-          p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-
-      - name: Disk / environment snapshot (pre-bundle debug)
-        if: contains(matrix.platform, 'ubuntu') || contains(matrix.platform, 'namespace')
-        run: |
-          echo "=== df -h ==="
-          df -h
-          echo "=== free -h ==="
-          free -h
-          echo "=== Rust / Cargo ==="
-          rustc --version
-          cargo --version
-          echo "=== Bun ==="
-          bun --version
-          echo "=== Tauri CLI ==="
-          cd tauri && bun run tauri --version
-
-      - name: Extract release notes from CHANGELOG.md
-        id: changelog
-        shell: bash
-        run: |
-          # Use the version tauri-action resolves (tauri.conf.json). On a tag
-          # push it equals the tag minus 'v'; under workflow_dispatch
-          # GITHUB_REF_NAME is a branch name (e.g. release/0.6) whose slash
-          # breaks the sed address below.
-          VERSION="$(jq -r '.version' tauri/src-tauri/tauri.conf.json)"
-
-          # Extract the section for this version from CHANGELOG.md
-          # Matches from "## [X.Y.Z]" until the next "## [" heading
-          NOTES=$(sed -n "/^## \[${VERSION}\]/,/^## \[/{/^## \[${VERSION}\]/d;/^## \[/d;p;}" CHANGELOG.md)
-
-          # Fall back to a placeholder if the version isn't in the changelog
-          if [ -z "$(echo "$NOTES" | tr -d '[:space:]')" ]; then
-            NOTES="See the assets below to download and install this version."
+          python -m pip install pyinstaller -r backend/requirements.txt
+          python -m pip install --no-deps chatterbox-tts hume-tada omnivoice
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            python -m pip install -r backend/requirements-mlx.txt
+            python -m pip install --no-deps mlx-lm==0.31.1 mlx-audio==0.4.1
           fi
 
-          # Use multiline output syntax
-          {
-            echo "notes<<CHANGELOG_EOF"
-            echo "$NOTES"
-            echo "CHANGELOG_EOF"
-          } >> "$GITHUB_OUTPUT"
-
-      # Linux hang watchdog: previous releases silently wedged inside tauri
-      # bundling (possibly linuxdeploy/AppImage download, possibly cargo link).
-      # Cap the step at 30 min so we get logs instead of waiting out the 6hr
-      # job timeout. Other platforms historically complete in ~25 min, so 45
-      # is comfortable.
-      - uses: tauri-apps/tauri-action@v0.6
-        timeout-minutes: ${{ (contains(matrix.platform, 'ubuntu') || contains(matrix.platform, 'namespace')) && 30 || 45 }}
+      - name: Build CPU and MCP binaries
+        if: steps.server-cache.outputs.cache-hit != 'true'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          ENABLE_CODE_SIGNING: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_PROVIDER_SHORT_NAME: ${{ secrets.APPLE_PROVIDER_SHORT_NAME }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-          # Stream subprocess stdout/stderr so the hang is visible in logs.
-          CARGO_TERM_VERBOSE: "true"
-          RUST_BACKTRACE: "1"
-        with:
-          projectPath: tauri
-          tagName: v__VERSION__
-          releaseName: "voicebox v__VERSION__"
-          releaseBody: ${{ steps.changelog.outputs.notes }}
-          releaseDraft: true
-          prerelease: false
-          args: ${{ matrix.args }}
-          includeUpdaterJson: true
-
-      # Tauri's bundler signs the .app and notarizes it, but the .dmg wrapper
-      # ships unnotarized. Gatekeeper rejects that on macOS 15 Sequoia (caught
-      # by Homebrew Cask CI) and causes "app isn't signed" dialogs on older
-      # Intel Macs when Apple's notarization servers are slow (see issue #509).
-      # Submit the .dmg to notarytool, staple the ticket, and overwrite the
-      # release asset uploaded by tauri-action.
-      - name: Notarize and staple DMG (macOS)
-        if: matrix.platform == 'macos-latest' || matrix.platform == 'macos-15-intel'
-        env:
-          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET: ${{ matrix.target }}
         run: |
-          set -euo pipefail
-          KEY_PATH="$HOME/.appstoreconnect/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8"
-          TARGET=$(echo "${{ matrix.args }}" | sed -n 's/.*--target \([a-z0-9_-]*\).*/\1/p')
-          DMG_DIR="tauri/src-tauri/target/${TARGET}/release/bundle/dmg"
-          # Match the release tag tauri-action resolved from tauri.conf.json's
-          # version field; GITHUB_REF_NAME is a branch name under workflow_dispatch.
-          RELEASE_TAG="v$(jq -r '.version' tauri/src-tauri/tauri.conf.json)"
-          shopt -s nullglob
-          dmgs=("${DMG_DIR}"/*.dmg)
-          if [ ${#dmgs[@]} -eq 0 ]; then
-            echo "::error::No DMGs found in ${DMG_DIR} — tauri bundler output path may have changed"
-            exit 1
-          fi
-          for dmg in "${dmgs[@]}"; do
-            echo "::group::Notarize $(basename "$dmg")"
-            xcrun notarytool submit "$dmg" \
-              --key "$KEY_PATH" \
-              --key-id "$APPLE_API_KEY_ID" \
-              --issuer "$APPLE_API_ISSUER" \
-              --wait --timeout 20m
-            xcrun stapler staple "$dmg"
-            spctl -a -t open --context context:primary-signature -vv "$dmg"
-            gh release upload "${RELEASE_TAG}" "$dmg" --clobber \
-              --repo "${GITHUB_REPOSITORY}"
-            echo "::endgroup::"
+          python backend/build_binary.py
+          python backend/build_binary.py --shim
+          mkdir -p tauri/src-tauri/binaries
+          suffix=""
+          if [ "$RUNNER_OS" = "Windows" ]; then suffix=".exe"; fi
+          for name in voicebox-server voicebox-mcp; do
+            cp "backend/dist/${name}${suffix}" "tauri/src-tauri/binaries/${name}-${TARGET}${suffix}"
           done
 
-  build-cuda-windows:
-    runs-on: windows-latest
-    permissions:
-      contents: write
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: "pip"
-
-      - name: Install Python dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install pyinstaller
-          pip install -r backend/requirements.txt
-          pip install --no-deps chatterbox-tts
-          pip install --no-deps hume-tada
-          pip install --no-deps omnivoice
-
-      - name: Install PyTorch with CUDA 12.8
-        run: |
-          pip install torch --index-url https://download.pytorch.org/whl/cu128 --force-reinstall --no-deps
-          pip install torchaudio --index-url https://download.pytorch.org/whl/cu128 --force-reinstall --no-deps
-
-      - name: Verify CUDA support in torch
-        run: |
-          python -c "import torch; print(f'CUDA available in build: {torch.cuda.is_available()}'); print(f'CUDA version: {torch.version.cuda}')"
-
-      - name: Build CUDA server binary (onedir)
-        shell: bash
-        working-directory: backend
+      - name: Build CUDA backend
+        if: runner.os == 'Windows' && steps.cuda-cache.outputs.cache-hit != 'true'
         env:
-          # Include Blackwell (sm_120) via PTX forward compatibility.
-          # Pre-built PyTorch cu128 wheels ship native kernels for sm_80/86/89/90
-          # but not sm_120. Setting this env var causes torch.utils.cpp_extension
-          # (and any JIT-compiled kernels) to target Blackwell GPUs as well.
           TORCH_CUDA_ARCH_LIST: "8.0;8.6;8.9;9.0;12.0+PTX"
-        run: python build_binary.py --cuda
-
-      - name: Package into server core + CUDA libs archives
-        shell: bash
         run: |
-          python scripts/package_cuda.py \
-            backend/dist/voicebox-server-cuda/ \
-            --output release-assets/ \
-            --platform windows-x86_64 \
-            --cuda-libs-version cu128-v1 \
-            --torch-compat ">=2.7.0,<2.11.0"
+          python -m pip install --force-reinstall --no-deps torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+          python -c "import torch; assert torch.version.cuda, 'CUDA PyTorch is required'; print(torch.__version__, torch.version.cuda)"
+          python backend/build_binary.py --cuda
 
-      - name: Upload archives to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            release-assets/voicebox-server-cuda-windows-x86_64.tar.gz
-            release-assets/voicebox-server-cuda-windows-x86_64.tar.gz.sha256
-            release-assets/cuda-libs-windows-x86_64-cu128-v1.tar.gz
-            release-assets/cuda-libs-windows-x86_64-cu128-v1.tar.gz.sha256
-            release-assets/cuda-libs.json
-          draft: true
+      - name: Install frontend dependencies and check types
+        run: |
+          bun install --frozen-lockfile
+          bun run typecheck
+
+      - name: Configure a custom build without upstream updates
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          config = {
+              "bundle": {"createUpdaterArtifacts": False},
+              "plugins": {"updater": {"endpoints": []}},
+          }
+          if os.environ["RUNNER_OS"] == "macOS":
+              config["bundle"]["macOS"] = {"signingIdentity": "-"}
+          Path("tauri/fork-build.json").write_text(json.dumps(config))
+          PY
+
+      - name: Build desktop bundle
+        working-directory: tauri
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          bundle=app
+          if [ "$RUNNER_OS" = "Windows" ]; then bundle=nsis; fi
+          bun run tauri build --ci --target "$TARGET" --bundles "$bundle" --config fork-build.json
 
-      - name: Upload onedir as workflow artifact
-        uses: actions/upload-artifact@v4
+      - name: Package macOS app
+        if: runner.os == 'macOS'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p release-assets
+          ditto -c -k --sequesterRsrc --keepParent "tauri/src-tauri/target/$TARGET/release/bundle/macos/Voicebox.app" release-assets/Voicebox-doublesharp-macos-arm64.zip
+
+      - name: Package Windows installer and complete CUDA backend
+        if: runner.os == 'Windows'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p release-assets
+          cp tauri/src-tauri/target/"$TARGET"/release/bundle/nsis/*-setup.exe release-assets/
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          Path("backend/dist/voicebox-server-cuda/cuda-libs.json").write_text(
+              json.dumps({"version": "cu128-v1"}) + "\n"
+          )
+          PY
+          # Use fast compression, and do not recompress this in upload-artifact.
+          tar -c -C backend/dist voicebox-server-cuda | gzip -1 > release-assets/voicebox-cuda-windows-x64.tar.gz
+          cp scripts/install-cuda-backend.ps1 release-assets/Install-CUDA.ps1
+
+      - name: Record source revision and file checksums
+        env:
+          BUILD_SOURCE_SHA: ${{ github.sha }}
+          BUILD_TARGET: ${{ matrix.target }}
+        run: |
+          python - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          folder = Path("release-assets")
+          manifest = {"commit": os.environ["BUILD_SOURCE_SHA"], "target": os.environ["BUILD_TARGET"], "files": {}}
+          for path in sorted(folder.iterdir()):
+              with path.open("rb") as stream:
+                  manifest["files"][path.name] = hashlib.file_digest(stream, "sha256").hexdigest()
+          (folder / "build-info.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          PY
+
+      - uses: actions/upload-artifact@v4
         with:
-          name: voicebox-server-cuda-windows
-          path: backend/dist/voicebox-server-cuda/
+          name: Voicebox-doublesharp-${{ matrix.artifact }}-${{ github.sha }}
+          path: release-assets/
+          if-no-files-found: error
           retention-days: 7
-
-  build-gpu-linux:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - backend: cuda
-            torch_index: https://download.pytorch.org/whl/cu128
-            torch_attr: cuda
-            libs_version: cu128-v1
-            torch_compat: ">=2.7.0,<2.11.0"
-            # Ampere through Blackwell; +PTX keeps forward-compat for newer arches.
-            arch_list: "8.0;8.6;8.9;9.0;12.0+PTX"
-          - backend: rocm
-            torch_index: https://download.pytorch.org/whl/rocm7.2
-            torch_attr: hip
-            libs_version: rocm7.2-v1
-            torch_compat: ">=2.12.0,<2.13.0"
-            arch_list: ""
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - name: Free up disk space
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
-        with:
-          tool-cache: true
-          large-packages: false
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install GPU PyTorch (Linux) first so requirements see it satisfied
-        # The Linux GPU runtime ships inside the torch wheels (for ROCm:
-        # torch/lib/*.so + rocBLAS/hipBLASLt/aotriton kernel data — unlike
-        # Windows, which uses separate rocm_sdk wheels). Installing it before
-        # requirements.txt keeps pip from first pulling the default torch stack
-        # that requirements.txt's unqualified torch would otherwise resolve —
-        # avoiding wasted downloads and disk pressure.
-        run: |
-          python -m pip install --upgrade pip
-          pip install pyinstaller
-          pip install torch torchaudio \
-            --index-url ${{ matrix.torch_index }}
-
-      - name: Install remaining Python dependencies
-        run: |
-          pip install -r backend/requirements.txt
-          pip install --no-deps chatterbox-tts
-          pip install --no-deps hume-tada
-
-      - name: Verify GPU support in torch
-        run: python -c "import torch; assert torch.version.${{ matrix.torch_attr }}, 'torch is not a ${{ matrix.backend }} build'; print(torch.__version__)"
-
-      - name: Build GPU server binary (onedir)
-        working-directory: backend
-        env:
-          TORCH_CUDA_ARCH_LIST: ${{ matrix.arch_list }}
-        run: python build_binary.py --${{ matrix.backend }}
-
-      - name: Package into server core + GPU libs archives
-        run: |
-          python scripts/package_${{ matrix.backend }}.py \
-            backend/dist/voicebox-server-${{ matrix.backend }}/ \
-            --output release-assets/ \
-            --platform linux-x86_64 \
-            --${{ matrix.backend }}-libs-version ${{ matrix.libs_version }} \
-            --torch-compat "${{ matrix.torch_compat }}"
-
-      - name: Upload archives to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            release-assets/voicebox-server-${{ matrix.backend }}-linux-x86_64.tar.gz
-            release-assets/voicebox-server-${{ matrix.backend }}-linux-x86_64.tar.gz.sha256
-            release-assets/${{ matrix.backend }}-libs-linux-x86_64-${{ matrix.libs_version }}.tar.gz
-            release-assets/${{ matrix.backend }}-libs-linux-x86_64-${{ matrix.libs_version }}.tar.gz.sha256
-          draft: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  build-rocm-windows:
-    runs-on: windows-latest
-    permissions:
-      contents: write
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          # ROCm wheels are cp312-cp312-specific — build_binary.py --rocm enforces this.
-          python-version: "3.12"
-          cache: "pip"
-
-      - name: Install Python dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install pyinstaller
-          pip install -r backend/requirements.txt
-          pip install --no-deps chatterbox-tts
-          pip install --no-deps hume-tada
-          pip install --no-deps omnivoice
-
-      - name: Build ROCm server binary (onedir)
-        shell: bash
-        working-directory: backend
-        # build_binary.py --rocm pulls the official AMD Radeon torch + rocm_sdk
-        # wheels (rocm-rel-7.2.1) itself when ROCm torch is not already present,
-        # then restores the dev torch afterwards.
-        run: python build_binary.py --rocm
-
-      - name: Package into server core + ROCm libs archives
-        shell: bash
-        run: |
-          python scripts/package_rocm.py \
-            backend/dist/voicebox-server-rocm/ \
-            --output release-assets/ \
-            --platform windows-x86_64 \
-            --rocm-libs-version rocm7.2-v1 \
-            --torch-compat ">=2.9.0,<2.10.0"
-
-      - name: Upload archives to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            release-assets/voicebox-server-rocm-windows-x86_64.tar.gz
-            release-assets/voicebox-server-rocm-windows-x86_64.tar.gz.sha256
-            release-assets/rocm-libs-windows-x86_64-rocm7.2-v1.tar.gz
-            release-assets/rocm-libs-windows-x86_64-rocm7.2-v1.tar.gz.sha256
-            release-assets/rocm-libs.json
-          draft: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload onedir as workflow artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: voicebox-server-rocm-windows
-          path: backend/dist/voicebox-server-rocm/
-          retention-days: 7
+          compression-level: 0
