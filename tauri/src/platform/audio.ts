@@ -1,5 +1,11 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { PlatformAudio, AudioDevice } from '@/platform/types';
+import { listen } from '@tauri-apps/api/event';
+import type {
+  AudioDevice,
+  NativePlaybackEvent,
+  NativePlaybackSession,
+  PlatformAudio,
+} from '@/platform/types';
 
 export const tauriAudio: PlatformAudio = {
   async isSystemAudioSupported(): Promise<boolean> {
@@ -29,16 +35,25 @@ export const tauriAudio: PlatformAudio = {
     return await invoke<AudioDevice[]>('list_audio_output_devices');
   },
 
-  async playToDevices(audioData: Uint8Array, deviceIds: string[]): Promise<void> {
-    await invoke('play_audio_to_devices', {
+  async playToDevices(audioData, deviceIds, options): Promise<NativePlaybackSession> {
+    return await invoke('play_audio_to_devices', {
       audioData: Array.from(audioData),
-      deviceIds,
+      deviceIds: [...new Set(deviceIds)],
+      options,
     });
   },
 
-  stopPlayback(): void {
-    invoke('stop_audio_playback').catch((error) => {
-      console.error('Failed to stop audio playback:', error);
-    });
+  async controlPlayback(sessionId, control): Promise<void> {
+    await invoke('control_audio_playback', { sessionId, control });
+  },
+
+  async subscribeToPlayback(callback): Promise<() => void> {
+    return await listen<NativePlaybackEvent>('native-audio-playback', ({ payload }) =>
+      callback(payload),
+    );
+  },
+
+  async stopPlayback(sessionId): Promise<void> {
+    await invoke('stop_audio_playback', { sessionId });
   },
 };

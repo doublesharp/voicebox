@@ -1,4 +1,4 @@
-import type { PlatformAudio, AudioDevice } from '@/platform/types';
+import type { AudioDevice, PlatformAudio } from '@/platform/types';
 
 export const webAudio: PlatformAudio = {
   async isSystemAudioSupported(): Promise<boolean> {
@@ -17,11 +17,19 @@ export const webAudio: PlatformAudio = {
     return []; // No native device routing in web
   },
 
-  async playToDevices(_audioData: Uint8Array, _deviceIds: string[]): Promise<void> {
+  async playToDevices() {
     throw new Error('Native audio device routing is only available in the desktop app.');
   },
 
-  stopPlayback(): void {
-    // No-op for web
+  async controlPlayback(): Promise<void> {
+    throw new Error('Native audio device routing is only available in the desktop app.');
+  },
+
+  async subscribeToPlayback(): Promise<() => void> {
+    return () => {};
+  },
+
+  async stopPlayback(): Promise<void> {
+    // No native playback exists in the web app.
   },
 };
