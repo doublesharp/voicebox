@@ -6,8 +6,8 @@ import copy
 import hashlib
 import json
 import math
+import os
 import re
-import shutil
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -72,21 +72,30 @@ class StudioStore:
         self.voice_resolver = voice_resolver
         self.root.mkdir(parents=True, exist_ok=True)
         self.asset_dir = self.root / "assets"
-        self.asset_dir.mkdir(exist_ok=True)
         self.db_path = self.root / "studio.sqlite"
+        from .migrations import migrate
+
+        migrate(self.db_path)
+        self.asset_dir.mkdir(exist_ok=True)
+        self._recover_unpublished()
+
+    def _recover_unpublished(self):
+        # All Studio publishers hold this database write lock through registration.
         with self.connect() as db:
-            db.executescript("""
-            CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, client_label TEXT, revision INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, document TEXT NOT NULL, undo TEXT NOT NULL, redo TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS operations (project_id TEXT NOT NULL, operation_id TEXT NOT NULL, request TEXT NOT NULL, response TEXT NOT NULL, PRIMARY KEY(project_id, operation_id));
-            CREATE TABLE IF NOT EXISTS revisions (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, name TEXT NOT NULL, created_at TEXT NOT NULL, document TEXT NOT NULL, project_revision INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS approvals (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, revision_id TEXT NOT NULL, note TEXT, created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS assets (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, hash TEXT NOT NULL, sample_rate INTEGER NOT NULL, channels INTEGER NOT NULL, frames INTEGER NOT NULL, duration REAL NOT NULL, size_bytes INTEGER NOT NULL, path TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS takes (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, passage_id TEXT NOT NULL, asset_id TEXT NOT NULL, text TEXT NOT NULL, engine TEXT NOT NULL, model_size TEXT, created_at TEXT NOT NULL, request TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL, passage_id TEXT, error TEXT, result TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, request TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS deliverables (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, data TEXT NOT NULL, path TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS passage_intents (project_id TEXT NOT NULL, passage_id TEXT NOT NULL, epoch INTEGER NOT NULL, PRIMARY KEY(project_id,passage_id));
-            CREATE TABLE IF NOT EXISTS recording_acknowledgements (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, revision_id TEXT NOT NULL, created_at TEXT NOT NULL, recordings TEXT NOT NULL);
-            """)
+            db.execute("BEGIN IMMEDIATE")
+            registered = {row[0] for row in db.execute("SELECT path FROM assets")}
+            for path in self.asset_dir.iterdir():
+                name = path.name
+                candidate = name.removeprefix(".publish-")
+                try:
+                    owned = str(uuid.UUID(candidate)) == candidate
+                except ValueError:
+                    owned = False
+                if not owned or name in registered or not path.is_file() or path.is_symlink():
+                    continue
+                recovery = self.root / "recovery" / str(uuid.uuid4())
+                recovery.mkdir(parents=True)
+                path.rename(recovery / name)
 
     def connect(self):
         db = sqlite3.connect(self.db_path, timeout=30)
@@ -605,40 +614,68 @@ class StudioStore:
         source = Path(source)
         asset_id = uid()
         target = self.asset_dir / asset_id
-        with self.connect() as db:
+        staged = self.asset_dir / (".publish-" + asset_id)
+        published = False
+        staged_created = False
+        db = self.connect()
+        try:
             db.execute("BEGIN IMMEDIATE")
             self._project(db, project_id)
+            digest = hashlib.sha256()
+            with source.open("rb") as src, staged.open("xb") as dst:
+                staged_created = True
+                for chunk in iter(lambda: src.read(1024 * 1024), b""):
+                    digest.update(chunk)
+                    dst.write(chunk)
+                dst.flush()
+                os.fsync(dst.fileno())
+            copied_digest = hashlib.sha256()
+            with staged.open("rb") as copied:
+                for chunk in iter(lambda: copied.read(1024 * 1024), b""):
+                    copied_digest.update(chunk)
+            if digest.digest() != copied_digest.digest():
+                raise ValueError("Copied audio hash mismatch")
             try:
-                with source.open("rb") as src, target.open("xb") as dst:
-                    shutil.copyfileobj(src, dst)
-                try:
-                    info = sf.info(str(target))
-                except (RuntimeError, OSError) as exc:
-                    raise ValueError("Invalid audio file") from exc
-                if info.samplerate <= 0 or info.channels not in (1, 2) or info.frames <= 0:
-                    raise ValueError("Empty or invalid audio")
-                digest = hashlib.sha256()
-                with target.open("rb") as f:
-                    for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                        digest.update(chunk)
-                db.execute(
-                    "INSERT INTO assets VALUES (?,?,?,?,?,?,?,?,?)",
-                    (
-                        asset_id,
-                        project_id,
-                        digest.hexdigest(),
-                        info.samplerate,
-                        info.channels,
-                        info.frames,
-                        info.frames / info.samplerate,
-                        target.stat().st_size,
-                        asset_id,
-                    ),
-                )
-            except BaseException:
+                info = sf.info(str(staged))
+            except (RuntimeError, OSError) as exc:
+                raise ValueError("Invalid audio file") from exc
+            if info.samplerate <= 0 or info.channels not in (1, 2) or info.frames <= 0:
+                raise ValueError("Empty or invalid audio")
+            size = staged.stat().st_size
+            if os.path.lexists(target):
+                raise FileExistsError(f"Asset destination already exists: {target}")
+            staged.rename(target)
+            published = True
+            db.execute(
+                "INSERT INTO assets VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    asset_id,
+                    project_id,
+                    digest.hexdigest(),
+                    info.samplerate,
+                    info.channels,
+                    info.frames,
+                    info.frames / info.samplerate,
+                    size,
+                    asset_id,
+                ),
+            )
+            result = next(a for a in self._project(db, project_id)["assets"] if a["id"] == asset_id)
+            db.commit()
+            return result
+        except BaseException:
+            db.rollback()
+            if staged_created:
+                staged.unlink(missing_ok=True)
+            # If commit succeeded despite an exception, preserve the registered audio.
+            if (
+                published
+                and not db.execute("SELECT 1 FROM assets WHERE id=? AND path=?", (asset_id, asset_id)).fetchone()
+            ):
                 target.unlink(missing_ok=True)
-                raise
-            return next(a for a in self._project(db, project_id)["assets"] if a["id"] == asset_id)
+            raise
+        finally:
+            db.close()
 
     def asset_path(self, asset_id):
         with self.connect() as db:
