@@ -117,3 +117,30 @@ async def test_stream_failure_is_propagated_and_next_request_can_run():
     async def next_request():
         return 'ready'
     assert await asyncio.wait_for(run_serialized_inference(next_request), 1) == 'ready'
+
+
+@pytest.mark.asyncio
+async def test_stalled_preview_releases_speech_ownership_before_client_closes():
+    from backend.services.inference_scheduler import run_serialized_inference
+    from backend.utils.streaming_audio import serialized_byte_stream
+
+    stopped = asyncio.Event()
+    async def producer(send):
+        try:
+            for index in range(100):
+                await send(bytes([index]))
+        finally:
+            stopped.set()
+    stream = serialized_byte_stream(producer, stall_timeout=.03)
+    try:
+        assert await anext(stream) == b'\0'
+        await asyncio.wait_for(stopped.wait(), 1)
+        async def next_speech():
+            return 'available'
+        assert await asyncio.wait_for(run_serialized_inference(next_speech), 1) == 'available'
+        # Drain the bounded buffered bytes, then receive the explicit stall error.
+        with pytest.raises(TimeoutError, match='stalled'):
+            async for _ in stream:
+                pass
+    finally:
+        await stream.aclose()

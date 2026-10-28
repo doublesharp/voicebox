@@ -7,6 +7,7 @@ peak guard. Buffered/export paths retain full-file normalization and effects.
 from __future__ import annotations
 
 import asyncio
+import math
 import struct
 from collections.abc import AsyncIterator, Awaitable, Callable
 
@@ -81,6 +82,8 @@ def pcm16_bytes(audio: np.ndarray) -> bytes:
 
 async def serialized_byte_stream(
     operation: Callable[[Callable[[bytes], Awaitable[None]]], Awaitable[None]],
+    *,
+    stall_timeout: float = 30.0,
 ) -> AsyncIterator[bytes]:
     """Bridge inference to a slow/disconnected client with bounded buffering.
 
@@ -88,16 +91,22 @@ async def serialized_byte_stream(
     drains any synchronous engine worker before allowing the next request.
     Cancellation-aware queue writes cannot strand that worker on a full queue.
     """
+    if not math.isfinite(stall_timeout) or stall_timeout <= 0:
+        raise ValueError("Preview stall timeout must be positive and finite")
     queue: asyncio.Queue[bytes | Exception | None] = asyncio.Queue(maxsize=2)
     consumer_closed = False
 
     async def send(data: bytes) -> None:
+        deadline = asyncio.get_running_loop().time() + stall_timeout
         while True:
             check_inference_cancelled()
             if consumer_closed:
                 raise asyncio.CancelledError()
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise TimeoutError("Incremental preview client stalled; start a new preview to resume")
             try:
-                await asyncio.wait_for(queue.put(data), 0.1)
+                await asyncio.wait_for(queue.put(data), min(0.1, remaining))
                 return
             except TimeoutError:
                 continue
