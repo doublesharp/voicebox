@@ -1,9 +1,11 @@
-import { afterEach, describe, expect, mock, test } from 'bun:test';
+import { afterAll, afterEach, describe, expect, mock, test } from 'bun:test';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { createElement, Fragment, type ReactNode } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import type { GenerationVersionResponse, HistoryResponse } from '../src/lib/api/types';
 import { usePlayerStore } from '../src/stores/playerStore';
+
+const { apiClient: actualApiClient } = await import('../src/lib/api/client');
 
 const original: GenerationVersionResponse = {
   id: 'original',
@@ -154,6 +156,11 @@ afterEach(() => {
   update.mockClear();
   remove.mockClear();
   toast.mockClear();
+});
+afterAll(() => {
+  // Bun's module mocks survive mock.restore(). Restore this export explicitly
+  // so recording-export tests in the same process use the real API client.
+  mock.module('../src/lib/api/client', () => ({ apiClient: actualApiClient }));
 });
 
 describe('generation version controls', () => {
