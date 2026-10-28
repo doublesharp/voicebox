@@ -4,7 +4,11 @@ export const tauriFilesystem: PlatformFilesystem = {
   async saveFile(filename: string, blob: Blob, filters?: FileFilter[]) {
     const { invoke } = await import('@tauri-apps/api/core');
     const bytes = Array.from(new Uint8Array(await blob.arrayBuffer()));
-    return invoke<SaveFileResult>('publish_file_bytes', { filename, filters: filters || [], bytes });
+    return invoke<SaveFileResult>('publish_file_bytes', {
+      filename,
+      filters: filters || [],
+      bytes,
+    });
   },
 
   async saveFromUrl(filename: string, url: string, filters?: FileFilter[]) {
