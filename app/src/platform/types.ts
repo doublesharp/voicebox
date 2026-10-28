@@ -41,13 +41,36 @@ export interface AudioDevice {
   is_default: boolean;
 }
 
+export interface NativePlaybackSession {
+  session_id: string;
+  duration: number;
+  position: number;
+}
+
+export interface NativePlaybackEvent extends NativePlaybackSession {
+  state: 'playing' | 'paused' | 'ended' | 'stopped' | 'error';
+  error?: string | null;
+}
+
+export interface NativePlaybackControl {
+  paused?: boolean;
+  position?: number;
+  volume?: number;
+}
+
 export interface PlatformAudio {
   isSystemAudioSupported(): Promise<boolean>;
   startSystemAudioCapture(maxDurationSecs: number): Promise<void>;
   stopSystemAudioCapture(): Promise<Blob>;
   listOutputDevices(): Promise<AudioDevice[]>;
-  playToDevices(audioData: Uint8Array, deviceIds: string[]): Promise<void>;
-  stopPlayback(): void;
+  playToDevices(
+    audioData: Uint8Array,
+    deviceIds: string[],
+    options?: { startTime?: number; volume?: number },
+  ): Promise<NativePlaybackSession>;
+  controlPlayback(sessionId: string, control: NativePlaybackControl): Promise<void>;
+  subscribeToPlayback(callback: (event: NativePlaybackEvent) => void): Promise<() => void>;
+  stopPlayback(sessionId?: string): Promise<void>;
 }
 
 export interface ServerLogEntry {
