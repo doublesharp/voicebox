@@ -1,6 +1,51 @@
 """Route registration for the voicebox API."""
 
 from fastapi import FastAPI
+from pathlib import Path
+from threading import Lock
+
+
+class _StudioProxy:
+    """Allow router registration before the native data directory is configured."""
+
+    def __init__(self, runtime, name):
+        self.runtime = runtime
+        self.name = name
+
+    def __getattr__(self, name):
+        self.runtime.initialize()
+        return getattr(getattr(self.runtime, self.name), name)
+
+
+class StudioRuntime:
+    def __init__(self, data_dir=None):
+        self.data_dir = data_dir
+        self._lock = Lock()
+        self._store = None
+        self._jobs = None
+        self.store = _StudioProxy(self, "_store")
+        self.jobs = _StudioProxy(self, "_jobs")
+
+    def initialize(self):
+        if self._store is not None:
+            return
+        with self._lock:
+            if self._store is not None:
+                return
+            from ..config import get_data_dir
+            from ..studio.jobs import StudioJobs
+            from ..studio.storage import StudioStore
+
+            def resolve_voice(store, project_id, profile_id, model_size=None):
+                from ..studio.voices import snapshot_voice
+
+                return snapshot_voice(store, project_id, profile_id, model_size=model_size)
+
+            root = self.data_dir() if self.data_dir is not None else get_data_dir()
+            store = StudioStore(Path(root) / "studio", voice_resolver=resolve_voice)
+            jobs = StudioJobs(store)
+            self._jobs = jobs
+            self._store = store
 
 
 def register_routers(app: FastAPI) -> None:
@@ -48,3 +93,9 @@ def register_routers(app: FastAPI) -> None:
     app.include_router(events_router)
     app.include_router(cloud_router)
     app.include_router(openai_compat_router)
+
+    from ..studio.api import make_router
+
+    runtime = StudioRuntime()
+    app.state.studio_runtime = runtime
+    app.include_router(make_router(runtime.store, runtime.jobs))

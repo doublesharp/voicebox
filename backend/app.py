@@ -132,6 +132,10 @@ def create_app() -> FastAPI:
     async def voicebox_lifespan(app: FastAPI):
         await _run_startup(app)
         try:
+            # Native CLI configuration happens after module import, so studio
+            # storage is opened only after the actual data directory is ready.
+            app.state.studio_runtime.initialize()
+            app.state.studio_runtime.jobs.interrupt_on_startup()
             yield
         finally:
             # Paired with _run_startup via try/finally: runs whether or
@@ -262,6 +266,9 @@ def _get_gpu_status() -> str:
 
 
 async def _run_startup(application: FastAPI) -> None:
+    from .utils.inference import start_inference
+
+    start_inference()
     """Database init, warnings, model-cache prep. Runs on lifespan entry."""
     import platform
     import sys
@@ -361,6 +368,12 @@ async def _run_startup(application: FastAPI) -> None:
 
 
 async def _run_shutdown() -> None:
+    from .utils.inference import shutdown_inference
+
+    await shutdown_inference(_unload_models)
+
+
+async def _unload_models() -> None:
     """Unload models on lifespan exit."""
     logger.info("Voicebox server shutting down...")
     try:

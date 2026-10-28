@@ -16,6 +16,7 @@ from ..services.generation import release_generation_memory, run_generation
 from ..services.task_queue import cancel_generation as cancel_generation_job, enqueue_generation
 from ..utils.audio import load_audio
 from ..utils.tasks import get_task_manager
+from ..utils.inference import serialized_inference
 
 logger = logging.getLogger(__name__)
 
@@ -316,6 +317,7 @@ async def get_generation_status(generation_id: str, db: Session = Depends(get_db
 
 
 @router.post("/generate/stream")
+@serialized_inference
 async def stream_speech(
     data: models.GenerationRequest,
     db: Session = Depends(get_db),

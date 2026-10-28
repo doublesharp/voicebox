@@ -1,0 +1,107 @@
+/* Static layered surfaces; motion is limited to short user feedback. */
+.dark .studio-shell {
+  background: linear-gradient(155deg, rgb(24 29 40 / 32%), transparent 45%), #0b0d12;
+}
+.studio-shell .studio-transport {
+  border-top: 1px solid rgb(113 164 235 / 24%);
+  box-shadow: 0 -5px 20px rgb(0 0 0 / 8%);
+}
+.studio-shell button {
+  transition:
+    transform 120ms ease,
+    opacity 120ms ease,
+    background-color 140ms ease;
+}
+.studio-shell button:active:not(:disabled) {
+  transform: translateY(1px);
+}
+.studio-meters {
+  width: 180px;
+  min-width: 0;
+  max-width: 100%;
+  flex-shrink: 0;
+  padding: 6px 9px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--background));
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+}
+.studio-meter-heading {
+  display: flex;
+  justify-content: space-between;
+  color: hsl(var(--muted-foreground));
+}
+.studio-meter-channel {
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr) 24px;
+  gap: 5px;
+  align-items: center;
+}
+.studio-meter-track {
+  height: 5px;
+  position: relative;
+  overflow: hidden;
+  background: hsl(var(--muted));
+  border-radius: 2px;
+}
+.studio-meter-fill {
+  position: absolute;
+  inset: 0;
+  transform-origin: left;
+  background: linear-gradient(90deg, #27b6b8, #65ccbd 70%, #efc65d 90%, #ef727e);
+}
+.studio-meter-hold {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: hsl(var(--foreground));
+  transform: translateX(-2px);
+}
+.studio-meter-clip {
+  color: hsl(var(--muted-foreground));
+  font-size: 8px;
+}
+.studio-meter-clip[data-clipped="true"] {
+  color: #e4425a;
+  font-weight: 700;
+}
+.studio-meters small {
+  font-size: 8px;
+  color: hsl(var(--muted-foreground));
+}
+.doublesharp-pulse {
+  animation: doublesharp-arrive 650ms ease-out 1;
+}
+.doublesharp-pulse:hover {
+  transform: scale(1.035);
+}
+.doublesharp-pulse {
+  transition: transform 160ms ease;
+}
+@keyframes doublesharp-arrive {
+  from {
+    opacity: 0.55;
+    transform: scale(0.94);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .studio-shell button,
+  .doublesharp-pulse {
+    animation: none;
+    transition: none;
+  }
+  .studio-shell button:active:not(:disabled),
+  .doublesharp-pulse:hover {
+    transform: none;
+  }
+}
+.dark .studio-shell .studio-project-header {
+  background: linear-gradient(100deg, rgb(55 173 197 / 5%), rgb(140 98 215 / 4%)), #11141c;
+  border-bottom-color: rgb(146 123 206 / 20%);
+}

@@ -25,6 +25,7 @@ from .. import config
 from . import history, profiles
 from ..database import get_db
 from ..utils.tasks import get_task_manager
+from ..utils.inference import serialized_inference
 
 
 def release_generation_memory(tts_model) -> None:
@@ -43,6 +44,7 @@ def release_generation_memory(tts_model) -> None:
         logging.getLogger(__name__).debug("post-generation cache cleanup failed: %s", e)
 
 
+@serialized_inference
 async def run_generation(
     *,
     generation_id: str,
@@ -268,6 +270,7 @@ def _save_retry(
     return config.to_storage_path(audio_path)
 
 
+@serialized_inference
 async def generate_audio_sync(
     *,
     profile_id: str,

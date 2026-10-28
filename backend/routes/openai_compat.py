@@ -36,6 +36,8 @@ import logging
 import shutil
 import subprocess
 import time
+
+from ..utils.inference import serialized_inference
 from typing import Any
 
 import numpy as np
@@ -284,6 +286,7 @@ async def create_speech(request: Request, db: Session = Depends(get_db)):
         return OpenAIError(e.status_code, detail).response()
 
 
+@serialized_inference
 async def _create_speech(request: Request, db: Session) -> Response:
     from ..backends import (
         engine_needs_trim,

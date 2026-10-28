@@ -47,7 +47,7 @@ export interface PlatformAudio {
   stopSystemAudioCapture(): Promise<Blob>;
   listOutputDevices(): Promise<AudioDevice[]>;
   playToDevices(audioData: Uint8Array, deviceIds: string[]): Promise<void>;
-  stopPlayback(): void;
+  stopPlayback(): void | Promise<void>;
 }
 
 export interface ServerLogEntry {

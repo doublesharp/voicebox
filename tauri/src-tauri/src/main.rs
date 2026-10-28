@@ -35,7 +35,7 @@ fn build_dictate_window(app: &tauri::AppHandle) -> tauri::Result<tauri::WebviewW
         DICTATE_WINDOW_LABEL,
         WebviewUrl::App("?view=dictate".into()),
     )
-    .title("Voicebox Dictate")
+    .title("Voicebox DS Dictate")
     .inner_size(DICTATE_WINDOW_WIDTH, DICTATE_WINDOW_HEIGHT)
     .decorations(false)
     .transparent(true)

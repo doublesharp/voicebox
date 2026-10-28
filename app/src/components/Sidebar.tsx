@@ -1,8 +1,20 @@
 import { Link, useMatchRoute } from '@tanstack/react-router';
-import { AudioLines, Box, Captions, type LucideIcon, Mic, Settings, Volume2, Wand2 } from 'lucide-react';
+import {
+  AudioLines,
+  Box,
+  Captions,
+  FolderOpen,
+  type LucideIcon,
+  Mic,
+  Settings,
+  Volume2,
+  Wand2,
+} from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import voiceboxLogo from '@/assets/voicebox-logo.png';
+import { DoubleSharpMark } from '@/components/Branding';
+import { APP_BRANDING } from '@/lib/constants/branding';
 import { cn } from '@/lib/utils/cn';
 import { usePlatform } from '@/platform/PlatformContext';
 import type { UpdateStatus } from '@/platform/types';
@@ -20,6 +32,7 @@ const tabs: Array<{
   labelKey?: string;
   label?: string;
 }> = [
+  { id: 'projects', path: '/studio/projects', icon: FolderOpen, label: 'Projects' },
   { id: 'main', path: '/', icon: Volume2, labelKey: 'nav.generate' },
   { id: 'stories', path: '/stories', icon: AudioLines, labelKey: 'nav.stories' },
   { id: 'captures', path: '/captures', icon: Captions, labelKey: 'nav.captures' },
@@ -41,17 +54,25 @@ export function Sidebar({ isMacOS }: SidebarProps) {
   return (
     <div
       className={cn(
-        'fixed left-0 top-0 h-full w-20 bg-sidebar border-r border-border flex flex-col items-center py-6 gap-6',
+        'fixed left-0 top-0 h-full w-20 bg-sidebar border-r border-border flex flex-col items-center py-4 gap-3 overflow-y-auto',
         isMacOS && 'pt-14',
       )}
     >
       {/* Logo */}
-      <div className="mb-2">
-        <img src={voiceboxLogo} alt="Voicebox" className="sidebar-logo w-12 h-12 object-contain" />
+      <div
+        className="relative mb-2 shrink-0"
+        title={`${APP_BRANDING.name} · ${APP_BRANDING.edition}`}
+      >
+        <img
+          src={voiceboxLogo}
+          alt={`${APP_BRANDING.name} · ${APP_BRANDING.edition}`}
+          className="sidebar-logo w-12 h-12 object-contain"
+        />
+        <DoubleSharpMark className="absolute -bottom-1 -right-1 h-5 w-5 rounded-md text-[8px] shadow-sm" />
       </div>
 
       {/* Navigation Buttons */}
-      <div className="flex flex-col gap-3">
+      <div className="flex flex-col gap-1.5">
         {tabs.map((tab, index) => {
           const Icon = tab.icon;
           const isActive =
@@ -67,7 +88,7 @@ export function Sidebar({ isMacOS }: SidebarProps) {
               key={tab.id}
               to={tab.path}
               className={cn(
-                'relative w-12 h-12 rounded-full flex items-center justify-center transition-all duration-200 overflow-hidden',
+                'relative w-12 h-11 shrink-0 rounded-full flex items-center justify-center transition-all duration-200 overflow-hidden',
                 isActive
                   ? 'bg-white/[0.07] text-foreground shadow-lg backdrop-blur-sm border border-white/[0.08]'
                   : 'text-muted-foreground hover:bg-muted/50',

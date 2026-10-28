@@ -1,0 +1,659 @@
+"""Independent, transactional studio project storage."""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import math
+import re
+import shutil
+import sqlite3
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+from .timing import nearest_sample, resampled_frames
+
+
+def uid():
+    return str(uuid.uuid4())
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def encode(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+class Conflict(Exception):
+    def __init__(self, message, current_revision=None):
+        super().__init__(message)
+        self.current_revision = current_revision
+
+
+class NotFound(Exception):
+    pass
+
+
+def passage(text, language):
+    return dict(
+        id=uid(),
+        text=text,
+        language=language,
+        profile_id=None,
+        voice_snapshot=None,
+        direction=dict(instruct="", seed=None, max_chunk_chars=300, crossfade_ms=0),
+        input_revision=0,
+        selection_token=0,
+        selected_take_id=None,
+        locked=False,
+    )
+
+
+def document(script, language):
+    return dict(
+        schema_version=1,
+        sample_rate=48000,
+        channels=2,
+        language=language,
+        passages=[passage(t.strip(), language) for t in re.split(r"\n\s*\n", script) if t.strip()],
+        tracks=[dict(id=uid(), name="Voice", kind="voice", mute=False, solo=False, gain=1.0)],
+        clips=[],
+        mix=dict(target_lufs=-16.0, max_true_peak_dbtp=-1.0, normalize=False),
+    )
+
+
+class StudioStore:
+    def __init__(self, root, voice_resolver=None):
+        self.root = Path(root)
+        self.voice_resolver = voice_resolver
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.asset_dir = self.root / "assets"
+        self.asset_dir.mkdir(exist_ok=True)
+        self.db_path = self.root / "studio.sqlite"
+        with self.connect() as db:
+            db.executescript("""
+            CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, client_label TEXT, revision INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, document TEXT NOT NULL, undo TEXT NOT NULL, redo TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS operations (project_id TEXT NOT NULL, operation_id TEXT NOT NULL, request TEXT NOT NULL, response TEXT NOT NULL, PRIMARY KEY(project_id, operation_id));
+            CREATE TABLE IF NOT EXISTS revisions (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, name TEXT NOT NULL, created_at TEXT NOT NULL, document TEXT NOT NULL, project_revision INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS approvals (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, revision_id TEXT NOT NULL, note TEXT, created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS assets (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, hash TEXT NOT NULL, sample_rate INTEGER NOT NULL, channels INTEGER NOT NULL, frames INTEGER NOT NULL, duration REAL NOT NULL, size_bytes INTEGER NOT NULL, path TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS takes (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, passage_id TEXT NOT NULL, asset_id TEXT NOT NULL, text TEXT NOT NULL, engine TEXT NOT NULL, model_size TEXT, created_at TEXT NOT NULL, request TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL, passage_id TEXT, error TEXT, result TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, request TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS deliverables (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, data TEXT NOT NULL, path TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS passage_intents (project_id TEXT NOT NULL, passage_id TEXT NOT NULL, epoch INTEGER NOT NULL, PRIMARY KEY(project_id,passage_id));
+            CREATE TABLE IF NOT EXISTS recording_acknowledgements (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, revision_id TEXT NOT NULL, created_at TEXT NOT NULL, recordings TEXT NOT NULL);
+            """)
+
+    def connect(self):
+        db = sqlite3.connect(self.db_path, timeout=30)
+        db.row_factory = sqlite3.Row
+        return db
+
+    def create_project(self, name, client_label=None, script="", language="en"):
+        if (
+            not isinstance(name, str)
+            or not name.strip()
+            or not isinstance(script, str)
+            or not isinstance(language, str)
+            or not language.strip()
+        ):
+            raise ValueError("Name, script and language must be valid strings")
+        identifier, timestamp = uid(), now()
+        with self.connect() as db:
+            db.execute(
+                "INSERT INTO projects VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    identifier,
+                    name.strip(),
+                    client_label,
+                    0,
+                    timestamp,
+                    timestamp,
+                    encode(document(script, language)),
+                    "[]",
+                    "[]",
+                ),
+            )
+            return self._project(db, identifier)
+
+    def list_projects(self):
+        with self.connect() as db:
+            return [
+                dict(row)
+                for row in db.execute(
+                    "SELECT id,name,client_label,revision,created_at,updated_at FROM projects ORDER BY updated_at DESC"
+                )
+            ]
+
+    def _project(self, db, project_id):
+        row = db.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+        if row is None:
+            raise NotFound("Project not found")
+        result = {k: row[k] for k in ("id", "name", "client_label", "revision", "created_at", "updated_at")}
+        result["document"] = json.loads(row["document"])
+        for table in (
+            "takes",
+            "assets",
+            "jobs",
+            "revisions",
+            "approvals",
+            "deliverables",
+            "recording_acknowledgements",
+        ):
+            items = []
+            for item in db.execute(f"SELECT * FROM {table} WHERE project_id=?", (project_id,)):
+                item = dict(item)
+                item.pop("project_id", None)
+                item.pop("path", None)
+                for key in ("document", "request", "result", "data", "recordings"):
+                    if item.get(key) is not None:
+                        item[key] = json.loads(item[key])
+                if table == "deliverables":
+                    item = {"id": item["id"], **item["data"]}
+                items.append(item)
+            result[table] = items
+        return result
+
+    def get_project(self, project_id):
+        with self.connect() as db:
+            return self._project(db, project_id)
+
+    def _operation(self, db, project_id, operation_id, request):
+        if not isinstance(operation_id, str) or not operation_id.strip():
+            raise ValueError("operation_id is required")
+        old = db.execute(
+            "SELECT request,response FROM operations WHERE project_id=? AND operation_id=?", (project_id, operation_id)
+        ).fetchone()
+        if old:
+            if old["request"] != encode(request):
+                raise Conflict("operation_id already used with different input")
+            return json.loads(old["response"])
+        return None
+
+    def _record(self, db, project_id, operation_id, request):
+        response = self._project(db, project_id)
+        db.execute(
+            "INSERT INTO operations VALUES (?,?,?,?)", (project_id, operation_id, encode(request), encode(response))
+        )
+        return response
+
+    def command(self, project_id, operation_id, expected_revision, type, payload):
+        request = dict(expected_revision=expected_revision, type=type, payload=payload)
+        voice_snapshot = None
+        if type == "assign_voice":
+            with self.connect() as db:
+                prior = self._operation(db, project_id, operation_id, request)
+                if prior is not None:
+                    return prior
+                project = self._project(db, project_id)
+                if project["revision"] != expected_revision:
+                    raise Conflict("Project revision changed", project["revision"])
+                ids = payload.get("passage_ids")
+                if (
+                    not isinstance(ids, list)
+                    or not ids
+                    or len(set(ids)) != len(ids)
+                    or not set(ids) <= {p["id"] for p in project["document"]["passages"]}
+                ):
+                    raise ValueError("Invalid passage IDs")
+                if any(p["locked"] for p in project["document"]["passages"] if p["id"] in ids):
+                    raise ValueError("Passage is locked")
+            if self.voice_resolver is None:
+                raise ValueError("Voice resolver unavailable")
+            kwargs = {"model_size": payload["model_size"]} if "model_size" in payload else {}
+            voice_snapshot = self.voice_resolver(self, project_id, payload.get("profile_id"), **kwargs)
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            prior = self._operation(db, project_id, operation_id, request)
+            if prior is not None:
+                return prior
+            row = db.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+            if row is None:
+                raise NotFound("Project not found")
+            if row["revision"] != expected_revision:
+                raise Conflict("Project revision changed", row["revision"])
+            doc = json.loads(row["document"])
+            undo = json.loads(row["undo"])
+            redo = json.loads(row["redo"])
+            self._remember_intents(db, project_id, doc)
+            state = dict(document=copy.deepcopy(doc), name=row["name"], client_label=row["client_label"])
+            if type in ("undo", "redo"):
+                source, target = (undo, redo) if type == "undo" else (redo, undo)
+                if not source:
+                    raise ValueError("Nothing to " + type)
+                restored = source.pop()
+                target.append(state)
+                self._invalidate(db, project_id, doc, restored["document"])
+                state = restored
+            elif type == "restore_revision":
+                rev = db.execute(
+                    "SELECT document FROM revisions WHERE id=? AND project_id=?",
+                    (payload.get("revision_id"), project_id),
+                ).fetchone()
+                if not rev:
+                    raise NotFound("Revision not found")
+                restored = json.loads(rev["document"])
+                self._invalidate(db, project_id, doc, restored)
+                undo.append(state)
+                redo.clear()
+                state = {**state, "document": restored}
+            else:
+                self._apply(db, project_id, state, type, payload, voice_snapshot)
+                undo.append(dict(document=doc, name=row["name"], client_label=row["client_label"]))
+                redo.clear()
+            from .archive import _validate_document
+
+            project = self._project(db, project_id)
+            _validate_document(
+                state["document"], {a["id"]: a for a in project["assets"]}, {t["id"]: t for t in project["takes"]}
+            )
+            self._remember_intents(db, project_id, state["document"])
+            db.execute(
+                "UPDATE projects SET name=?,client_label=?,document=?,undo=?,redo=?,revision=revision+1,updated_at=? WHERE id=?",
+                (
+                    state["name"],
+                    state["client_label"],
+                    encode(state["document"]),
+                    encode(undo),
+                    encode(redo),
+                    now(),
+                    project_id,
+                ),
+            )
+            return self._record(db, project_id, operation_id, request)
+
+    def _remember_intents(self, db, project_id, doc):
+        for p in doc["passages"]:
+            db.execute(
+                "INSERT INTO passage_intents VALUES (?,?,?) ON CONFLICT(project_id,passage_id) DO UPDATE SET epoch=MAX(epoch,excluded.epoch)",
+                (project_id, p["id"], p["selection_token"]),
+            )
+
+    def _invalidate(self, db, project_id, current, restored):
+        tokens = {p["id"]: p["selection_token"] for p in current["passages"]}
+        for p in restored["passages"]:
+            old = db.execute(
+                "SELECT epoch FROM passage_intents WHERE project_id=? AND passage_id=?", (project_id, p["id"])
+            ).fetchone()
+            p["selection_token"] = max(p["selection_token"], tokens.get(p["id"], 0), old["epoch"] if old else 0) + 1
+
+    def _apply(self, db, project_id, state, kind, payload, voice_snapshot=None):
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be an object")
+        doc = state["document"]
+        passages = doc["passages"]
+        clips = doc["clips"]
+        tracks = doc["tracks"]
+
+        def find(items, identifier):
+            result = next((x for x in items if x["id"] == identifier), None)
+            if result is None:
+                raise NotFound("Item not found in project")
+            return result
+
+        if kind in ("update_passage", "select_take", "delete_passage", "assign_voice"):
+            ids = payload.get("passage_ids", []) if kind == "assign_voice" else [payload.get("passage_id")]
+            if any(find(passages, ident)["locked"] for ident in ids):
+                raise ValueError("Passage is locked")
+        if kind == "update_project":
+            for key in ("name", "client_label"):
+                if key in payload:
+                    if key == "name" and (not isinstance(payload[key], str) or not payload[key].strip()):
+                        raise ValueError("Name is required")
+                    state[key] = payload[key]
+        elif kind == "add_passages":
+            texts = payload.get("texts")
+            if not isinstance(texts, list) or not texts or any(not isinstance(t, str) or not t.strip() for t in texts):
+                raise ValueError("Passages require text")
+            index = len(passages)
+            if payload.get("after_id") is not None:
+                index = passages.index(find(passages, payload["after_id"])) + 1
+            passages[index:index] = [passage(t, doc["language"]) for t in texts]
+        elif kind == "update_passage":
+            p = find(passages, payload.get("passage_id"))
+            for key in ("text", "language"):
+                if key in payload:
+                    if not isinstance(payload[key], str) or not payload[key].strip():
+                        raise ValueError(f"{key} is required")
+                    p[key] = payload[key]
+            if "direction" in payload:
+                direction = payload["direction"]
+                if not isinstance(direction, dict) or set(direction) - set(p["direction"]):
+                    raise ValueError("Invalid direction")
+                p["direction"].update(direction)
+                d = p["direction"]
+                if (
+                    not isinstance(d["instruct"], str)
+                    or (d["seed"] is not None and (type(d["seed"]) is not int))
+                    or type(d["max_chunk_chars"]) is not int
+                    or d["max_chunk_chars"] <= 0
+                    or type(d["crossfade_ms"]) is not int
+                    or d["crossfade_ms"] < 0
+                ):
+                    raise ValueError("Invalid direction")
+            p["input_revision"] += 1
+            p["selection_token"] += 1
+        elif kind == "assign_voice":
+            for ident in payload["passage_ids"]:
+                p = find(passages, ident)
+                p["profile_id"] = payload["profile_id"]
+                p["voice_snapshot"] = copy.deepcopy(voice_snapshot)
+                p["input_revision"] += 1
+                p["selection_token"] += 1
+        elif kind == "delete_passage":
+            p = find(passages, payload.get("passage_id"))
+            passages.remove(p)
+            doc["clips"] = [c for c in clips if c["passage_id"] != p["id"]]
+        elif kind == "reorder_passages":
+            ids = payload.get("passage_ids")
+            if not isinstance(ids, list) or len(ids) != len(passages) or set(ids) != {p["id"] for p in passages}:
+                raise ValueError("Expected all passage IDs exactly once")
+            doc["passages"] = [find(passages, x) for x in ids]
+        elif kind == "set_lock":
+            p = find(passages, payload.get("passage_id"))
+            if type(payload.get("locked")) is not bool:
+                raise ValueError("locked must be boolean")
+            p["locked"] = payload["locked"]
+            p["selection_token"] += 1
+        elif kind == "select_take":
+            p = find(passages, payload.get("passage_id"))
+            take = db.execute(
+                "SELECT * FROM takes WHERE id=? AND project_id=? AND passage_id=?",
+                (payload.get("take_id"), project_id, p["id"]),
+            ).fetchone()
+            if not take:
+                raise NotFound("Take not found for passage")
+            p["selected_take_id"] = take["id"]
+            p["selection_token"] += 1
+            if payload.get("replace_clips"):
+                for clip in clips:
+                    if clip["passage_id"] == p["id"]:
+                        clip["take_id"] = take["id"]
+                        clip["asset_id"] = take["asset_id"]
+                        clip["track_id"] = self._voice_track(db, project_id, doc, take, p)["id"]
+                        self._validate_clip(db, project_id, doc, clip)
+        elif kind == "update_track":
+            track = find(tracks, payload.get("track_id"))
+            for key in ("name", "mute", "solo", "gain"):
+                if key in payload:
+                    track[key] = payload[key]
+            if (
+                not isinstance(track["name"], str)
+                or not track["name"].strip()
+                or type(track["mute"]) is not bool
+                or type(track["solo"]) is not bool
+                or not _gain(track["gain"])
+            ):
+                raise ValueError("Invalid track")
+        elif kind == "update_mix":
+            for key in ("target_lufs", "max_true_peak_dbtp", "normalize"):
+                if key in payload:
+                    doc["mix"][key] = payload[key]
+            m = doc["mix"]
+            if (
+                any(not _finite(m[k]) for k in ("target_lufs", "max_true_peak_dbtp"))
+                or type(m["normalize"]) is not bool
+            ):
+                raise ValueError("Invalid mix")
+        elif kind in ("update_clip", "duplicate_clip", "delete_clip", "split_clip"):
+            clip = find(clips, payload.get("clip_id"))
+            if kind == "delete_clip":
+                clips.remove(clip)
+            elif kind == "duplicate_clip":
+                clips.append({**clip, "id": uid()})
+            elif kind == "update_clip":
+                for key in (
+                    "start_sample",
+                    "trim_start_sample",
+                    "trim_end_sample",
+                    "gain",
+                    "fade_in_samples",
+                    "fade_out_samples",
+                    "track_id",
+                ):
+                    if key in payload:
+                        clip[key] = payload[key]
+                self._validate_clip(db, project_id, doc, clip)
+            else:
+                at = payload.get("at_sample")
+                length = self._clip_length(db, project_id, doc, clip)
+                if type(at) is not int or not clip["start_sample"] < at < clip["start_sample"] + length:
+                    raise ValueError("Split outside clip")
+                left = at - clip["start_sample"]
+                right = length - left
+                other = {
+                    **clip,
+                    "id": uid(),
+                    "start_sample": at,
+                    "trim_start_sample": clip["trim_start_sample"] + left,
+                    "fade_in_samples": 0,
+                    "fade_out_samples": min(clip["fade_out_samples"], right),
+                }
+                clip["trim_end_sample"] += right
+                clip["fade_in_samples"] = min(clip["fade_in_samples"], left)
+                clip["fade_out_samples"] = 0
+                clips.append(other)
+        elif kind == "insert_asset":
+            asset_id = payload.get("asset_id")
+            if not db.execute("SELECT 1 FROM assets WHERE id=? AND project_id=?", (asset_id, project_id)).fetchone():
+                raise NotFound("Asset not found in project")
+            track_id = payload.get("track_id")
+            if track_id is None:
+                media_kind = payload.get("kind", "music")
+                name = payload.get("name", "Imported audio")
+                if media_kind not in ("music", "sfx", "voice") or not isinstance(name, str) or not name.strip():
+                    raise ValueError("Invalid imported track")
+                track = dict(id=uid(), name=name, kind=media_kind, mute=False, solo=False, gain=1.0)
+                tracks.append(track)
+                track_id = track["id"]
+            clip = dict(
+                id=uid(),
+                passage_id=None,
+                take_id=None,
+                asset_id=asset_id,
+                track_id=track_id,
+                start_sample=payload.get("start_sample", 0),
+                trim_start_sample=0,
+                trim_end_sample=0,
+                gain=1.0,
+                fade_in_samples=0,
+                fade_out_samples=0,
+            )
+            self._validate_clip(db, project_id, doc, clip)
+            clips.append(clip)
+        elif kind == "insert_passages":
+            ids = payload.get("passage_ids")
+            if not isinstance(ids, list) or not ids or len(set(ids)) != len(ids):
+                raise ValueError("passage_ids required")
+            gap = payload.get("gap_ms", 0)
+            start = payload.get("start_sample")
+            if not _finite(gap) or gap < 0 or (start is not None and (type(start) is not int or start < 0)):
+                raise ValueError("Invalid placement")
+            if start is None:
+                start = max((c["start_sample"] + self._clip_length(db, project_id, doc, c) for c in clips), default=0)
+            for ident in ids:
+                p = find(passages, ident)
+                take = db.execute(
+                    "SELECT * FROM takes WHERE id=? AND project_id=? AND passage_id=?",
+                    (p["selected_take_id"], project_id, ident),
+                ).fetchone()
+                if not take:
+                    raise ValueError("Passage has no selected take")
+                track = self._voice_track(db, project_id, doc, take, p)
+                c = dict(
+                    id=uid(),
+                    passage_id=ident,
+                    take_id=take["id"],
+                    asset_id=take["asset_id"],
+                    track_id=track["id"],
+                    start_sample=start,
+                    trim_start_sample=0,
+                    trim_end_sample=0,
+                    gain=1.0,
+                    fade_in_samples=0,
+                    fade_out_samples=0,
+                )
+                clips.append(c)
+                start += self._clip_length(db, project_id, doc, c) + nearest_sample(gap * doc["sample_rate"] / 1000)
+        else:
+            raise ValueError("Unknown command: " + str(kind))
+
+    def _voice_track(self, db, project_id, doc, take, passage):
+        tracks, clips = doc["tracks"], doc["clips"]
+        frozen = json.loads(take["request"]).get("passage", {})
+        voice = copy.deepcopy(frozen.get("voice_snapshot", passage.get("voice_snapshot")))
+        identity = copy.deepcopy(voice)
+        if identity:
+            identity.pop("name", None)
+            for sample in identity.get("samples", []):
+                source = db.execute(
+                    "SELECT hash FROM assets WHERE id=? AND project_id=?", (sample["asset_id"], project_id)
+                ).fetchone()
+                sample["asset_id"] = source["hash"] if source else sample["asset_id"]
+        voice_key = hashlib.sha256(encode(identity).encode()).hexdigest()
+        track = next((t for t in tracks if t.get("voice_key") == voice_key), None)
+        if track is None:
+            track = next(
+                (
+                    t
+                    for t in tracks
+                    if t["kind"] == "voice"
+                    and not t.get("voice_key")
+                    and not any(c["track_id"] == t["id"] for c in clips)
+                ),
+                None,
+            )
+            if track is None:
+                track = dict(
+                    id=uid(),
+                    name=(voice or {}).get("name") or "Voice " + str(sum(t["kind"] == "voice" for t in tracks) + 1),
+                    kind="voice",
+                    mute=False,
+                    solo=False,
+                    gain=1.0,
+                )
+                tracks.append(track)
+            track["voice_key"] = voice_key
+        return track
+
+    def _clip_length(self, db, project_id, doc, clip):
+        asset = db.execute(
+            "SELECT * FROM assets WHERE id=? AND project_id=?", (clip["asset_id"], project_id)
+        ).fetchone()
+        if not asset:
+            raise NotFound("Asset not found in project")
+        return (
+            resampled_frames(asset["frames"], asset["sample_rate"], doc["sample_rate"])
+            - clip["trim_start_sample"]
+            - clip["trim_end_sample"]
+        )
+
+    def _validate_clip(self, db, project_id, doc, clip):
+        if not any(t["id"] == clip["track_id"] for t in doc["tracks"]):
+            raise NotFound("Track not found")
+        for key in ("start_sample", "trim_start_sample", "trim_end_sample", "fade_in_samples", "fade_out_samples"):
+            if type(clip[key]) is not int or clip[key] < 0:
+                raise ValueError("Invalid clip position")
+        length = self._clip_length(db, project_id, doc, clip)
+        if (
+            length <= 0
+            or clip["fade_in_samples"] > length
+            or clip["fade_out_samples"] > length
+            or not _gain(clip["gain"])
+        ):
+            raise ValueError("Invalid clip range or gain")
+
+    def checkpoint(self, project_id, operation_id, expected_revision, name):
+        request = dict(action="checkpoint", expected_revision=expected_revision, name=name)
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            prior = self._operation(db, project_id, operation_id, request)
+            if prior is not None:
+                return prior
+            project = self._project(db, project_id)
+            if project["revision"] != expected_revision:
+                raise Conflict("Project revision changed", project["revision"])
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("Revision name required")
+            db.execute(
+                "INSERT INTO revisions VALUES (?,?,?,?,?,?)",
+                (uid(), project_id, name.strip(), now(), encode(project["document"]), expected_revision),
+            )
+            return self._record(db, project_id, operation_id, request)
+
+    def approve(self, project_id, operation_id, revision_id, note=None):
+        request = dict(action="approve", revision_id=revision_id, note=note)
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            prior = self._operation(db, project_id, operation_id, request)
+            if prior is not None:
+                return prior
+            if not db.execute(
+                "SELECT 1 FROM revisions WHERE id=? AND project_id=?", (revision_id, project_id)
+            ).fetchone():
+                raise NotFound("Revision not found")
+            db.execute("INSERT INTO approvals VALUES (?,?,?,?,?)", (uid(), project_id, revision_id, note, now()))
+            return self._record(db, project_id, operation_id, request)
+
+    def add_asset(self, project_id, source):
+        import soundfile as sf
+
+        source = Path(source)
+        asset_id = uid()
+        target = self.asset_dir / asset_id
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._project(db, project_id)
+            try:
+                with source.open("rb") as src, target.open("xb") as dst:
+                    shutil.copyfileobj(src, dst)
+                try:
+                    info = sf.info(str(target))
+                except (RuntimeError, OSError) as exc:
+                    raise ValueError("Invalid audio file") from exc
+                if info.samplerate <= 0 or info.channels not in (1, 2) or info.frames <= 0:
+                    raise ValueError("Empty or invalid audio")
+                digest = hashlib.sha256()
+                with target.open("rb") as f:
+                    for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                db.execute(
+                    "INSERT INTO assets VALUES (?,?,?,?,?,?,?,?,?)",
+                    (
+                        asset_id,
+                        project_id,
+                        digest.hexdigest(),
+                        info.samplerate,
+                        info.channels,
+                        info.frames,
+                        info.frames / info.samplerate,
+                        target.stat().st_size,
+                        asset_id,
+                    ),
+                )
+            except BaseException:
+                target.unlink(missing_ok=True)
+                raise
+            return next(a for a in self._project(db, project_id)["assets"] if a["id"] == asset_id)
+
+    def asset_path(self, asset_id):
+        with self.connect() as db:
+            row = db.execute("SELECT path FROM assets WHERE id=?", (asset_id,)).fetchone()
+            if not row:
+                raise NotFound("Asset not found")
+            path = self.asset_dir / row["path"]
+            if not path.is_file():
+                raise NotFound("Asset audio missing")
+            return path
+
+
+def _finite(value):
+    return type(value) in (int, float) and math.isfinite(value)
+
+
+def _gain(value):
+    return _finite(value) and value >= 0
