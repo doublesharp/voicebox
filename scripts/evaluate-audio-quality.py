@@ -22,9 +22,6 @@ from backend.utils.audio_quality import (  # noqa: E402
     transcript_metrics,
 )
 
-REPORTS_ROOT = Path("/Volumes/Scratch/voicebox/reports")
-
-
 def file_hash(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -140,17 +137,15 @@ def analyze_manifest(manifest_path: Path) -> dict:
     }
 
 
-def write_report(report: dict, output_dir: Path) -> None:
-    scratch = Path("/Volumes/Scratch")
-    if not scratch.is_mount():
-        raise ValueError("Scratch volume is not mounted")
+def write_report(report: dict, output_dir: Path, reports_root: Path) -> None:
+    reports_root = reports_root.resolve()
     output_dir = output_dir.resolve()
     if (
-        not output_dir.is_relative_to(REPORTS_ROOT.resolve())
-        or output_dir == REPORTS_ROOT.resolve()
+        not output_dir.is_relative_to(reports_root)
+        or output_dir == reports_root
     ):
         raise ValueError(
-            f"Choose an explicit task report directory below {REPORTS_ROOT}"
+            f"Choose an explicit task report directory below {reports_root}"
         )
     targets = [output_dir / "report.json", output_dir / "listening-worksheet.md"]
     if any(target.exists() for target in targets):
@@ -192,15 +187,18 @@ def main(argv: list[str] | None = None) -> int:
         help="Version 1 JSON manifest pointing to existing WAV files",
     )
     parser.add_argument(
-        "--output-dir", type=Path, help=f"New report directory below {REPORTS_ROOT}"
+        "--reports-root", type=Path, help="Disposable report root outside the source checkout"
+    )
+    parser.add_argument(
+        "--output-dir", type=Path, help="New task directory below --reports-root"
     )
     args = parser.parse_args(argv)
     if args.list_corpus:
         print(json.dumps(QUALITY_CORPUS, ensure_ascii=False, indent=2))
         return 0
-    if args.manifest is None or args.output_dir is None:
+    if args.manifest is None or args.output_dir is None or args.reports_root is None:
         parser.error(
-            "analysis is opt-in: provide --manifest and --output-dir, or --list-corpus"
+            "analysis is opt-in: provide --manifest, --reports-root and --output-dir, or --list-corpus"
         )
     # Defense in depth for environments that import additional libraries:
     # this command never calls an engine, provider, server, ASR or model loader.
@@ -208,7 +206,7 @@ def main(argv: list[str] | None = None) -> int:
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     try:
         report = analyze_manifest(args.manifest.resolve())
-        write_report(report, args.output_dir)
+        write_report(report, args.output_dir, args.reports_root)
     except (ValueError, OSError, RuntimeError) as error:
         parser.error(str(error))
     print(f"Analyzed {len(report['cases'])} WAVs. Reports: {args.output_dir.resolve()}")

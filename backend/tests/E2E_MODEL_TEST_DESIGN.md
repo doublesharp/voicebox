@@ -262,11 +262,13 @@ reviewed canonical transcript (for example, spelling out a number);
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python scripts/evaluate-audio-quality.py \
   --manifest /Volumes/Scratch/voicebox/reports/my-quality-run/input.json \
+  --reports-root /Volumes/Scratch/voicebox/reports \
   --output-dir /Volumes/Scratch/voicebox/reports/my-quality-run/analysis
 ```
 
-The explicit destination must be below `/Volumes/Scratch/voicebox/reports`,
-with Scratch mounted. Existing report files are never overwritten. Output is
+Choose a disposable reports root with `--reports-root` and a new task directory
+below it with `--output-dir`. These paths work on any platform; the example
+uses our local Scratch volume. Existing report files are never overwritten. Output is
 `report.json` plus an unscored `listening-worksheet.md`; neither belongs in git.
 WAVs are read in bounded blocks. The report records sample hashes, provenance,
 duration, channels, peak/RMS, nonfinite/full-scale samples and energy-based
