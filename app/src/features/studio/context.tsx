@@ -1,9 +1,11 @@
 import { createContext, useContext } from 'react';
 import type { StudioClient, StudioProfile } from './client';
 import type { StudioPlayback } from './playback';
+import type { ReviewSessions } from './review-session';
 import type { ProjectSession, SessionState } from './session';
 import type { StudioEngine, StudioProject } from './types';
 export interface StudioContextValue {
+  reviewSessions?: ReviewSessions;
   client: StudioClient;
   project: StudioProject;
   session: ProjectSession;

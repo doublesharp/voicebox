@@ -199,6 +199,9 @@ def _validate_project(project, assets):
             raise ValueError("invalid take request")
     documents = [project["document"]]
     revisions = _records(project.get("revisions", []), "revision")
+    from .review_schema import validate_reviews
+
+    validate_reviews(project)
     for revision in revisions.values():
         if not isinstance(revision, dict) or not isinstance(revision.get("document"), dict):
             raise ValueError("invalid revision")

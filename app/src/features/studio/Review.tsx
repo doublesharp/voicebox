@@ -1,13 +1,13 @@
 import { CheckCircle2, History } from 'lucide-react';
-import { useState } from 'react';
+import { useState, useSyncExternalStore } from 'react';
 import { Textarea } from '@/components/ui/textarea';
 import { useStudio } from './context';
+import type { ReviewSession } from './review-session';
 import { Field, StudioButton } from './ui';
 
 export function Review() {
   const studio = useStudio();
   const { project, session, revisionId, setRevisionId } = studio;
-  const [note, setNote] = useState('');
   const [restoreConfirm, setRestoreConfirm] = useState(false);
   const revision = project.revisions.find((r) => r.id === revisionId);
   const approvals = project.approvals.filter((a) => a.revision_id === revision?.id);
@@ -87,25 +87,12 @@ export function Review() {
               </StudioButton>
             ))}
           </div>
-          <Field label="Local review note">
-            <Textarea
-              value={note}
-              onChange={(e) => setNote(e.target.value)}
-              placeholder="Pacing, pronunciation, and timing checked…"
-            />
-          </Field>
+          {studio.reviewSessions ? (
+            <ReviewEditor key={revision.id} review={studio.reviewSessions.get(revision.id)} />
+          ) : (
+            <p role="alert">Local review storage is unavailable.</p>
+          )}
           <div className="studio-action-row">
-            <StudioButton
-              primary
-              disabled={!studio.canMutate}
-              onClick={() =>
-                void session.approve(revision.id, note).then((ok) => {
-                  if (ok) setNote('');
-                })
-              }
-            >
-              <CheckCircle2 size={15} /> Approve this checkpoint locally
-            </StudioButton>
             <StudioButton
               disabled={!studio.canMutate}
               onClick={() => setRestoreConfirm(!restoreConfirm)}
@@ -148,6 +135,137 @@ export function Review() {
           </div>
         </>
       )}
+    </section>
+  );
+}
+
+function ReviewEditor({ review }: { review: ReviewSession }) {
+  const studio = useStudio();
+  const state = useSyncExternalStore(review.subscribe, review.getSnapshot);
+  const [showCopy, setShowCopy] = useState(false);
+  const value = review.value();
+  const blocked = !state.review || ['loading', 'recovery'].includes(state.status);
+  const labels = {
+    loading: 'Loading review…',
+    saved: 'Review saved',
+    dirty: 'Review has unsaved changes',
+    saving: 'Saving review…',
+    error: 'Review save failed',
+    recovery: 'Review recovery available',
+    conflict: 'Review save conflict',
+  };
+  return (
+    <section aria-label="Checkpoint review notes and checklist">
+      <output aria-live="polite">{labels[state.status]}</output>
+      {state.error && <p role="alert">{state.error}</p>}
+      {!state.recoverySaved && (
+        <p role="alert">
+          Local recovery storage is unavailable. Keep this project open and copy your review before
+          leaving.
+        </p>
+      )}
+      <Field label="Local review note">
+        <Textarea
+          value={value.note}
+          disabled={blocked}
+          maxLength={4000}
+          onChange={(e) => review.edit({ note: e.target.value })}
+          placeholder="Pacing, pronunciation, and timing checked…"
+        />
+      </Field>
+      <fieldset disabled={blocked}>
+        <legend>Local review checklist (optional)</legend>
+        {value.checklist.map((item) => (
+          <label key={item.id}>
+            <input
+              type="checkbox"
+              checked={item.checked}
+              onChange={(e) =>
+                review.edit({
+                  checklist: value.checklist.map((i) =>
+                    i.id === item.id ? { ...i, checked: e.target.checked } : i,
+                  ),
+                })
+              }
+            />
+            {item.label}
+          </label>
+        ))}
+      </fieldset>
+      <div className="studio-action-row">
+        <StudioButton
+          disabled={blocked || ['error', 'conflict'].includes(state.status)}
+          onClick={() => review.flush()}
+        >
+          Save review
+        </StudioButton>
+        <StudioButton
+          primary
+          disabled={
+            !studio.canMutate ||
+            !state.review ||
+            ['loading', 'error', 'conflict', 'recovery', 'saving'].includes(state.status)
+          }
+          onClick={async () => {
+            if (await review.approve()) await studio.session.refresh();
+          }}
+        >
+          <CheckCircle2 size={15} /> Approve this checkpoint locally
+        </StudioButton>
+        {state.status === 'error' && (
+          <StudioButton onClick={() => review.retry()}>Retry exact review request</StudioButton>
+        )}
+        {(!state.recoverySaved || ['error', 'conflict', 'recovery'].includes(state.status)) && (
+          <>
+            <StudioButton onClick={() => setShowCopy(!showCopy)}>
+              Show review recovery copy
+            </StudioButton>
+            <StudioButton
+              onClick={() => {
+                if (
+                  window.confirm(
+                    'Discard the current review draft and reload the saved review? Other recovery copies stay available. Copy your draft first if needed.',
+                  )
+                )
+                  void review.reloadSaved();
+              }}
+            >
+              Discard current draft and reload review
+            </StudioButton>
+          </>
+        )}
+        {state.recoveries.map((record, index) => (
+          <div key={record.key}>
+            <StudioButton
+              disabled={!record.readable || !!state.draft || state.status === 'saving'}
+              onClick={() => review.recover(record.key)}
+            >
+              Recover review copy {index + 1}
+            </StudioButton>
+            <StudioButton
+              onClick={() => {
+                if (
+                  window.confirm(
+                    `Discard review recovery copy ${index + 1}? Copy it first if needed.`,
+                  )
+                )
+                  review.discardRecovery(record.key);
+              }}
+            >
+              Discard review copy {index + 1}
+            </StudioButton>
+          </div>
+        ))}
+      </div>
+      {showCopy && (
+        <Field label="Review recovery copy">
+          <Textarea readOnly value={review.recoveryCopy()} />
+        </Field>
+      )}
+      <p className="studio-note">
+        Approval records the saved note and actual checklist state for this checkpoint. This is
+        local self-approval.
+      </p>
     </section>
   );
 }

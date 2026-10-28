@@ -14,6 +14,12 @@ import { Deliver } from '../src/features/studio/Deliver';
 import { Director } from '../src/features/studio/Director';
 import type { StudioPlayback } from '../src/features/studio/playback';
 import { Review } from '../src/features/studio/Review';
+import {
+  type CheckpointReview,
+  ReviewClient,
+  type ReviewResponse,
+} from '../src/features/studio/review-client';
+import { ReviewSessions } from '../src/features/studio/review-session';
 import { ScriptEditor } from '../src/features/studio/ScriptEditor';
 import { ProjectSession } from '../src/features/studio/session';
 import { Timeline } from '../src/features/studio/Timeline';
@@ -22,7 +28,7 @@ import { PlatformProvider } from '../src/platform/PlatformContext';
 import type { Platform } from '../src/platform/types';
 
 let renderer: ReactTestRenderer;
-const sessions: ProjectSession[] = [];
+const sessions: Array<{ dispose(): void }> = [];
 afterEach(() => {
   act(() => renderer?.unmount());
   for (const session of sessions.splice(0)) session.dispose();
@@ -133,6 +139,7 @@ async function mount(
     conflict?: boolean;
     failGenerate?: boolean;
     failRender?: boolean;
+    failReviewSave?: boolean;
     store?: Map<string, string>;
   } = {},
 ) {
@@ -142,8 +149,61 @@ async function mount(
   const generations: unknown[] = [];
   const renders: unknown[] = [];
   const auditions: string[] = [];
-  const client = new StudioClient('http://test', (async (url, init) => {
+  const savedReviews = new Map<string, CheckpointReview>();
+  const reviewOperations = new Map<string, ReviewResponse>();
+  const reviewRequests: unknown[] = [];
+  const fetcher = (async (url, init) => {
     const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+    if (String(url).includes('/reviews/')) {
+      const revision = String(url).split('/reviews/')[1].split('/')[0];
+      const review = savedReviews.get(revision) ?? {
+        revision_id: revision,
+        version: 0,
+        note: '',
+        checklist: [],
+        updated_at: null,
+      };
+      if (!body) return Response.json({ review });
+      reviewRequests.push(body);
+      const prior = reviewOperations.get(body.operation_id);
+      if (prior) return Response.json(prior);
+      if (body.expected_version !== review.version)
+        return Response.json(
+          { detail: { message: 'Review changed', current_revision: review.version } },
+          { status: 409 },
+        );
+      if (String(url).endsWith('/approvals')) {
+        const note = [
+          review.note,
+          `Local review snapshot · version ${review.version}`,
+          ...review.checklist.map((i) => `[${i.checked ? 'x' : ' '}] ${i.label}`),
+        ].join('\n');
+        approvals.push({ ...body, revision_id: revision, note });
+        current = {
+          ...current,
+          approvals: [
+            ...current.approvals,
+            { id: body.operation_id, revision_id: revision, note, created_at: '2026-10-28' },
+          ],
+        };
+        const result = { review, project: current };
+        reviewOperations.set(body.operation_id, structuredClone(result));
+        return Response.json(result);
+      }
+      const saved = {
+        revision_id: revision,
+        version: body.expected_version + 1,
+        note: body.note,
+        checklist: body.checklist,
+        updated_at: '2026-10-28',
+      };
+      savedReviews.set(revision, saved);
+      const result = { review: saved };
+      reviewOperations.set(body.operation_id, structuredClone(result));
+      if (options.failReviewSave && reviewRequests.length === 1)
+        throw new Error('Review response lost');
+      return Response.json(result);
+    }
     if (String(url).endsWith('/commands')) {
       commands.push(body);
       if (options.conflict)
@@ -171,21 +231,29 @@ async function mount(
       return Response.json({ job: {} });
     }
     return Response.json(current);
-  }) as typeof fetch);
+  }) as typeof fetch;
+  const client = new StudioClient('http://test', fetcher);
   const store = options.store ?? new Map<string, string>();
-  const session = new ProjectSession(client, 'project', {
+  const storage = {
     get length() {
       return store.size;
     },
     key: (index: number) => [...store.keys()][index] ?? null,
-    getItem: (key) => store.get(key) ?? null,
-    setItem: (key, value) => {
+    getItem: (key: string) => store.get(key) ?? null,
+    setItem: (key: string, value: string) => {
       store.set(key, value);
     },
-    removeItem: (key) => {
+    removeItem: (key: string) => {
       store.delete(key);
     },
-  });
+  };
+  const session = new ProjectSession(client, 'project', storage);
+  const reviewSessions = new ReviewSessions(
+    new ReviewClient('http://test', fetcher),
+    'project',
+    storage,
+  );
+  sessions.push(reviewSessions);
   sessions.push(session);
   await session.load();
   function Harness() {
@@ -194,6 +262,7 @@ async function mount(
     const [checkedPassages, setCheckedPassages] = useState<string[]>([]);
     const context: StudioContextValue = {
       client,
+      reviewSessions,
       project: save.project!,
       save,
       session,
@@ -241,10 +310,19 @@ async function mount(
       </PlatformProvider>
     );
   }
-  act(() => {
+  await act(async () => {
     renderer = create(<Harness />);
   });
-  return { session, commands, approvals, generations, renders, auditions };
+  return {
+    session,
+    commands,
+    approvals,
+    generations,
+    renders,
+    auditions,
+    reviewSessions,
+    reviewRequests,
+  };
 }
 function button(text: string) {
   const found = renderer.root
@@ -346,6 +424,26 @@ describe('connected studio controls', () => {
       ['insert_passages', { passage_ids: ['line'], gap_ms: 200 }],
     ]);
   });
+  test('review notes stay with their checkpoint when switching revisions', async () => {
+    const project = fixture();
+    project.revisions.push({
+      ...structuredClone(project.revisions[0]),
+      id: 'second',
+      name: 'Second',
+    });
+    await mount(<Review />, { project });
+    act(() =>
+      renderer.root.findByType('textarea').props.onChange({ target: { value: 'First only' } }),
+    );
+    await act(async () => {
+      renderer.root.findByType('select').props.onChange({ target: { value: 'second' } });
+    });
+    expect(renderer.root.findByType('textarea').props.value).toBe('');
+    await act(async () => {
+      renderer.root.findByType('select').props.onChange({ target: { value: 'checkpoint' } });
+    });
+    expect(renderer.root.findByType('textarea').props.value).toBe('First only');
+  });
   test('review text and approval stay bound to the selected immutable checkpoint', async () => {
     const project = fixture();
     project.document.passages[0].text = 'A later draft has different words.';
@@ -359,7 +457,10 @@ describe('connected studio controls', () => {
     await act(async () => {
       await button(' Approve this checkpoint locally').props.onClick();
     });
-    expect(approvals[0]).toMatchObject({ revision_id: 'checkpoint', note: 'Pacing checked' });
+    expect(approvals[0]).toMatchObject({ revision_id: 'checkpoint' });
+    expect((approvals[0] as { note: string }).note).toContain(
+      'Pacing checked\nLocal review snapshot',
+    );
   });
 });
 
@@ -630,4 +731,92 @@ test('Director exposes independent orphan choices and recovers only the chosen s
   });
   expect(session.getSnapshot().drafts.line.text).toBe('second orphan');
   expect(store.get(`${prefix}first`)).toContain('first orphan');
+});
+
+test('review save failure blocks approval, exact retry keeps newer typing and freezes the checked snapshot', async () => {
+  const { reviewRequests, approvals } = await mount(<Review />, { failReviewSave: true });
+  act(() => renderer.root.findByType('textarea').props.onChange({ target: { value: 'Original' } }));
+  await act(async () => {
+    await button('Save review').props.onClick();
+  });
+  expect(JSON.stringify(renderer.toJSON())).toContain('Review save failed');
+  expect(button(' Approve this checkpoint locally').props.disabled).toBe(true);
+  expect(approvals).toHaveLength(0);
+  act(() => {
+    renderer.root
+      .findByType('textarea')
+      .props.onChange({ target: { value: 'Newer checked note' } });
+    renderer.root
+      .findAllByType('input')
+      .find((n) => n.props.type === 'checkbox')!
+      .props.onChange({ target: { checked: true } });
+  });
+  await act(async () => {
+    await button('Retry exact review request').props.onClick();
+  });
+  expect(reviewRequests[1]).toEqual(reviewRequests[0]);
+  expect(renderer.root.findByType('textarea').props.value).toBe('Newer checked note');
+  expect(JSON.stringify(renderer.toJSON())).toContain('Review saved');
+  await act(async () => {
+    await button(' Approve this checkpoint locally').props.onClick();
+  });
+  const note = (approvals[0] as { note: string }).note;
+  expect(note).toContain('Newer checked note');
+  expect(note).toContain('[x] Pronunciation and wording checked');
+  expect(note).toContain('[ ] Pacing and timing checked');
+  act(() =>
+    renderer.root.findByType('textarea').props.onChange({ target: { value: 'After approval' } }),
+  );
+  await act(async () => {
+    await button('Save review').props.onClick();
+  });
+  expect((approvals[0] as { note: string }).note).toBe(note);
+});
+
+test('Review reconnect exposes a durable note/checklist copy and recovers it before approval', async () => {
+  const store = new Map<string, string>();
+  const first = await mount(<Review />, { store });
+  act(() => {
+    renderer.root.findByType('textarea').props.onChange({ target: { value: 'Restart note' } });
+    renderer.root
+      .findAllByType('input')
+      .find((n) => n.props.type === 'checkbox')!
+      .props.onChange({ target: { checked: true } });
+  });
+  act(() => renderer.unmount());
+  first.reviewSessions.dispose();
+  first.session.dispose();
+  const next = await mount(<Review />, { store });
+  expect(JSON.stringify(renderer.toJSON())).toContain('Review recovery available');
+  expect(button(' Approve this checkpoint locally').props.disabled).toBe(true);
+  act(() => button('Recover review copy 1').props.onClick());
+  expect(renderer.root.findByType('textarea').props.value).toBe('Restart note');
+  expect(
+    renderer.root.findAllByType('input').find((n) => n.props.type === 'checkbox')!.props.checked,
+  ).toBe(true);
+  await act(async () => {
+    await button(' Approve this checkpoint locally').props.onClick();
+  });
+  expect((next.approvals[0] as { note: string }).note).toContain('Restart note');
+});
+
+test('Review presents exportable typing when local storage fails and never submits an approval', async () => {
+  const store = new Map<string, string>();
+  const { reviewRequests, approvals } = await mount(<Review />, { store });
+  store.set = () => {
+    throw new Error('Storage unavailable');
+  };
+  act(() =>
+    renderer.root.findByType('textarea').props.onChange({ target: { value: 'Copy this note' } }),
+  );
+  await act(async () => {
+    await button(' Approve this checkpoint locally').props.onClick();
+  });
+  expect(reviewRequests).toHaveLength(0);
+  expect(approvals).toHaveLength(0);
+  expect(JSON.stringify(renderer.toJSON())).toContain('Keep this project open');
+  act(() => button('Show review recovery copy').props.onClick());
+  expect(
+    renderer.root.findAllByType('textarea').find((n) => n.props.readOnly)!.props.value,
+  ).toContain('Copy this note');
 });
