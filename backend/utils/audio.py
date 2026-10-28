@@ -2,6 +2,9 @@
 Audio processing utilities.
 """
 
+import re
+import unicodedata
+
 import numpy as np
 import soundfile as sf
 import librosa
@@ -14,7 +17,7 @@ def normalize_audio(
     peak_limit: float = 0.85,
 ) -> np.ndarray:
     """
-    Normalize audio to target loudness with peak limiting.
+    Normalize RMS with a single gain capped by available peak headroom.
     
     Args:
         audio: Input audio array
@@ -24,29 +27,46 @@ def normalize_audio(
     Returns:
         Normalized audio array
     """
-    # Convert to float32
-    audio = audio.astype(np.float32)
-    
-    # Calculate current RMS
-    rms = np.sqrt(np.mean(audio**2))
-    
-    # Calculate target RMS
-    target_rms = 10**(target_db / 20)
-    
-    # Apply gain
-    if rms > 0:
-        gain = target_rms / rms
-        audio = audio * gain
-    
-    # Peak limiting
-    audio = np.clip(audio, -peak_limit, peak_limit)
-    
-    return audio
+    audio = np.asarray(audio, dtype=np.float32)
+    if not np.isfinite(audio).all():
+        raise ValueError("Audio samples must be finite")
+    if not np.isfinite(target_db) or not 0 < peak_limit <= 1:
+        raise ValueError("Normalization requires a finite target and a peak limit in (0, 1]")
+    if audio.size == 0:
+        return audio.copy()
+
+    peak = float(np.abs(audio).max())
+    if peak == 0:
+        return audio.copy()
+
+    # Scale before squaring to avoid overflowing on otherwise finite inputs.
+    relative_rms = float(np.sqrt(np.mean((audio / peak) ** 2, dtype=np.float64)))
+    target_rms = 10 ** (target_db / 20)
+    gain = min(target_rms / (peak * relative_rms), peak_limit / peak)
+    return audio * gain
+
+
+def protect_audio_peak(audio: np.ndarray, peak_limit: float = 0.999) -> np.ndarray:
+    """Attenuate hot output before PCM encoding without flattening its peaks.
+
+    This is a single linear gain, not a compressor or perceptual loudness
+    normalizer. Quiet audio is left at its requested level, including when
+    output normalization is disabled.
+    """
+    audio = np.asarray(audio, dtype=np.float32)
+    if not np.isfinite(audio).all():
+        raise ValueError("Audio samples must be finite")
+    if not 0 < peak_limit <= 1:
+        raise ValueError("Peak limit must be in (0, 1]")
+    if audio.size == 0:
+        return audio.copy()
+    peak = float(np.abs(audio).max())
+    return audio * (peak_limit / peak) if peak > peak_limit else audio.copy()
 
 
 def load_audio(
     path: str,
-    sample_rate: int = 24000,
+    sample_rate: Optional[int] = 24000,
     mono: bool = True,
 ) -> Tuple[np.ndarray, int]:
     """
@@ -54,7 +74,7 @@ def load_audio(
     
     Args:
         path: Path to audio file
-        sample_rate: Target sample rate
+        sample_rate: Target sample rate, or None to preserve the source rate
         mono: Convert to mono
         
     Returns:
@@ -147,6 +167,50 @@ def has_tts_runaway(
     return False
 
 
+def _text_duration_budget(text: str | None) -> float | None:
+    """A deliberately slow reading budget, used only for tiny residual bursts.
+
+    This is not alignment or a speech-completeness test. Count wide-script
+    characters and digits generously, and exclude nonspoken bracket tags.
+    Internal pauses never count toward the preceding spoken duration.
+    """
+    if not text:
+        return None
+    spoken = re.sub(r"\[[^\]]*\]", "", text)
+    units = sum(
+        8 if char.isdigit() else 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+        for char in spoken
+        if char.isalnum()
+    )
+    return max(5.0, units / 3.0) if units else None
+
+
+def _stationary_noise_tail(
+    frames: np.ndarray, rms: np.ndarray, frame_seconds: float, min_duration: float = 0.3
+) -> bool:
+    """Recognize sustained broadband hiss, preserving modulated/tonal output.
+
+    A quiet or short continuation alone is not evidence of hallucination.
+    Require nearly steady energy and a flat spectrum for the minimum duration.
+    More than 40 ms of non-noise-like content keeps the entire continuation.
+    """
+    if len(frames) * frame_seconds < min_duration:
+        return False
+    mean_rms = float(np.mean(rms))
+    if mean_rms <= 0 or float(np.std(rms)) / mean_rms > 0.15:
+        return False
+    power = np.abs(np.fft.rfft(frames * np.hanning(frames.shape[1]), axis=1))[:, 1:] ** 2
+    if not power.shape[1]:
+        return False
+    epsilon = np.finfo(np.float64).tiny
+    arithmetic_mean = np.mean(power, axis=1)
+    flatness = np.exp(np.mean(np.log(np.maximum(power, epsilon)), axis=1)) / np.maximum(
+        arithmetic_mean, epsilon
+    )
+    noise_like = (flatness >= 0.25) & (arithmetic_mean > np.finfo(np.float64).eps)
+    return np.count_nonzero(~noise_like) * frame_seconds <= 0.04
+
+
 def trim_tts_output(
     audio: np.ndarray,
     sample_rate: int = 24000,
@@ -155,85 +219,68 @@ def trim_tts_output(
     min_silence_ms: int = 200,
     max_internal_silence_ms: int | None = 1000,
     fade_ms: int = 30,
+    *,
+    text: str | None = None,
 ) -> np.ndarray:
-    """
-    Trim trailing silence and post-silence hallucination from TTS output.
+    """Trim edges and guarded post-silence artifacts without discarding pauses.
 
-    Chatterbox sometimes produces ``[speech][silence][hallucinated noise]``.
-    This detects internal silence gaps longer than *max_internal_silence_ms*
-    and cuts the audio at that boundary, then trims trailing silence and
-    applies a short cosine fade-out.
+    A long gap is a candidate boundary, not proof that the sentence ended.
+    Preserve resumed speech unless the remaining active audio is stationary
+    broadband noise for at least 300 ms. Tiny noise bursts (60-250 ms) also
+    require preceding active audio beyond a generous text-duration budget.
+    A duration estimate alone never discards a continuation. Waveform
+    heuristics cannot identify hallucinated words reliably.
 
-    Args:
-        audio: Input audio array (mono float32)
-        sample_rate: Sample rate in Hz
-        frame_ms: Frame size for RMS energy calculation
-        silence_threshold_db: dB threshold below which a frame is silence
-        min_silence_ms: Minimum trailing silence to keep
-        max_internal_silence_ms: Cut after any silence gap longer than this.
-            ``None`` disables the internal cut and only trims the edges.
-        fade_ms: Cosine fade-out duration in ms
-
-    Returns:
-        Trimmed audio array
+    ``max_internal_silence_ms=None`` disables internal cuts (used by Kokoro).
+    Keep up to ``min_silence_ms`` of the original trailing silence and apply
+    the existing cosine fade. ``text`` is optional for legacy callers.
     """
     frame_len = int(sample_rate * frame_ms / 1000)
-    if frame_len == 0 or len(audio) < frame_len:
+    if frame_len <= 0 or len(audio) < frame_len:
         return audio
 
-    n_frames = len(audio) // frame_len
-    threshold_linear = 10 ** (silence_threshold_db / 20)
-
-    # Compute per-frame RMS
-    rms = np.array(
-        [
-            np.sqrt(np.mean(audio[i * frame_len : (i + 1) * frame_len] ** 2))
-            for i in range(n_frames)
-        ]
-    )
-    is_speech = rms >= threshold_linear
-
-    # Find first speech frame
-    first_speech = 0
-    for i, s in enumerate(is_speech):
-        if s:
-            first_speech = max(0, i - 1)  # keep 1 frame padding
-            break
-
-    # Walk forward from first speech; cut at long internal silence gaps
+    # Include the final partial frame so a short final syllable is not lost.
+    n_frames = (len(audio) + frame_len - 1) // frame_len
+    padded = np.pad(audio, (0, n_frames * frame_len - len(audio)))
+    frames = padded.reshape(n_frames, frame_len)
+    counts = np.full(n_frames, frame_len)
+    counts[-1] = len(audio) - (n_frames - 1) * frame_len
+    rms = np.sqrt(np.sum(frames.astype(np.float64) ** 2, axis=1) / counts)
+    is_speech = rms >= 10 ** (silence_threshold_db / 20)
+    speech_frames = np.flatnonzero(is_speech)
+    first_speech = max(0, int(speech_frames[0]) - 1) if len(speech_frames) else 0
     cut_frame = n_frames
-    if max_internal_silence_ms is not None:
-        max_silence_frames = int(max_internal_silence_ms / frame_ms)
-        consecutive_silence = 0
-        for i in range(first_speech, n_frames):
-            if is_speech[i]:
-                consecutive_silence = 0
-            else:
-                consecutive_silence += 1
-                if consecutive_silence >= max_silence_frames:
-                    cut_frame = i - consecutive_silence + 1
-                    break
 
-    # Trim trailing silence from the cut point
-    min_silence_frames = int(min_silence_ms / frame_ms)
+    if max_internal_silence_ms is not None and len(speech_frames) > 1:
+        frame_seconds = frame_len / sample_rate
+        max_silence_frames = max(1, int(np.ceil(max_internal_silence_ms / (frame_seconds * 1000))))
+        budget = _text_duration_budget(text)
+        gaps = np.flatnonzero(np.diff(speech_frames) - 1 >= max_silence_frames)
+        for gap in gaps:
+            next_speech = int(speech_frames[gap + 1])
+            remaining = speech_frames[gap + 1:]
+            short_after_complete = (
+                budget is not None
+                and (gap + 1) * frame_seconds >= budget
+                and len(remaining) * frame_seconds <= 0.25
+            )
+            minimum_noise = 0.06 if short_after_complete else 0.3
+            if _stationary_noise_tail(frames[remaining], rms[remaining], frame_seconds, minimum_noise):
+                cut_frame = next_speech  # retain original silence before the suspect tail
+                break
+
+    # Trim the retained region's trailing silence, keeping a natural tail.
+    min_silence_frames = max(0, int(min_silence_ms / (frame_len / sample_rate * 1000)))
     end_frame = cut_frame
     while end_frame > first_speech and not is_speech[end_frame - 1]:
         end_frame -= 1
-    # Keep a short tail
     end_frame = min(end_frame + min_silence_frames, cut_frame)
+    trimmed = audio[first_speech * frame_len:min(end_frame * frame_len, len(audio))].copy()
 
-    # Convert frames back to samples
-    start_sample = first_speech * frame_len
-    end_sample = min(end_frame * frame_len, len(audio))
-
-    trimmed = audio[start_sample:end_sample].copy()
-
-    # Cosine fade-out
     fade_samples = int(sample_rate * fade_ms / 1000)
     if fade_samples > 0 and len(trimmed) > fade_samples:
         fade = np.cos(np.linspace(0, np.pi / 2, fade_samples)) ** 2
         trimmed[-fade_samples:] *= fade
-
     return trimmed
 
 

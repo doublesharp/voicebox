@@ -28,6 +28,7 @@ import { useAddSample, useProfile } from '@/lib/hooks/useProfiles';
 import { useSystemAudioCapture } from '@/lib/hooks/useSystemAudioCapture';
 import { useTranscription } from '@/lib/hooks/useTranscription';
 import { usePlatform } from '@/platform/PlatformContext';
+import { useMicrophoneStore } from '@/stores/microphoneStore';
 import { AudioSampleRecording } from './AudioSampleRecording';
 import { AudioSampleSystem } from './AudioSampleSystem';
 import { AudioSampleUpload } from './AudioSampleUpload';
@@ -56,6 +57,7 @@ export function SampleUpload({ profileId, open, onOpenChange }: SampleUploadProp
   const { toast } = useToast();
   const [mode, setMode] = useState<'upload' | 'record' | 'system'>('upload');
   const { isPlaying, playPause, cleanup: cleanupAudio } = useAudioPlayer();
+  const cleanReferenceAudio = useMicrophoneStore((state) => state.cleanReferenceAudio);
 
   const form = useForm<SampleFormValues>({
     resolver: zodResolver(sampleSchema),
@@ -77,6 +79,7 @@ export function SampleUpload({ profileId, open, onOpenChange }: SampleUploadProp
     stopRecording,
     cancelRecording,
   } = useAudioRecording({
+    processing: cleanReferenceAudio ? 'clean' : 'processed',
     maxDurationSeconds: 29,
     onRecordingComplete: (blob, recordedDuration) => {
       // Convert blob to File object
@@ -234,12 +237,15 @@ export function SampleUpload({ profileId, open, onOpenChange }: SampleUploadProp
 
         <Form {...form}>
           <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
-            <Tabs value={mode} onValueChange={(v) => {
-              const nextMode = v as 'upload' | 'record' | 'system';
-              if ((isRecording || isStarting) && nextMode !== 'record') cancelRecording();
-              if (isSystemRecording && nextMode !== 'system') cancelSystemRecording();
-              setMode(nextMode);
-            }}>
+            <Tabs
+              value={mode}
+              onValueChange={(v) => {
+                const nextMode = v as 'upload' | 'record' | 'system';
+                if ((isRecording || isStarting) && nextMode !== 'record') cancelRecording();
+                if (isSystemRecording && nextMode !== 'system') cancelSystemRecording();
+                setMode(nextMode);
+              }}
+            >
               <TabsList
                 className={`grid w-full ${platform.metadata.isTauri && isSystemAudioSupported ? 'grid-cols-3' : 'grid-cols-2'}`}
               >

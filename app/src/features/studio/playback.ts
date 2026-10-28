@@ -1,3 +1,4 @@
+import { registerStudioPlaybackStop } from '@/lib/audio/playbackOwnership';
 import { clipFrames, timelineEnd } from './domain';
 import { AudioMeter } from './meters';
 import type { StudioAsset, StudioDocument } from './types';
@@ -20,7 +21,10 @@ export class StudioPlayback {
   private request: AbortController | null = null;
   private epoch = 0;
   private timer: ReturnType<typeof setInterval> | undefined;
-  constructor(private readonly claim: () => void | Promise<void> = () => {}) {}
+  private readonly unregister: () => void;
+  constructor(private readonly claim: () => void | Promise<void> = () => {}) {
+    this.unregister = registerStudioPlaybackStop(this.stop);
+  }
   getSnapshot = () => this.state;
   subscribe = (listener: () => void) => {
     this.listeners.add(listener);
@@ -296,6 +300,7 @@ export class StudioPlayback {
     }
   }
   dispose() {
+    this.unregister();
     this.stop();
     this.listeners.clear();
   }

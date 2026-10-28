@@ -68,7 +68,8 @@ async def test_legacy_preparation_waits_for_studio_lifecycle(monkeypatch, stage)
     await entered.wait()
     second = asyncio.create_task(
         generation.generate_audio_sync(
-            profile_id="voice", text="Legacy", language="en", engine="legacy", model_size="default"
+            profile_id="voice", text="Legacy", language="en", engine="legacy", model_size="default",
+            normalize=False, effects_chain=[]
         )
     )
     await asyncio.sleep(0.01)

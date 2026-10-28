@@ -4,7 +4,9 @@ import { persist } from 'zustand/middleware';
 interface MicrophoneStore {
   deviceId: string | null;
   deviceLabel: string | null;
+  cleanReferenceAudio: boolean;
   setMicrophone: (deviceId: string | null, deviceLabel: string | null) => void;
+  setCleanReferenceAudio: (enabled: boolean) => void;
 }
 
 const storageKey = 'voicebox-microphone';
@@ -14,11 +16,17 @@ export const useMicrophoneStore = create<MicrophoneStore>()(
     (set) => ({
       deviceId: null,
       deviceLabel: null,
+      cleanReferenceAudio: false,
       setMicrophone: (deviceId, deviceLabel) => set({ deviceId, deviceLabel }),
+      setCleanReferenceAudio: (cleanReferenceAudio) => set({ cleanReferenceAudio }),
     }),
     {
       name: storageKey,
-      partialize: ({ deviceId, deviceLabel }) => ({ deviceId, deviceLabel }),
+      partialize: ({ deviceId, deviceLabel, cleanReferenceAudio }) => ({
+        deviceId,
+        deviceLabel,
+        cleanReferenceAudio,
+      }),
     },
   ),
 );

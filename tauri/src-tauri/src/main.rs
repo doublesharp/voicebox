@@ -4,6 +4,7 @@
 mod accessibility;
 mod audio_capture;
 mod audio_output;
+mod audio_pcm;
 mod clipboard;
 mod focus_capture;
 #[cfg(desktop)]
@@ -953,18 +954,30 @@ fn list_audio_output_devices(
 
 #[command]
 async fn play_audio_to_devices(
+    app: tauri::AppHandle,
     state: State<'_, audio_output::AudioOutputState>,
     audio_data: Vec<u8>,
     device_ids: Vec<String>,
+    options: Option<audio_output::PlaybackOptions>,
+) -> Result<audio_output::PlaybackSession, String> {
+    state.play_audio_to_devices(app, audio_data, device_ids, options).await
+}
+
+#[command]
+fn control_audio_playback(
+    state: State<'_, audio_output::AudioOutputState>,
+    session_id: String,
+    control: audio_output::PlaybackControl,
 ) -> Result<(), String> {
-    state.play_audio_to_devices(audio_data, device_ids).await
+    state.control_playback(&session_id, control)
 }
 
 #[command]
 fn stop_audio_playback(
     state: State<'_, audio_output::AudioOutputState>,
+    session_id: Option<String>,
 ) -> Result<(), String> {
-    state.stop_all_playback()
+    state.stop_playback(session_id.as_deref())
 }
 
 /// Identifier of the Voicebox app itself — used to short-circuit auto-paste
@@ -1536,6 +1549,7 @@ pub fn run() {
             list_audio_output_devices,
             play_audio_to_devices,
             stop_audio_playback,
+            control_audio_playback,
             debug_clipboard_roundtrip,
             debug_paste_text,
             debug_capture_focus,

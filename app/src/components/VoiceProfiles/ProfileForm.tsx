@@ -53,6 +53,7 @@ import { useSystemAudioCapture } from '@/lib/hooks/useSystemAudioCapture';
 import { useTranscription } from '@/lib/hooks/useTranscription';
 import { convertToWav, formatAudioDuration, getAudioDuration } from '@/lib/utils/audio';
 import { usePlatform } from '@/platform/PlatformContext';
+import { useMicrophoneStore } from '@/stores/microphoneStore';
 import { useServerStore } from '@/stores/serverStore';
 import { type ProfileFormDraft, useUIStore } from '@/stores/uiStore';
 import { AudioSampleRecording } from './AudioSampleRecording';
@@ -163,6 +164,7 @@ export function ProfileForm() {
   const [selectedPresetVoiceId, setSelectedPresetVoiceId] = useState<string>('');
   const avatarInputRef = useRef<HTMLInputElement>(null);
   const { isPlaying, playPause, cleanup: cleanupAudio } = useAudioPlayer();
+  const cleanReferenceAudio = useMicrophoneStore((state) => state.cleanReferenceAudio);
   const isCreating = !editingProfileId;
   const serverUrl = useServerStore((state) => state.serverUrl);
   const [profileEffectsChain, setProfileEffectsChain] = useState<EffectConfig[]>([]);
@@ -240,6 +242,7 @@ export function ProfileForm() {
     stopRecording,
     cancelRecording,
   } = useAudioRecording({
+    processing: cleanReferenceAudio ? 'clean' : 'processed',
     maxDurationSeconds: 29,
     onRecordingComplete: (blob, recordedDuration) => {
       const file = new File([blob], `recording-${Date.now()}.webm`, {
@@ -1215,9 +1218,7 @@ export function ProfileForm() {
                           <div className="text-sm font-medium text-muted-foreground">
                             {t('profileForm.design.badge')}
                           </div>
-                          <p className="text-sm leading-relaxed">
-                            {editingProfile.design_prompt}
-                          </p>
+                          <p className="text-sm leading-relaxed">{editingProfile.design_prompt}</p>
                           <Badge variant="secondary" className="text-xs">
                             {editingProfile.default_engine}
                           </Badge>
@@ -1332,9 +1333,7 @@ export function ProfileForm() {
                             {...field}
                           />
                         </FormControl>
-                        <FormDescription>
-                          {t('profileForm.fields.personalityHint')}
-                        </FormDescription>
+                        <FormDescription>{t('profileForm.fields.personalityHint')}</FormDescription>
                         <FormMessage />
                       </FormItem>
                     )}

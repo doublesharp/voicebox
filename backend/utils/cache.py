@@ -3,10 +3,14 @@ Voice prompt caching utilities.
 """
 
 import hashlib
+import json
 import logging
-import torch
+import os
+import tempfile
 from pathlib import Path
-from typing import Optional, Union, Dict, Any
+from typing import Any, Dict, Optional, Union
+
+import torch
 
 from .. import config
 
@@ -22,26 +26,30 @@ def _get_cache_dir() -> Path:
 _memory_cache: dict[str, Union[torch.Tensor, Dict[str, Any]]] = {}
 
 
-def get_cache_key(audio_path: str, reference_text: str) -> str:
+def get_cache_key(audio_path: str, reference_text: str, *, namespace: str | None = None) -> str:
     """
     Generate cache key from audio file and reference text.
 
     Args:
         audio_path: Path to audio file
         reference_text: Reference text
+        namespace: Engine/backend/model/cache-format identity for new formats.
 
     Returns:
-        Cache key (MD5 hash)
+        Content/transcript hash, isolated by namespace when provided.
     """
-    # Read audio file
+    # Older adapters retain their existing keys. New cache formats must supply
+    # a namespace including engine/backend/model/format before enabling reuse.
+    digest = hashlib.sha256() if namespace is not None else hashlib.md5()
+    if namespace is not None:
+        digest.update(json.dumps([namespace, reference_text], ensure_ascii=False).encode("utf-8"))
+        digest.update(b"\0")
     with open(audio_path, "rb") as f:
-        audio_bytes = f.read()
-
-    # Combine audio bytes and text
-    combined = audio_bytes + reference_text.encode("utf-8")
-
-    # Generate hash
-    return hashlib.md5(combined).hexdigest()
+        while block := f.read(1024 * 1024):
+            digest.update(block)
+    if namespace is None:
+        digest.update(reference_text.encode("utf-8"))
+    return digest.hexdigest()
 
 
 def get_cached_voice_prompt(
@@ -69,7 +77,7 @@ def get_cached_voice_prompt(
             return prompt
         except Exception:
             # Cache file corrupted, delete it
-            cache_file.unlink()
+            cache_file.unlink(missing_ok=True)
 
     return None
 
@@ -88,9 +96,19 @@ def cache_voice_prompt(
     # Store in memory
     _memory_cache[cache_key] = voice_prompt
 
-    # Store on disk (torch.save can handle both dicts and tensors)
-    cache_file = _get_cache_dir() / f"{cache_key}.prompt"
-    torch.save(voice_prompt, cache_file)
+    # A failed/interrupted writer must not expose a partial prompt to a reader.
+    cache_dir = _get_cache_dir()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / f"{cache_key}.prompt"
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=cache_dir, prefix=f"{cache_key}.", suffix=".tmp", delete=False) as handle:
+            temporary_path = Path(handle.name)
+            torch.save(voice_prompt, handle)
+        os.replace(temporary_path, cache_file)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def clear_voice_prompt_memory_cache() -> None:

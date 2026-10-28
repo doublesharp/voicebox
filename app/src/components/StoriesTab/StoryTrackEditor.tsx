@@ -14,8 +14,8 @@ import {
   Volume2,
   VolumeX,
 } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import WaveSurfer from 'wavesurfer.js';
+import { memo, type RefObject, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { StoryClipWaveform as ClipWaveform } from '@/lib/audio/storyWaveform';
 import { Button } from '@/components/ui/button';
 import {
   DropdownMenu,
@@ -41,97 +41,63 @@ import { cn } from '@/lib/utils/cn';
 import { useGenerationStore } from '@/stores/generationStore';
 import { useStoryStore } from '@/stores/storyStore';
 
-// Clip waveform component with trim support
-function ClipWaveform({
-  generationId,
-  versionId,
-  width,
-  trimStartMs,
-  trimEndMs,
-  duration,
+function StoryPlaybackNotice({ storyId }: { storyId: string }) {
+  const error = useStoryStore((state) =>
+    state.playbackError?.storyId === storyId ? state.playbackError.message : null,
+  );
+  return error ? (
+    <p role="alert" className="text-sm text-destructive px-4 py-2">
+      {error}
+    </p>
+  ) : null;
+}
+
+function StoryTimeReadout({
+  storyId,
+  totalDurationMs,
+  formatTime,
 }: {
-  generationId: string;
-  versionId?: string;
-  width: number;
-  trimStartMs: number;
-  trimEndMs: number;
-  duration: number;
+  storyId: string;
+  totalDurationMs: number;
+  formatTime: (time: number) => string;
 }) {
-  const waveformRef = useRef<HTMLDivElement>(null);
-  const wavesurferRef = useRef<WaveSurfer | null>(null);
-
-  // Calculate the full waveform width based on the original duration
-  // The visible portion (width) represents the effective duration after trimming
-  const effectiveDurationMs = duration * 1000 - trimStartMs - trimEndMs;
-  const fullWaveformWidth =
-    effectiveDurationMs > 0 ? (width / effectiveDurationMs) * (duration * 1000) : width;
-
-  // Calculate how much to offset the waveform to hide the trimmed start
-  const offsetX =
-    effectiveDurationMs > 0 ? (trimStartMs / (duration * 1000)) * fullWaveformWidth : 0;
-
-  useEffect(() => {
-    if (!waveformRef.current || fullWaveformWidth < 20) return;
-
-    // Get CSS colors
-    const root = document.documentElement;
-    const getCSSVar = (varName: string) => {
-      const value = getComputedStyle(root).getPropertyValue(varName).trim();
-      return value ? `hsl(${value})` : '';
-    };
-
-    const waveColor = getCSSVar('--accent-foreground');
-
-    // Hand WaveSurfer a muted <audio> element so the MediaElement backend
-    // can never bleed audio. Web Audio is doing the actual playback in
-    // useStoryPlayback; this clip waveform exists purely for the visual.
-    // Without this, long imported clips (MP3 / M4A) end up audible from
-    // wavesurfer's own element on top of the timeline, and that element
-    // doesn't get paused by stopAllSources().
-    const mediaElement = document.createElement('audio');
-    mediaElement.muted = true;
-    mediaElement.preload = 'metadata';
-
-    const wavesurfer = WaveSurfer.create({
-      container: waveformRef.current,
-      media: mediaElement,
-      waveColor,
-      progressColor: waveColor,
-      cursorWidth: 0,
-      barWidth: 1,
-      barRadius: 1,
-      barGap: 1,
-      height: 28,
-      normalize: true,
-      interact: false,
-    });
-
-    wavesurferRef.current = wavesurfer;
-
-    const audioUrl = versionId
-      ? apiClient.getVersionAudioUrl(versionId)
-      : apiClient.getAudioUrl(generationId);
-    wavesurfer.load(audioUrl).catch(() => {
-      // Ignore load errors
-    });
-
-    return () => {
-      wavesurfer.destroy();
-      wavesurferRef.current = null;
-    };
-  }, [generationId, versionId, fullWaveformWidth]);
-
+  const time = useStoryStore((state) =>
+    state.playbackStoryId === storyId ? state.currentTimeMs : 0,
+  );
   return (
-    <div className="w-full h-full opacity-60 overflow-hidden">
-      {/* Inner container that holds the full waveform, offset to show only visible portion */}
-      <div
-        ref={waveformRef}
-        style={{
-          width: `${fullWaveformWidth}px`,
-          transform: `translateX(-${offsetX}px)`,
-        }}
-        className="h-full"
-      />
+    <span className="text-xs text-muted-foreground tabular-nums ml-2">
+      {formatTime(time)} / {formatTime(totalDurationMs)}
+    </span>
+  );
+}
+
+function StoryPlayhead({
+  storyId,
+  pixelsPerSecond,
+  scrollRef,
+  follow,
+}: {
+  storyId: string;
+  pixelsPerSecond: number;
+  scrollRef: RefObject<HTMLDivElement>;
+  follow: boolean;
+}) {
+  const time = useStoryStore((state) =>
+    state.playbackStoryId === storyId ? state.currentTimeMs : 0,
+  );
+  const left = (time / 1000) * pixelsPerSecond;
+  useEffect(() => {
+    const container = scrollRef.current;
+    if (follow && container && left > container.scrollLeft + container.clientWidth / 2) {
+      container.scrollLeft = left - container.clientWidth / 2;
+    }
+  }, [follow, left, scrollRef]);
+  return (
+    <div
+      className="absolute top-0 bottom-0 w-1 bg-accent z-30 pointer-events-none rounded-full"
+      style={{ left: `${left}px` }}
+    >
+      <div className="absolute -top-1 left-1/2 -translate-x-1/2 w-3 h-3 bg-accent rounded-full" />
     </div>
   );
 }
@@ -215,7 +181,10 @@ const DEFAULT_TRACKS = [1, 0, -1]; // Default 3 tracks
 const MIN_EDITOR_HEIGHT = 120;
 const MAX_EDITOR_HEIGHT = 500;
 
-export function StoryTrackEditor({ storyId, items }: StoryTrackEditorProps) {
+export const StoryTrackEditor = memo(function StoryTrackEditor({
+  storyId,
+  items,
+}: StoryTrackEditorProps) {
   const [pixelsPerSecond, setPixelsPerSecond] = useState(FALLBACK_PIXELS_PER_SECOND);
   const hasAppliedDefaultZoomRef = useRef(false);
   const [draggingItem, setDraggingItem] = useState<string | null>(null);
@@ -304,7 +273,6 @@ export function StoryTrackEditor({ storyId, items }: StoryTrackEditorProps) {
 
   // Playback state
   const isPlaying = useStoryStore((state) => state.isPlaying);
-  const currentTimeMs = useStoryStore((state) => state.currentTimeMs);
   const playbackStoryId = useStoryStore((state) => state.playbackStoryId);
   const play = useStoryStore((state) => state.play);
   const pause = useStoryStore((state) => state.pause);
@@ -466,7 +434,10 @@ export function StoryTrackEditor({ storyId, items }: StoryTrackEditorProps) {
   useEffect(() => {
     if (hasAppliedDefaultZoomRef.current) return;
     if (visibleTrackWidth <= 0) return;
-    const defaultScope = Math.min(DEFAULT_VISIBLE_SECONDS, Math.max(projectSeconds, MIN_VISIBLE_SECONDS));
+    const defaultScope = Math.min(
+      DEFAULT_VISIBLE_SECONDS,
+      Math.max(projectSeconds, MIN_VISIBLE_SECONDS),
+    );
     setPixelsPerSecond(visibleTrackWidth / defaultScope);
     hasAppliedDefaultZoomRef.current = true;
   }, [visibleTrackWidth, projectSeconds]);
@@ -693,7 +664,7 @@ export function StoryTrackEditor({ storyId, items }: StoryTrackEditorProps) {
     // currentTimeMs is driven by audio playback and arrives as a float;
     // the backend's StoryItemSplit.split_time_ms is `int`, so round before
     // sending or pydantic rejects the request.
-    const splitTimeMs = Math.round(currentTimeMs - item.start_time_ms);
+    const splitTimeMs = Math.round(useStoryStore.getState().currentTimeMs - item.start_time_ms);
     const effectiveDuration = getEffectiveDuration(item);
 
     if (splitTimeMs <= 0 || splitTimeMs >= effectiveDuration) {
@@ -724,16 +695,7 @@ export function StoryTrackEditor({ storyId, items }: StoryTrackEditorProps) {
         },
       },
     );
-  }, [
-    selectedClipId,
-    items,
-    currentTimeMs,
-    getEffectiveDuration,
-    storyId,
-    splitItem,
-    toast,
-    setSelectedClipId,
-  ]);
+  }, [selectedClipId, items, getEffectiveDuration, storyId, splitItem, toast, setSelectedClipId]);
 
   const handleDuplicate = useCallback(() => {
     if (!selectedClipId) return;
@@ -875,11 +837,7 @@ export function StoryTrackEditor({ storyId, items }: StoryTrackEditorProps) {
 
       const rect = tracksRef.current.getBoundingClientRect();
       const x =
-        e.clientX -
-        rect.left +
-        tracksRef.current.scrollLeft -
-        dragOffset.x -
-        LABEL_COL_WIDTH;
+        e.clientX - rect.left + tracksRef.current.scrollLeft - dragOffset.x - LABEL_COL_WIDTH;
       // Subtract ruler height since clips are positioned relative to tracks area
       const y = e.clientY - rect.top - dragOffset.y - TIME_RULER_HEIGHT;
 
@@ -954,25 +912,6 @@ export function StoryTrackEditor({ storyId, items }: StoryTrackEditorProps) {
     };
   };
 
-  // Playhead position
-  const playheadLeft = msToPixels(currentTimeMs);
-
-  // Auto-scroll timeline to follow playhead during playback
-  useEffect(() => {
-    if (!isCurrentlyPlaying || !tracksRef.current) return;
-
-    const container = tracksRef.current;
-    const containerWidth = container.clientWidth;
-    const scrollLeft = container.scrollLeft;
-    const halfwayPoint = scrollLeft + containerWidth / 2;
-
-    // If playhead is past the halfway point, scroll to keep it centered
-    if (playheadLeft > halfwayPoint) {
-      const targetScroll = playheadLeft - containerWidth / 2;
-      container.scrollLeft = targetScroll;
-    }
-  }, [isCurrentlyPlaying, playheadLeft]);
-
   // Calculate tracks area height
   const tracksAreaHeight = tracks.length * TRACK_HEIGHT;
   const timelineContainerHeight = editorHeight - 40 - SCRUB_BAR_HEIGHT;
@@ -1032,8 +971,7 @@ export function StoryTrackEditor({ storyId, items }: StoryTrackEditorProps) {
 
       // Recompute the thumb width that corresponded to the drag start, then
       // apply the mouse delta to the dragged edge.
-      const startTimelinePx =
-        (totalDurationMs / 1000) * drag.startPixelsPerSecond + 200;
+      const startTimelinePx = (totalDurationMs / 1000) * drag.startPixelsPerSecond + 200;
       const startThumbWidth = Math.max(
         30,
         Math.min(scrollbarTrackWidth, (containerWidth / startTimelinePx) * scrollbarTrackWidth),
@@ -1058,8 +996,7 @@ export function StoryTrackEditor({ storyId, items }: StoryTrackEditorProps) {
             }
           : {
               type: 'right',
-              timeMs:
-                ((drag.startScrollLeft + containerWidth) / drag.startPixelsPerSecond) * 1000,
+              timeMs: ((drag.startScrollLeft + containerWidth) / drag.startPixelsPerSecond) * 1000,
             };
 
       setPixelsPerSecond(newPps);
@@ -1074,7 +1011,15 @@ export function StoryTrackEditor({ storyId, items }: StoryTrackEditorProps) {
       window.removeEventListener('mousemove', onMouseMove);
       window.removeEventListener('mouseup', onMouseUp);
     };
-  }, [maxTimelineScroll, thumbRange, scrollbarTrackWidth, containerWidth, totalDurationMs, minPps, maxPps]);
+  }, [
+    maxTimelineScroll,
+    thumbRange,
+    scrollbarTrackWidth,
+    containerWidth,
+    totalDurationMs,
+    minPps,
+    maxPps,
+  ]);
 
   if (items.length === 0) {
     return null;
@@ -1096,6 +1041,7 @@ export function StoryTrackEditor({ storyId, items }: StoryTrackEditorProps) {
           <GripHorizontal className="h-3 w-3 text-muted-foreground/50 group-hover:text-muted-foreground" />
         </button>
 
+        <StoryPlaybackNotice storyId={storyId} />
         {/* Toolbar */}
         <div className="flex items-center justify-between px-3 py-2 border-b bg-muted/30 mt-2">
           {/* Play controls - left side */}
@@ -1120,9 +1066,11 @@ export function StoryTrackEditor({ storyId, items }: StoryTrackEditorProps) {
             >
               <Square className="h-3 w-3" />
             </Button>
-            <span className="text-xs text-muted-foreground tabular-nums ml-2">
-              {formatTime(currentTimeMs)} / {formatTime(totalDurationMs)}
-            </span>
+            <StoryTimeReadout
+              storyId={storyId}
+              totalDurationMs={totalDurationMs}
+              formatTime={formatTime}
+            />
           </div>
 
           {/* Clip editing controls - center */}
@@ -1435,6 +1383,9 @@ export function StoryTrackEditor({ storyId, items }: StoryTrackEditorProps) {
                         <ClipWaveform
                           generationId={item.generation_id}
                           versionId={item.version_id}
+                          activeVersionId={item.active_version_id}
+                          audioRevision={item.audio_path}
+                          versions={item.versions}
                           width={clipWidth}
                           trimStartMs={displayTrimStart}
                           trimEndMs={displayTrimEnd}
@@ -1467,26 +1418,20 @@ export function StoryTrackEditor({ storyId, items }: StoryTrackEditorProps) {
               })}
 
               {/* Playhead - always visible */}
-              <div
-                className="absolute top-0 bottom-0 w-1 bg-accent z-30 pointer-events-none rounded-full"
-                style={{ left: `${playheadLeft}px` }}
-              >
-                <div className="absolute -top-1 left-1/2 -translate-x-1/2 w-3 h-3 bg-accent rounded-full" />
-              </div>
+              <StoryPlayhead
+                storyId={storyId}
+                pixelsPerSecond={pixelsPerSecond}
+                scrollRef={tracksRef}
+                follow={isCurrentlyPlaying}
+              />
             </div>
           </div>
         </div>
 
         {/* Horizontal timeline scrollbar + zoom handles */}
-        <div
-          className="flex border-t bg-background/40"
-          style={{ height: `${SCRUB_BAR_HEIGHT}px` }}
-        >
+        <div className="flex border-t bg-background/40" style={{ height: `${SCRUB_BAR_HEIGHT}px` }}>
           <div className="w-16 shrink-0 border-r" />
-          <div
-            ref={scrollbarTrackRef}
-            className="relative flex-1 overflow-hidden select-none px-1"
-          >
+          <div ref={scrollbarTrackRef} className="relative flex-1 overflow-hidden select-none px-1">
             <div
               className="absolute top-1 bottom-1 bg-foreground/10 hover:bg-foreground/15 transition-colors group rounded-full"
               style={{ width: `${thumbWidth}px`, left: `${thumbLeft}px` }}
@@ -1528,4 +1473,4 @@ export function StoryTrackEditor({ storyId, items }: StoryTrackEditorProps) {
       </div>
     </div>
   );
-}
+});

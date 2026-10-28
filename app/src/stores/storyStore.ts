@@ -14,6 +14,7 @@ interface StoryPlaybackState {
 
   // Playback state
   isPlaying: boolean;
+  playbackError: { storyId: string; message: string } | null;
   currentTimeMs: number;
   totalDurationMs: number;
   playbackStoryId: string | null;
@@ -46,6 +47,7 @@ export const useStoryStore = create<StoryPlaybackState>((set, get) => ({
 
   // Playback state
   isPlaying: false,
+  playbackError: null,
   currentTimeMs: 0,
   totalDurationMs: 0,
   playbackStoryId: null,
@@ -85,6 +87,7 @@ export const useStoryStore = create<StoryPlaybackState>((set, get) => ({
 
     set({
       isPlaying: true,
+      playbackError: null,
       playbackStoryId: storyId,
       playbackItems: items,
       totalDurationMs: maxEndTimeMs,

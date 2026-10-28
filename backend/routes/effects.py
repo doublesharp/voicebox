@@ -42,7 +42,8 @@ async def preview_effects(
 
     from ..services import versions as versions_mod
     from ..utils.audio import load_audio
-    from ..utils.effects import apply_effects, validate_effects_chain
+    from ..utils.effects import validate_effects_chain
+    from ..utils.audio_processing import process_generated_audio
 
     chain_dicts = [e.model_dump() for e in data.effects_chain]
     error = validate_effects_chain(chain_dicts)
@@ -56,8 +57,10 @@ async def preview_effects(
     if resolved_source_path is None or not resolved_source_path.exists():
         raise HTTPException(status_code=404, detail="Source audio file not found")
 
-    audio, sample_rate = await asyncio.to_thread(load_audio, str(resolved_source_path))
-    processed = await asyncio.to_thread(apply_effects, audio, sample_rate, chain_dicts)
+    audio, sample_rate = await asyncio.to_thread(load_audio, str(resolved_source_path), sample_rate=None)
+    _, processed = await asyncio.to_thread(
+        process_generated_audio, audio, sample_rate, normalize=False, effects_chain=chain_dicts
+    )
 
     import soundfile as sf
 
@@ -184,7 +187,8 @@ async def apply_effects_to_generation(
 
     from ..services import versions as versions_mod
     from ..utils.audio import load_audio, save_audio
-    from ..utils.effects import apply_effects, validate_effects_chain
+    from ..utils.effects import validate_effects_chain
+    from ..utils.audio_processing import process_generated_audio
 
     chain_dicts = [e.model_dump() for e in data.effects_chain]
     error = validate_effects_chain(chain_dicts)
@@ -210,8 +214,10 @@ async def apply_effects_to_generation(
     if resolved_source_path is None or not resolved_source_path.exists():
         raise HTTPException(status_code=404, detail="Source audio file not found")
 
-    audio, sample_rate = await asyncio.to_thread(load_audio, str(resolved_source_path))
-    processed_audio = await asyncio.to_thread(apply_effects, audio, sample_rate, chain_dicts)
+    audio, sample_rate = await asyncio.to_thread(load_audio, str(resolved_source_path), sample_rate=None)
+    _, processed_audio = await asyncio.to_thread(
+        process_generated_audio, audio, sample_rate, normalize=False, effects_chain=chain_dicts
+    )
 
     version_id = str(uuid.uuid4())
     processed_path = config.get_generations_dir() / f"{generation_id}_{version_id[:8]}.wav"
@@ -255,7 +261,8 @@ async def update_generation_version(
     from ..database import GenerationVersion as DBGenerationVersion
     from ..services import versions as versions_mod
     from ..utils.audio import load_audio, save_audio
-    from ..utils.effects import apply_effects, validate_effects_chain
+    from ..utils.effects import validate_effects_chain
+    from ..utils.audio_processing import process_generated_audio
 
     version = db.query(DBGenerationVersion).filter_by(id=version_id, generation_id=generation_id).first()
     if not version:
@@ -286,8 +293,10 @@ async def update_generation_version(
     if source_path is None or not source_path.is_file():
         raise HTTPException(status_code=404, detail="Source audio file not found")
 
-    audio, sample_rate = await asyncio.to_thread(load_audio, str(source_path))
-    processed = await asyncio.to_thread(apply_effects, audio, sample_rate, chain)
+    audio, sample_rate = await asyncio.to_thread(load_audio, str(source_path), sample_rate=None)
+    _, processed = await asyncio.to_thread(
+        process_generated_audio, audio, sample_rate, normalize=False, effects_chain=chain
+    )
     processed_path = config.get_generations_dir() / f"{generation_id}_{uuid.uuid4().hex}.wav"
     try:
         await asyncio.to_thread(save_audio, processed, str(processed_path), sample_rate)

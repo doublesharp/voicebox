@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { convertToWav } from '@/lib/utils/audio';
-import { microphoneErrorMessage, requestMicrophone } from '@/lib/utils/microphone';
+import {
+  type MicrophoneProcessing,
+  microphoneErrorMessage,
+  requestMicrophone,
+} from '@/lib/utils/microphone';
 import { usePlatform } from '@/platform/PlatformContext';
 import { useMicrophoneStore } from '@/stores/microphoneStore';
 
@@ -8,12 +12,15 @@ interface UseAudioRecordingOptions {
   maxDurationSeconds?: number;
   /** undefined uses the saved input; null explicitly chooses the system default. */
   deviceId?: string | null;
+  /** Clean capture only disables requested browser processing; codecs are unchanged. */
+  processing?: MicrophoneProcessing;
   onRecordingComplete?: (blob: Blob, duration?: number) => void;
 }
 
 export function useAudioRecording({
   maxDurationSeconds,
   deviceId,
+  processing = 'processed',
   onRecordingComplete,
 }: UseAudioRecordingOptions = {}) {
   const platform = usePlatform();
@@ -78,6 +85,7 @@ export function useAudioRecording({
         deviceId !== undefined ? deviceId : useMicrophoneStore.getState().deviceId,
         controller.signal,
         () => setUsingDefaultMicrophone(true),
+        processing,
       );
 
       if (controller.signal.aborted) {
@@ -199,7 +207,7 @@ export function useAudioRecording({
         setIsStarting(false);
       }
     }
-  }, [deviceId, maxDurationSeconds, onRecordingComplete, platform.metadata.isTauri]);
+  }, [deviceId, maxDurationSeconds, onRecordingComplete, platform.metadata.isTauri, processing]);
 
   const stopRecording = useCallback(() => {
     if (mediaRecorderRef.current && isRecording) {

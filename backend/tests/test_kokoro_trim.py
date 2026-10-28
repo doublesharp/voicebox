@@ -8,8 +8,7 @@ from backend.utils.audio import trim_tts_output
 
 
 def test_kokoro_engine_does_not_use_generic_trim():
-    """Kokoro trims inside the backend; the generic needs_trim path would cut
-    multi-segment output at the first >1s inter-segment gap."""
+    """Kokoro trims segment edges internally, outside the generic trim path."""
     assert engine_needs_trim("kokoro") is False
     config = get_model_config("kokoro")
     assert config is not None
@@ -27,8 +26,8 @@ def test_trim_tts_output_edge_only_keeps_internal_gaps():
     default_trim = trim_tts_output(raw_audio, sample_rate=sr)
     edge_trim = trim_tts_output(raw_audio, sample_rate=sr, max_internal_silence_ms=None)
 
-    # Default behaviour cuts at the internal gap and drops the second utterance.
-    assert len(default_trim) / sr == pytest.approx(1.0, abs=0.25)
+    # Both modes preserve a substantive continuation after a deliberate pause.
+    assert len(default_trim) / sr == pytest.approx(1.0 + 1.5 + 1.0 + 0.2, abs=0.05)
     # Edge-only trim keeps both utterances and the gap between them.
     assert len(edge_trim) / sr == pytest.approx(1.0 + 1.5 + 1.0 + 0.2, abs=0.05)
 
@@ -42,8 +41,8 @@ def test_kokoro_trim_tts_output_removes_trailing_dead_space():
 
     trimmed = trim_tts_output(raw_audio, sample_rate=sr)
 
-    # Trimming cuts trailing silence from 2.5s down to speech duration boundary (1.5s)
-    expected_dur_samples = int(sr * 1.5)
+    # Preserve the configured 200 ms natural tail after the final utterance.
+    expected_dur_samples = int(sr * 1.7)
     assert len(trimmed) == expected_dur_samples
     assert len(trimmed) < len(raw_audio)
 

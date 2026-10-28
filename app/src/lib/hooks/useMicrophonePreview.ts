@@ -1,12 +1,21 @@
 import { useEffect, useState } from 'react';
-import { microphoneErrorMessage, requestMicrophone } from '@/lib/utils/microphone';
+import {
+  type MicrophoneProcessing,
+  microphoneErrorMessage,
+  requestMicrophone,
+} from '@/lib/utils/microphone';
 import { useMicrophoneStore } from '@/stores/microphoneStore';
 
-export function useMicrophonePreview(enabled: boolean) {
+export function useMicrophonePreview(
+  enabled: boolean,
+  processing: MicrophoneProcessing = 'processed',
+) {
   const deviceId = useMicrophoneStore((state) => state.deviceId);
-  const [preview, setPreview] = useState<{ stream: MediaStream; deviceId: string | null } | null>(
-    null,
-  );
+  const [preview, setPreview] = useState<{
+    stream: MediaStream;
+    deviceId: string | null;
+    processing: MicrophoneProcessing;
+  } | null>(null);
   const [usingDefaultMicrophone, setUsingDefaultMicrophone] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -17,8 +26,12 @@ export function useMicrophonePreview(enabled: boolean) {
     setError(null);
     setUsingDefaultMicrophone(false);
     setPreview(null);
-    requestMicrophone(navigator.mediaDevices, deviceId, controller.signal, () =>
-      setUsingDefaultMicrophone(true),
+    requestMicrophone(
+      navigator.mediaDevices,
+      deviceId,
+      controller.signal,
+      () => setUsingDefaultMicrophone(true),
+      processing,
     )
       .then((result) => {
         if (controller.signal.aborted) {
@@ -28,7 +41,7 @@ export function useMicrophonePreview(enabled: boolean) {
           return;
         }
         stream = result;
-        setPreview({ stream: result, deviceId });
+        setPreview({ stream: result, deviceId, processing });
       })
       .catch((cause: unknown) => {
         if (!controller.signal.aborted) setError(microphoneErrorMessage(cause));
@@ -39,11 +52,13 @@ export function useMicrophonePreview(enabled: boolean) {
         track.stop();
       });
     };
-  }, [deviceId, enabled]);
+  }, [deviceId, enabled, processing]);
 
+  const currentPreview =
+    enabled && preview?.deviceId === deviceId && preview.processing === processing;
   return {
-    stream: enabled && preview?.deviceId === deviceId ? preview.stream : null,
+    stream: currentPreview ? preview.stream : null,
     error: enabled ? error : null,
-    usingDefaultMicrophone: enabled && preview?.deviceId === deviceId && usingDefaultMicrophone,
+    usingDefaultMicrophone: currentPreview && usingDefaultMicrophone,
   };
 }

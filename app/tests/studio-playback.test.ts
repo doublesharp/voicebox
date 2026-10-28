@@ -317,3 +317,27 @@ test('long preview starts with one window and requests the next only as playback
   expect(urls[1]).toContain('start_sample=96000');
   expect(FakeContext.instances[0].sources[1].start).toEqual([2.04, 0, 2]);
 });
+
+test('a legacy native request stops active Studio audition before fetching', async () => {
+  const { NativePlaybackController } = await import('../src/lib/audio/nativePlayback');
+  const player = setup();
+  await player.audition('/take', 'Studio take');
+  expect(FakeAudio.instances[0].paused).toBe(false);
+  let stoppedBeforeFetch = false;
+  const native = new NativePlaybackController(
+    {
+      stopPlayback: async () => {},
+      subscribeToPlayback: async () => () => {},
+      playToDevices: async () => ({ session_id: 'native', duration: 1, position: 0 }),
+      controlPlayback: async () => {},
+    } as unknown as import('../src/platform/types').PlatformAudio,
+    () => {},
+    async () => {
+      stoppedBeforeFetch = FakeAudio.instances[0].paused && player.getSnapshot().mode === 'idle';
+      return new Response(new Uint8Array(4));
+    },
+  );
+  await native.start('/legacy', ['one'], 0, 1);
+  expect(stoppedBeforeFetch).toBe(true);
+  native.dispose();
+});

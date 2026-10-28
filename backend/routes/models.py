@@ -8,12 +8,12 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
+from ..services.inference_scheduler import run_serialized_inference, serialized_inference
 from .. import models
 from ..utils.platform_detect import get_backend_type
 from ..services.task_queue import create_background_task
 from ..utils.progress import get_progress_manager
 from ..utils.tasks import get_task_manager
-from ..utils.inference import serialized_inference
 
 router = APIRouter()
 
@@ -51,6 +51,19 @@ def _copy_with_progress(src: Path, dst: Path, progress_manager, copied_so_far: i
 DEFAULT_QWEN_MODEL_SIZE = "1.7B"
 
 
+async def _run_model_work(configuration, operation):
+    """Reserve TTS state only for TTS loads; STT/LLM keep their own policies."""
+    from ..backends import TTS_ENGINES
+
+    async def invoke():
+        result = operation()
+        return await result if asyncio.iscoroutine(result) else result
+
+    if configuration is None or configuration.engine in TTS_ENGINES:
+        return await run_serialized_inference(invoke)
+    return await invoke()
+
+
 def _resolve_model_config(model_name: str):
     """Look up a model config by name or raise a 400 listing the valid ids."""
     from ..backends import get_all_model_configs, get_model_config
@@ -66,7 +79,6 @@ def _resolve_model_config(model_name: str):
 
 
 @router.post("/models/load")
-@serialized_inference
 async def load_model(
     request: models.ModelLoadRequest | None = None,
     model_size: str | None = None,
@@ -89,9 +101,7 @@ async def load_model(
     if requested_name is not None:
         config = _resolve_model_config(requested_name)
         try:
-            result = get_model_load_func(config)()
-            if asyncio.iscoroutine(result):
-                await result
+            await _run_model_work(config, get_model_load_func(config))
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e)) from e
         return {"message": f"Model {config.model_name} loaded successfully"}
@@ -99,14 +109,13 @@ async def load_model(
     size = requested_size or DEFAULT_QWEN_MODEL_SIZE
     try:
         tts_model = tts.get_tts_model()
-        await tts_model.load_model_async(size)
+        await _run_model_work(None, lambda: tts_model.load_model_async(size))
         return {"message": f"Model {size} loaded successfully"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @router.post("/models/unload")
-@serialized_inference
 async def unload_model(request: models.ModelLoadRequest | None = None):
     """Unload a model from memory.
 
@@ -123,7 +132,7 @@ async def unload_model(request: models.ModelLoadRequest | None = None):
     if requested_name is not None:
         config = _resolve_model_config(requested_name)
         try:
-            was_loaded = unload_model_by_config(config)
+            was_loaded = await _run_model_work(config, lambda: unload_model_by_config(config))
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e)) from e
         if not was_loaded:
@@ -131,14 +140,13 @@ async def unload_model(request: models.ModelLoadRequest | None = None):
         return {"message": f"Model {config.model_name} unloaded successfully"}
 
     try:
-        tts.unload_tts_model()
+        await _run_model_work(None, tts.unload_tts_model)
         return {"message": "Model unloaded successfully"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @router.post("/models/{model_name}/unload")
-@serialized_inference
 async def unload_model_by_name(model_name: str):
     """Unload a specific model from memory without deleting it from disk."""
     from ..backends import get_model_config, unload_model_by_config
@@ -148,7 +156,7 @@ async def unload_model_by_name(model_name: str):
         raise HTTPException(status_code=400, detail=f"Unknown model: {model_name}")
 
     try:
-        was_loaded = unload_model_by_config(config)
+        was_loaded = await _run_model_work(config, lambda: unload_model_by_config(config))
         if not was_loaded:
             return {"message": f"Model {model_name} is not loaded"}
         return {"message": f"Model {model_name} unloaded successfully"}
@@ -476,9 +484,7 @@ async def trigger_model_download(request: models.ModelDownloadRequest):
 
     async def download_in_background():
         try:
-            result = load_func()
-            if asyncio.iscoroutine(result):
-                await result
+            await _run_model_work(config, load_func)
             task_manager.complete_download(request.model_name)
         except Exception as e:
             task_manager.error_download(request.model_name, str(e))

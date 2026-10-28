@@ -2,19 +2,33 @@
 let generation = 0;
 let pending: Promise<void> = Promise.resolve();
 const aborters = new Set<AbortController>();
+const studioStops = new Set<() => void>();
+
+export function registerStudioPlaybackStop(stop: () => void) {
+  studioStops.add(stop);
+  return () => {
+    studioStops.delete(stop);
+  };
+}
 export function revokePlayback() {
   generation++;
   for (const controller of aborters) controller.abort();
   aborters.clear();
 }
 export function legacyPlaybackToken() {
-  const token = ++generation;
+  revokePlayback();
+  for (const stop of studioStops) stop();
+  const token = generation;
+  let active = true;
   const controller = new AbortController();
   aborters.add(controller);
   return {
     signal: controller.signal,
-    valid: () => token === generation,
-    release: () => aborters.delete(controller),
+    valid: () => active && token === generation,
+    release: () => {
+      active = false;
+      aborters.delete(controller);
+    },
   };
 }
 export function stopNative(stop: () => void | Promise<void>): Promise<void> {

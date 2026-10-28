@@ -1,9 +1,12 @@
 """Voice profile management module."""
 
+import asyncio
+import hashlib
 import json as _json
 import logging
 import shutil
 import uuid
+import weakref
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -26,11 +29,15 @@ from ..models import (
     VoiceProfileResponse,
 )
 from ..utils.audio import save_audio, validate_and_load_reference_audio
-from ..utils.cache import _get_cache_dir, clear_profile_cache
+from ..utils.cache import _get_cache_dir, clear_profile_cache, get_cache_key
 from ..utils.images import process_avatar, validate_image
 from . import history
 
 logger = logging.getLogger(__name__)
+
+# Keep only locks with active users; editing many profiles does not retain an
+# unbounded registry. Access and acquisition occur on the API event loop.
+_prepared_reference_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 
 CLONING_ENGINES = {"qwen", "luxtts", "chatterbox", "chatterbox_turbo", "tada", "omnivoice"}
 
@@ -626,7 +633,7 @@ async def create_voice_prompt_for_profile(
         raise ValueError(f"Engine '{engine}' does not support cloned voice profiles")
 
     # ── Cloned profiles: create from audio samples ──
-    samples = db.query(DBProfileSample).filter_by(profile_id=profile_id).all()
+    samples = db.query(DBProfileSample).filter_by(profile_id=profile_id).order_by(DBProfileSample.id).all()
 
     if not samples:
         raise ValueError(f"No samples found for profile {profile_id}")
@@ -653,23 +660,34 @@ async def create_voice_prompt_for_profile(
         audio_paths.append(str(sample_audio_path))
     reference_texts = [s.reference_text for s in samples]
 
-    combined_audio, combined_text = await tts_model.combine_voice_prompts(
-        audio_paths,
-        reference_texts,
-    )
+    def _prepared_path():
+        namespace = (
+            f"combined-reference-v2:24k-mono:{engine}:"
+            f"{type(tts_model).__module__}.{type(tts_model).__qualname__}:"
+            f"{getattr(tts_model, 'model_size', 'default')}"
+        )
+        # Ordered hashes track the actual waveform/transcript, not just row
+        # IDs, so edits and replaced files cannot reuse stale preparation.
+        identities = [
+            get_cache_key(path, transcript, namespace=namespace)
+            for path, transcript in zip(audio_paths, reference_texts, strict=True)
+        ]
+        digest = hashlib.sha256(_json.dumps(identities).encode("utf-8")).hexdigest()
+        cache_dir = _get_cache_dir()
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir / f"combined_{profile_id}_{digest}.wav"
 
-    # Save combined audio to cache directory (persistent)
-    # Create a hash of sample IDs to identify this specific combination
-    import hashlib
-
-    sample_ids_str = "-".join(sorted([s.id for s in samples]))
-    combination_hash = hashlib.md5(sample_ids_str.encode()).hexdigest()[:12]
-
-    cache_dir = _get_cache_dir()
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    combined_path = cache_dir / f"combined_{profile_id}_{combination_hash}.wav"
-
-    save_audio(combined_audio, str(combined_path), 24000)
+    combined_path = await asyncio.to_thread(_prepared_path)
+    lock_key = str(combined_path)
+    prepare_lock = _prepared_reference_locks.get(lock_key)
+    if prepare_lock is None:
+        prepare_lock = asyncio.Lock()
+        _prepared_reference_locks[lock_key] = prepare_lock
+    combined_text = " ".join(reference_texts)
+    async with prepare_lock:
+        if not use_cache or not combined_path.is_file():
+            combined_audio, combined_text = await tts_model.combine_voice_prompts(audio_paths, reference_texts)
+            await asyncio.to_thread(save_audio, combined_audio, str(combined_path), 24000)
 
     voice_prompt, _ = await tts_model.create_voice_prompt(
         str(combined_path),

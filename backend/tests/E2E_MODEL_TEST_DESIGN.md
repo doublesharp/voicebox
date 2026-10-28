@@ -218,3 +218,66 @@ The script uses only stdlib + `httpx` (or `requests`) + `sseclient-py` — all a
 - No model unload between runs — models stay loaded; server manages its own eviction.
 - No version-drift check on the binary.
 - No `instruct` parameter exercised on qwen_custom_voice runs.
+
+## Separate opt-in audio quality tier
+
+`scripts/evaluate-audio-quality.py` analyzes **existing WAVs only**. It does
+not generate speech, start a server, load models, run ASR, or download anything.
+The maintained small corpus covers names, numbers, abbreviations, pauses,
+narration, Spanish, Chinese and Japanese:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python scripts/evaluate-audio-quality.py --list-corpus
+```
+
+Generate or export matching samples separately with an already cached model,
+recording the exact engine, model, seed and configuration. Generation is not
+part of this command, and no uncached model should be downloaded for a quality
+run. Keep samples, manifests and output on Scratch. An example manifest shape
+(maintain the actual JSON as run evidence outside git) is:
+
+```json
+{
+  "version": 1,
+  "cases": [{
+    "case_id": "names-en",
+    "audio_path": "names-en.wav",
+    "engine": "qwen",
+    "model": "qwen-tts-1.7B",
+    "seed": 42,
+    "config": {"normalize": true, "max_chunk_chars": 800, "crossfade_ms": 50},
+    "generation_seconds": 2.4,
+    "asr_transcript": "A separately obtained transcript goes here."
+  }]
+}
+```
+
+`seed` may be null when the original run was unseeded. `generation_seconds`
+and `asr_transcript` are optional and reported as supplied observations, not
+measurements performed by this tool. Custom samples can supply an unknown
+`case_id` plus their exact `text`. `transcript_reference` can provide a
+reviewed canonical transcript (for example, spelling out a number);
+`transcript_unit: "character"` selects CER for languages without word spaces.
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python scripts/evaluate-audio-quality.py \
+  --manifest /Volumes/Scratch/voicebox/reports/my-quality-run/input.json \
+  --reports-root /Volumes/Scratch/voicebox/reports \
+  --output-dir /Volumes/Scratch/voicebox/reports/my-quality-run/analysis
+```
+
+Choose a disposable reports root with `--reports-root` and a new task directory
+below it with `--output-dir`. These paths work on any platform; the example
+uses our local Scratch volume. Existing report files are never overwritten. Output is
+`report.json` plus an unscored `listening-worksheet.md`; neither belongs in git.
+WAVs are read in bounded blocks. The report records sample hashes, provenance,
+duration, channels, peak/RMS, nonfinite/full-scale samples and energy-based
+silence. Optional supplied transcripts produce edit counts, WER/CER and extra
+repeated-token counts. Empty, invalid, silent and unmeasured values remain
+distinct. Transcript comparisons are limited to 2,000 tokens per sample.
+
+These measurements do not establish naturalness, pronunciation, speaker
+similarity or acceptable expressive pauses. Use paired, level-matched listening
+comparisons and record human ratings in the worksheet. The optional browser
+processing switch for reference recordings keeps its current default until
+paired recordings demonstrate a benefit; it does not promise lossless capture.

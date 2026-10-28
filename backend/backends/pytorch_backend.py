@@ -27,6 +27,61 @@ from ..utils.cache import get_cache_key, get_cached_voice_prompt, cache_voice_pr
 from ..utils.audio import load_audio
 
 
+def _serialize_qwen_voice_prompt(items: list) -> dict:
+    """Keep the disk cache compatible with torch.load(weights_only=True).
+
+    Qwen returns dataclass instances rather than a dict. CPU tensors avoid
+    retaining device buffers in the process-lifetime prompt cache.
+    """
+    return {
+        "format": "qwen-voice-clone-v2",
+        "items": [
+            {
+                "ref_code": item.ref_code.detach().cpu() if item.ref_code is not None else None,
+                "ref_spk_embedding": item.ref_spk_embedding.detach().cpu(),
+                "x_vector_only_mode": item.x_vector_only_mode,
+                "icl_mode": item.icl_mode,
+                "ref_text": item.ref_text,
+            }
+            for item in items
+        ],
+    }
+
+
+def _restore_qwen_voice_prompt(payload, device):
+    if not isinstance(payload, dict) or payload.get("format") != "qwen-voice-clone-v2":
+        return None
+    items = payload.get("items")
+    if not isinstance(items, list) or not items:
+        return None
+    for item in items:
+        if not isinstance(item, dict):
+            return None
+        if not {"ref_code", "ref_spk_embedding", "x_vector_only_mode", "icl_mode", "ref_text"}.issubset(item):
+            return None
+        if not isinstance(item.get("ref_spk_embedding"), torch.Tensor):
+            return None
+        if item.get("ref_code") is not None and not isinstance(item["ref_code"], torch.Tensor):
+            return None
+        if not isinstance(item.get("x_vector_only_mode"), bool) or not isinstance(item.get("icl_mode"), bool):
+            return None
+        if item.get("ref_text") is not None and not isinstance(item["ref_text"], str):
+            return None
+
+    from qwen_tts.inference.qwen3_tts_model import VoiceClonePromptItem
+
+    return [
+        VoiceClonePromptItem(
+            ref_code=item["ref_code"].to(device) if item["ref_code"] is not None else None,
+            ref_spk_embedding=item["ref_spk_embedding"].to(device),
+            x_vector_only_mode=item["x_vector_only_mode"],
+            icl_mode=item["icl_mode"],
+            ref_text=item["ref_text"],
+        )
+        for item in items
+    ]
+
+
 class PyTorchTTSBackend:
     """PyTorch-based TTS backend using Qwen3-TTS."""
 
@@ -144,7 +199,7 @@ class PyTorchTTSBackend:
         audio_path: str,
         reference_text: str,
         use_cache: bool = True,
-    ) -> Tuple[dict, bool]:
+    ) -> tuple[list, bool]:
         """
         Create voice prompt from reference audio.
 
@@ -154,47 +209,35 @@ class PyTorchTTSBackend:
             use_cache: Whether to use cached prompt if available
 
         Returns:
-            Tuple of (voice_prompt_dict, was_cached)
+            Tuple of (VoiceClonePromptItem list, was_cached)
         """
         await self.load_model_async(None)
 
-        # Check cache if enabled
-        if use_cache:
-            cache_key = get_cache_key(audio_path, reference_text)
-            cached_prompt = get_cached_voice_prompt(cache_key)
-            if cached_prompt is not None:
-                # Cache stores as torch.Tensor but actual prompt is dict
-                # Convert if needed
-                if isinstance(cached_prompt, dict):
-                    # For PyTorch backend, the dict should contain tensors, not file paths
-                    # So we can safely return it
-                    return cached_prompt, True
-                elif isinstance(cached_prompt, torch.Tensor):
-                    # Legacy cache format - convert to dict
-                    # This shouldn't happen in practice, but handle it
-                    return {"prompt": cached_prompt}, True
+        namespace = f"qwen:pytorch:{self._current_model_size or self.model_size}:voice-clone-v2"
 
         def _create_prompt_sync():
             """Run synchronous voice prompt creation in thread pool."""
+            cache_key = get_cache_key(audio_path, reference_text, namespace=namespace) if use_cache else None
+            if cache_key is not None:
+                cached = _restore_qwen_voice_prompt(get_cached_voice_prompt(cache_key), self.device)
+                if cached is not None:
+                    return cached, True
             # Inference runs with the process's default HF_HUB_OFFLINE
             # state. Forcing offline here (issue #462) regressed online
             # users whose libraries issue legitimate metadata lookups
             # during voice-prompt creation.
-            return self.model.create_voice_clone_prompt(
+            items = self.model.create_voice_clone_prompt(
                 ref_audio=str(audio_path),
                 ref_text=reference_text,
                 x_vector_only_mode=False,
             )
+            if cache_key is not None:
+                cache_voice_prompt(cache_key, _serialize_qwen_voice_prompt(items))
+            return items, False
 
-        # Run blocking operation in thread pool
-        voice_prompt_items = await asyncio.to_thread(_create_prompt_sync)
-
-        # Cache if enabled
-        if use_cache:
-            cache_key = get_cache_key(audio_path, reference_text)
-            cache_voice_prompt(cache_key, voice_prompt_items)
-
-        return voice_prompt_items, False
+        # Hashing, serialization, device transfers and encoding all stay off
+        # the API event loop, including the warm disk-cache path.
+        return await asyncio.to_thread(_create_prompt_sync)
 
     async def combine_voice_prompts(
         self,

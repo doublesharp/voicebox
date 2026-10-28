@@ -19,8 +19,10 @@ Supported effect types:
 
 from __future__ import annotations
 
-import numpy as np
+import math
 from typing import Any, Dict, List, Optional
+
+import numpy as np
 
 from pedalboard import (
     Pedalboard,
@@ -339,6 +341,36 @@ def build_pedalboard(effects_chain: List[Dict[str, Any]]) -> Pedalboard:
     return Pedalboard(plugins)
 
 
+MAX_EFFECT_TAIL_SECONDS = 10.0
+
+
+def _effect_tail_seconds(effects_chain: List[Dict[str, Any]]) -> float:
+    """Bound render padding for delay lines and reverberation.
+
+    Cascaded time effects can extend each other, so their tails add. High
+    feedback and large rooms still have a hard ten-second output budget.
+    """
+    tail_seconds = 0.0
+    for effect in effects_chain:
+        if not effect.get("enabled", True):
+            continue
+        effect_type = effect["type"]
+        params = effect.get("params", {})
+        if effect_type == "reverb":
+            if params.get("wet_level", 0.33) > 0:
+                tail_seconds += MAX_EFFECT_TAIL_SECONDS
+        elif effect_type in ("delay", "chorus") and params.get("mix", 0.3 if effect_type == "delay" else 0.5) > 0:
+            delay_seconds = (
+                params.get("delay_seconds", 0.3)
+                if effect_type == "delay"
+                else 2 * params.get("centre_delay_ms", 7.0) / 1000
+            )
+            feedback = abs(params.get("feedback", 0.3 if effect_type == "delay" else 0.0))
+            repeats = 1 if feedback == 0 else math.ceil(math.log(1e-4) / math.log(min(feedback, 0.999))) + 1
+            tail_seconds += delay_seconds * repeats
+    return min(MAX_EFFECT_TAIL_SECONDS, tail_seconds + 0.05) if tail_seconds else 0.0
+
+
 def apply_effects(
     audio: np.ndarray,
     sample_rate: int,
@@ -352,7 +384,7 @@ def apply_effects(
         effects_chain: List of effect configuration dicts.
 
     Returns:
-        Processed audio array.
+        Processed audio array, including a bounded audible delay/reverb tail.
     """
     if not effects_chain:
         return audio
@@ -365,7 +397,33 @@ def apply_effects(
     else:
         audio_2d = audio
 
+    original_samples = audio_2d.shape[-1]
+    if original_samples == 0:
+        return audio.copy()
+    tail_samples = int(math.ceil(_effect_tail_seconds(effects_chain) * sample_rate))
+    if tail_samples:
+        # A plugin cannot return more samples than supplied. Padding within
+        # this single processing call keeps state intact across the boundary.
+        audio_2d = np.pad(audio_2d, ((0, 0), (0, tail_samples)))
     processed = board(audio_2d.astype(np.float32), sample_rate)
+
+    if tail_samples and processed.shape[-1] > original_samples:
+        # Keep the complete source, then only the audible decay plus a short
+        # release. Never trim source speech when deciding where a tail ends.
+        peak = float(np.max(np.abs(processed)))
+        threshold = max(1e-7, peak * 1e-4)
+        tail_level = np.max(np.abs(processed[:, original_samples:]), axis=0)
+        audible = np.flatnonzero(tail_level > threshold)
+        if audible.size:
+            end = min(processed.shape[-1], original_samples + int(audible[-1]) + 1 + int(sample_rate * 0.02))
+            processed = processed[:, :end]
+            # Decays that reach the safety budget get a short fade instead of
+            # an abrupt discontinuity at the imposed tail boundary.
+            fade_samples = min(int(sample_rate * 0.01), processed.shape[-1] - original_samples)
+            if fade_samples and end == original_samples + tail_samples:
+                processed[:, -fade_samples:] *= np.linspace(1.0, 0.0, fade_samples, dtype=np.float32)
+        else:
+            processed = processed[:, :original_samples]
 
     # Return same dimensionality as input
     if audio.ndim == 1:
