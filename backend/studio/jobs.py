@@ -16,10 +16,6 @@ class StudioJobs:
 
             enqueue = enqueue_generation
         self.enqueue = enqueue
-        with store.connect() as db:
-            db.execute(
-                "CREATE TABLE IF NOT EXISTS job_requests (project_id TEXT, key TEXT, request TEXT, response TEXT, PRIMARY KEY(project_id,key))"
-            )
 
     def submit(self, project_id, key, passage_ids, count, adopt):
         if (

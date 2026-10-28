@@ -1,10 +1,10 @@
 """Copy a legacy Story and its pinned audio into a new studio project."""
 
-import hashlib
 import soundfile as sf
 from .. import config
 from ..database import Story, StoryItem, Generation, GenerationVersion
 from .storage import NotFound, document, encode, now, passage, uid
+from .publication import discard_unregistered, publish_audio
 from .timing import nearest_sample
 
 
@@ -71,29 +71,11 @@ def import_story(store, story_id, db):
             )
             for item, gen, path, info, p, take_id, asset_id, clip in prepared:
                 target = store.asset_dir / asset_id
-                digest = hashlib.sha256()
-                with path.open("rb") as src, target.open("xb") as dest:
-                    copied.append(target)
-                    for block in iter(lambda: src.read(1024 * 1024), b""):
-                        digest.update(block)
-                        dest.write(block)
-                info = sf.info(str(target))
-                if info.frames <= 0 or info.samplerate <= 0 or info.channels not in (1, 2):
-                    raise ValueError("Invalid copied Story audio")
-                target_db.execute(
-                    "INSERT INTO assets VALUES (?,?,?,?,?,?,?,?,?)",
-                    (
-                        asset_id,
-                        project_id,
-                        digest.hexdigest(),
-                        info.samplerate,
-                        info.channels,
-                        info.frames,
-                        info.frames / info.samplerate,
-                        target.stat().st_size,
-                        asset_id,
-                    ),
+                publish_audio(
+                    target_db, store.asset_dir, project_id, path, asset_id,
+                    expected={"sample_rate": info.samplerate, "channels": info.channels, "frames": info.frames},
                 )
+                copied.append(target)
                 request = {
                     "legacy_story_id": story_id,
                     "legacy_item_id": item.id,
@@ -117,6 +99,6 @@ def import_story(store, story_id, db):
                 store._validate_clip(target_db, project_id, doc, clip)
             return store._project(target_db, project_id)
     except BaseException:
-        for path in copied:
-            path.unlink(missing_ok=True)
+        if copied:
+            discard_unregistered(target_db, copied)
         raise
