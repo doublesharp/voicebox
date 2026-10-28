@@ -207,3 +207,27 @@ def test_failed_rename_rolls_back_staged_copy(tmp_path, monkeypatch):
     assert source.read_bytes() == contents
     assert list(store.asset_dir.iterdir()) == []
     assert store.get_project(project["id"])["assets"] == []
+
+
+def test_service_request_tables_are_migrated_and_preserve_old_identities(tmp_path):
+    from backend.studio.migrations import CURRENT_VERSION
+
+    store = StudioStore(tmp_path)
+    with store.connect() as db:
+        for table in ("job_requests", "render_requests"):
+            assert db.execute("SELECT 1 FROM sqlite_master WHERE name=?", (table,)).fetchone()
+            db.execute(f"INSERT INTO {table} VALUES (?,?,?,?)", ("project", "retry-key", "{}", "[]"))
+        db.execute("PRAGMA user_version=1")
+    reopened = StudioStore(tmp_path)
+    with reopened.connect() as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == CURRENT_VERSION
+        for table in ("job_requests", "render_requests"):
+            assert tuple(db.execute(f"SELECT * FROM {table}").fetchone()) == (
+                "project",
+                "retry-key",
+                "{}",
+                "[]",
+            )
+    with sqlite3.connect(next((tmp_path / "backups").glob("studio-v1-*.sqlite"))) as snapshot:
+        assert snapshot.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert snapshot.execute("SELECT key FROM job_requests").fetchone()[0] == "retry-key"

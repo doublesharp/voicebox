@@ -4,6 +4,7 @@ import copy
 import shutil
 import soundfile as sf
 from .storage import encode, now, uid
+from .publication import discard_unregistered, publish_audio
 
 
 def import_archive(store, archive_path):
@@ -114,23 +115,8 @@ def import_archive(store, archive_path):
             for asset in assets:
                 ident = mapping[asset["id"]]
                 target = store.asset_dir / ident
-                with open(asset["path"], "rb") as source, target.open("xb") as dest:
-                    shutil.copyfileobj(source, dest)
+                publish_audio(db, store.asset_dir, project_id, asset["path"], ident, expected=asset)
                 copied.append(target)
-                db.execute(
-                    "INSERT INTO assets VALUES (?,?,?,?,?,?,?,?,?)",
-                    (
-                        ident,
-                        project_id,
-                        asset["hash"],
-                        asset["sample_rate"],
-                        asset["channels"],
-                        asset["frames"],
-                        asset["duration"],
-                        asset["size_bytes"],
-                        ident,
-                    ),
-                )
             for take in imported.get("takes", []):
                 db.execute(
                     "INSERT INTO takes VALUES (?,?,?,?,?,?,?,?,?)",
@@ -186,8 +172,8 @@ def import_archive(store, archive_path):
                         raise ValueError("Invalid selected take")
             return store._project(db, project_id)
     except BaseException:
-        for path in copied:
-            path.unlink(missing_ok=True)
+        if copied:
+            discard_unregistered(db, copied)
         raise
     finally:
         shutil.rmtree(staging, ignore_errors=True)

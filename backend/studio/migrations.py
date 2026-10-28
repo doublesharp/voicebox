@@ -5,7 +5,7 @@ import uuid
 from contextlib import closing
 from pathlib import Path
 
-CURRENT_VERSION = 1
+CURRENT_VERSION = 2
 
 # Version 1 adopts the previously unversioned schema without replacing existing tables.
 MIGRATIONS = {
@@ -20,7 +20,11 @@ MIGRATIONS = {
         "CREATE TABLE IF NOT EXISTS deliverables (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, data TEXT NOT NULL, path TEXT NOT NULL);",
         "CREATE TABLE IF NOT EXISTS passage_intents (project_id TEXT NOT NULL, passage_id TEXT NOT NULL, epoch INTEGER NOT NULL, PRIMARY KEY(project_id,passage_id));",
         "CREATE TABLE IF NOT EXISTS recording_acknowledgements (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, revision_id TEXT NOT NULL, created_at TEXT NOT NULL, recordings TEXT NOT NULL);",
-    )
+    ),
+    2: (
+        "CREATE TABLE IF NOT EXISTS job_requests (project_id TEXT, key TEXT, request TEXT, response TEXT, PRIMARY KEY(project_id,key));",
+        "CREATE TABLE IF NOT EXISTS render_requests (project_id TEXT, key TEXT, request TEXT, response TEXT, PRIMARY KEY(project_id,key));",
+    ),
 }
 
 

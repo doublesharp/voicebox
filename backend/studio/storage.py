@@ -6,7 +6,6 @@ import copy
 import hashlib
 import json
 import math
-import os
 import re
 import sqlite3
 import uuid
@@ -609,70 +608,24 @@ class StudioStore:
             return self._record(db, project_id, operation_id, request)
 
     def add_asset(self, project_id, source):
-        import soundfile as sf
+        from .publication import discard_unregistered, publish_audio
 
-        source = Path(source)
         asset_id = uid()
         target = self.asset_dir / asset_id
-        staged = self.asset_dir / (".publish-" + asset_id)
         published = False
-        staged_created = False
         db = self.connect()
         try:
             db.execute("BEGIN IMMEDIATE")
             self._project(db, project_id)
-            digest = hashlib.sha256()
-            with source.open("rb") as src, staged.open("xb") as dst:
-                staged_created = True
-                for chunk in iter(lambda: src.read(1024 * 1024), b""):
-                    digest.update(chunk)
-                    dst.write(chunk)
-                dst.flush()
-                os.fsync(dst.fileno())
-            copied_digest = hashlib.sha256()
-            with staged.open("rb") as copied:
-                for chunk in iter(lambda: copied.read(1024 * 1024), b""):
-                    copied_digest.update(chunk)
-            if digest.digest() != copied_digest.digest():
-                raise ValueError("Copied audio hash mismatch")
-            try:
-                info = sf.info(str(staged))
-            except (RuntimeError, OSError) as exc:
-                raise ValueError("Invalid audio file") from exc
-            if info.samplerate <= 0 or info.channels not in (1, 2) or info.frames <= 0:
-                raise ValueError("Empty or invalid audio")
-            size = staged.stat().st_size
-            if os.path.lexists(target):
-                raise FileExistsError(f"Asset destination already exists: {target}")
-            staged.rename(target)
+            publish_audio(db, self.asset_dir, project_id, source, asset_id)
             published = True
-            db.execute(
-                "INSERT INTO assets VALUES (?,?,?,?,?,?,?,?,?)",
-                (
-                    asset_id,
-                    project_id,
-                    digest.hexdigest(),
-                    info.samplerate,
-                    info.channels,
-                    info.frames,
-                    info.frames / info.samplerate,
-                    size,
-                    asset_id,
-                ),
-            )
             result = next(a for a in self._project(db, project_id)["assets"] if a["id"] == asset_id)
             db.commit()
             return result
         except BaseException:
             db.rollback()
-            if staged_created:
-                staged.unlink(missing_ok=True)
-            # If commit succeeded despite an exception, preserve the registered audio.
-            if (
-                published
-                and not db.execute("SELECT 1 FROM assets WHERE id=? AND path=?", (asset_id, asset_id)).fetchone()
-            ):
-                target.unlink(missing_ok=True)
+            if published:
+                discard_unregistered(db, [target])
             raise
         finally:
             db.close()

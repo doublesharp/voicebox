@@ -20,10 +20,6 @@ class StudioDelivery:
         self.schedule = schedule
         self.directory = store.root / "deliverables"
         self.directory.mkdir(exist_ok=True)
-        with store.connect() as db:
-            db.execute(
-                "CREATE TABLE IF NOT EXISTS render_requests (project_id TEXT, key TEXT, request TEXT, response TEXT, PRIMARY KEY(project_id,key))"
-            )
 
     def submit(self, project_id, idempotency_key, revision_id, kind, format, allow_stale_audio=False):
         if (
