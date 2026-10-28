@@ -22,10 +22,22 @@ The current core is a foundation slice, not full S1 acceptance. The user has req
 - Take names and annotations, plus temporary level-matched A/B audition (P2.7–8).
 - Studio effects, explicit master gain/limiting controls, dry/processed audition and processed voice stems (P5.3, P6.6). Legacy Effects remains accessible.
 - A persistent revision-bound review checklist alongside existing local approval notes (P6.2).
+- Versioned Studio database migrations, backup/newer-schema protection and staged asset recovery.
+- Complete frozen capability/job provenance, archive scope and missing optional-reference handling, plus atomic native destination publication.
+- Remaining replacement-trim and Story-to-Studio workflow affordances identified in the S1 gap audit.
 - Applicable integration and runtime acceptance in the spec, with unrun environments tracked separately from missing feature code.
 
-Verification: 113 backend/affected-legacy tests and 71 Studio frontend tests pass. App/web no-emit typechecks, web/Tauri frontend production builds, scoped Biome, new Python import lint/format checks and patch whitespace checks pass. Fixture tests, static checks and frontend builds do not establish native/model/browser acceptance. Current environment lacks `fastmcp` for the broader compatibility suite. The pre-existing `playback-output.test.ts` also has four failures against its pre-existing output helper; those unrelated edits are preserved.
+Verification for the integrated testing branch: 255 backend checks, 181 frontend checks across 19 isolated test files, and seven device-independent native PCM/control tests pass. App and web no-emit typechecks pass. Independent scoped source reviews accepted the shared inference owner and playback handoff repairs. Frontend files run in separate processes because existing module mocks contaminate a combined invocation.
+
+The existing complete Scratch Python environment supplies the compatibility dependencies. Full native Cargo compilation remains unverified: the offline cache lacks `symphonia`. A standalone Tauri TypeScript check also reports window/virtual-module declarations and a missing workspace dependency link; it is not a passing gate. The original checkout's uncommitted playback helper and four failing fixtures are preserved outside these merges.
 
 A real offline renderer check against the final renderer/timing source used a 30-minute source split into 200 clips and produced the expected 48 kHz stereo WAV24 sample count. It completed in about 72 seconds with about 195 MiB process peak RSS. This measures that renderer fixture, excluding model inference, browser memory, UI timing and native audio. Raw evidence stays on Scratch and is referenced in Coordinate.
 
 Open qualification includes real preset/cloned/directed engines, GPU cancellation/contention, packaged lifecycle and output routing, listening and independent metering, rendered 800×600/200% zoom/accessibility checks, and native destination publication. Later S2 video automation, S3 collaboration and S4 calling/advanced capabilities remain separate phases.
+
+
+## Testing branch integration
+
+All 15 local feature, fix, improvement and test branch tips are included in the integrated history. This includes the audio-quality aggregate, TTS pipeline, native playback sessions, Story scheduling, pause preservation, clean reference capture and offline quality tools. Historical upstream branches are outside this integration.
+
+Merge repairs retain one shared TTS lifecycle owner, queue pending native starts before Studio handover, preserve output-clock/version-edit safeguards, and consolidate the earlier reference preference into microphone settings. Reference recording retains the recorder's actual fallback container type. This integration makes the accumulated work available for testing; the S1 feature and runtime gaps above remain open.
