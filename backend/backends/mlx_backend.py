@@ -42,6 +42,10 @@ from .base import (  # noqa: E402
 from ..utils.cache import get_cache_key, get_cached_voice_prompt, cache_voice_prompt  # noqa: E402
 
 
+class VoiceCloningError(RuntimeError):
+    """The selected voice could not be used; no replacement voice was rendered."""
+
+
 class MLXTTSBackend:
     """MLX-based TTS backend using mlx-audio."""
 
@@ -180,34 +184,23 @@ class MLXTTSBackend:
         async with self._op_lock:
             await self.load_model_async(None)
 
-        # Check cache if enabled
-        if use_cache:
-            cache_key = get_cache_key(audio_path, reference_text)
-            cached_prompt = get_cached_voice_prompt(cache_key)
-            if cached_prompt is not None:
-                # Return cached prompt (should be dict format)
-                if isinstance(cached_prompt, dict):
-                    # Validate that the cached audio file still exists
-                    cached_audio_path = cached_prompt.get("ref_audio") or cached_prompt.get("ref_audio_path")
-                    if cached_audio_path and Path(cached_audio_path).exists():
-                        return cached_prompt, True
-                    else:
-                        # Cached file no longer exists, invalidate cache
-                        logger.warning("Cached audio file not found: %s, regenerating prompt", cached_audio_path)
+        namespace = f"qwen:mlx:{self._current_model_size or self.model_size}:reference-v2"
 
-        # MLX voice prompt format - store audio path and text
-        # The model will process this during generation
-        voice_prompt_items = {
-            "ref_audio": str(audio_path),
-            "ref_text": reference_text,
-        }
+        def _reference_prompt():
+            if not Path(audio_path).is_file():
+                raise VoiceCloningError("Voice reference audio is missing. Re-add the sample before generating speech.")
+            # MLX still encodes this reference inside generate(). This cache
+            # stores metadata only, and must always use the caller's current
+            # path even when identical content was cached from another path.
+            prompt = {"ref_audio": str(audio_path), "ref_text": reference_text}
+            cache_key = get_cache_key(audio_path, reference_text, namespace=namespace) if use_cache else None
+            cached = get_cached_voice_prompt(cache_key) if cache_key is not None else None
+            was_cached = isinstance(cached, dict) and cached.get("ref_text") == reference_text
+            if cache_key is not None and (not was_cached or cached.get("ref_audio") != str(audio_path)):
+                cache_voice_prompt(cache_key, prompt)
+            return prompt, was_cached
 
-        # Cache if enabled
-        if use_cache:
-            cache_key = get_cache_key(audio_path, reference_text)
-            cache_voice_prompt(cache_key, voice_prompt_items)
-
-        return voice_prompt_items, False
+        return await asyncio.to_thread(_reference_prompt)
 
     async def combine_voice_prompts(self, audio_paths, reference_texts):
         return await _combine_voice_prompts(audio_paths, reference_texts)
@@ -259,11 +252,10 @@ class MLXTTSBackend:
                 ref_text = voice_prompt.get("ref_text", "")
 
                 # Validate that the audio file exists
-                if ref_audio and not Path(ref_audio).exists():
-                    logger.warning("Audio file not found: %s", ref_audio)
-                    logger.warning("This may be due to a cached voice prompt referencing a deleted temp file.")
-                    logger.warning("Regenerating without voice prompt.")
-                    ref_audio = None
+                if ref_audio and not Path(ref_audio).is_file():
+                    raise VoiceCloningError(
+                        "Voice reference audio is missing. Re-add the sample before generating speech."
+                    )
 
                 # Inference runs with the process's default HF_HUB_OFFLINE
                 # state. Forcing offline here (previously used to avoid lazy
@@ -276,27 +268,29 @@ class MLXTTSBackend:
                         import inspect
 
                         sig = inspect.signature(model.generate)
-                        if "ref_audio" in sig.parameters:
+                        accepts_reference = "ref_audio" in sig.parameters or any(
+                            parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in sig.parameters.values()
+                        )
+                        if accepts_reference:
                             # Generate with voice cloning
                             for result in model.generate(text, ref_audio=ref_audio, ref_text=ref_text, lang_code=lang):
                                 audio_chunks.append(np.array(result.audio))
                                 sample_rate = result.sample_rate
                         else:
-                            # Fallback: generate without voice cloning
-                            for result in model.generate(text, lang_code=lang):
-                                audio_chunks.append(np.array(result.audio))
-                                sample_rate = result.sample_rate
+                            raise VoiceCloningError(
+                                "This model does not support voice references. Select a voice-cloning model."
+                            )
                     else:
                         # No voice prompt, generate normally
                         for result in model.generate(text, lang_code=lang):
                             audio_chunks.append(np.array(result.audio))
                             sample_rate = result.sample_rate
                 except Exception as e:
-                    # If voice cloning fails, try without it
-                    logger.warning("Voice cloning failed, generating without voice prompt: %s", e)
-                    for result in model.generate(text, lang_code=lang):
-                        audio_chunks.append(np.array(result.audio))
-                        sample_rate = result.sample_rate
+                    if ref_audio and not isinstance(e, VoiceCloningError):
+                        raise VoiceCloningError(
+                            f"Voice cloning failed; no replacement voice was generated: {e}"
+                        ) from e
+                    raise
 
                 # Concatenate all chunks
                 if audio_chunks:
