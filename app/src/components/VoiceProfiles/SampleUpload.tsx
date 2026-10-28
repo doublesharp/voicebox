@@ -24,6 +24,7 @@ import { Textarea } from '@/components/ui/textarea';
 import { useToast } from '@/components/ui/use-toast';
 import { useAudioPlayer } from '@/lib/hooks/useAudioPlayer';
 import { useAudioRecording } from '@/lib/hooks/useAudioRecording';
+import { useReferenceCaptureStore } from '@/stores/referenceCaptureStore';
 import { useAddSample, useProfile } from '@/lib/hooks/useProfiles';
 import { useSystemAudioCapture } from '@/lib/hooks/useSystemAudioCapture';
 import { useTranscription } from '@/lib/hooks/useTranscription';
@@ -66,14 +67,18 @@ export function SampleUpload({ profileId, open, onOpenChange }: SampleUploadProp
 
   const selectedFile = form.watch('file');
 
+  const cleanReferenceAudio = useReferenceCaptureStore((state) => state.cleanReferenceAudio);
+
   const {
     isRecording,
+    audioStream: recordingStream,
     duration,
     error: recordingError,
     startRecording,
     stopRecording,
     cancelRecording,
   } = useAudioRecording({
+    processing: cleanReferenceAudio ? 'clean' : 'processed',
     maxDurationSeconds: 29,
     onRecordingComplete: (blob, recordedDuration) => {
       // Convert blob to File object
@@ -277,6 +282,7 @@ export function SampleUpload({ profileId, open, onOpenChange }: SampleUploadProp
                     <AudioSampleRecording
                       file={selectedFile}
                       isRecording={isRecording}
+                      recordingStream={recordingStream}
                       duration={duration}
                       onStart={startRecording}
                       onStop={stopRecording}

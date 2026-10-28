@@ -3,6 +3,7 @@ import { usePlatform } from '@/platform/PlatformContext';
 import { convertToWav } from '@/lib/utils/audio';
 
 interface UseAudioRecordingOptions {
+  processing?: 'processed' | 'clean';
   maxDurationSeconds?: number;
   onRecordingComplete?: (blob: Blob, duration?: number) => void;
 }
@@ -10,9 +11,11 @@ interface UseAudioRecordingOptions {
 export function useAudioRecording({
   maxDurationSeconds,
   onRecordingComplete,
+  processing = 'processed',
 }: UseAudioRecordingOptions = {}) {
   const platform = usePlatform();
   const [isRecording, setIsRecording] = useState(false);
+  const [audioStream, setAudioStream] = useState<MediaStream | null>(null);
   const [duration, setDuration] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -61,13 +64,14 @@ export function useAudioRecording({
       // Request microphone access
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
+          echoCancellation: processing !== 'clean',
+          noiseSuppression: processing !== 'clean',
+          autoGainControl: processing !== 'clean',
         },
       });
 
       streamRef.current = stream;
+      setAudioStream(stream);
 
       // Create MediaRecorder with preferred MIME type
       const options: MediaRecorderOptions = {
@@ -97,13 +101,14 @@ export function useAudioRecording({
           ? (Date.now() - startTimeRef.current) / 1000
           : undefined;
 
-        const webmBlob = new Blob(chunksRef.current, { type: 'audio/webm' });
+        const webmBlob = new Blob(chunksRef.current, { type: mediaRecorder.mimeType || options.mimeType || 'audio/webm' });
 
         // Stop all tracks now that we have the data
         streamRef.current?.getTracks().forEach((track) => {
           track.stop();
         });
         streamRef.current = null;
+        setAudioStream(null);
 
         // Don't fire completion callback if the recording was cancelled
         if (wasCancelled) return;
@@ -162,7 +167,7 @@ export function useAudioRecording({
       setError(errorMessage);
       setIsRecording(false);
     }
-  }, [maxDurationSeconds, onRecordingComplete]);
+  }, [maxDurationSeconds, onRecordingComplete, processing]);
 
   const stopRecording = useCallback(() => {
     if (mediaRecorderRef.current && isRecording) {
@@ -190,6 +195,7 @@ export function useAudioRecording({
       track.stop();
     });
     streamRef.current = null;
+    setAudioStream(null);
 
     if (timerRef.current !== null) {
       clearInterval(timerRef.current);
@@ -210,6 +216,7 @@ export function useAudioRecording({
   }, []);
 
   return {
+    audioStream,
     isRecording,
     duration,
     error,

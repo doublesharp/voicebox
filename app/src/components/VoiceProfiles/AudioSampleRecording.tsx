@@ -1,8 +1,10 @@
 import { Mic, Pause, Play, Square } from 'lucide-react';
-import { memo, useEffect, useState } from 'react';
+import { memo, useEffect, useId, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Visualizer } from 'react-sound-visualizer';
 import { Button } from '@/components/ui/button';
+import { Checkbox } from '@/components/ui/checkbox';
+import { useReferenceCaptureStore } from '@/stores/referenceCaptureStore';
 import { FormControl, FormItem, FormMessage } from '@/components/ui/form';
 import { formatAudioDuration } from '@/lib/utils/audio';
 
@@ -25,6 +27,7 @@ const MemoizedWaveform = memo(function MemoizedWaveform({
 interface AudioSampleRecordingProps {
   file: File | null | undefined;
   isRecording: boolean;
+  recordingStream?: MediaStream | null;
   duration: number;
   onStart: () => void;
   onStop: () => void;
@@ -39,6 +42,7 @@ interface AudioSampleRecordingProps {
 export function AudioSampleRecording({
   file,
   isRecording,
+  recordingStream,
   duration,
   onStart,
   onStop,
@@ -50,18 +54,32 @@ export function AudioSampleRecording({
   showWaveform = true,
 }: AudioSampleRecordingProps) {
   const { t } = useTranslation();
+  const cleanReferenceAudio = useReferenceCaptureStore((state) => state.cleanReferenceAudio);
+  const setCleanReferenceAudio = useReferenceCaptureStore((state) => state.setCleanReferenceAudio);
+  const processingId = useId();
   const [audioStream, setAudioStream] = useState<MediaStream | null>(null);
 
-  // Request microphone access when component mounts
+  const waveformStream = isRecording ? recordingStream : audioStream;
+
+  // Preview uses the same requested processing policy as reference recording.
   useEffect(() => {
-    if (!showWaveform) return;
+    if (!showWaveform || isRecording || file) return;
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
 
     let stream: MediaStream | null = null;
+    let disposed = false;
 
     navigator.mediaDevices
-      .getUserMedia({ audio: true, video: false })
+      .getUserMedia({ audio: {
+        echoCancellation: !cleanReferenceAudio,
+        noiseSuppression: !cleanReferenceAudio,
+        autoGainControl: !cleanReferenceAudio,
+      }, video: false })
       .then((s) => {
+        if (disposed) {
+          s.getTracks().forEach((track) => track.stop());
+          return;
+        }
         stream = s;
         setAudioStream(s);
       })
@@ -70,21 +88,42 @@ export function AudioSampleRecording({
       });
 
     return () => {
+      disposed = true;
+      setAudioStream(null);
       if (stream) {
         stream.getTracks().forEach((track) => {
           track.stop();
         });
       }
     };
-  }, [showWaveform]);
+  }, [showWaveform, isRecording, file, cleanReferenceAudio]);
 
   return (
     <FormItem>
       <FormControl>
         <div className="space-y-4">
+          {!file && (
+            <div className="space-y-1">
+              <label htmlFor={processingId} className="flex items-center gap-2 text-sm">
+                <Checkbox
+                  id={processingId}
+                  checked={cleanReferenceAudio}
+                  onCheckedChange={(checked) => setCleanReferenceAudio(checked === true)}
+                  disabled={isRecording}
+                />
+                {t('audioSample.disableProcessing', 'Disable browser audio processing')}
+              </label>
+              <p className="text-xs text-muted-foreground">
+                {t(
+                  'audioSample.disableProcessingHint',
+                  'For reference recordings only. Requests no noise suppression, echo cancellation, or automatic gain. Recordings may still use compressed audio.',
+                )}
+              </p>
+            </div>
+          )}
           {!isRecording && !file && (
             <div className="relative flex flex-col items-center justify-center gap-4 p-4 border-2 border-dashed rounded-lg min-h-[180px] overflow-hidden">
-              {showWaveform && audioStream && <MemoizedWaveform audioStream={audioStream} />}
+              {showWaveform && waveformStream && <MemoizedWaveform audioStream={waveformStream} />}
               <Button
                 type="button"
                 onClick={onStart}
@@ -102,7 +141,7 @@ export function AudioSampleRecording({
 
           {isRecording && (
             <div className="relative flex flex-col items-center justify-center gap-4 p-4 border-2 border-accent rounded-lg bg-accent/5 min-h-[180px] overflow-hidden">
-              {showWaveform && audioStream && <MemoizedWaveform audioStream={audioStream} />}
+              {showWaveform && waveformStream && <MemoizedWaveform audioStream={waveformStream} />}
               <div className="relative z-10 flex items-center gap-4">
                 <div className="flex items-center gap-2">
                   <div className="h-3 w-3 rounded-full bg-accent animate-pulse" />

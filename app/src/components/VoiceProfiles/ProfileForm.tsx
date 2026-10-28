@@ -40,6 +40,7 @@ import type { EffectConfig, PresetVoice, VoiceType } from '@/lib/api/types';
 import { LANGUAGE_CODES, LANGUAGE_OPTIONS, type LanguageCode } from '@/lib/constants/languages';
 import { useAudioPlayer } from '@/lib/hooks/useAudioPlayer';
 import { useAudioRecording } from '@/lib/hooks/useAudioRecording';
+import { useReferenceCaptureStore } from '@/stores/referenceCaptureStore';
 import {
   useAddSample,
   useCreateProfile,
@@ -229,14 +230,18 @@ export function ProfileForm() {
     }
   }, [selectedFile, form, t]);
 
+  const cleanReferenceAudio = useReferenceCaptureStore((state) => state.cleanReferenceAudio);
+
   const {
     isRecording,
+    audioStream: recordingStream,
     duration,
     error: recordingError,
     startRecording,
     stopRecording,
     cancelRecording,
   } = useAudioRecording({
+    processing: cleanReferenceAudio ? 'clean' : 'processed',
     maxDurationSeconds: 29,
     onRecordingComplete: (blob, recordedDuration) => {
       const file = new File([blob], `recording-${Date.now()}.webm`, {
@@ -1106,6 +1111,7 @@ export function ProfileForm() {
                                   <AudioSampleRecording
                                     file={selectedFile}
                                     isRecording={isRecording}
+                                    recordingStream={recordingStream}
                                     duration={duration}
                                     onStart={startRecording}
                                     onStop={stopRecording}
