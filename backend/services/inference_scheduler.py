@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
-from typing import Awaitable, Callable, TypeVar
+from typing import TypeVar
 from weakref import WeakKeyDictionary
 
 T = TypeVar("T")

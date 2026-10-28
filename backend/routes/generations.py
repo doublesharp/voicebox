@@ -1,6 +1,7 @@
 """TTS generation endpoints."""
 
 import asyncio
+import json
 import logging
 import uuid
 from pathlib import Path
@@ -9,7 +10,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
-from ..services.inference_scheduler import check_inference_cancelled, serialized_inference
+from ..services.inference_scheduler import check_inference_cancelled, run_serialized_inference, serialized_inference
 from .. import config, models
 from ..services import history, personality, profiles, tts
 from ..database import Generation as DBGeneration, VoiceProfile as DBVoiceProfile, get_db
@@ -89,6 +90,27 @@ async def generate_speech(
             raise HTTPException(status_code=500, detail="LLM produced empty output; nothing to speak.")
         source = "personality_speak"
 
+    effects_chain_config = None
+    if data.effects_chain is not None:
+        effects_chain_config = [e.model_dump() for e in data.effects_chain]
+    else:
+        import json as _json
+
+        profile_obj = db.query(DBVoiceProfile).filter_by(id=data.profile_id).first()
+        if profile_obj and profile_obj.effects_chain:
+            try:
+                effects_chain_config = _json.loads(profile_obj.effects_chain)
+            except Exception:
+                pass
+
+    synthesis_config = {
+        "version": 1,
+        "normalize": data.normalize,
+        "max_chunk_chars": data.max_chunk_chars,
+        "crossfade_ms": data.crossfade_ms,
+        "effects_chain": effects_chain_config,
+    }
+
     generation = await history.create_generation(
         profile_id=data.profile_id,
         text=text,
@@ -103,6 +125,7 @@ async def generate_speech(
         engine=engine,
         model_size=model_size if engine_has_model_sizes(engine) else None,
         source=source,
+        synthesis_config=synthesis_config,
     )
 
     task_manager.start_generation(
@@ -110,19 +133,6 @@ async def generate_speech(
         profile_id=data.profile_id,
         text=text,
     )
-
-    effects_chain_config = None
-    if data.effects_chain is not None:
-        effects_chain_config = [e.model_dump() for e in data.effects_chain]
-    else:
-        import json as _json
-
-        profile_obj = db.query(DBVoiceProfile).filter_by(id=data.profile_id).first()
-        if profile_obj and profile_obj.effects_chain:
-            try:
-                effects_chain_config = _json.loads(profile_obj.effects_chain)
-            except Exception:
-                pass
 
     enqueue_generation(
         generation_id,
@@ -146,6 +156,39 @@ async def generate_speech(
     return generation
 
 
+def _replay_synthesis_config(generation: DBGeneration) -> dict:
+    """Replay immutable request settings, including explicit False and zero.
+
+    Legacy/imported rows have no recoverable request snapshot. Use the normal
+    GenerationRequest defaults and no effects, never the profile's mutable
+    current defaults. Persist that choice when the first replay is requested.
+    """
+    options = {
+        name: models.GenerationRequest.model_fields[name].default
+        for name in ("normalize", "max_chunk_chars", "crossfade_ms", "effects_chain")
+    }
+    saved = getattr(generation, "synthesis_config", None)
+    if saved is None:
+        return options
+    try:
+        stored = json.loads(saved)
+        if not isinstance(stored, dict) or stored.get("version", 1) != 1:
+            raise ValueError("Unsupported synthesis configuration")
+        options.update({name: stored[name] for name in options if name in stored})
+        if type(options["normalize"]) is not bool:
+            raise ValueError("Invalid normalize setting")
+        for name, lower, upper in (("max_chunk_chars", 100, 5000), ("crossfade_ms", 0, 500)):
+            value = options[name]
+            if type(value) is not int or not lower <= value <= upper:
+                raise ValueError(f"Invalid {name} setting")
+        effects = options["effects_chain"]
+        if effects is not None and (not isinstance(effects, list) or any(not isinstance(effect, dict) for effect in effects)):
+            raise ValueError("Invalid effects settings")
+    except (TypeError, ValueError) as error:
+        raise HTTPException(status_code=400, detail="Saved generation settings are invalid; create a new generation.") from error
+    return options
+
+
 @router.post("/generate/{generation_id}/retry", response_model=models.GenerationResponse)
 async def retry_generation(generation_id: str, db: Session = Depends(get_db)):
     """Retry a failed generation using the same parameters."""
@@ -156,6 +199,12 @@ async def retry_generation(generation_id: str, db: Session = Depends(get_db)):
     if (gen.status or "completed") != "failed":
         raise HTTPException(status_code=400, detail="Only failed generations can be retried")
 
+    from ..backends import engine_has_model_sizes
+
+    model_size = (gen.model_size or "1.7B") if engine_has_model_sizes(gen.engine or "qwen") else None
+    synthesis_config = _replay_synthesis_config(gen)
+    if gen.synthesis_config is None:
+        gen.synthesis_config = json.dumps({"version": 1, **synthesis_config})
     gen.status = "generating"
     gen.error = None
     gen.audio_path = ""
@@ -178,9 +227,10 @@ async def retry_generation(generation_id: str, db: Session = Depends(get_db)):
             text=gen.text,
             language=gen.language,
             engine=gen.engine or "qwen",
-            model_size=gen.model_size or "1.7B",
+            model_size=model_size,
             seed=gen.seed,
             instruct=gen.instruct,
+            **synthesis_config,
             mode="retry",
         )
     )
@@ -200,6 +250,12 @@ async def regenerate_generation(generation_id: str, db: Session = Depends(get_db
     if (gen.status or "completed") != "completed":
         raise HTTPException(status_code=400, detail="Generation must be completed to regenerate")
 
+    from ..backends import engine_has_model_sizes
+
+    model_size = (gen.model_size or "1.7B") if engine_has_model_sizes(gen.engine or "qwen") else None
+    synthesis_config = _replay_synthesis_config(gen)
+    if gen.synthesis_config is None:
+        gen.synthesis_config = json.dumps({"version": 1, **synthesis_config})
     gen.status = "generating"
     gen.error = None
     db.commit()
@@ -222,9 +278,10 @@ async def regenerate_generation(generation_id: str, db: Session = Depends(get_db
             text=gen.text,
             language=gen.language,
             engine=gen.engine or "qwen",
-            model_size=gen.model_size or "1.7B",
+            model_size=model_size,
             seed=gen.seed,
             instruct=gen.instruct,
+            **synthesis_config,
             mode="regenerate",
             version_id=version_id,
         )
@@ -317,10 +374,91 @@ async def get_generation_status(generation_id: str, db: Session = Depends(get_db
 
 
 @router.post("/generate/stream")
-@serialized_inference
 async def stream_speech(
     data: models.GenerationRequest,
     db: Session = Depends(get_db),
+    incremental: bool = False,
+):
+    """Return mastered WAV, or opt into bounded incremental preview delivery.
+
+    ``incremental=true`` requires ``normalize=false`` and no enabled effects.
+    Preview uses text groups of at most 240 characters and an unknown-length
+    PCM WAV header; buffered mode preserves full-file processing and headers.
+    """
+    if incremental:
+        return await _incremental_speech(data, db)
+    return await _buffered_speech(data, db)
+
+
+async def _incremental_speech(data: models.GenerationRequest, db: Session):
+    from ..backends import (
+        engine_needs_trim, engine_retries_runaway, ensure_model_cached_or_raise,
+        get_tts_backend_for_engine, load_engine_model,
+    )
+    from ..utils.audio import has_tts_runaway, trim_tts_output
+    from ..utils.audio_processing import effects_chain_from_config
+    from ..utils.streaming_audio import iter_speech_audio, pcm16_bytes, serialized_byte_stream, streaming_wav_header
+
+    profile = await profiles.get_profile(data.profile_id, db)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    chain = (
+        [effect.model_dump() for effect in data.effects_chain]
+        if data.effects_chain is not None else effects_chain_from_config(profile.effects_chain)
+    )
+    if data.normalize or any(effect.get("enabled", True) for effect in chain or []):
+        raise HTTPException(
+            status_code=400,
+            detail="Incremental preview requires normalize=false and no enabled effects; use effects_chain=[] "
+                   "to override profile effects. Buffered mode supports whole-file mastering.",
+        )
+    engine = _resolve_generation_engine(data, profile)
+    try:
+        profiles.validate_profile_engine(profile, engine)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    model_size = data.model_size or "1.7B"
+    await ensure_model_cached_or_raise(engine, model_size)
+    # Own a session for the response lifetime, independently of FastAPI's
+    # dependency teardown policy while waiting for another inference request.
+    bind = db.get_bind()
+
+    async def produce(send):
+        backend = get_tts_backend_for_engine(engine)
+        try:
+            await load_engine_model(engine, model_size)
+            check_inference_cancelled()
+            with Session(bind=bind) as stream_db:
+                prompt = await profiles.create_voice_prompt_for_profile(data.profile_id, stream_db, engine=engine)
+            first = True
+            async for audio, rate in iter_speech_audio(
+                backend, data.text, prompt, language=data.language, seed=data.seed,
+                instruct=data.instruct, max_chunk_chars=min(data.max_chunk_chars, 240),
+                crossfade_ms=data.crossfade_ms,
+                trim_fn=trim_tts_output if engine_needs_trim(engine) else None,
+                runaway_detector=has_tts_runaway if engine_retries_runaway(engine) else None,
+            ):
+                if first:
+                    await send(streaming_wav_header(rate))
+                    first = False
+                await send(pcm16_bytes(audio))
+        finally:
+            release_generation_memory(backend)
+
+    return StreamingResponse(
+        serialized_byte_stream(produce), media_type="audio/wav",
+        headers={
+            "Content-Disposition": 'inline; filename="speech-preview.wav"',
+            "Cache-Control": "no-store", "X-Accel-Buffering": "no",
+            "X-Voicebox-Audio-Mode": "incremental-preview",
+        },
+    )
+
+
+@serialized_inference
+async def _buffered_speech(
+    data: models.GenerationRequest,
+    db: Session,
 ):
     """Generate speech and stream the WAV audio directly without saving to disk."""
     from ..backends import (
@@ -382,28 +520,21 @@ async def stream_speech(
     finally:
         release_generation_memory(tts_model)
 
+    from ..utils.audio_processing import effects_chain_from_config, process_generated_audio
+
     effects_chain_config = None
     if data.effects_chain is not None:
         effects_chain_config = [e.model_dump() for e in data.effects_chain]
-    elif profile.effects_chain:
-        import json as _json
+    else:
+        effects_chain_config = effects_chain_from_config(profile.effects_chain)
 
-        try:
-            effects_chain_config = _json.loads(profile.effects_chain)
-        except Exception:
-            effects_chain_config = None
+    _, audio = await asyncio.to_thread(
+        process_generated_audio, audio, sample_rate, normalize=data.normalize, effects_chain=effects_chain_config
+    )
 
-    if effects_chain_config:
-        from ..utils.effects import apply_effects
-
-        audio = apply_effects(audio, sample_rate, effects_chain_config)
-
-    if data.normalize:
-        from ..utils.audio import normalize_audio
-
-        audio = normalize_audio(audio)
-
-    wav_bytes = tts.audio_to_wav_bytes(audio, sample_rate)
+    check_inference_cancelled()
+    wav_bytes = await asyncio.to_thread(tts.audio_to_wav_bytes, audio, sample_rate)
+    check_inference_cancelled()
 
     async def _wav_stream():
         try:

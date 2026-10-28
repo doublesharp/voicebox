@@ -3,6 +3,7 @@ Generation history management module.
 """
 
 from typing import List, Optional, Tuple
+import json
 from datetime import UTC, datetime
 import logging
 import uuid
@@ -68,6 +69,7 @@ def _get_versions_for_generations(generation_ids: list[str], db: Session) -> dic
             label=v.label,
             audio_path=v.audio_path,
             effects_chain=effects_chain,
+            source_version_id=v.source_version_id,
             is_default=v.is_default,
             created_at=v.created_at,
         ))
@@ -102,6 +104,7 @@ async def create_generation(
     engine: Optional[str] = "qwen",
     model_size: Optional[str] = None,
     source: str = "manual",
+    synthesis_config: Optional[dict] = None,
 ) -> GenerationResponse:
     """
     Create a new generation history entry.
@@ -140,6 +143,7 @@ async def create_generation(
         model_size=model_size,
         status=status,
         source=source,
+        synthesis_config=json.dumps(synthesis_config) if synthesis_config is not None else None,
         created_at=datetime.now(UTC),
     )
 

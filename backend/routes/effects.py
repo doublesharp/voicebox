@@ -29,7 +29,8 @@ async def preview_effects(
         raise HTTPException(status_code=400, detail="Generation is not completed")
 
     from ..services import versions as versions_mod
-    from ..utils.effects import apply_effects, validate_effects_chain
+    from ..utils.effects import validate_effects_chain
+    from ..utils.audio_processing import process_generated_audio
     from ..utils.audio import load_audio
 
     chain_dicts = [e.model_dump() for e in data.effects_chain]
@@ -44,8 +45,12 @@ async def preview_effects(
     if resolved_source_path is None or not resolved_source_path.exists():
         raise HTTPException(status_code=404, detail="Source audio file not found")
 
-    audio, sample_rate = await asyncio.to_thread(load_audio, str(resolved_source_path))
-    processed = await asyncio.to_thread(apply_effects, audio, sample_rate, chain_dicts)
+    audio, sample_rate = await asyncio.to_thread(
+        load_audio, str(resolved_source_path), sample_rate=None
+    )
+    _, processed = await asyncio.to_thread(
+        process_generated_audio, audio, sample_rate, normalize=False, effects_chain=chain_dicts
+    )
 
     import soundfile as sf
 
@@ -170,7 +175,8 @@ async def apply_effects_to_generation(
         raise HTTPException(status_code=400, detail="Generation is not completed")
 
     from ..services import versions as versions_mod
-    from ..utils.effects import apply_effects, validate_effects_chain
+    from ..utils.effects import validate_effects_chain
+    from ..utils.audio_processing import process_generated_audio
     from ..utils.audio import load_audio, save_audio
 
     chain_dicts = [e.model_dump() for e in data.effects_chain]
@@ -197,8 +203,12 @@ async def apply_effects_to_generation(
     if resolved_source_path is None or not resolved_source_path.exists():
         raise HTTPException(status_code=404, detail="Source audio file not found")
 
-    audio, sample_rate = await asyncio.to_thread(load_audio, str(resolved_source_path))
-    processed_audio = await asyncio.to_thread(apply_effects, audio, sample_rate, chain_dicts)
+    audio, sample_rate = await asyncio.to_thread(
+        load_audio, str(resolved_source_path), sample_rate=None
+    )
+    _, processed_audio = await asyncio.to_thread(
+        process_generated_audio, audio, sample_rate, normalize=False, effects_chain=chain_dicts
+    )
 
     version_id = str(uuid.uuid4())
     processed_path = config.get_generations_dir() / f"{generation_id}_{version_id[:8]}.wav"

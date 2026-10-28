@@ -35,9 +35,27 @@ from ..database import (
     Generation as DBGeneration,
     VoiceProfile as DBVoiceProfile,
 )
-from .history import _get_versions_for_generation
-from ..utils.audio import load_audio, save_audio
+from .history import _get_versions_for_generation, _get_versions_for_generations
+from ..utils.audio import load_audio, protect_audio_peak, save_audio
+from ..utils.audio_metadata import audio_duration
 import numpy as np
+
+
+def _selected_item_audio(item: DBStoryItem, generation: DBGeneration, versions) -> tuple:
+    """Resolve pinned/default audio from already fetched version metadata."""
+    audio_path = generation.audio_path
+    if item.version_id:
+        audio_path = next((version.audio_path for version in versions or [] if version.id == item.version_id), audio_path)
+    return audio_path, audio_duration(audio_path, fallback=generation.duration)
+
+
+def _item_duration_ms(item: DBStoryItem, generation: DBGeneration, versions) -> int:
+    _, duration = _selected_item_audio(item, generation, versions)
+    return int((duration or 0.0) * 1000)
+
+
+def _effective_item_duration_ms(item: DBStoryItem, generation: DBGeneration, versions) -> int:
+    return max(0, _item_duration_ms(item, generation, versions) - item.trim_start_ms - item.trim_end_ms)
 
 
 def _build_item_detail(
@@ -45,17 +63,13 @@ def _build_item_detail(
     generation: DBGeneration,
     profile_name: str,
     db: Session,
+    version_info: Optional[tuple] = None,
 ) -> StoryItemDetail:
-    """Build a StoryItemDetail with version info from a story item and its generation."""
-    versions, active_version_id = _get_versions_for_generation(generation.id, db)
-
-    # Resolve the audio path: if version_id is set, use that version's audio
-    audio_path = generation.audio_path
-    if item.version_id and versions:
-        for v in versions:
-            if v.id == item.version_id:
-                audio_path = v.audio_path
-                break
+    """Build a StoryItemDetail using selected-file duration and version info."""
+    versions, active_version_id = (
+        version_info if version_info is not None else _get_versions_for_generation(generation.id, db)
+    )
+    audio_path, duration = _selected_item_audio(item, generation, versions)
 
     return StoryItemDetail(
         id=item.id,
@@ -72,7 +86,7 @@ def _build_item_detail(
         text=generation.text,
         language=generation.language,
         audio_path=audio_path,
-        duration=generation.duration,
+        duration=duration,
         seed=generation.seed,
         instruct=generation.instruct,
         engine=generation.engine,
@@ -180,9 +194,10 @@ async def get_story(
         .all()
     )
 
+    version_info = _get_versions_for_generations([generation.id for _, generation, _ in items], db)
     item_details = []
     for item, generation, profile_name in items:
-        item_details.append(_build_item_detail(item, generation, profile_name, db))
+        item_details.append(_build_item_detail(item, generation, profile_name, db, version_info[generation.id]))
 
     response = StoryDetailResponse.model_validate(story)
     response.items = item_details
@@ -304,9 +319,10 @@ async def add_item_to_story(
         if not existing_items:
             start_time_ms = 0
         else:
+            version_info = _get_versions_for_generations([gen.id for _, gen in existing_items], db)
             max_end_time_ms = 0
             for item, gen in existing_items:
-                item_end_ms = item.start_time_ms + int(gen.duration * 1000)
+                item_end_ms = item.start_time_ms + _effective_item_duration_ms(item, gen, version_info[gen.id][0])
                 max_end_time_ms = max(max_end_time_ms, item_end_ms)
 
             # Add 200ms gap after the last item
@@ -464,7 +480,8 @@ async def trim_story_item(
         return None
 
     # Validate trim values don't exceed duration
-    max_duration_ms = int(generation.duration * 1000)
+    version_info = _get_versions_for_generation(generation.id, db)
+    max_duration_ms = _item_duration_ms(item, generation, version_info[0])
     if data.trim_start_ms + data.trim_end_ms >= max_duration_ms:
         return None  # Invalid trim - would result in zero or negative duration
 
@@ -483,7 +500,7 @@ async def trim_story_item(
     # Get profile name
     profile = db.query(DBVoiceProfile).filter_by(id=generation.profile_id).first()
 
-    return _build_item_detail(item, generation, profile.name if profile else "Unknown", db)
+    return _build_item_detail(item, generation, profile.name if profile else "Unknown", db, version_info)
 
 
 async def update_story_item_volume(
@@ -557,7 +574,8 @@ async def split_story_item(
     # Calculate effective duration and validate split point
     current_trim_start = getattr(item, "trim_start_ms", 0)
     current_trim_end = getattr(item, "trim_end_ms", 0)
-    original_duration_ms = int(generation.duration * 1000)
+    version_info = _get_versions_for_generation(generation.id, db)
+    original_duration_ms = _item_duration_ms(item, generation, version_info[0])
     effective_duration_ms = original_duration_ms - current_trim_start - current_trim_end
 
     # Validate split_time_ms is within the effective duration
@@ -600,8 +618,8 @@ async def split_story_item(
     profile_name = profile.name if profile else "Unknown"
 
     return [
-        _build_item_detail(item, generation, profile_name, db),
-        _build_item_detail(new_item, generation, profile_name, db),
+        _build_item_detail(item, generation, profile_name, db, version_info),
+        _build_item_detail(new_item, generation, profile_name, db, version_info),
     ]
 
 
@@ -641,7 +659,8 @@ async def duplicate_story_item(
     # Calculate effective duration
     current_trim_start = getattr(original_item, "trim_start_ms", 0)
     current_trim_end = getattr(original_item, "trim_end_ms", 0)
-    original_duration_ms = int(generation.duration * 1000)
+    version_info = _get_versions_for_generation(generation.id, db)
+    original_duration_ms = _item_duration_ms(original_item, generation, version_info[0])
     effective_duration_ms = original_duration_ms - current_trim_start - current_trim_end
 
     # Create duplicate item - place it right after the original
@@ -671,7 +690,7 @@ async def duplicate_story_item(
     # Get profile name
     profile = db.query(DBVoiceProfile).filter_by(id=generation.profile_id).first()
 
-    return _build_item_detail(new_item, generation, profile.name if profile else "Unknown", db)
+    return _build_item_detail(new_item, generation, profile.name if profile else "Unknown", db, version_info)
 
 
 async def update_story_item_times(
@@ -749,7 +768,8 @@ async def reorder_story_items(
     if set(generation_ids) != set(item_map.keys()):
         return None
 
-    # Recalculate timecodes based on new order
+    version_info = _get_versions_for_generations(list(item_map), db)
+    # Recalculate timecodes based on the selected files and existing trims.
     current_time_ms = 0
     updated_items = []
 
@@ -760,13 +780,13 @@ async def reorder_story_items(
         item.start_time_ms = current_time_ms
 
         # Calculate the duration in ms
-        duration_ms = int(generation.duration * 1000)
+        duration_ms = _effective_item_duration_ms(item, generation, version_info[generation.id][0])
 
         # Move to next position (current end + gap)
         current_time_ms += duration_ms + gap_ms
 
         # Build the response item
-        updated_items.append(_build_item_detail(item, generation, profile_name, db))
+        updated_items.append(_build_item_detail(item, generation, profile_name, db, version_info[generation.id]))
 
     # Update story updated_at
     story.updated_at = datetime.now(UTC)
@@ -997,9 +1017,8 @@ async def export_story_audio(
     if not items:
         return None
 
-    # Load all audio files and calculate total duration
+    # Retain source rates and channels until a common mix format is known.
     audio_data = []
-    sample_rate = 24000  # Default sample rate
 
     for item, generation in items:
         # Resolve audio path: use pinned version if set, otherwise generation default
@@ -1016,20 +1035,18 @@ async def export_story_audio(
             continue
 
         try:
-            audio, sr = load_audio(str(audio_path), sample_rate=sample_rate)
-            sample_rate = sr  # Use actual sample rate from first file
+            audio, sr = await asyncio.to_thread(load_audio, str(audio_path), sample_rate=None, mono=False)
+            # librosa uses (channels, frames), while soundfile writes
+            # (frames, channels). Mono is kept as a single channel here.
+            audio = audio[:, np.newaxis] if audio.ndim == 1 else audio.T
 
             # Get trim values
             trim_start_ms = getattr(item, "trim_start_ms", 0)
             trim_end_ms = getattr(item, "trim_end_ms", 0)
 
-            # Calculate effective duration
-            original_duration_ms = int(generation.duration * 1000)
-            effective_duration_ms = original_duration_ms - trim_start_ms - trim_end_ms
-
             # Slice audio based on trim values
-            trim_start_sample = int((trim_start_ms / 1000.0) * sample_rate)
-            trim_end_sample = int((trim_end_ms / 1000.0) * sample_rate)
+            trim_start_sample = int((trim_start_ms / 1000.0) * sr)
+            trim_end_sample = int((trim_end_ms / 1000.0) * sr)
 
             # Extract the trimmed portion
             if trim_end_ms > 0:
@@ -1038,9 +1055,12 @@ async def export_story_audio(
                 )
             else:
                 trimmed_audio = audio[trim_start_sample:]
+            if len(trimmed_audio) == 0:
+                continue
 
             # Apply per-clip volume to the export mix.
-            volume = float(getattr(item, "volume", 1.0) or 1.0)
+            stored_volume = getattr(item, "volume", None)
+            volume = 1.0 if stored_volume is None else float(stored_volume)
             if volume != 1.0:
                 trimmed_audio = trimmed_audio * volume
 
@@ -1050,8 +1070,9 @@ async def export_story_audio(
             audio_data.append(
                 {
                     "audio": trimmed_audio,
+                    "sample_rate": sr,
                     "start_time_ms": start_time_ms,
-                    "duration_ms": effective_duration_ms,
+                    "duration_ms": len(trimmed_audio) / sr * 1000,
                     "text": generation.text,
                 }
             )
@@ -1062,14 +1083,34 @@ async def export_story_audio(
     if not audio_data:
         return None
 
-    # Calculate total duration: max(start_time_ms + duration_ms)
-    max_end_time_ms = max((data["start_time_ms"] + data["duration_ms"] for data in audio_data), default=0)
+    sample_rate = max(data["sample_rate"] for data in audio_data)
+    channels = max(data["audio"].shape[1] for data in audio_data)
+    for data in audio_data:
+        audio = data["audio"]
+        if data["sample_rate"] != sample_rate:
+            from librosa import resample
 
-    # Convert to samples
-    total_samples = int((max_end_time_ms / 1000.0) * sample_rate)
+            audio = await asyncio.to_thread(
+                resample, audio, orig_sr=data["sample_rate"], target_sr=sample_rate, axis=0
+            )
+        if audio.shape[1] == 1 and channels > 1:
+            audio = np.repeat(audio, channels, axis=1)
+        elif audio.shape[1] < channels:
+            audio = np.pad(audio, ((0, 0), (0, channels - audio.shape[1])))
+        data["audio"] = audio
+        data["duration_ms"] = len(audio) / sample_rate * 1000
+
+    # Selected versions may include longer effects tails than generation
+    # metadata. Allocate from the actual rendered samples, including trims.
+    total_samples = max(
+        int(data["start_time_ms"] / 1000 * sample_rate) + len(data["audio"]) for data in audio_data
+    )
+    if total_samples <= 0:
+        return None
+    max_end_time_ms = int(np.ceil(total_samples / sample_rate * 1000))
 
     # Create output buffer initialized to zeros
-    final_audio = np.zeros(total_samples, dtype=np.float32)
+    final_audio = np.zeros((total_samples, channels), dtype=np.float32)
 
     # Mix each audio segment at its timecode position
     for data in audio_data:
@@ -1091,10 +1132,9 @@ async def export_story_audio(
             # Normalize to prevent clipping (simple approach: divide by max)
             final_audio[start_sample:end_sample] += audio_to_mix
 
-    # Normalize to prevent clipping
-    max_val = np.abs(final_audio).max()
-    if max_val > 1.0:
-        final_audio = final_audio / max_val
+    final_audio = protect_audio_peak(final_audio)
+    if channels == 1:
+        final_audio = final_audio[:, 0]
 
     fmt = (fmt or "wav").lower()
     if fmt not in ("wav", "m4b", "mp3"):

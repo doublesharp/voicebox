@@ -474,6 +474,7 @@ async def trigger_model_download(request: models.ModelDownloadRequest):
 
     load_func = get_model_load_func(config)
 
+    @serialized_inference
     async def download_in_background():
         try:
             result = load_func()
@@ -518,6 +519,7 @@ async def cancel_model_download(request: models.ModelDownloadRequest):
 
 
 @router.delete("/models/{model_name}")
+@serialized_inference
 async def delete_model(model_name: str):
     """Delete a downloaded model from the HuggingFace cache."""
     from huggingface_hub import constants as hf_constants
