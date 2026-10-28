@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/button';
 import { Slider } from '@/components/ui/slider';
 import { apiClient } from '@/lib/api/client';
 import { NativePlaybackController, type NativePlaybackUpdate } from '@/lib/audio/nativePlayback';
+import { bindPlaybackPresentation } from '@/lib/audio/playbackPresentation';
 import { formatAudioDuration } from '@/lib/utils/audio';
 import { debug } from '@/lib/utils/debug';
 import { usePlatform } from '@/platform/PlatformContext';
@@ -166,12 +167,18 @@ export function AudioPlayer() {
           backend: 'WebAudio',
         });
 
+        const presentation = bindPlaybackPresentation(
+          wavesurfer,
+          setCurrentTime,
+          () => !isUsingNativePlaybackRef.current,
+        );
+
         // Wire up event handlers (these persist for the lifetime of the instance)
         wavesurfer.on('timeupdate', (time) => {
           if (isUsingNativePlaybackRef.current) return;
           const dur = usePlayerStore.getState().duration;
           if (dur > 0 && time >= dur) {
-            setCurrentTime(dur);
+            presentation.update(dur);
             const loop = usePlayerStore.getState().isLooping;
             if (loop) {
               wavesurfer.seekTo(0);
@@ -182,7 +189,7 @@ export function AudioPlayer() {
             }
             return;
           }
-          setCurrentTime(time);
+          presentation.update(time);
         });
 
         wavesurfer.on('ready', () => {
@@ -203,15 +210,19 @@ export function AudioPlayer() {
         wavesurfer.on('pause', () => {
           if (isUsingNativePlaybackRef.current) return;
           setIsPlaying(false);
-          setCurrentTime(wavesurfer.getCurrentTime());
+          presentation.update();
         });
 
         wavesurfer.on('seeking', (time) => {
-          setCurrentTime(time);
-          if (isUsingNativePlaybackRef.current && !syncingNativePositionRef.current) {
-            void nativeControllerRef.current
-              ?.control({ position: time })
-              .catch((error) => setError(String(error)));
+          if (isUsingNativePlaybackRef.current) {
+            setCurrentTime(time);
+            if (!syncingNativePositionRef.current) {
+              void nativeControllerRef.current
+                ?.control({ position: time })
+                .catch((error) => setError(String(error)));
+            }
+          } else {
+            presentation.update(time);
           }
         });
 
