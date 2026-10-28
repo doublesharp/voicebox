@@ -29,6 +29,7 @@ interface AudioSampleRecordingProps {
   isRecording: boolean;
   isStarting?: boolean;
   recordingStream?: MediaStream | null;
+  usingDefaultMicrophone?: boolean;
   duration: number;
   onStart: () => void;
   onStop: () => void;
@@ -45,6 +46,7 @@ export function AudioSampleRecording({
   isRecording,
   isStarting = false,
   recordingStream,
+  usingDefaultMicrophone = false,
   duration,
   onStart,
   onStop,
@@ -64,7 +66,16 @@ export function AudioSampleRecording({
       <FormControl>
         <div className="space-y-4">
           <MicrophoneSelector disabled={isRecording || isStarting} />
-          {preview.error && <p role="alert" className="text-sm text-destructive">{preview.error}</p>}
+          {(usingDefaultMicrophone || preview.usingDefaultMicrophone) && (
+            <output className="block text-sm text-muted-foreground">
+              {t('microphone.fallbackNotice')}
+            </output>
+          )}
+          {preview.error && (
+            <p role="alert" className="text-sm text-destructive">
+              {preview.error}
+            </p>
+          )}
           {!isRecording && !file && (
             <div className="relative flex flex-col items-center justify-center gap-4 p-4 border-2 border-dashed rounded-lg min-h-[180px] overflow-hidden">
               {showWaveform && audioStream && <MemoizedWaveform audioStream={audioStream} />}

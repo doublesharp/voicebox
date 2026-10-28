@@ -1314,6 +1314,8 @@
   "microphone": {
     "label": "Microphone",
     "systemDefault": "System default",
+    "recordingDefault": "Recording (default mic)",
+    "fallbackNotice": "The selected microphone is unavailable. Using the system default for this session. Your saved choice is unchanged.",
     "enable": "Enable microphones",
     "enabling": "Enabling…",
     "refresh": "Refresh microphones",

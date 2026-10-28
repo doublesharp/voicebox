@@ -33,13 +33,87 @@ describe('microphone acquisition', () => {
     expect(getUserMedia.mock.calls[0][0].audio).not.toHaveProperty('deviceId');
   });
 
-  test('reports an unavailable selected mic without retrying the default mic', async () => {
-    const error = new DOMException('USB microphone disconnected', 'NotFoundError');
+  for (const name of ['NotFoundError', 'OverconstrainedError', 'NotReadableError']) {
+    test(`falls back to the default mic and reports it after ${name}`, async () => {
+      const { stream } = microphone('built-in');
+      const fallback = mock(() => {});
+      const getUserMedia = mock(async (constraints: MediaStreamConstraints) => {
+        if ((constraints.audio as MediaTrackConstraints).deviceId) {
+          throw new DOMException('Selected mic unavailable', name);
+        }
+        return stream;
+      });
+      expect(await requestMicrophone({ getUserMedia }, 'shure-usb', undefined, fallback)).toBe(
+        stream,
+      );
+      expect(getUserMedia).toHaveBeenCalledTimes(2);
+      expect(getUserMedia.mock.calls[1][0].audio).not.toHaveProperty('deviceId');
+      expect(fallback).toHaveBeenCalledTimes(1);
+    });
+  }
+
+  test('does not retry denied permission on another microphone', async () => {
+    const error = new DOMException('Permission denied', 'NotAllowedError');
     const getUserMedia = mock(async () => {
       throw error;
     });
     await expect(requestMicrophone({ getUserMedia }, 'shure-usb')).rejects.toBe(error);
     expect(getUserMedia).toHaveBeenCalledTimes(1);
+  });
+
+  test('reports fallback failure without announcing a successful switch', async () => {
+    const error = new DOMException('Default mic unavailable', 'NotReadableError');
+    const fallback = mock(() => {});
+    let calls = 0;
+    const getUserMedia = mock(async () => {
+      if (++calls === 1) throw new DOMException('Selected mic missing', 'NotFoundError');
+      throw error;
+    });
+    await expect(
+      requestMicrophone({ getUserMedia }, 'shure-usb', undefined, fallback),
+    ).rejects.toBe(error);
+    expect(getUserMedia).toHaveBeenCalledTimes(2);
+    expect(fallback).not.toHaveBeenCalled();
+  });
+
+  test('canceling a failed selected request prevents the fallback request', async () => {
+    const controller = new AbortController();
+    const getUserMedia = mock(async () => {
+      controller.abort();
+      throw new DOMException('Selected mic missing', 'NotFoundError');
+    });
+    await expect(
+      requestMicrophone({ getUserMedia }, 'shure-usb', controller.signal),
+    ).rejects.toThrow();
+    expect(getUserMedia).toHaveBeenCalledTimes(1);
+  });
+
+  test('releases a fallback stream granted after cancellation without notifying', async () => {
+    const { stream, stop } = microphone('built-in');
+    const fallback = mock(() => {});
+    const controller = new AbortController();
+    let grant!: (stream: MediaStream) => void;
+    const pending = requestMicrophone(
+      {
+        getUserMedia: async (constraints) => {
+          if ((constraints.audio as MediaTrackConstraints).deviceId) {
+            throw new DOMException('Selected mic missing', 'NotFoundError');
+          }
+          return new Promise((resolve) => {
+            grant = resolve;
+          });
+        },
+      },
+      'shure-usb',
+      controller.signal,
+      fallback,
+    );
+    await Promise.resolve();
+    controller.abort();
+    grant(stream);
+    await expect(pending).rejects.toThrow();
+    expect(stop).toHaveBeenCalledTimes(1);
+    expect(fallback).not.toHaveBeenCalled();
   });
 
   test('stops a wrong input returned by the webview and refuses to record it', async () => {

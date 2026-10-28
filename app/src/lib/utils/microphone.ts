@@ -1,24 +1,42 @@
-/** Open the same explicit input for recordings and live previews. */
+/** Open an explicit input, falling back to the system default if it is unavailable. */
 export async function requestMicrophone(
   mediaDevices: Pick<MediaDevices, 'getUserMedia'>,
   deviceId: string | null,
   signal?: AbortSignal,
+  onFallback?: () => void,
 ): Promise<MediaStream> {
   signal?.throwIfAborted();
-  const stream = await mediaDevices.getUserMedia({
-    audio: {
-      ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true,
-    },
-  });
+  const audio: MediaTrackConstraints = {
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl: true,
+  };
+  let stream: MediaStream;
+  let usedFallback = false;
+  try {
+    stream = await mediaDevices.getUserMedia({
+      audio: { ...audio, ...(deviceId ? { deviceId: { exact: deviceId } } : {}) },
+    });
+  } catch (error) {
+    signal?.throwIfAborted();
+    // Permission/security failures must remain errors, rather than retrying another input.
+    if (
+      !deviceId ||
+      !(error instanceof Error) ||
+      !['NotFoundError', 'OverconstrainedError', 'NotReadableError'].includes(error.name)
+    ) {
+      throw error;
+    }
+    stream = await mediaDevices.getUserMedia({ audio });
+    usedFallback = true;
+  }
   try {
     signal?.throwIfAborted();
     const actualDeviceId = stream.getAudioTracks()[0]?.getSettings().deviceId;
-    if (deviceId && actualDeviceId && actualDeviceId !== deviceId) {
+    if (!usedFallback && deviceId && actualDeviceId && actualDeviceId !== deviceId) {
       throw new DOMException('The selected microphone could not be opened.', 'NotFoundError');
     }
+    if (usedFallback) onFallback?.();
     return stream;
   } catch (error) {
     stream.getTracks().forEach((track) => {

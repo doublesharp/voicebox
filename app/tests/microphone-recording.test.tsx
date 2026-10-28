@@ -62,8 +62,8 @@ let renderer: ReactTestRenderer | null = null;
 let recording!: ReturnType<typeof useAudioRecording>;
 let preview!: ReturnType<typeof useMicrophonePreview>;
 
-function RecordingProbe() {
-  recording = useAudioRecording();
+function RecordingProbe({ deviceId }: { deviceId?: string | null }) {
+  recording = useAudioRecording({ deviceId });
   return null;
 }
 function PreviewProbe() {
@@ -71,11 +71,11 @@ function PreviewProbe() {
   return null;
 }
 
-function mountRecording() {
+function mountRecording(deviceId?: string | null) {
   act(() => {
     renderer = create(
       <PlatformProvider platform={{ metadata: { isTauri: true } } as Platform}>
-        <RecordingProbe />
+        <RecordingProbe deviceId={deviceId} />
       </PlatformProvider>,
     );
   });
@@ -96,6 +96,84 @@ afterEach(async () => {
 });
 
 describe('recording input lifecycle', () => {
+  test('an input override changes only this recording, leaving the saved choice intact', async () => {
+    const { stream } = microphone('other-usb');
+    const acquire = mock(async (_constraints: MediaStreamConstraints) => stream);
+    useDevices(acquire);
+    mountRecording('other-usb');
+    await act(async () => {
+      await recording.startRecording();
+    });
+    expect(acquire.mock.calls[0][0].audio).toMatchObject({ deviceId: { exact: 'other-usb' } });
+    expect(recording.audioStream).toBe(stream);
+    expect(useMicrophoneStore.getState().deviceId).toBe('shure-usb');
+  });
+
+  test('an explicit null override uses the system default without changing the saved mic', async () => {
+    const { stream } = microphone('built-in');
+    const acquire = mock(async (_constraints: MediaStreamConstraints) => stream);
+    useDevices(acquire);
+    mountRecording(null);
+    await act(async () => {
+      await recording.startRecording();
+    });
+    expect(acquire.mock.calls[0][0].audio).not.toHaveProperty('deviceId');
+    expect(recording.usingDefaultMicrophone).toBe(false);
+    expect(useMicrophoneStore.getState().deviceId).toBe('shure-usb');
+  });
+
+  test('a successful fallback exposes a notice and the actual recording stream, then resets on retry', async () => {
+    const defaultMic = microphone('built-in');
+    const selected = microphone('shure-usb');
+    let missing = true;
+    useDevices(async (constraints) => {
+      if ((constraints.audio as MediaTrackConstraints).deviceId) {
+        if (missing) throw new DOMException('Selected mic missing', 'NotFoundError');
+        return selected.stream;
+      }
+      return defaultMic.stream;
+    });
+    mountRecording();
+    await act(async () => {
+      await recording.startRecording();
+    });
+    expect(recording.isRecording).toBe(true);
+    expect(recording.usingDefaultMicrophone).toBe(true);
+    expect(recording.audioStream).toBe(defaultMic.stream);
+    expect(recording.error).toBeNull();
+    expect(useMicrophoneStore.getState().deviceId).toBe('shure-usb');
+    await act(async () => {
+      recording.cancelRecording();
+    });
+    missing = false;
+    await act(async () => {
+      await recording.startRecording();
+    });
+    expect(recording.usingDefaultMicrophone).toBe(false);
+    expect(recording.audioStream).toBe(selected.stream);
+  });
+
+  test('the preview reports fallback and releases its default stream on close', async () => {
+    const { stream, stop } = microphone('built-in');
+    useDevices(async (constraints) => {
+      if ((constraints.audio as MediaTrackConstraints).deviceId) {
+        throw new DOMException('Selected mic missing', 'NotFoundError');
+      }
+      return stream;
+    });
+    await act(async () => {
+      renderer = create(createElement(PreviewProbe));
+    });
+    expect(preview.stream).toBe(stream);
+    expect(preview.usingDefaultMicrophone).toBe(true);
+    expect(preview.error).toBeNull();
+    await act(async () => {
+      renderer?.unmount();
+    });
+    renderer = null;
+    expect(stop).toHaveBeenCalled();
+  });
+
   test('automatic input stop returns the recorder to idle and allows Stop safely', async () => {
     const { stream } = microphone('shure-usb');
     useDevices(async () => stream);

@@ -233,6 +233,7 @@ export function ProfileForm() {
     isRecording,
     isStarting,
     audioStream: recordingStream,
+    usingDefaultMicrophone,
     duration,
     error: recordingError,
     startRecording,
@@ -1110,6 +1111,7 @@ export function ProfileForm() {
                                     isRecording={isRecording}
                                     isStarting={isStarting}
                                     recordingStream={recordingStream}
+                                    usingDefaultMicrophone={usingDefaultMicrophone}
                                     duration={duration}
                                     onStart={startRecording}
                                     onStop={stopRecording}

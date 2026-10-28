@@ -70,6 +70,7 @@ export function SampleUpload({ profileId, open, onOpenChange }: SampleUploadProp
     isRecording,
     isStarting,
     audioStream: recordingStream,
+    usingDefaultMicrophone,
     duration,
     error: recordingError,
     startRecording,
@@ -286,6 +287,7 @@ export function SampleUpload({ profileId, open, onOpenChange }: SampleUploadProp
                       isRecording={isRecording}
                       isStarting={isStarting}
                       recordingStream={recordingStream}
+                      usingDefaultMicrophone={usingDefaultMicrophone}
                       duration={duration}
                       onStart={startRecording}
                       onStop={stopRecording}

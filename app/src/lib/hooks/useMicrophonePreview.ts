@@ -7,6 +7,7 @@ export function useMicrophonePreview(enabled: boolean) {
   const [preview, setPreview] = useState<{ stream: MediaStream; deviceId: string | null } | null>(
     null,
   );
+  const [usingDefaultMicrophone, setUsingDefaultMicrophone] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -14,8 +15,11 @@ export function useMicrophonePreview(enabled: boolean) {
     const controller = new AbortController();
     let stream: MediaStream | null = null;
     setError(null);
+    setUsingDefaultMicrophone(false);
     setPreview(null);
-    requestMicrophone(navigator.mediaDevices, deviceId, controller.signal)
+    requestMicrophone(navigator.mediaDevices, deviceId, controller.signal, () =>
+      setUsingDefaultMicrophone(true),
+    )
       .then((result) => {
         if (controller.signal.aborted) {
           result.getTracks().forEach((track) => {
@@ -40,5 +44,6 @@ export function useMicrophonePreview(enabled: boolean) {
   return {
     stream: enabled && preview?.deviceId === deviceId ? preview.stream : null,
     error: enabled ? error : null,
+    usingDefaultMicrophone: enabled && preview?.deviceId === deviceId && usingDefaultMicrophone,
   };
 }

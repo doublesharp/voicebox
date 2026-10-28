@@ -80,6 +80,7 @@ export interface UseCaptureRecordingSessionResult {
   pillElapsedMs: number;
   errorMessage: string | null;
   isRecording: boolean;
+  usingDefaultMicrophone: boolean;
   isUploading: boolean;
   isRefining: boolean;
   startRecording: () => void;
@@ -249,6 +250,7 @@ export function useCaptureRecordingSession(
     startRecording: beginAudioRecording,
     stopRecording,
     error: recordError,
+    usingDefaultMicrophone,
   } = useAudioRecording({
     onRecordingComplete: (blob, recordedDuration) => {
       // Trigger-happy tap — MediaRecorder hasn't emitted a usable chunk yet
@@ -316,6 +318,7 @@ export function useCaptureRecordingSession(
     pillElapsedMs,
     errorMessage,
     isRecording,
+    usingDefaultMicrophone,
     isUploading: uploadMutation.isPending,
     isRefining: refineMutation.isPending,
     startRecording,

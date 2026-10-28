@@ -6,11 +6,14 @@ import { useMicrophoneStore } from '@/stores/microphoneStore';
 
 interface UseAudioRecordingOptions {
   maxDurationSeconds?: number;
+  /** undefined uses the saved input; null explicitly chooses the system default. */
+  deviceId?: string | null;
   onRecordingComplete?: (blob: Blob, duration?: number) => void;
 }
 
 export function useAudioRecording({
   maxDurationSeconds,
+  deviceId,
   onRecordingComplete,
 }: UseAudioRecordingOptions = {}) {
   const platform = usePlatform();
@@ -19,6 +22,7 @@ export function useAudioRecording({
   const [audioStream, setAudioStream] = useState<MediaStream | null>(null);
   const requestRef = useRef<AbortController | null>(null);
   const [duration, setDuration] = useState(0);
+  const [usingDefaultMicrophone, setUsingDefaultMicrophone] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -34,6 +38,7 @@ export function useAudioRecording({
     setIsStarting(true);
     try {
       setError(null);
+      setUsingDefaultMicrophone(false);
       chunksRef.current = [];
       cancelledRef.current = false;
       setDuration(0);
@@ -70,8 +75,9 @@ export function useAudioRecording({
       // Request microphone access
       const stream = await requestMicrophone(
         navigator.mediaDevices,
-        useMicrophoneStore.getState().deviceId,
+        deviceId !== undefined ? deviceId : useMicrophoneStore.getState().deviceId,
         controller.signal,
+        () => setUsingDefaultMicrophone(true),
       );
 
       if (controller.signal.aborted) {
@@ -193,7 +199,7 @@ export function useAudioRecording({
         setIsStarting(false);
       }
     }
-  }, [maxDurationSeconds, onRecordingComplete, platform.metadata.isTauri]);
+  }, [deviceId, maxDurationSeconds, onRecordingComplete, platform.metadata.isTauri]);
 
   const stopRecording = useCallback(() => {
     if (mediaRecorderRef.current && isRecording) {
@@ -251,6 +257,7 @@ export function useAudioRecording({
     isRecording,
     isStarting,
     audioStream,
+    usingDefaultMicrophone,
     duration,
     error,
     startRecording,

@@ -555,6 +555,7 @@ export function CapturesTab() {
                 state={session.pillState}
                 elapsedMs={session.pillElapsedMs}
                 errorMessage={session.errorMessage}
+                usingDefaultMicrophone={session.usingDefaultMicrophone}
                 onDismiss={session.dismissError}
                 onStop={session.isRecording ? session.stopRecording : undefined}
               />
