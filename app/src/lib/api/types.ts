@@ -548,6 +548,10 @@ export interface ApplyEffectsRequest {
   set_as_default?: boolean;
 }
 
+export interface UpdateVersionEffectsRequest {
+  effects_chain: EffectConfig[];
+}
+
 /* ─── MCP ─────────────────────────────────────────────────────────────── */
 
 export interface MCPClientBinding {

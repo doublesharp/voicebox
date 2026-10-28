@@ -3,16 +3,28 @@
 import asyncio
 import io
 import uuid
+from functools import wraps
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from .. import config, models
-from ..services import history
 from ..database import Generation as DBGeneration, get_db
+from ..services import history
 
 router = APIRouter()
+
+
+def _serialize_version_change(handler):
+    @wraps(handler)
+    async def serialized(*args, **kwargs):
+        from ..services import versions as versions_mod
+
+        async with versions_mod.generation_lock(kwargs["generation_id"]):
+            return await handler(*args, **kwargs)
+
+    return serialized
 
 
 @router.post("/effects/preview/{generation_id}")
@@ -29,8 +41,8 @@ async def preview_effects(
         raise HTTPException(status_code=400, detail="Generation is not completed")
 
     from ..services import versions as versions_mod
-    from ..utils.effects import apply_effects, validate_effects_chain
     from ..utils.audio import load_audio
+    from ..utils.effects import apply_effects, validate_effects_chain
 
     chain_dicts = [e.model_dump() for e in data.effects_chain]
     error = validate_effects_chain(chain_dicts)
@@ -101,7 +113,7 @@ async def create_effect_preset(
     try:
         return effects_mod.create_preset(data, db)
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 @router.put("/effects/presets/{preset_id}", response_model=models.EffectPresetResponse)
@@ -119,7 +131,7 @@ async def update_effect_preset(
             raise HTTPException(status_code=404, detail="Preset not found")
         return result
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 @router.delete("/effects/presets/{preset_id}")
@@ -132,7 +144,7 @@ async def delete_effect_preset(preset_id: str, db: Session = Depends(get_db)):
             raise HTTPException(status_code=404, detail="Preset not found")
         return {"status": "deleted"}
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 @router.get(
@@ -157,6 +169,7 @@ async def list_generation_versions(
     "/generations/{generation_id}/versions/apply-effects",
     response_model=models.GenerationVersionResponse,
 )
+@_serialize_version_change
 async def apply_effects_to_generation(
     generation_id: str,
     data: models.ApplyEffectsRequest,
@@ -170,8 +183,8 @@ async def apply_effects_to_generation(
         raise HTTPException(status_code=400, detail="Generation is not completed")
 
     from ..services import versions as versions_mod
-    from ..utils.effects import apply_effects, validate_effects_chain
     from ..utils.audio import load_audio, save_audio
+    from ..utils.effects import apply_effects, validate_effects_chain
 
     chain_dicts = [e.model_dump() for e in data.effects_chain]
     error = validate_effects_chain(chain_dicts)
@@ -204,7 +217,15 @@ async def apply_effects_to_generation(
     processed_path = config.get_generations_dir() / f"{generation_id}_{version_id[:8]}.wav"
     await asyncio.to_thread(save_audio, processed_audio, str(processed_path), sample_rate)
 
-    label = data.label or f"version-{len(all_versions) + 1}"
+    # Deleting a middle version must not make the next label collide.
+    next_number = (
+        max(
+            [len(all_versions)]
+            + [int(v.label[8:]) for v in all_versions if v.label.startswith("version-") and v.label[8:].isdigit()]
+        )
+        + 1
+    )
+    label = data.label or f"version-{next_number}"
 
     version = versions_mod.create_version(
         generation_id=generation_id,
@@ -220,9 +241,72 @@ async def apply_effects_to_generation(
 
 
 @router.put(
+    "/generations/{generation_id}/versions/{version_id}",
+    response_model=models.GenerationVersionResponse,
+)
+@_serialize_version_change
+async def update_generation_version(
+    generation_id: str,
+    version_id: str,
+    data: models.UpdateVersionEffectsRequest,
+    db: Session = Depends(get_db),
+):
+    """Replace effects in place, rendering from the version's preserved source."""
+    from ..database import GenerationVersion as DBGenerationVersion
+    from ..services import versions as versions_mod
+    from ..utils.audio import load_audio, save_audio
+    from ..utils.effects import apply_effects, validate_effects_chain
+
+    version = db.query(DBGenerationVersion).filter_by(id=version_id, generation_id=generation_id).first()
+    if not version:
+        raise HTTPException(status_code=404, detail="Version not found")
+    generation = db.query(DBGeneration).filter_by(id=generation_id).first()
+    if not generation or (generation.status or "completed") != "completed":
+        raise HTTPException(status_code=409, detail="Generation is not completed")
+    try:
+        versions_mod.ensure_version_mutable(version, db, editing=True)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+    chain = [effect.model_dump() for effect in data.effects_chain]
+    error = validate_effects_chain(chain)
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+
+    # Older processed versions (including generation-time presets) did not
+    # record a source ID. Their source is the preserved original.
+    source = (
+        db.query(DBGenerationVersion).filter_by(id=version.source_version_id, generation_id=generation_id).first()
+        if version.source_version_id
+        else versions_mod.original_version(generation_id, db)
+    )
+    if source is None or source.id == version_id:
+        raise HTTPException(status_code=409, detail="The source for this version is no longer available")
+    source_path = config.resolve_storage_path(source.audio_path)
+    if source_path is None or not source_path.is_file():
+        raise HTTPException(status_code=404, detail="Source audio file not found")
+
+    audio, sample_rate = await asyncio.to_thread(load_audio, str(source_path))
+    processed = await asyncio.to_thread(apply_effects, audio, sample_rate, chain)
+    processed_path = config.get_generations_dir() / f"{generation_id}_{uuid.uuid4().hex}.wav"
+    try:
+        await asyncio.to_thread(save_audio, processed, str(processed_path), sample_rate)
+        return versions_mod.replace_version_audio(
+            version_id, config.to_storage_path(processed_path), chain, source.id, db
+        )
+    except Exception:
+        db.rollback()
+        # Never remove a render that was already committed successfully.
+        if not db.query(DBGenerationVersion).filter_by(audio_path=config.to_storage_path(processed_path)).first():
+            processed_path.unlink(missing_ok=True)
+        raise
+
+
+@router.put(
     "/generations/{generation_id}/versions/{version_id}/set-default",
     response_model=models.GenerationVersionResponse,
 )
+@_serialize_version_change
 async def set_default_version(
     generation_id: str,
     version_id: str,
@@ -242,6 +326,7 @@ async def set_default_version(
 
 
 @router.delete("/generations/{generation_id}/versions/{version_id}")
+@_serialize_version_change
 async def delete_generation_version(
     generation_id: str,
     version_id: str,
@@ -254,9 +339,13 @@ async def delete_generation_version(
     if not version or version.generation_id != generation_id:
         raise HTTPException(status_code=404, detail="Version not found")
 
-    if not versions_mod.delete_version(version_id, db):
-        raise HTTPException(
-            status_code=400,
-            detail="Cannot delete the last remaining version",
-        )
-    return {"status": "deleted"}
+    try:
+        if not versions_mod.delete_version(version_id, db):
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot delete the last remaining version",
+            )
+    except (ValueError, OSError) as error:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return {"status": "deleted", "versions": versions_mod.list_versions(generation_id, db)}

@@ -814,6 +814,12 @@ class ApplyEffectsRequest(BaseModel):
     set_as_default: bool = Field(default=True, description="Set this version as the default")
 
 
+class UpdateVersionEffectsRequest(BaseModel):
+    """Replace a version's effects, rendering again from its preserved source."""
+
+    effects_chain: List[EffectConfig]
+
+
 class ProfileEffectsUpdate(BaseModel):
     """Request to update the default effects chain on a profile."""
 
