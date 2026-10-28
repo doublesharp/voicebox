@@ -916,8 +916,9 @@ class ApiClient {
     });
   }
 
-  getVersionAudioUrl(versionId: string): string {
-    return `${this.getBaseUrl()}/audio/version/${versionId}`;
+  getVersionAudioUrl(versionId: string, revision?: string): string {
+    const suffix = revision ? `?revision=${encodeURIComponent(revision)}` : '';
+    return `${this.getBaseUrl()}/audio/version/${versionId}${suffix}`;
   }
 
   async updateProfileEffects(
