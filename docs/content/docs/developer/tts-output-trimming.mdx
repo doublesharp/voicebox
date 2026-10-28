@@ -1,0 +1,38 @@
+---
+title: TTS output trimming
+description: Preserve internal pauses while guarding against post-silence noise.
+---
+
+Chatterbox and Chatterbox Turbo use `trim_tts_output` after each generated text
+chunk. An internal silence of one second or more is now a candidate boundary:
+it no longer discards every word that follows the first long pause.
+
+The trim keeps resumed speech, including brief final words and modulated,
+breathy continuations. It removes a continuation only when its active frames
+look like stationary broadband noise: nearly constant energy and a flat
+spectrum. The normal minimum is 300 ms of active noise. A 60–250 ms noise burst
+also requires the preceding active audio to exceed a deliberately generous
+reading-duration budget for that chunk's text. Pauses do not consume this
+budget, and the budget alone cannot remove a voiced continuation.
+
+The duration budget counts Unicode letters, wide-script characters and digits
+conservatively, excluding bracket tags. It is a heuristic rather than speech
+alignment. These waveform checks cannot reliably recognize hallucinated words
+or establish that the requested text was spoken. Ambiguous continuations are
+kept, so some nonstationary artifacts may remain for listening review.
+
+Leading/trailing edge trimming and the cosine fade remain. The trim retains up
+to 200 ms of the original trailing silence. A final partial analysis frame is
+included so it cannot silently discard a short ending. Kokoro continues using
+`max_internal_silence_ms=None` for edge-only trimming.
+
+`generate_chunked` supplies each actual chunk or retry subdivision through an
+optional `text` keyword when the trim callback accepts it. Existing
+`(audio, sample_rate)` callbacks still work. The separate runaway retry detector
+and its engine-specific settings are unchanged.
+
+Deterministic regression cases cover voiced pauses, quiet room noise, breathy
+continuations, obvious hiss, short endings, retry fallback and legacy callbacks.
+Comparison artifacts from existing speech recordings belong outside the source
+tree. A controlled pause inserted between existing recordings verifies sample
+preservation, not how a real Chatterbox model chooses to pause or terminate.
