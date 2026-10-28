@@ -1,8 +1,10 @@
 import { Mic, Pause, Play, Square } from 'lucide-react';
-import { memo, useEffect, useState } from 'react';
+import { memo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Visualizer } from 'react-sound-visualizer';
 import { Button } from '@/components/ui/button';
+import { MicrophoneSelector } from '@/components/MicrophoneSelector/MicrophoneSelector';
+import { useMicrophonePreview } from '@/lib/hooks/useMicrophonePreview';
 import { FormControl, FormItem, FormMessage } from '@/components/ui/form';
 import { formatAudioDuration } from '@/lib/utils/audio';
 
@@ -25,6 +27,8 @@ const MemoizedWaveform = memo(function MemoizedWaveform({
 interface AudioSampleRecordingProps {
   file: File | null | undefined;
   isRecording: boolean;
+  isStarting?: boolean;
+  recordingStream?: MediaStream | null;
   duration: number;
   onStart: () => void;
   onStop: () => void;
@@ -39,6 +43,8 @@ interface AudioSampleRecordingProps {
 export function AudioSampleRecording({
   file,
   isRecording,
+  isStarting = false,
+  recordingStream,
   duration,
   onStart,
   onStop,
@@ -50,44 +56,22 @@ export function AudioSampleRecording({
   showWaveform = true,
 }: AudioSampleRecordingProps) {
   const { t } = useTranslation();
-  const [audioStream, setAudioStream] = useState<MediaStream | null>(null);
-
-  // Request microphone access when component mounts
-  useEffect(() => {
-    if (!showWaveform) return;
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
-
-    let stream: MediaStream | null = null;
-
-    navigator.mediaDevices
-      .getUserMedia({ audio: true, video: false })
-      .then((s) => {
-        stream = s;
-        setAudioStream(s);
-      })
-      .catch((err) => {
-        console.warn('Could not access microphone for visualization:', err);
-      });
-
-    return () => {
-      if (stream) {
-        stream.getTracks().forEach((track) => {
-          track.stop();
-        });
-      }
-    };
-  }, [showWaveform]);
+  const preview = useMicrophonePreview(showWaveform && !file && !isRecording && !isStarting);
+  const audioStream = isRecording ? recordingStream : preview.stream;
 
   return (
     <FormItem>
       <FormControl>
         <div className="space-y-4">
+          <MicrophoneSelector disabled={isRecording || isStarting} />
+          {preview.error && <p role="alert" className="text-sm text-destructive">{preview.error}</p>}
           {!isRecording && !file && (
             <div className="relative flex flex-col items-center justify-center gap-4 p-4 border-2 border-dashed rounded-lg min-h-[180px] overflow-hidden">
               {showWaveform && audioStream && <MemoizedWaveform audioStream={audioStream} />}
               <Button
                 type="button"
                 onClick={onStart}
+                disabled={isStarting}
                 size="lg"
                 className="relative z-10 flex items-center gap-2"
               >

@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { usePlatform } from '@/platform/PlatformContext';
 import { convertToWav } from '@/lib/utils/audio';
+import { microphoneErrorMessage, requestMicrophone } from '@/lib/utils/microphone';
+import { usePlatform } from '@/platform/PlatformContext';
+import { useMicrophoneStore } from '@/stores/microphoneStore';
 
 interface UseAudioRecordingOptions {
   maxDurationSeconds?: number;
@@ -13,6 +15,9 @@ export function useAudioRecording({
 }: UseAudioRecordingOptions = {}) {
   const platform = usePlatform();
   const [isRecording, setIsRecording] = useState(false);
+  const [isStarting, setIsStarting] = useState(false);
+  const [audioStream, setAudioStream] = useState<MediaStream | null>(null);
+  const requestRef = useRef<AbortController | null>(null);
   const [duration, setDuration] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -23,6 +28,10 @@ export function useAudioRecording({
   const cancelledRef = useRef<boolean>(false);
 
   const startRecording = useCallback(async () => {
+    if (requestRef.current || mediaRecorderRef.current?.state === 'recording') return;
+    const controller = new AbortController();
+    requestRef.current = controller;
+    setIsStarting(true);
     try {
       setError(null);
       chunksRef.current = [];
@@ -59,15 +68,20 @@ export function useAudioRecording({
       }
 
       // Request microphone access
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
+      const stream = await requestMicrophone(
+        navigator.mediaDevices,
+        useMicrophoneStore.getState().deviceId,
+        controller.signal,
+      );
 
+      if (controller.signal.aborted) {
+        stream.getTracks().forEach((track) => {
+          track.stop();
+        });
+        return;
+      }
       streamRef.current = stream;
+      setAudioStream(stream);
 
       // Create MediaRecorder with preferred MIME type
       const options: MediaRecorderOptions = {
@@ -100,10 +114,18 @@ export function useAudioRecording({
         const webmBlob = new Blob(chunksRef.current, { type: 'audio/webm' });
 
         // Stop all tracks now that we have the data
-        streamRef.current?.getTracks().forEach((track) => {
+        stream.getTracks().forEach((track) => {
           track.stop();
         });
-        streamRef.current = null;
+        if (streamRef.current === stream) {
+          streamRef.current = null;
+          setAudioStream(null);
+          setIsRecording(false);
+          if (timerRef.current !== null) {
+            clearInterval(timerRef.current);
+            timerRef.current = null;
+          }
+        }
 
         // Don't fire completion callback if the recording was cancelled
         if (wasCancelled) return;
@@ -155,18 +177,27 @@ export function useAudioRecording({
         }
       }, 100);
     } catch (err) {
-      const errorMessage =
-        err instanceof Error
-          ? err.message
-          : 'Failed to access microphone. Please check permissions.';
-      setError(errorMessage);
-      setIsRecording(false);
+      if (controller.signal.aborted) return;
+      streamRef.current?.getTracks().forEach((track) => {
+        track.stop();
+      });
+      streamRef.current = null;
+      if (!controller.signal.aborted) {
+        setAudioStream(null);
+        setError(microphoneErrorMessage(err));
+        setIsRecording(false);
+      }
+    } finally {
+      if (requestRef.current === controller) {
+        requestRef.current = null;
+        setIsStarting(false);
+      }
     }
-  }, [maxDurationSeconds, onRecordingComplete]);
+  }, [maxDurationSeconds, onRecordingComplete, platform.metadata.isTauri]);
 
   const stopRecording = useCallback(() => {
     if (mediaRecorderRef.current && isRecording) {
-      mediaRecorderRef.current.stop();
+      if (mediaRecorderRef.current.state !== 'inactive') mediaRecorderRef.current.stop();
       setIsRecording(false);
 
       if (timerRef.current !== null) {
@@ -177,7 +208,10 @@ export function useAudioRecording({
   }, [isRecording]);
 
   const cancelRecording = useCallback(() => {
-    if (mediaRecorderRef.current) {
+    requestRef.current?.abort();
+    requestRef.current = null;
+    setIsStarting(false);
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
       cancelledRef.current = true; // Must be set before stop() triggers onstop
       chunksRef.current = [];
       mediaRecorderRef.current.stop();
@@ -190,6 +224,7 @@ export function useAudioRecording({
       track.stop();
     });
     streamRef.current = null;
+    setAudioStream(null);
 
     if (timerRef.current !== null) {
       clearInterval(timerRef.current);
@@ -200,6 +235,9 @@ export function useAudioRecording({
   // Cleanup on unmount
   useEffect(() => {
     return () => {
+      cancelledRef.current = true;
+      requestRef.current?.abort();
+      requestRef.current = null;
       if (timerRef.current !== null) {
         clearInterval(timerRef.current);
       }
@@ -211,6 +249,8 @@ export function useAudioRecording({
 
   return {
     isRecording,
+    isStarting,
+    audioStream,
     duration,
     error,
     startRecording,

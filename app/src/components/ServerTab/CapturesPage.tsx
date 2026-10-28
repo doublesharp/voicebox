@@ -7,6 +7,7 @@ import { CapturePill, type PillState } from '@/components/CapturePill/CapturePil
 import { DictationReadinessChecklist } from '@/components/CapturesTab/DictationReadinessChecklist';
 import { ChordPicker } from '@/components/ChordPicker/ChordPicker';
 import { Button } from '@/components/ui/button';
+import { MicrophoneSelector } from '@/components/MicrophoneSelector/MicrophoneSelector';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -227,6 +228,7 @@ export function CapturesPage() {
   return (
     <div className="flex gap-8 items-start max-w-5xl">
       <div className="flex-1 min-w-0 max-w-2xl space-y-10">
+        <div className="max-w-xl"><MicrophoneSelector /></div>
       <SettingSection
         title={t('settings.captures.dictation.title')}
         description={t('settings.captures.dictation.description')}
