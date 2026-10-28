@@ -9,6 +9,7 @@ Short text (≤ max_chunk_chars) uses the single-shot fast path with zero
 overhead.
 """
 
+import inspect
 import logging
 import re
 from typing import List, Tuple
@@ -241,7 +242,9 @@ async def generate_chunked(
     trim_fn : callable | None
         Optional ``(audio, sample_rate) -> audio`` post-processing
         function applied to each chunk before concatenation (e.g.
-        ``trim_tts_output`` for Chatterbox engines).
+        ``trim_tts_output`` for Chatterbox engines). Callbacks accepting a
+        ``text`` keyword receive the actual chunk or retry text; existing
+        two-argument callbacks are unchanged.
     runaway_detector : callable | None
         Optional ``(audio, sample_rate) -> bool`` detector. When it flags
         unstable output, the affected text is split in half and retried.
@@ -250,6 +253,19 @@ async def generate_chunked(
     -------
     (audio, sample_rate) : Tuple[np.ndarray, int]
     """
+    accepts_text = False
+    if trim_fn is not None:
+        try:
+            inspect.signature(trim_fn).bind(None, None, text="")
+            accepts_text = True
+        except (TypeError, ValueError):
+            pass
+
+    def trim_chunk(audio, sample_rate, chunk_text):
+        if accepts_text:
+            return trim_fn(audio, sample_rate, text=chunk_text)
+        return trim_fn(audio, sample_rate)
+
     async def generate_one(
         chunk_text: str,
         chunk_seed: int | None,
@@ -273,7 +289,7 @@ async def generate_chunked(
                         "Unstable TTS output for %d chars could not be retried further; keeping trimmed output",
                         len(chunk_text),
                     )
-                    return np.asarray(trim_fn(chunk_audio, chunk_sr), dtype=np.float32), chunk_sr
+                    return np.asarray(trim_chunk(chunk_audio, chunk_sr, chunk_text), dtype=np.float32), chunk_sr
                 raise RuntimeError(
                     "TTS output remained unstable after retrying smaller text chunks"
                 )
@@ -312,7 +328,7 @@ async def generate_chunked(
             )
 
         if trim_fn is not None:
-            chunk_audio = trim_fn(chunk_audio, chunk_sr)
+            chunk_audio = trim_chunk(chunk_audio, chunk_sr, chunk_text)
         return np.asarray(chunk_audio, dtype=np.float32), chunk_sr
 
     chunks = split_text_into_chunks(text, max_chunk_chars)
