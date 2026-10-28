@@ -44,6 +44,8 @@ import { clipFrames, formatTime, isJobActive, timelineEnd, toSamples } from './d
 import { studioShortcut } from './keyboard';
 import { StudioPlayback } from './playback';
 import { Review } from './Review';
+import { ReviewClient } from './review-client';
+import { ReviewSessions } from './review-session';
 import { ScriptEditor } from './ScriptEditor';
 import { errorMessage, ProjectSession, type RecoveryStorage } from './session';
 import { ClipInspector, Mixer, Timeline } from './Timeline';
@@ -89,6 +91,11 @@ function ProjectWorkspace({
     () => new ProjectSession(client, projectId, storage),
     [client, projectId],
   );
+  const reviewSessions = useMemo(
+    () => new ReviewSessions(new ReviewClient(server), projectId, storage),
+    [server, projectId],
+  );
+  useSyncExternalStore(reviewSessions.subscribe, reviewSessions.getSnapshot);
   const save = useSyncExternalStore(session.subscribe, session.getSnapshot);
   const playback = useMemo(
     () =>
@@ -151,8 +158,8 @@ function ProjectWorkspace({
         return false;
       const current = session.getSnapshot();
       return (
-        !current.recoverySaved &&
-        current.status !== 'saved' &&
+        (reviewSessions.unsafeToLeave() ||
+          (!current.recoverySaved && current.status !== 'saved')) &&
         !window.confirm(
           'Local recovery storage is unavailable. Leave and lose unacknowledged edits? Cancel to export a recovery copy first.',
         )
@@ -162,7 +169,10 @@ function ProjectWorkspace({
   useEffect(() => {
     alive.current = true;
     void session.load();
-    const poll = setInterval(() => void session.refresh(), 1800);
+    const poll = setInterval(() => {
+      void session.refresh();
+      void reviewSessions.refresh();
+    }, 1800);
     const unsubscribe = usePlayerStore.subscribe((state, previous) => {
       if (
         (state.isPlaying && !previous.isPlaying) ||
@@ -175,9 +185,10 @@ function ProjectWorkspace({
       clearInterval(poll);
       unsubscribe();
       session.dispose();
+      reviewSessions.dispose();
       playback.dispose();
     };
-  }, [session, playback]);
+  }, [session, playback, reviewSessions]);
   useEffect(() => {
     const request = new AbortController();
     setCapabilitiesError(null);
@@ -214,6 +225,7 @@ function ProjectWorkspace({
   useEffect(() => {
     const beforeUnload = (event: BeforeUnloadEvent) => {
       if (
+        reviewSessions.unsafeToLeave() ||
         ['dirty', 'saving', 'error', 'conflict', 'recovery'].includes(session.getSnapshot().status)
       ) {
         event.preventDefault();
@@ -222,7 +234,7 @@ function ProjectWorkspace({
     };
     window.addEventListener('beforeunload', beforeUnload);
     return () => window.removeEventListener('beforeunload', beforeUnload);
-  }, [session]);
+  }, [session, reviewSessions]);
   const selectPassage = useCallback((id: string) => {
     setSelectedPassageId(id);
     setSelectedClipId(null);
@@ -462,6 +474,7 @@ function ProjectWorkspace({
         actionError,
         runAction,
         canMutate,
+        reviewSessions,
       }}
     >
       <section

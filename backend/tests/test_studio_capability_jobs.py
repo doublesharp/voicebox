@@ -118,7 +118,7 @@ def test_migration_three_retains_v2_request_and_backup(tmp_path):
         db.execute("INSERT INTO job_requests VALUES ('project','key','request','response')")
     migrate(path)
     with sqlite3.connect(path) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 4
         assert db.execute("SELECT request,response FROM job_requests").fetchone() == ("request", "response")
     backup = next((tmp_path / "backups").glob("studio-v2-*.sqlite"))
     with sqlite3.connect(backup) as db:

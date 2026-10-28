@@ -57,10 +57,12 @@ def make_router(store, jobs=None):
     from .preview import make_preview_router
     from .waveforms import make_waveform_router
     from .audition import make_audition_router
+    from .reviews import make_review_router
 
     router.include_router(make_preview_router(store))
     router.include_router(make_waveform_router(store))
     router.include_router(make_audition_router(store))
+    router.include_router(make_review_router(store))
     jobs = jobs or StudioJobs(store)
 
     def get_delivery():
@@ -146,8 +148,10 @@ def make_router(store, jobs=None):
     @router.get("/projects/{project_id}/archive")
     def archive(project_id: str):
         from .archive import write_archive
+        from .reviews import StudioReviews
 
         project = call(store.get_project, project_id)
+        project["reviews"] = call(StudioReviews(store).export, project_id)
         target = store.root / (".archive-" + uid() + ".zip")
         try:
             call(write_archive, project, project["assets"], store.asset_path, target)

@@ -137,3 +137,12 @@ def read_archive(archive_path, destination, *, max_total_bytes=1073741824,
 Renderer has no store/database imports. Use existing numpy/soundfile/scipy/FFmpeg capabilities where installed. Preserve sources, fixed clip starts, trims, gains/fades, overlaps and track mute/solo. Silence is not a measurable loudness value. True peak/LUFS claims require a qualified implementation; if missing, report unavailable and do not label RMS/peak clipping as equivalent. Archive routines have no store imports and reject traversal, symlinks, unsupported schema, hash/size mismatches, oversized expansion, and missing required audio.
 
 Core backend imports those pure modules through thin services. The initial store, metadata/API/generation implementation must remain usable while renderer/archive modules are developed in parallel. Root owns the final integration and resolves a justified contract change across workers.
+
+
+## Checkpoint reviews and native publication
+
+`GET /studio/v1/projects/{project_id}/reviews/{revision_id}` returns `{review}`. An untouched checkpoint has version 0, empty note/checklist and null update time. `POST` accepts `operation_id`, `expected_version`, `note` and ordered `checklist` entries `{id,label,checked}`. Saving uses independent version CAS and exact request replay. `POST .../approvals` accepts the operation and acknowledged review version, atomically freezes the saved note/checklist into a local approval, and returns `{review,project}`. Changed replay content conflicts. Approval of an unsaved version 0 is rejected.
+
+Review keystrokes and uncertain save/approval identities are journaled per session and checkpoint, preserving original versions through refresh and restart. Unacknowledged newer typing survives acknowledgement; explicit recovery never consumes another window's journal. Checklist comparison ignores JSON object key order while preserving entry order and values. Archives include only persisted reviews for included checkpoints, remap identity fields only, and restore them in the same import transaction.
+
+Platform saves return `saved`, `cancelled`, or browser `download_started`; legacy void adapters remain compatible. Native save commands own the destination chooser, stream URL downloads into an exclusive sibling staging file, flush/sync before rename, and preserve existing Unix file permissions. The URL bridge avoids loading long downloads into JavaScript. These source and filesystem guarantees do not establish dialog, Windows ACL/replacement or packaged-runtime qualification.

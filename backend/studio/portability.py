@@ -2,9 +2,13 @@
 
 import copy
 import shutil
+
 import soundfile as sf
-from .storage import encode, now, uid
+
 from .publication import discard_unregistered, publish_audio
+from .review_schema import remap_reviews, validate_reviews
+from .reviews import restore_reviews
+from .storage import encode, now, uid
 
 
 def import_archive(store, archive_path):
@@ -16,6 +20,7 @@ def import_archive(store, archive_path):
     try:
         payload = read_archive(archive_path, staging)
         project = payload["project"]
+        validate_reviews(project)
         assets = payload["assets"]
         for asset in assets:
             info = sf.info(asset["path"])
@@ -96,6 +101,7 @@ def import_archive(store, archive_path):
             for recording in item["recordings"]:
                 for key in ("clip_id", "take_id"):
                     recording[key] = ref(recording[key])
+        imported["reviews"] = remap_reviews(project, mapping)
         project_id = imported["id"]
         stamp = now()
         with store.connect() as db:
@@ -146,6 +152,7 @@ def import_archive(store, archive_path):
                         revision["project_revision"],
                     ),
                 )
+            restore_reviews(db, project_id, imported["reviews"])
             for approval in imported.get("approvals", []):
                 if not db.execute(
                     "SELECT 1 FROM revisions WHERE id=? AND project_id=?", (approval["revision_id"], project_id)
