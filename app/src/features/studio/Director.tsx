@@ -1,11 +1,12 @@
-import { Check, Headphones, Sparkles } from 'lucide-react';
+import { Sparkles } from 'lucide-react';
 import { useState } from 'react';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { useStudio } from './context';
-import { engineForPassage, formatTime } from './domain';
+import { engineForPassage } from './domain';
 import { operationId } from './session';
 import { useDurableSubmission } from './submissions';
+import { TakeWorkflow } from './TakeWorkflow';
 import { Field, NumberField, StudioButton } from './ui';
 
 export function Director() {
@@ -13,7 +14,7 @@ export function Director() {
   const { project, session, save, selectedPassageId, profiles, engines, client } = studio;
   const [count, setCount] = useState<1 | 2 | 3>(1);
   const [adopt, setAdopt] = useState(false);
-  const [replaceClips, setReplaceClips] = useState(false);
+  const [commercialOnly, setCommercialOnly] = useState(false);
   const {
     request,
     rejected,
@@ -21,8 +22,19 @@ export function Director() {
     error: submissionError,
     submit,
   } = useDurableSubmission(session.storage, client.baseUrl, project.id, 'generation');
+  const commercialFilter = request ? request.commercial_only === true : commercialOnly;
+  const eligibleEngines = commercialFilter
+    ? engines.filter((item) => item.commercial_use === 'allowed')
+    : engines;
+  const eligibleProfiles = commercialFilter
+    ? profiles.filter((profile) =>
+        eligibleEngines.some(
+          (item) => item.id === (profile.preset_engine || profile.default_engine),
+        ),
+      )
+    : profiles;
   const passage = project.document.passages.find((p) => p.id === selectedPassageId);
-  const engine = engineForPassage(passage, profiles, engines);
+  const engine = engineForPassage(passage, profiles, eligibleEngines);
   const recoveryChoices = save.status === 'recovery' ? session.recoverableJournals() : [];
   const recoveryPanel = recoveryChoices.length > 1 && (
     <div className="studio-recovery">
@@ -80,7 +92,6 @@ export function Director() {
   const selectedIds = studio.checkedPassages.length
     ? studio.checkedPassages.filter((id) => project.document.passages.some((p) => p.id === id))
     : [passage.id];
-  const takes = project.takes.filter((take) => take.passage_id === passage.id);
   const direction = save.drafts[passage.id]?.direction ?? passage.direction;
   const currentText = save.drafts[passage.id]?.text ?? passage.text;
   const disabled = !studio.canMutate || passage.locked;
@@ -91,12 +102,15 @@ export function Director() {
     passage.voice_snapshot?.default_engine ||
     profile?.preset_engine ||
     profile?.default_engine;
-  const variants = engines.filter((variant) => variant.id === engineId && variant.model_size);
+  const variants = eligibleEngines.filter(
+    (variant) => variant.id === engineId && variant.model_size,
+  );
   const incompatible = !engine?.supports_instruct && !!direction.instruct;
   const editDisabled = passage.locked || save.status === 'recovery';
   const incompatibleSeed = !engine?.supports_seed && direction.seed !== null;
   const unsupportedTags = (currentText.match(/\[[^\]\n]+\]/g) ?? []).filter(
     (tag) =>
+      engine?.recognized_tags?.some((known) => known.toLowerCase() === tag.toLowerCase()) &&
       !engine?.expressive_tags.some(
         (supported) =>
           supported.replace(/^\[|\]$/g, '').toLowerCase() === tag.slice(1, -1).toLowerCase(),
@@ -109,7 +123,13 @@ export function Director() {
     }
     await studio.runAction(async () => {
       await submit(
-        () => ({ idempotency_key: operationId(), passage_ids: selectedIds, count, adopt }),
+        () => ({
+          idempotency_key: operationId(),
+          passage_ids: selectedIds,
+          count,
+          adopt,
+          ...(commercialOnly ? { commercial_only: true } : {}),
+        }),
         (input) => client.generate(project.id, input),
       );
     });
@@ -134,8 +154,10 @@ export function Director() {
           disabled={disabled || studio.actionBusy}
           onChange={(event) => {
             if (event.target.value) {
-              const nextProfile = profiles.find((profile) => profile.id === event.target.value);
-              const nextVariants = engines.filter(
+              const nextProfile = eligibleProfiles.find(
+                (profile) => profile.id === event.target.value,
+              );
+              const nextVariants = eligibleEngines.filter(
                 (variant) =>
                   variant.id === (nextProfile?.preset_engine || nextProfile?.default_engine),
               );
@@ -152,10 +174,10 @@ export function Director() {
           }}
         >
           <option value="">Choose a voice</option>
-          {passage.profile_id && !profiles.some((p) => p.id === passage.profile_id) && (
-            <option value={passage.profile_id}>Saved voice (profile unavailable)</option>
+          {passage.profile_id && !eligibleProfiles.some((p) => p.id === passage.profile_id) && (
+            <option value={passage.profile_id}>Saved voice (unavailable in this filter)</option>
           )}
-          {profiles.map((profile) => (
+          {eligibleProfiles.map((profile) => (
             <option key={profile.id} value={profile.id}>
               {profile.name} · {profile.language}
             </option>
@@ -223,7 +245,7 @@ export function Director() {
           label="Delivery direction"
           hint={
             incompatible
-              ? 'Inactive for this engine. Stored direction is retained; resolve it before generating.'
+              ? 'Inactive for this engine. Stored direction is retained and excluded from generation.'
               : 'Performance instructions supported by this engine.'
           }
         >
@@ -315,6 +337,22 @@ export function Director() {
         />
       </details>
       <div className="studio-generate-box">
+        <label className="studio-check">
+          <input
+            type="checkbox"
+            aria-label="Commercial-use models only"
+            checked={commercialFilter}
+            disabled={studio.actionBusy || !!request}
+            onChange={(event) => setCommercialOnly(event.target.checked)}
+          />{' '}
+          Commercial-use models only
+        </label>
+        {commercialFilter && (
+          <p className="studio-note">
+            Models with restricted or unknown terms are excluded.
+            {!eligibleEngines.length && ' No eligible models are currently reported.'}
+          </p>
+        )}
         {submissionError && (
           <p role="alert" className="studio-error">
             {submissionError}
@@ -362,8 +400,6 @@ export function Director() {
                 !passage.profile_id ||
                 !currentText.trim() ||
                 studio.actionBusy ||
-                incompatible ||
-                incompatibleSeed ||
                 unsupportedTags.length > 0 ||
                 (engine.languages.length > 0 &&
                   !engine.languages.includes(
@@ -388,87 +424,7 @@ export function Director() {
             : 'Keeps your current selected takes.'}
         </p>
       </div>
-      <div className="studio-section-title">
-        <h3>Takes</h3>
-        <span>{takes.length}</span>
-      </div>
-      {takes.length > 0 && (
-        <label className="studio-check">
-          <input
-            type="checkbox"
-            checked={replaceClips}
-            onChange={(event) => setReplaceClips(event.target.checked)}
-          />{' '}
-          Replace linked timeline clips when choosing
-        </label>
-      )}
-      {!takes.length && (
-        <p className="studio-note">
-          Completed performances appear here. Your existing take stays selected if a job fails.
-        </p>
-      )}
-      <div className="studio-takes">
-        {takes
-          .slice()
-          .reverse()
-          .map((take, index) => {
-            const asset = project.assets.find((a) => a.id === take.asset_id);
-            return (
-              <div
-                className={`studio-take ${passage.selected_take_id === take.id ? 'is-selected' : ''}`}
-                key={take.id}
-              >
-                <div className="studio-take-title">
-                  <strong>Take {takes.length - index}</strong>
-                  <span>{asset ? formatTime(asset.duration) : 'Audio missing'}</span>
-                </div>
-                <p>
-                  {take.engine}
-                  {take.model_size ? ` · ${take.model_size}` : ''}
-                </p>
-                {take.text !== currentText && (
-                  <span className="studio-status-chip">Different script</span>
-                )}
-                <div className="studio-action-row">
-                  <StudioButton
-                    disabled={!asset}
-                    onClick={() =>
-                      void studio.playback.audition(
-                        client.assetAudio(take.asset_id),
-                        `Take ${takes.length - index}`,
-                      )
-                    }
-                  >
-                    <Headphones size={14} /> Audition
-                  </StudioButton>
-                  <StudioButton
-                    disabled={disabled || passage.selected_take_id === take.id}
-                    onClick={() =>
-                      void session.command('select_take', {
-                        passage_id: passage.id,
-                        take_id: take.id,
-                        replace_clips: replaceClips,
-                      })
-                    }
-                  >
-                    {passage.selected_take_id === take.id ? (
-                      <>
-                        <Check size={14} /> Selected
-                      </>
-                    ) : (
-                      'Use take'
-                    )}
-                  </StudioButton>
-                </div>
-                <details>
-                  <summary>Performance snapshot</summary>
-                  <p className="studio-take-script">{take.text}</p>
-                  <pre>{JSON.stringify(take.request, null, 2)}</pre>
-                </details>
-              </div>
-            );
-          })}
-      </div>
+      <TakeWorkflow key={passage.id} passage={passage} currentText={currentText} />
     </div>
   );
 }

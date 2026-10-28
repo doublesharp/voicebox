@@ -116,6 +116,20 @@ def _validate_document(doc, assets, takes):
     passages = _records(doc.get("passages"), "passage")
     tracks = _records(doc.get("tracks"), "track")
     clips = _records(doc.get("clips"), "clip")
+    annotations = doc.get("take_annotations", {})
+    if not isinstance(annotations, dict):
+        raise ValueError("invalid take annotations")
+    for take_id, annotation in annotations.items():
+        if (
+            take_id not in takes
+            or not isinstance(annotation, dict)
+            or set(annotation) != {"name", "note"}
+            or any(
+                not isinstance(annotation[key], str) or len(annotation[key]) > limit
+                for key, limit in (("name", 120), ("note", 4000))
+            )
+        ):
+            raise ValueError("invalid take annotation")
     if not isinstance(doc.get("language"), str) or not doc["language"]:
         raise ValueError("invalid project language")
     for passage in passages.values():

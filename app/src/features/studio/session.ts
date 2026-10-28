@@ -11,10 +11,12 @@ export type SaveStatus =
 export interface SessionState {
   project: StudioProject | null;
   drafts: Record<string, PassageEdit>;
+  takeDrafts: Record<string, TakeAnnotationEdit>;
   status: SaveStatus;
   error: string | null;
   recoverySaved: boolean;
 }
+type TakeAnnotationEdit = { name?: string; note?: string };
 export interface RecoveryStorage {
   readonly length?: number;
   key?(index: number): string | null;
@@ -38,12 +40,14 @@ interface PendingMutation {
   type?: StudioCommandType;
   payload: Record<string, unknown>;
   edit?: { id: string; value: PassageEdit };
+  takeEdit?: { id: string; value: TakeAnnotationEdit };
 }
 interface RecoveryJournal {
-  version: 1;
+  version: 1 | 2;
   project_id: string;
   base_revision: number;
   drafts: Record<string, PassageEdit>;
+  takeDrafts?: Record<string, TakeAnnotationEdit>;
   queue: PendingMutation[];
 }
 interface RecoveryRecord {
@@ -62,6 +66,7 @@ export class ProjectSession {
   private state: SessionState = {
     project: null,
     drafts: {},
+    takeDrafts: {},
     status: 'loading',
     error: null,
     recoverySaved: true,
@@ -119,10 +124,14 @@ export class ProjectSession {
         try {
           const value = JSON.parse(raw) as RecoveryJournal;
           if (
-            value.version === 1 &&
+            (value.version === 1 || value.version === 2) &&
             value.project_id === this.id &&
             Number.isInteger(value.base_revision) &&
             value.drafts &&
+            (value.version === 1 ||
+              (value.takeDrafts &&
+                typeof value.takeDrafts === 'object' &&
+                !Array.isArray(value.takeDrafts))) &&
             Array.isArray(value.queue)
           )
             journal = value;
@@ -178,10 +187,11 @@ export class ProjectSession {
   private currentJournal() {
     return JSON.stringify(
       {
-        version: 1,
+        version: 2,
         project_id: this.id,
         base_revision: this.journalBaseRevision ?? this.state.project?.revision ?? 0,
         drafts: this.state.drafts,
+        takeDrafts: this.state.takeDrafts,
         queue: this.queue,
       },
       null,
@@ -191,7 +201,7 @@ export class ProjectSession {
   private persist() {
     if (this.unreadableRecovery) return;
     try {
-      if (!this.queue.length && !Object.keys(this.state.drafts).length) {
+      if (!this.queue.length && !this.hasDrafts()) {
         this.storage.removeItem(this.key);
         this.journalBaseRevision = null;
       } else this.storage.setItem(this.key, this.currentJournal());
@@ -205,6 +215,28 @@ export class ProjectSession {
     clearTimeout(this.maxTimer);
     this.idleTimer = undefined;
     this.maxTimer = undefined;
+  }
+  private hasDrafts() {
+    return (
+      Object.keys(this.state.drafts).length > 0 || Object.keys(this.state.takeDrafts).length > 0
+    );
+  }
+  editTakeAnnotation(id: string, edit: TakeAnnotationEdit) {
+    if (
+      !this.state.project?.takes.some((take) => take.id === id) ||
+      this.state.status === 'recovery'
+    )
+      return;
+    this.journalBaseRevision ??= this.state.project.revision;
+    this.emit({
+      takeDrafts: { ...this.state.takeDrafts, [id]: { ...this.state.takeDrafts[id], ...edit } },
+      status: this.blocked() ? this.state.status : this.active ? 'saving' : 'dirty',
+    });
+    this.persist();
+    if (this.blocked()) return;
+    clearTimeout(this.idleTimer);
+    this.idleTimer = setTimeout(() => void this.flush(), 450);
+    this.maxTimer ??= setTimeout(() => void this.flush(), 2000);
   }
   editPassage(id: string, edit: PassageEdit) {
     const passage = this.state.project?.document.passages.find((p) => p.id === id);
@@ -232,6 +264,19 @@ export class ProjectSession {
         type: 'update_passage',
         payload: { passage_id: id, ...structuredClone(value) },
         edit: { id, value: structuredClone(value) },
+      });
+    }
+    for (const [id, value] of Object.entries(this.state.takeDrafts)) {
+      if (
+        this.queue.some((entry) => entry.takeEdit?.id === id && same(entry.takeEdit.value, value))
+      )
+        continue;
+      this.queue.push({
+        operation_id: operationId(),
+        kind: 'command',
+        type: 'annotate_take',
+        payload: { take_id: id, ...structuredClone(value) },
+        takeEdit: { id, value: structuredClone(value) },
       });
     }
   }
@@ -285,15 +330,19 @@ export class ProjectSession {
         const newerHead = result.revision < (this.state.project?.revision ?? 0);
         this.journalBaseRevision = result.revision;
         const drafts = { ...this.state.drafts };
+        const takeDrafts = { ...this.state.takeDrafts };
         if (entry.edit && same(drafts[entry.edit.id], entry.edit.value))
           delete drafts[entry.edit.id];
+        if (entry.takeEdit && same(takeDrafts[entry.takeEdit.id], entry.takeEdit.value))
+          delete takeDrafts[entry.takeEdit.id];
         this.emit({
           project:
             result.revision >= (this.state.project?.revision ?? 0) ? result : this.state.project,
           drafts,
+          takeDrafts,
         });
         this.persist();
-        if (newerHead && (this.queue.length || Object.keys(drafts).length)) {
+        if (newerHead && (this.queue.length || this.hasDrafts())) {
           this.emit({
             status: 'conflict',
             error:
@@ -314,14 +363,9 @@ export class ProjectSession {
         return;
       }
     }
-    if (!Object.keys(this.state.drafts).length && !this.disposed)
-      this.recovered = this.readRecovery();
+    if (!this.hasDrafts() && !this.disposed) this.recovered = this.readRecovery();
     this.emit({
-      status: Object.keys(this.state.drafts).length
-        ? 'dirty'
-        : this.recovered.length
-          ? 'recovery'
-          : 'saved',
+      status: this.hasDrafts() ? 'dirty' : this.recovered.length ? 'recovery' : 'saved',
     });
   }
   async command(type: StudioCommandType, payload: Record<string, unknown> = {}): Promise<boolean> {
@@ -377,6 +421,7 @@ export class ProjectSession {
       this.queue[0]?.expected_revision === undefined;
     this.emit({
       drafts: recovery.drafts,
+      takeDrafts: recovery.takeDrafts ?? {},
       status: changed ? 'conflict' : 'dirty',
       error: changed
         ? 'The saved draft changed while this recovery copy was offline. Export your copy before reloading.'
@@ -399,7 +444,7 @@ export class ProjectSession {
       this.journalBaseRevision = null;
       this.queue = [];
       this.epoch++;
-      this.emit({ project, drafts: {}, status: 'saved', error: null });
+      this.emit({ project, drafts: {}, takeDrafts: {}, status: 'saved', error: null });
       this.persist();
       this.recovered = this.readRecovery();
       if (this.recovered.length) this.emit({ status: 'recovery' });
@@ -416,7 +461,7 @@ export class ProjectSession {
       const currentRevision = this.state.project?.revision ?? 0;
       if (
         project.revision > currentRevision &&
-        (Object.keys(this.state.drafts).length || this.queue.length || this.recovered.length)
+        (this.hasDrafts() || this.queue.length || this.recovered.length)
       ) {
         // Polls may add job/asset information, but may never rebase local editing intent.
         const current = this.state.project;

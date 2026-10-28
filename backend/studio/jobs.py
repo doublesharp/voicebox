@@ -3,21 +3,24 @@
 import copy
 import json
 
-from .storage import Conflict, NotFound, encode, now, uid
 from ..utils.inference import serialized_inference
+from .capabilities import freeze_passage, resolve_voice
+from .job_state import enrich_job, phase, start_attempt
+from .storage import Conflict, NotFound, encode, now, uid
 
 
 class StudioJobs:
-    def __init__(self, store, synth=None, enqueue=None):
+    def __init__(self, store, synth=None, enqueue=None, capability_resolver=None):
         self.store = store
-        self.synth = synth or (lambda request: synthesize(request, store))
+        self.synth = synth
+        self.capability_resolver = capability_resolver or resolve_voice
         if enqueue is None:
             from ..services.task_queue import enqueue_generation
 
             enqueue = enqueue_generation
         self.enqueue = enqueue
 
-    def submit(self, project_id, key, passage_ids, count, adopt):
+    def submit(self, project_id, key, passage_ids, count, adopt, commercial_only=False):
         if (
             not isinstance(key, str)
             or not key.strip()
@@ -27,9 +30,13 @@ class StudioJobs:
             or type(count) is not int
             or count not in (1, 2, 3)
             or type(adopt) is not bool
+            or type(commercial_only) is not bool
         ):
             raise ValueError("Invalid generation request")
         request = dict(passage_ids=passage_ids, count=count, adopt=adopt)
+        # Keep the pre-policy default request identity replay-compatible.
+        if commercial_only:
+            request["commercial_only"] = True
         scheduled = []
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -46,10 +53,18 @@ class StudioJobs:
                     raise NotFound("Passage not found in project")
                 if p["locked"]:
                     raise ValueError("Passage is locked")
+                caps, effective = freeze_passage(p, self.capability_resolver)
+                if commercial_only and caps.get("commercial_use") != "allowed":
+                    raise ValueError(f"Passage {ident}: model is not eligible for commercial-only generation")
+                p = copy.deepcopy(p)
+                if p.get("voice_snapshot") is not None:
+                    p["voice_snapshot"]["capabilities"] = caps
                 for _ in range(count):
                     job_id = uid()
                     timestamp = now()
-                    frozen = dict(passage=p, adopt=adopt)
+                    frozen = dict(passage=p, adopt=adopt, capabilities=caps, effective_direction=effective)
+                    if commercial_only:
+                        frozen["commercial_only"] = True
                     db.execute(
                         "INSERT INTO jobs VALUES (?,?,?,?,?,?,?,?,?,?)",
                         (
@@ -66,7 +81,7 @@ class StudioJobs:
                         ),
                     )
                     scheduled.append(job_id)
-            response = [j for j in self.store._project(db, project_id)["jobs"] if j["id"] in scheduled]
+            response = [enrich_job(db, j) for j in self.store._project(db, project_id)["jobs"] if j["id"] in scheduled]
             db.execute(
                 "INSERT INTO job_requests VALUES (?,?,?,?)", (project_id, key, encode(request), encode(response))
             )
@@ -79,7 +94,9 @@ class StudioJobs:
             row = db.execute("SELECT project_id FROM jobs WHERE id=?", (job_id,)).fetchone()
             if not row:
                 raise NotFound("Job not found")
-            return next(j for j in self.store._project(db, row["project_id"])["jobs"] if j["id"] == job_id)
+            return enrich_job(
+                db, next(j for j in self.store._project(db, row["project_id"])["jobs"] if j["id"] == job_id)
+            )
 
     def cancel(self, job_id):
         with self.store.connect() as db:
@@ -90,6 +107,9 @@ class StudioJobs:
             if row["status"] in ("queued", "running"):
                 status = "cancelled" if row["status"] == "queued" else "cancelling"
                 db.execute("UPDATE jobs SET status=?,updated_at=? WHERE id=?", (status, now(), job_id))
+                last = db.execute("SELECT MAX(attempt) FROM job_attempts WHERE job_id=?", (job_id,)).fetchone()[0]
+                if last is not None:
+                    phase(db, job_id, last, status)
         return self.get(job_id)
 
     def retry(self, job_id):
@@ -124,6 +144,11 @@ class StudioJobs:
                 (now(),),
             )
             db.execute("UPDATE jobs SET status='cancelled',updated_at=? WHERE status='cancelling'", (now(),))
+            interrupted = db.execute(
+                "SELECT a.job_id,a.attempt,j.status FROM job_attempts a JOIN jobs j ON j.id=a.job_id WHERE a.phase IN ('running','loading_model','generating','processing','cancelling') AND j.status IN ('interrupted','cancelled')"
+            ).fetchall()
+            for item in interrupted:
+                phase(db, item["job_id"], item["attempt"], item["status"])
             queued = db.execute("SELECT id,kind FROM jobs WHERE status='queued' ORDER BY created_at,id").fetchall()
         for row in queued:
             if row["kind"] == "generation":
@@ -149,9 +174,34 @@ class StudioJobs:
             db.execute("UPDATE jobs SET status='running',updated_at=? WHERE id=?", (now(), job_id))
             project_id = row["project_id"]
             frozen = json.loads(row["request"])
+            attempt = start_attempt(db, job_id)
+        frozen["creation_job_id"] = job_id
+        frozen["creation_attempt"] = attempt
+
+        def set_phase(value):
+            with self.store.connect() as db:
+                status = db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+                if not status or status["status"] != "running":
+                    raise RuntimeError("Generation cancelled before the next phase")
+                phase(db, job_id, attempt, value)
+
         temporary = self.store.asset_dir / (".generation-" + job_id)
         try:
-            audio, rate = await self.synth(frozen)
+            # Version 0-2 jobs already contain a frozen passage but predate capability
+            # snapshots. Upgrade only that input, without changing request replay identity.
+            if "effective_direction" not in frozen:
+                caps, effective = freeze_passage(frozen["passage"], self.capability_resolver)
+                frozen["capabilities"] = caps
+                frozen["effective_direction"] = effective
+                if frozen["passage"].get("voice_snapshot") is not None:
+                    frozen["passage"]["voice_snapshot"]["capabilities"] = caps
+                stored = {k: v for k, v in frozen.items() if k not in ("creation_job_id", "creation_attempt")}
+                with self.store.connect() as db:
+                    db.execute("UPDATE jobs SET request=? WHERE id=? AND status='running'", (encode(stored), job_id))
+            audio, rate = await (
+                self.synth(frozen) if self.synth is not None else synthesize(frozen, self.store, set_phase)
+            )
+            set_phase("processing")
             sf.write(str(temporary), audio, rate, format="WAV")
             with self.store.connect() as db:
                 row = db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -205,12 +255,16 @@ class StudioJobs:
                         "UPDATE projects SET document=?,undo=?,redo=?,revision=revision+1,updated_at=? WHERE id=?",
                         (encode(project["document"]), encode(undo), "[]", now(), project_id),
                     )
+                phase(db, job_id, attempt, "completed")
                 db.execute(
                     "UPDATE jobs SET status='completed',result=?,updated_at=? WHERE id=?",
                     (encode({"take_id": take_id, "asset_id": asset["id"]}), now(), job_id),
                 )
         except Exception as exc:
             with self.store.connect() as db:
+                status = db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+                if status and status["status"] == "running":
+                    phase(db, job_id, attempt, "failed", str(exc))
                 db.execute(
                     "UPDATE jobs SET status='failed',error=?,updated_at=? WHERE id=? AND status='running'",
                     (str(exc), now(), job_id),
@@ -218,6 +272,9 @@ class StudioJobs:
         finally:
             temporary.unlink(missing_ok=True)
             with self.store.connect() as db:
+                status = db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+                if status and status["status"] == "cancelling":
+                    phase(db, job_id, attempt, "cancelled")
                 db.execute(
                     "UPDATE jobs SET status='cancelled',updated_at=? WHERE id=? AND status='cancelling'",
                     (now(), job_id),
@@ -225,17 +282,17 @@ class StudioJobs:
 
 
 @serialized_inference
-async def synthesize(request, store):
+async def synthesize(request, store, set_phase=None):
     """Use the copied snapshot, never the mutable profile row."""
     from ..backends import (
+        engine_needs_trim,
+        engine_retries_runaway,
         ensure_model_cached_or_raise,
         get_tts_backend_for_engine,
         load_engine_model,
-        engine_needs_trim,
-        engine_retries_runaway,
     )
-    from ..utils.chunked_tts import generate_chunked
     from ..utils.audio import has_tts_runaway, trim_tts_output
+    from ..utils.chunked_tts import generate_chunked
 
     p = request["passage"]
     voice = p.get("voice_snapshot")
@@ -243,6 +300,14 @@ async def synthesize(request, store):
         raise ValueError("Assign a voice before generation")
     engine = voice["engine"]
     size = voice.get("model_size") or "default"
+    if set_phase:
+        set_phase("loading_model")
+    # Refuse a platform/registry change rather than run a different model under a frozen identity.
+    if (
+        request.get("capabilities")
+        and resolve_voice(voice)["registry_identity"] != request["capabilities"]["registry_identity"]
+    ):
+        raise ValueError("Frozen model identity is unavailable on this runtime; reassign the voice")
     await ensure_model_cached_or_raise(engine, size)
     model = get_tts_backend_for_engine(engine)
     await load_engine_model(engine, size)
@@ -267,7 +332,9 @@ async def synthesize(request, store):
                 prompt, _ = await model.create_voice_prompt(str(path), reference_text, use_cache=False)
             finally:
                 path.unlink(missing_ok=True)
-    d = p["direction"]
+    d = request.get("effective_direction", p["direction"])
+    if set_phase:
+        set_phase("generating")
     return await generate_chunked(
         model,
         p["text"],

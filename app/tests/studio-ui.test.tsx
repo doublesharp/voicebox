@@ -121,6 +121,7 @@ const engine: StudioEngine = {
   supports_instruct: false,
   supports_seed: false,
   expressive_tags: [],
+  recognized_tags: ['[laugh]', '[cough]', '[whisper]'],
   ready: true,
   commercial_use: 'unknown',
 };
@@ -369,6 +370,69 @@ test('unsupported stage tags block generation with an explicit wording resolutio
   expect(button('Generate alternatives').props.disabled).toBe(true);
   expect(JSON.stringify(renderer.toJSON())).toContain('Unsupported stage tags: ');
   expect(generations).toHaveLength(0);
+});
+
+test('inactive direction and seed remain saved without blocking a supported generation', async () => {
+  const project = fixture();
+  project.document.passages[0].direction = {
+    instruct: 'Warm',
+    seed: 42,
+    max_chunk_chars: 500,
+    crossfade_ms: 0,
+  };
+  const { generations, session } = await mount(<Director />, { project });
+  expect(button('Generate alternatives').props.disabled).toBe(false);
+  await act(async () => {
+    await button('Generate alternatives').props.onClick();
+  });
+  expect(generations).toHaveLength(1);
+  expect(session.getSnapshot().project?.document.passages[0].direction.instruct).toBe('Warm');
+  expect(session.getSnapshot().project?.document.passages[0].direction.seed).toBe(42);
+});
+
+test('ordinary bracketed prose is not treated as an unsupported expressive tag', async () => {
+  const project = fixture();
+  project.document.passages[0].text = 'Continue with [chapter two].';
+  await mount(<Director />, { project });
+  expect(button('Generate alternatives').props.disabled).toBe(false);
+  expect(JSON.stringify(renderer.toJSON())).not.toContain('Unsupported stage tags: ');
+});
+
+test('commercial-only mode excludes unresolved models before generation', async () => {
+  const { generations } = await mount(<Director />);
+  act(() =>
+    renderer.root
+      .findByProps({ 'aria-label': 'Commercial-use models only' })
+      .props.onChange({ target: { checked: true } }),
+  );
+  expect(button('Generate alternatives').props.disabled).toBe(true);
+  expect(JSON.stringify(renderer.toJSON())).toContain('No eligible models are currently reported');
+  expect(generations).toHaveLength(0);
+});
+
+test('commercial policy survives an uncertain request and component restart', async () => {
+  const store = new Map<string, string>();
+  const available = { ...engine, commercial_use: 'allowed' as const };
+  const first = await mount(<Director />, { store, engines: [available], failGenerate: true });
+  act(() =>
+    renderer.root
+      .findByProps({ 'aria-label': 'Commercial-use models only' })
+      .props.onChange({ target: { checked: true } }),
+  );
+  await act(async () => {
+    await button('Generate alternatives').props.onClick();
+  });
+  expect(first.generations[0]).toMatchObject({ commercial_only: true });
+  act(() => renderer.unmount());
+  first.session.dispose();
+  const reopened = await mount(<Director />, { store, engines: [available] });
+  expect(
+    renderer.root.findByProps({ 'aria-label': 'Commercial-use models only' }).props.checked,
+  ).toBe(true);
+  await act(async () => {
+    await button('Retry same request').props.onClick();
+  });
+  expect(reopened.generations[0]).toEqual(first.generations[0]);
 });
 
 test('generation remount and restart replay the original identity and body before any new submission', async () => {

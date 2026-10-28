@@ -16,6 +16,10 @@ from backend.studio.jobs import StudioJobs
 from backend.studio.storage import StudioStore
 
 
+def fixture_capabilities(voice):
+    return {"languages": ["en"], "expressive_tags": [], "supports_instruct": False, "supports_seed": False}
+
+
 @pytest.mark.asyncio
 async def test_three_passage_delivery_and_clean_profile_archive(tmp_path, monkeypatch):
     tasks = []
@@ -42,7 +46,9 @@ async def test_three_passage_delivery_and_clean_profile_archive(tmp_path, monkey
         return np.sin(np.arange(2400) * 0.1).astype("float32") * 0.1, 24000
 
     store = StudioStore(tmp_path / "author", voice_resolver=voice)
-    jobs = StudioJobs(store, synth=synth, enqueue=lambda ident, coro: schedule(coro))
+    jobs = StudioJobs(
+        store, synth=synth, capability_resolver=fixture_capabilities, enqueue=lambda ident, coro: schedule(coro)
+    )
     monkeypatch.setattr(task_queue, "create_background_task", schedule)
     app = FastAPI()
     app.include_router(make_router(store, jobs))

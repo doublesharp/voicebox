@@ -131,8 +131,21 @@ function deferred<T>() {
   });
   return { promise, resolve, reject };
 }
-function setup() {
+function setup(withTake = false) {
   let current = project();
+  if (withTake)
+    current.takes = [
+      {
+        id: 'take',
+        passage_id: 'p',
+        asset_id: 'audio',
+        text: 'Saved text',
+        engine: 'fixture',
+        model_size: null,
+        created_at: '',
+        request: {},
+      },
+    ];
   const requests: StudioCommand[] = [];
   const transport: StudioTransport = {
     baseUrl: 'http://test',
@@ -141,7 +154,19 @@ function setup() {
       requests.push(command);
       current = structuredClone(current);
       current.revision++;
-      Object.assign(current.document.passages[0], command.payload);
+      if (command.type === 'annotate_take') {
+        current.document.take_annotations = {
+          ...current.document.take_annotations,
+          [String(command.payload.take_id)]: {
+            name: '',
+            note: '',
+            ...current.document.take_annotations?.[String(command.payload.take_id)],
+            ...Object.fromEntries(
+              Object.entries(command.payload).filter(([key]) => key !== 'take_id'),
+            ),
+          },
+        };
+      } else Object.assign(current.document.passages[0], command.payload);
       return current;
     },
     checkpoint: async () => current,
@@ -151,6 +176,49 @@ function setup() {
   const session = new ProjectSession(transport, 'project', journal);
   return { session, transport, requests, journal };
 }
+
+test('annotation keystrokes recover after restart with their original revision and command identity', async () => {
+  const { session, transport, requests, journal } = setup(true);
+  await session.load();
+  session.editTakeAnnotation('take', { note: 'Keep through restart' });
+  expect(JSON.parse(session.recoveryCopy()).version).toBe(2);
+  session.dispose();
+  const reopened = new ProjectSession(transport, 'project', journal);
+  await reopened.load();
+  expect(reopened.getSnapshot().status).toBe('recovery');
+  reopened.recover();
+  expect(reopened.getSnapshot().takeDrafts.take.note).toBe('Keep through restart');
+  await reopened.flush();
+  expect(requests[0]).toMatchObject({
+    expected_revision: 0,
+    type: 'annotate_take',
+    payload: { take_id: 'take', note: 'Keep through restart' },
+  });
+  expect(reopened.getSnapshot().status).toBe('saved');
+  expect(reopened.getSnapshot().project?.document.take_annotations?.take.note).toBe(
+    'Keep through restart',
+  );
+  reopened.dispose();
+});
+
+test('an annotation acknowledgement retains newer typing in the same take', async () => {
+  const { session, transport } = setup(true);
+  await session.load();
+  const response = deferred<StudioProject>();
+  transport.command = async () => response.promise;
+  session.editTakeAnnotation('take', { name: 'First pick' });
+  const saving = session.flush();
+  session.editTakeAnnotation('take', { name: 'Newer pick' });
+  const acknowledged = structuredClone(session.getSnapshot().project!);
+  acknowledged.revision++;
+  acknowledged.document.take_annotations = { take: { name: 'First pick', note: '' } };
+  response.resolve(acknowledged);
+  await saving;
+  expect(session.getSnapshot().takeDrafts.take.name).toBe('Newer pick');
+  expect(session.getSnapshot().status).toBe('dirty');
+  expect(session.recoveryCopy()).toContain('Newer pick');
+  session.dispose();
+});
 
 describe('studio durable editing boundary', () => {
   test('typing journals locally and Saved waits for acknowledgement, preserving edits made during save', async () => {

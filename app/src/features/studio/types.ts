@@ -45,7 +45,18 @@ export interface StudioDocument {
   passages: StudioPassage[];
   tracks: StudioTrack[];
   clips: StudioClip[];
+  take_annotations?: Record<string, { name: string; note: string }>;
   mix: { target_lufs: number; max_true_peak_dbtp: number; normalize: boolean };
+}
+export interface AuditionLevel {
+  method: 'sample_rms_v1';
+  status: 'measured' | 'silence';
+  rms: number;
+  peak: number;
+  frames: number;
+  measured_frames: number;
+  sample_rate: number;
+  channels: number;
 }
 export interface StudioAsset {
   id: string;
@@ -70,6 +81,15 @@ export interface StudioJob {
   id: string;
   kind: string;
   status: string;
+  phase?: string;
+  attempts?: Array<{
+    attempt: number;
+    phase: string;
+    started_at: string;
+    updated_at: string;
+    error?: string | null;
+    phases?: Array<{ phase: string; created_at: string }>;
+  }>;
   passage_id?: string | null;
   error?: string | null;
   result?: Record<string, unknown> | null;
@@ -123,6 +143,7 @@ export interface StudioEngine {
   supports_instruct: boolean;
   supports_seed: boolean;
   expressive_tags: string[];
+  recognized_tags?: string[];
   ready: boolean;
   commercial_use: 'allowed' | 'restricted' | 'unknown';
 }
@@ -134,6 +155,7 @@ export type StudioCommandType =
   | 'delete_passage'
   | 'reorder_passages'
   | 'select_take'
+  | 'annotate_take'
   | 'set_lock'
   | 'insert_passages'
   | 'insert_asset'

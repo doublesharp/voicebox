@@ -162,6 +162,10 @@ class StudioStore:
                         item[key] = json.loads(item[key])
                 if table == "deliverables":
                     item = {"id": item["id"], **item["data"]}
+                if table == "jobs":
+                    from .job_state import enrich_job
+
+                    item = enrich_job(db, item)
                 items.append(item)
             result[table] = items
         return result
@@ -367,7 +371,28 @@ class StudioStore:
                 raise ValueError("locked must be boolean")
             p["locked"] = payload["locked"]
             p["selection_token"] += 1
+        elif kind == "annotate_take":
+            if not isinstance(payload.get("take_id"), str) or not payload["take_id"]:
+                raise ValueError("Take ID must be a nonempty string")
+            take = db.execute(
+                "SELECT id FROM takes WHERE id=? AND project_id=?", (payload.get("take_id"), project_id)
+            ).fetchone()
+            if not take:
+                raise NotFound("Take not found in project")
+            if not {"name", "note"}.intersection(payload) or set(payload) - {"take_id", "name", "note"}:
+                raise ValueError("Expected take name or note")
+            annotation = doc.setdefault("take_annotations", {}).setdefault(take["id"], {"name": "", "note": ""})
+            for key, limit in (("name", 120), ("note", 4000)):
+                if key in payload:
+                    if not isinstance(payload[key], str) or len(payload[key]) > limit:
+                        raise ValueError(f"Take {key} must be a string of at most {limit} characters")
+                    annotation[key] = payload[key]
         elif kind == "select_take":
+            for flag in ("replace_clips", "reset_trims"):
+                if flag in payload and type(payload[flag]) is not bool:
+                    raise ValueError(f"{flag} must be boolean")
+            if payload.get("reset_trims") and not payload.get("replace_clips"):
+                raise ValueError("Reset trims requires replacing linked clips")
             p = find(passages, payload.get("passage_id"))
             take = db.execute(
                 "SELECT * FROM takes WHERE id=? AND project_id=? AND passage_id=?",
@@ -383,6 +408,12 @@ class StudioStore:
                         clip["take_id"] = take["id"]
                         clip["asset_id"] = take["asset_id"]
                         clip["track_id"] = self._voice_track(db, project_id, doc, take, p)["id"]
+                        if payload.get("reset_trims"):
+                            clip["trim_start_sample"] = clip["trim_end_sample"] = 0
+                            length = self._clip_length(db, project_id, doc, clip)
+                            for key in ("fade_in_samples", "fade_out_samples"):
+                                if clip[key] > length:
+                                    clip[key] = 0
                         self._validate_clip(db, project_id, doc, clip)
         elif kind == "update_track":
             track = find(tracks, payload.get("track_id"))

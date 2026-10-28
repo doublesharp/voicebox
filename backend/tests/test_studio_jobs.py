@@ -5,6 +5,10 @@ from backend.studio.storage import StudioStore
 from backend.studio.jobs import StudioJobs
 
 
+def fixture_capabilities(voice):
+    return {"languages": ["en"], "expressive_tags": [], "supports_instruct": False, "supports_seed": False}
+
+
 @pytest.mark.asyncio
 async def test_late_generation_is_saved_but_cannot_override_newer_intent(tmp_path):
     store = StudioStore(tmp_path)
@@ -19,7 +23,9 @@ async def test_late_generation_is_saved_but_cannot_override_newer_intent(tmp_pat
         return np.zeros(1000, dtype="float32"), 1000
 
     pending = []
-    jobs = StudioJobs(store, synth=synth, enqueue=lambda ident, coro: pending.append(coro))
+    jobs = StudioJobs(
+        store, synth=synth, capability_resolver=fixture_capabilities, enqueue=lambda ident, coro: pending.append(coro)
+    )
     first = jobs.submit(project["id"], "request", [p["id"]], 1, True)
     assert jobs.submit(project["id"], "request", [p["id"]], 1, True) == first
     task = asyncio.create_task(pending.pop())
@@ -47,7 +53,9 @@ async def test_cancel_keeps_running_work_from_adopting_and_retry_is_explicit(tmp
         return np.zeros(100, dtype="float32"), 1000
 
     queued = []
-    jobs = StudioJobs(store, synth=synth, enqueue=lambda ident, coro: queued.append(coro))
+    jobs = StudioJobs(
+        store, synth=synth, capability_resolver=fixture_capabilities, enqueue=lambda ident, coro: queued.append(coro)
+    )
     job = jobs.submit(project["id"], "request", [p["id"]], 1, True)[0]
     task = asyncio.create_task(queued.pop())
     await started.wait()
@@ -76,7 +84,9 @@ async def test_restore_invalidates_inflight_selection(tmp_path):
         return np.zeros(100, dtype="float32"), 1000
 
     queued = []
-    jobs = StudioJobs(store, synth=synth, enqueue=lambda ident, coro: queued.append(coro))
+    jobs = StudioJobs(
+        store, synth=synth, capability_resolver=fixture_capabilities, enqueue=lambda ident, coro: queued.append(coro)
+    )
     jobs.submit(project["id"], "request", [pid], 1, True)
     task = asyncio.create_task(queued.pop())
     await started.wait()
@@ -129,7 +139,9 @@ async def test_render_frozen_revision_publishes_managed_audio(tmp_path):
     async def synth(request):
         return np.zeros(1000, dtype="float32"), 1000
 
-    jobs = StudioJobs(store, synth=synth, enqueue=lambda ident, coro: queued.append(coro))
+    jobs = StudioJobs(
+        store, synth=synth, capability_resolver=fixture_capabilities, enqueue=lambda ident, coro: queued.append(coro)
+    )
     jobs.submit(project["id"], "generate", [pid], 1, True)
     await queued.pop()
     project = store.get_project(project["id"])
@@ -158,7 +170,9 @@ async def test_startup_resumes_queued_and_marks_running_interrupted(tmp_path):
     async def synth(request):
         return np.zeros(100, dtype="float32"), 1000
 
-    first = StudioJobs(store, synth=synth, enqueue=lambda ident, coro: pending.append(coro))
+    first = StudioJobs(
+        store, synth=synth, capability_resolver=fixture_capabilities, enqueue=lambda ident, coro: pending.append(coro)
+    )
     submitted = first.submit(p["id"], "request", ids, 1, False)
     for coro in pending:
         coro.close()
@@ -185,7 +199,9 @@ async def test_archive_round_trip_preserves_take_and_clip_graph(tmp_path):
     async def synth(request):
         return np.zeros(100, dtype="float32"), 1000
 
-    jobs = StudioJobs(store, synth=synth, enqueue=lambda ident, coro: pending.append(coro))
+    jobs = StudioJobs(
+        store, synth=synth, capability_resolver=fixture_capabilities, enqueue=lambda ident, coro: pending.append(coro)
+    )
     jobs.submit(project["id"], "gen", [pid], 1, True)
     await pending.pop()
     project = store.get_project(project["id"])
@@ -213,7 +229,9 @@ async def test_startup_dispatches_queued_render_to_delivery(tmp_path, monkeypatc
     async def synth(request):
         return np.zeros(100, dtype="float32"), 1000
 
-    jobs = StudioJobs(store, synth=synth, enqueue=lambda ident, coro: pending.append(coro))
+    jobs = StudioJobs(
+        store, synth=synth, capability_resolver=fixture_capabilities, enqueue=lambda ident, coro: pending.append(coro)
+    )
     pid = project["document"]["passages"][0]["id"]
     jobs.submit(project["id"], "generate", [pid], 1, True)
     await pending.pop()
