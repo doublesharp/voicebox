@@ -1,0 +1,323 @@
+import { Download, FileArchive, Headphones } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from '@/components/ui/dialog';
+import { usePlatform } from '@/platform/PlatformContext';
+import { useStudio } from './context';
+import { isJobActive, preflight, staleRecordings } from './domain';
+import { operationId } from './session';
+import { useDurableSubmission } from './submissions';
+import { Field, StudioButton } from './ui';
+
+export function Deliver() {
+  const studio = useStudio();
+  const platform = usePlatform();
+  const { project, client, session, revisionId, setRevisionId } = studio;
+  const [kind, setKind] = useState<'mix' | 'stems'>('mix');
+  const [format, setFormat] = useState<'wav' | 'mp3'>('wav');
+  const {
+    request,
+    rejected,
+    discardRejected,
+    error: submissionError,
+    submit,
+  } = useDurableSubmission(session.storage, client.baseUrl, project.id, 'render');
+  const [acknowledgedRevision, setAcknowledgedRevision] = useState<string | null>(null);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: Changing source must revoke consent, including when returning to a previously acknowledged source.
+  useEffect(() => {
+    setAcknowledgedRevision(null);
+  }, [revisionId, project.id]);
+  const revision = project.revisions.find((r) => r.id === revisionId);
+  const allowStale = acknowledgedRevision === `${project.id}:${revisionId}`;
+  const stale = revision ? staleRecordings(revision.document, project) : [];
+  const flight = revision
+    ? preflight(revision.document, project, allowStale)
+    : { errors: ['Choose a named checkpoint.'], warnings: [] };
+  const jobs = project.jobs.filter(
+    (j) => j.kind === 'render' || j.kind === 'mix' || j.kind === 'stems',
+  );
+  const files = project.deliverables.filter((file) => file.revision_id === revisionId);
+  const render = async () => {
+    if (!request && (!revision || flight.errors.length)) return;
+    await studio.runAction(async () => {
+      await submit(
+        () => ({
+          idempotency_key: operationId(),
+          revision_id: revision!.id,
+          kind,
+          format,
+          ...(allowStale ? { allow_stale_audio: true } : {}),
+        }),
+        (input) => client.render(project.id, input),
+      );
+    });
+  };
+  const safeName = project.name.replace(/[^a-zA-Z0-9._-]+/g, '-').slice(0, 100) || 'studio-project';
+  return (
+    <Dialog>
+      <DialogTrigger asChild>
+        <button type="button" className="studio-primary">
+          <Download size={15} /> Deliver
+        </button>
+      </DialogTrigger>
+      <DialogContent className="studio studio-modal studio-deliver">
+        <DialogHeader>
+          <DialogTitle>Deliver a performance.</DialogTitle>
+          <DialogDescription>
+            Render an immutable checkpoint, inspect the result, and audition the actual encoded file
+            before saving a copy.
+          </DialogDescription>
+        </DialogHeader>
+        <Field label="Source checkpoint">
+          <select
+            value={revisionId}
+            disabled={studio.actionBusy || !!request}
+            onChange={(event) => {
+              setAcknowledgedRevision(null);
+              setRevisionId(event.target.value);
+            }}
+          >
+            <option value="">Choose a checkpoint</option>
+            {project.revisions.map((revision) => (
+              <option key={revision.id} value={revision.id}>
+                {revision.name} · draft {revision.project_revision}
+              </option>
+            ))}
+          </select>
+        </Field>
+        <div className="studio-field-grid">
+          <Field label="Output">
+            <select
+              value={kind}
+              disabled={studio.actionBusy || !!request}
+              onChange={(event) => setKind(event.target.value as 'mix' | 'stems')}
+            >
+              <option value="mix">Stereo mix</option>
+              <option value="stems">Dry track stems</option>
+            </select>
+          </Field>
+          <Field label="Format">
+            <select
+              value={format}
+              disabled={studio.actionBusy || !!request}
+              onChange={(event) => setFormat(event.target.value as 'wav' | 'mp3')}
+            >
+              <option value="wav">WAV</option>
+              <option value="mp3">MP3 · requires server encoder</option>
+            </select>
+          </Field>
+        </div>
+        <p className="studio-note">
+          Dry track stems preserve clip and track gain, fades, and placement. Master normalization
+          applies only to the mix.
+        </p>
+        <div className="studio-preflight" aria-live="polite">
+          <h3>Preflight</h3>
+          {flight.errors.length ? (
+            flight.errors.map((error) => (
+              <p className="studio-error" key={error}>
+                {error}
+              </p>
+            ))
+          ) : (
+            <p>Checkpoint sources and script relationships are ready for server validation.</p>
+          )}
+          {flight.warnings.map((warning) => (
+            <p className="studio-note" key={warning}>
+              {warning}
+            </p>
+          ))}
+        </div>
+        {!!stale.length && (
+          <div className="studio-stale-recordings">
+            <h3>Earlier recordings</h3>
+            {stale.map(({ clip, passage, take }) => (
+              <div key={clip.id}>
+                <p>Recorded: {take.text}</p>
+                <p>Checkpoint script: {passage.text}</p>
+                <p className="studio-note">
+                  Clip {clip.id} · take {take.id}. Script or direction differs from the recorded
+                  inputs.
+                </p>
+              </div>
+            ))}
+            <label className="studio-check">
+              <input
+                type="checkbox"
+                aria-label="Use earlier recording"
+                checked={allowStale}
+                disabled={studio.actionBusy || !!request}
+                onChange={(event) =>
+                  setAcknowledgedRevision(
+                    event.target.checked ? `${project.id}:${revisionId}` : null,
+                  )
+                }
+              />{' '}
+              Use earlier recording for this checkpoint
+            </label>
+          </div>
+        )}
+        {request && (
+          <p className="studio-note">
+            Reconcile the pending {request.kind} · {request.format} request for checkpoint{' '}
+            {request.revision_id}. Replay retains its original recording acknowledgement.
+          </p>
+        )}
+        {submissionError && (
+          <p role="alert" className="studio-error">
+            {submissionError}
+          </p>
+        )}
+        {rejected && (
+          <StudioButton disabled={studio.actionBusy} onClick={discardRejected}>
+            Dismiss rejected submission
+          </StudioButton>
+        )}
+        {studio.actionError && (
+          <p role="alert" className="studio-error">
+            {studio.actionError}
+          </p>
+        )}
+        <StudioButton
+          primary
+          onClick={render}
+          disabled={(!request && flight.errors.length > 0) || studio.actionBusy}
+        >
+          {studio.actionBusy
+            ? 'Submitting…'
+            : request
+              ? 'Retry same render request'
+              : `Render ${kind === 'mix' ? 'mix' : 'dry stems'}`}
+        </StudioButton>
+        {!!jobs.length && (
+          <div className="studio-job-list">
+            {jobs
+              .slice(-5)
+              .reverse()
+              .map((job) => (
+                <div className="studio-job" key={job.id}>
+                  <div>
+                    <strong>{job.kind}</strong>
+                    <span>{job.status}</span>
+                    {typeof job.result?.progress === 'number' &&
+                      Number.isFinite(job.result.progress) &&
+                      job.result.progress >= 0 &&
+                      job.result.progress <= 1 && (
+                        <progress
+                          aria-label="Render progress"
+                          max={1}
+                          value={job.result.progress}
+                        />
+                      )}
+                    {job.error && <p className="studio-error">{job.error}</p>}
+                    {job.result?.measurements != null && (
+                      <details>
+                        <summary>Reported render-job measurements</summary>
+                        <pre>{JSON.stringify(job.result.measurements, null, 2)}</pre>
+                      </details>
+                    )}
+                    {Array.isArray(job.result?.warnings) &&
+                      job.result.warnings.map((warning) => (
+                        <p className="studio-note" key={String(warning)}>
+                          {String(warning)}
+                        </p>
+                      ))}
+                  </div>
+                  {isJobActive(job.status) && (
+                    <StudioButton
+                      disabled={studio.actionBusy}
+                      onClick={() => void studio.runAction(() => client.cancelJob(job.id))}
+                    >
+                      Request cancel
+                    </StudioButton>
+                  )}
+                  {['failed', 'interrupted'].includes(job.status) && (
+                    <StudioButton
+                      disabled={studio.actionBusy}
+                      onClick={() => void studio.runAction(() => client.retryJob(job.id))}
+                    >
+                      Retry frozen job
+                    </StudioButton>
+                  )}
+                </div>
+              ))}
+          </div>
+        )}
+        <div className="studio-section-title">
+          <h3>Rendered files</h3>
+          <span>{files.length}</span>
+        </div>
+        {!files.length && (
+          <p className="studio-note">
+            Completed files for this checkpoint appear here. Rendering continues if you close this
+            sheet.
+          </p>
+        )}
+        {files.map((file) => (
+          <div className="studio-deliverable" key={file.id}>
+            <strong>{file.filename || `${file.kind}.${file.format}`}</strong>
+            <div className="studio-action-row">
+              <StudioButton
+                onClick={() =>
+                  void studio.playback.audition(
+                    client.deliverableAudio(file.id),
+                    `Final file · ${file.filename || file.format}`,
+                  )
+                }
+              >
+                <Headphones size={14} /> Audition final file
+              </StudioButton>
+              <StudioButton
+                disabled={studio.actionBusy}
+                onClick={() =>
+                  void studio.runAction(async () => {
+                    const blob = await client.download(client.deliverableDownload(file.id));
+                    await platform.filesystem.saveFile(
+                      file.filename || `${safeName}-${file.kind}.${file.format}`,
+                      blob,
+                      [{ name: 'Audio', extensions: [file.format] }],
+                    );
+                  })
+                }
+              >
+                <Download size={14} /> Save a copy
+              </StudioButton>
+            </div>
+            <details>
+              <summary>Reported measurements</summary>
+              {file.measurements ? (
+                <pre>{JSON.stringify(file.measurements, null, 2)}</pre>
+              ) : (
+                <p className="studio-note">No qualified measurements reported for this file.</p>
+              )}
+            </details>
+          </div>
+        ))}
+        <div className="studio-divider" />
+        <StudioButton
+          disabled={studio.actionBusy}
+          onClick={() =>
+            void studio.runAction(async () => {
+              const blob = await client.download(client.archiveUrl(project.id));
+              await platform.filesystem.saveFile(`${safeName}.studio.zip`, blob, [
+                { name: 'Studio project archive', extensions: ['zip'] },
+              ]);
+            })
+          }
+        >
+          <FileArchive size={15} /> Export complete project archive
+        </StudioButton>
+        <p className="studio-note">
+          The server keeps managed deliverables. Save a copy opens your platform’s destination flow;
+          it is separate from rendering. Archives include owned audio for playback without models.
+        </p>
+      </DialogContent>
+    </Dialog>
+  );
+}

@@ -15,6 +15,8 @@ from typing import List, Tuple
 
 import numpy as np
 
+from .inference import serialized_inference
+
 logger = logging.getLogger("voicebox.chunked-tts")
 
 # Default chunk size in characters.  Can be overridden per-request via
@@ -203,7 +205,21 @@ def concatenate_audio_chunks(
     return result
 
 
-async def generate_chunked(
+@serialized_inference
+async def generate_chunked(backend, text, voice_prompt, language='en', seed=None,
+                           instruct=None, max_chunk_chars=DEFAULT_MAX_CHUNK_CHARS,
+                           crossfade_ms=50, trim_fn=None, runaway_detector=None):
+    """Serialize TTS across callers, including after caller cancellation.
+
+    The shielded operation owns the slot until its backend coroutine returns;
+    cancelling the caller does not imply that native inference has stopped.
+    """
+    return await _generate_chunked(backend, text, voice_prompt, language, seed,
+                                   instruct, max_chunk_chars, crossfade_ms,
+                                   trim_fn, runaway_detector)
+
+
+async def _generate_chunked(
     backend,
     text: str,
     voice_prompt: dict,

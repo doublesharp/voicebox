@@ -6,6 +6,13 @@ import { Button } from '@/components/ui/button';
 import { Slider } from '@/components/ui/slider';
 import { apiClient } from '@/lib/api/client';
 import { bindPlaybackPresentation } from '@/lib/audio/playbackPresentation';
+import {
+  legacyPlaybackToken,
+  prepareLegacy,
+  revokePlayback,
+  startNative,
+  stopNative,
+} from '@/lib/audio/playbackOwnership';
 import { formatAudioDuration } from '@/lib/utils/audio';
 import { debug } from '@/lib/utils/debug';
 import { usePlatform } from '@/platform/PlatformContext';
@@ -74,6 +81,13 @@ export function AudioPlayer() {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [wsReady, setWsReady] = useState(false);
+
+  useEffect(
+    () => () => {
+      void stopNative(() => platform.audio.stopPlayback()).catch(() => {});
+    },
+    [platform.audio, audioUrl],
+  );
 
   // Create WaveSurfer once when the player becomes visible (audioUrl is set).
   // This instance is reused for all subsequent audio loads - never destroyed until unmount.
@@ -281,6 +295,7 @@ export function AudioPlayer() {
       return;
     }
 
+    revokePlayback();
     // Reset native playback state
     isUsingNativePlaybackRef.current = false;
     wavesurfer.setMuted(false);
@@ -421,7 +436,7 @@ export function AudioPlayer() {
       if (isPlaying) {
         // Pause: stop native playback and pause WaveSurfer visualization
         try {
-          platform.audio.stopPlayback();
+          await stopNative(() => platform.audio.stopPlayback());
           debug.log('Stopped native audio playback');
         } catch (error) {
           debug.error('Failed to stop native playback:', error);
@@ -430,15 +445,11 @@ export function AudioPlayer() {
         return;
       }
 
-      // Play: trigger native playback
+      // Capture ownership before any asynchronous stop or fetch.
+      const token = legacyPlaybackToken();
       try {
-        // Stop any existing native playback first
-        try {
-          platform.audio.stopPlayback();
-        } catch (_error) {
-          // Ignore errors when stopping (might not be playing)
-          debug.log('No existing playback to stop');
-        }
+        await prepareLegacy(token, () => platform.audio.stopPlayback());
+        if (!token.valid()) return;
 
         // Collect all device IDs from assigned channels
         const assignedChannels = channels.filter((ch) =>
@@ -448,11 +459,22 @@ export function AudioPlayer() {
 
         if (deviceIds.length > 0) {
           // Fetch audio data
-          const response = await fetch(audioUrl);
-          const audioData = new Uint8Array(await response.arrayBuffer());
-
-          // Play via native audio
-          await platform.audio.playToDevices(audioData, deviceIds);
+          try {
+            const response = await fetch(audioUrl, { signal: token.signal });
+            const audioData = new Uint8Array(await response.arrayBuffer());
+            if (!token.valid()) return;
+            await startNative(
+              token,
+              () => platform.audio.playToDevices(audioData, deviceIds),
+              () => platform.audio.stopPlayback(),
+            );
+            if (!token.valid()) return;
+          } catch (error) {
+            if (!token.valid()) return;
+            throw error;
+          } finally {
+            token.release();
+          }
 
           // Mark that we're using native playback
           isUsingNativePlaybackRef.current = true;
@@ -471,9 +493,15 @@ export function AudioPlayer() {
           return;
         }
       } catch (error) {
-        debug.error('Native playback failed, falling back to WaveSurfer:', error);
-        // Fall through to WaveSurfer playback
+        if (!token.valid()) return;
+        debug.error('Native playback failed:', error);
         isUsingNativePlaybackRef.current = false;
+        setError(
+          `Native playback failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        return;
+      } finally {
+        token.release();
       }
     }
 
@@ -506,10 +534,12 @@ export function AudioPlayer() {
   };
 
   const handleClose = () => {
-    // Stop any native playback
-    if (isUsingNativePlaybackRef.current && platform.metadata.isTauri) {
+    // Revoke pending starts even when native playback has not started yet.
+    if (platform.metadata.isTauri) {
       try {
-        platform.audio.stopPlayback();
+        void stopNative(() => platform.audio.stopPlayback()).catch((error) =>
+          debug.error('Failed to stop native playback:', error),
+        );
       } catch (error) {
         debug.error('Failed to stop native playback:', error);
       }

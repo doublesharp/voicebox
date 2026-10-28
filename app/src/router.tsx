@@ -4,6 +4,7 @@ import {
   createRouter,
   Outlet,
   redirect,
+  useRouterState,
 } from '@tanstack/react-router';
 import { AppFrame } from '@/components/AppFrame/AppFrame';
 import { CapturesTab } from '@/components/CapturesTab/CapturesTab';
@@ -23,6 +24,9 @@ import { Sidebar } from '@/components/Sidebar';
 import { StoriesTab } from '@/components/StoriesTab/StoriesTab';
 import { Toaster } from '@/components/ui/toaster';
 import { VoicesTab } from '@/components/VoicesTab/VoicesTab';
+import { ProjectsPage } from '@/features/studio/ProjectsPage';
+import { StudioFrame } from '@/features/studio/StudioFrame';
+import { StudioProjectPage } from '@/features/studio/StudioProjectPage';
 import { useGenerationProgress } from '@/lib/hooks/useGenerationProgress';
 import { useModelDownloadToast } from '@/lib/hooks/useModelDownloadToast';
 import { MODEL_DISPLAY_NAMES, useRestoreActiveTasks } from '@/lib/hooks/useRestoreActiveTasks';
@@ -34,17 +38,28 @@ const isMacOS = () => navigator.platform.toLowerCase().includes('mac');
 function RootLayout() {
   // Monitor active downloads/generations and show toasts for them
   const activeDownloads = useRestoreActiveTasks();
+  const isStudio = useRouterState({
+    select: (state) => state.location.pathname.startsWith('/studio/'),
+  });
 
   // Subscribe to SSE for pending generations — handles completion, auto-play, and history refresh
   useGenerationProgress();
 
+  const Frame = isStudio ? StudioFrame : AppFrame;
+
   return (
-    <AppFrame>
+    <Frame>
       <div className="flex flex-1 min-h-0 overflow-hidden">
         <Sidebar isMacOS={isMacOS()} />
 
         <main className="flex-1 ml-20 overflow-hidden flex flex-col">
-          <div className="container mx-auto px-8 max-w-[1800px] h-full overflow-hidden flex flex-col">
+          <div
+            className={
+              isStudio
+                ? 'mx-auto w-full px-2 sm:px-4 max-w-[1800px] h-full overflow-hidden flex flex-col'
+                : 'container mx-auto px-8 max-w-[1800px] h-full overflow-hidden flex flex-col'
+            }
+          >
             <Outlet />
           </div>
         </main>
@@ -63,7 +78,7 @@ function RootLayout() {
       })}
 
       <Toaster />
-    </AppFrame>
+    </Frame>
   );
 }
 
@@ -97,6 +112,18 @@ const indexRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/',
   component: MainEditor,
+});
+
+const studioProjectsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/studio/projects',
+  component: ProjectsPage,
+});
+
+const studioProjectRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/studio/projects/$projectId/$workspace',
+  component: StudioProjectPage,
 });
 
 // Stories route
@@ -202,6 +229,8 @@ const serverRedirectRoute = createRoute({
 // Route tree
 const routeTree = rootRoute.addChildren([
   indexRoute,
+  studioProjectsRoute,
+  studioProjectRoute,
   storiesRoute,
   capturesRoute,
   voicesRoute,

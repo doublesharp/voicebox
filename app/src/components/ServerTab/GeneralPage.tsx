@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useForm } from 'react-hook-form';
 import { Trans, useTranslation } from 'react-i18next';
 import * as z from 'zod';
+import { DoubleSharpMark, EditionBadge } from '@/components/Branding';
 import { Button } from '@/components/ui/button';
 import { Form, FormControl, FormField, FormItem, FormMessage } from '@/components/ui/form';
 import { Input } from '@/components/ui/input';
@@ -11,6 +12,7 @@ import { Progress } from '@/components/ui/progress';
 import { Toggle } from '@/components/ui/toggle';
 import { useToast } from '@/components/ui/use-toast';
 import { useAutoUpdater } from '@/hooks/useAutoUpdater';
+import { APP_BRANDING } from '@/lib/constants/branding';
 import { useServerHealth } from '@/lib/hooks/useServer';
 import { usePlatform } from '@/platform/PlatformContext';
 import { useServerStore } from '@/stores/serverStore';
@@ -72,6 +74,18 @@ export function GeneralPage() {
 
   return (
     <div className="space-y-8 max-w-2xl">
+      <div className="flex flex-wrap items-center gap-4 rounded-xl border border-accent/20 bg-gradient-to-r from-accent/10 to-transparent p-4">
+        <DoubleSharpMark className="h-10 w-10 rounded-xl text-sm" />
+        <div className="min-w-0 flex-1 space-y-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-sm font-semibold">{APP_BRANDING.name}</span>
+            <EditionBadge />
+          </div>
+          <p className="text-xs text-muted-foreground">
+            {t('settings.about.modifiedEdition', { defaultValue: APP_BRANDING.description })}
+          </p>
+        </div>
+      </div>
       <div className="grid grid-cols-2 gap-3">
         <a
           href="https://docs.voicebox.sh"

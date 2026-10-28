@@ -1,6 +1,8 @@
 import { RouterProvider } from '@tanstack/react-router';
+import { useReducedMotion } from 'motion/react';
 import { useEffect, useRef, useState } from 'react';
 import voiceboxLogo from '@/assets/voicebox-logo.png';
+import { DoubleSharpMark, DoubleSharpSignature, EditionBadge } from '@/components/Branding';
 import { DictateWindow } from '@/components/DictateWindow/DictateWindow';
 import ShinyText from '@/components/ShinyText';
 import { TitleBarDragRegion } from '@/components/TitleBarDragRegion';
@@ -8,8 +10,9 @@ import { useAutoUpdater } from '@/hooks/useAutoUpdater';
 import { useThemeSync } from '@/hooks/useThemeSync';
 import { apiClient } from '@/lib/api/client';
 import type { HealthResponse } from '@/lib/api/types';
-import { useChordSync } from '@/lib/hooks/useChordSync';
+import { APP_BRANDING } from '@/lib/constants/branding';
 import { TOP_SAFE_AREA_PADDING } from '@/lib/constants/ui';
+import { useChordSync } from '@/lib/hooks/useChordSync';
 import { cn } from '@/lib/utils/cn';
 import { usePlatform } from '@/platform/PlatformContext';
 import { router } from '@/router';
@@ -53,26 +56,9 @@ function isPortInUseError(error: unknown): boolean {
 }
 
 const LOADING_MESSAGES = [
-  'Warming up tensors...',
-  'Calibrating synthesizer engine...',
-  'Initializing voice models...',
-  'Loading neural networks...',
-  'Preparing audio pipelines...',
-  'Optimizing waveform generators...',
-  'Tuning frequency analyzers...',
-  'Building voice embeddings...',
-  'Configuring text-to-speech cores...',
-  'Syncing audio buffers...',
-  'Establishing model connections...',
-  'Preprocessing training data...',
-  'Validating voice samples...',
-  'Compiling inference engines...',
-  'Mapping phoneme sequences...',
-  'Aligning prosody parameters...',
-  'Activating speech synthesis...',
-  'Fine-tuning acoustic models...',
-  'Preparing voice cloning matrices...',
-  'Initializing Qwen TTS framework...',
+  'Opening your voice studio...',
+  'Connecting to your voice server...',
+  'Waiting for your voice server to be ready...',
 ];
 
 function App() {
@@ -90,6 +76,7 @@ function App() {
 
 function MainApp() {
   const platform = usePlatform();
+  const prefersReducedMotion = useReducedMotion();
   const [serverReady, setServerReady] = useState(false);
   const [startupError, setStartupError] = useState<string | null>(null);
   const [loadingMessageIndex, setLoadingMessageIndex] = useState(0);
@@ -253,26 +240,35 @@ function MainApp() {
     return (
       <div
         className={cn(
-          'min-h-screen bg-background flex items-center justify-center',
+          'h-screen min-h-0 bg-background flex flex-col items-center overflow-y-auto',
           TOP_SAFE_AREA_PADDING,
         )}
       >
         <TitleBarDragRegion />
-        <div className="text-center space-y-6">
-          <div className="flex justify-center relative">
+        <div className="my-auto w-full max-w-xl shrink-0 text-center space-y-7 px-6 py-10">
+          <div className="flex justify-center relative mx-auto w-fit">
             <div className="absolute inset-0 flex items-center justify-center">
-              <div className="w-48 h-48 rounded-full bg-accent/20 blur-3xl" />
+              <div
+                className="w-48 h-48 rounded-full opacity-15 blur-3xl"
+                style={{ background: 'var(--brand-gradient)' }}
+              />
             </div>
             <img
               src={voiceboxLogo}
-              alt="Voicebox"
-              className="w-48 h-48 object-contain animate-fade-in-scale relative z-10"
+              alt=""
+              className="w-32 h-32 object-contain animate-fade-in-scale motion-reduce:animate-none relative z-10"
             />
+            <DoubleSharpMark className="absolute bottom-0 -right-2 z-20 h-10 w-10 shadow-lg" />
+          </div>
+          <div className="space-y-3">
+            <EditionBadge />
+            <h1 className="text-3xl font-light tracking-[0.12em]">{APP_BRANDING.name}</h1>
+            <DoubleSharpSignature className="mt-2 text-left" />
           </div>
           {startupError ? (
-            <div className="animate-fade-in-delayed max-w-md mx-auto space-y-3">
+            <div className="animate-fade-in-delayed motion-reduce:animate-none max-w-md mx-auto space-y-3">
               <p className="text-lg font-medium text-destructive">Server startup failed</p>
-              <p className="text-sm text-muted-foreground">{startupError}</p>
+              <p className="text-sm text-muted-foreground break-words">{startupError}</p>
               <button
                 type="button"
                 className="mt-2 px-4 py-2 text-sm rounded-md bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"
@@ -287,10 +283,11 @@ function MainApp() {
               </button>
             </div>
           ) : (
-            <div className="animate-fade-in-delayed">
+            <div className="animate-fade-in-delayed motion-reduce:animate-none">
               <ShinyText
                 text={LOADING_MESSAGES[loadingMessageIndex]}
-                className="text-lg font-medium text-muted-foreground"
+                disabled={prefersReducedMotion === true}
+                className="text-sm font-medium text-muted-foreground"
                 speed={2}
                 color="hsl(var(--muted-foreground))"
                 shineColor="hsl(var(--foreground))"

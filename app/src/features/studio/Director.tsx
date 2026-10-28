@@ -1,0 +1,474 @@
+import { Check, Headphones, Sparkles } from 'lucide-react';
+import { useState } from 'react';
+import { Input } from '@/components/ui/input';
+import { Textarea } from '@/components/ui/textarea';
+import { useStudio } from './context';
+import { engineForPassage, formatTime } from './domain';
+import { operationId } from './session';
+import { useDurableSubmission } from './submissions';
+import { Field, NumberField, StudioButton } from './ui';
+
+export function Director() {
+  const studio = useStudio();
+  const { project, session, save, selectedPassageId, profiles, engines, client } = studio;
+  const [count, setCount] = useState<1 | 2 | 3>(1);
+  const [adopt, setAdopt] = useState(false);
+  const [replaceClips, setReplaceClips] = useState(false);
+  const {
+    request,
+    rejected,
+    discardRejected,
+    error: submissionError,
+    submit,
+  } = useDurableSubmission(session.storage, client.baseUrl, project.id, 'generation');
+  const passage = project.document.passages.find((p) => p.id === selectedPassageId);
+  const engine = engineForPassage(passage, profiles, engines);
+  const recoveryChoices = save.status === 'recovery' ? session.recoverableJournals() : [];
+  const recoveryPanel = recoveryChoices.length > 1 && (
+    <div className="studio-recovery">
+      <p>
+        Independent editing sessions have local recovery copies. Recover one at a time, or export
+        all copies from the recovery bar.
+      </p>
+      {recoveryChoices.map((choice, index) => (
+        <StudioButton
+          key={choice.key}
+          disabled={!choice.readable}
+          onClick={() => session.recover(choice.key)}
+        >
+          Recover local copy {index + 1} · draft {choice.baseRevision ?? 'unreadable'}
+        </StudioButton>
+      ))}
+    </div>
+  );
+  if (!passage)
+    return (
+      <div className="studio-inspector-content">
+        {recoveryPanel}
+        <p className="studio-eyebrow">DIRECTOR</p>
+        <h2>One passage. Every possibility.</h2>
+        <p className="studio-note">
+          Select a passage to assign a voice, direct its delivery, and compare performances.
+        </p>
+        {submissionError && (
+          <p role="alert" className="studio-error">
+            {submissionError}
+          </p>
+        )}
+        {request && (
+          <StudioButton
+            disabled={studio.actionBusy}
+            onClick={() =>
+              studio.runAction(() =>
+                submit(
+                  () => request,
+                  (input) => client.generate(project.id, input),
+                ),
+              )
+            }
+          >
+            Retry same request
+          </StudioButton>
+        )}
+        {rejected && (
+          <StudioButton disabled={studio.actionBusy} onClick={discardRejected}>
+            Dismiss rejected submission
+          </StudioButton>
+        )}
+      </div>
+    );
+  const selectedIds = studio.checkedPassages.length
+    ? studio.checkedPassages.filter((id) => project.document.passages.some((p) => p.id === id))
+    : [passage.id];
+  const takes = project.takes.filter((take) => take.passage_id === passage.id);
+  const direction = save.drafts[passage.id]?.direction ?? passage.direction;
+  const currentText = save.drafts[passage.id]?.text ?? passage.text;
+  const disabled = !studio.canMutate || passage.locked;
+  const profile = profiles.find((profile) => profile.id === passage.profile_id);
+  const engineId =
+    passage.voice_snapshot?.engine ||
+    passage.voice_snapshot?.preset_engine ||
+    passage.voice_snapshot?.default_engine ||
+    profile?.preset_engine ||
+    profile?.default_engine;
+  const variants = engines.filter((variant) => variant.id === engineId && variant.model_size);
+  const incompatible = !engine?.supports_instruct && !!direction.instruct;
+  const editDisabled = passage.locked || save.status === 'recovery';
+  const incompatibleSeed = !engine?.supports_seed && direction.seed !== null;
+  const unsupportedTags = (currentText.match(/\[[^\]\n]+\]/g) ?? []).filter(
+    (tag) =>
+      !engine?.expressive_tags.some(
+        (supported) =>
+          supported.replace(/^\[|\]$/g, '').toLowerCase() === tag.slice(1, -1).toLowerCase(),
+      ),
+  );
+  const generate = async () => {
+    if (!request) {
+      await session.flush();
+      if (session.getSnapshot().status !== 'saved') return;
+    }
+    await studio.runAction(async () => {
+      await submit(
+        () => ({ idempotency_key: operationId(), passage_ids: selectedIds, count, adopt }),
+        (input) => client.generate(project.id, input),
+      );
+    });
+  };
+  return (
+    <div className="studio-inspector-content">
+      {recoveryPanel}
+      <div className="studio-section-title">
+        <div>
+          <p className="studio-eyebrow">DIRECTOR</p>
+          <h2>Make it yours.</h2>
+        </div>
+        <span className="studio-status-chip">{passage.locked ? 'Locked' : 'Passage'}</span>
+      </div>
+      <Field
+        label="Voice / cast"
+        hint="Assignments snapshot this profile. Global profile changes do not silently update the project."
+      >
+        <select
+          aria-label="Passage voice"
+          value={passage.profile_id ?? ''}
+          disabled={disabled || studio.actionBusy}
+          onChange={(event) => {
+            if (event.target.value) {
+              const nextProfile = profiles.find((profile) => profile.id === event.target.value);
+              const nextVariants = engines.filter(
+                (variant) =>
+                  variant.id === (nextProfile?.preset_engine || nextProfile?.default_engine),
+              );
+              const variant =
+                nextVariants.find((candidate) => candidate.model_size === engine?.model_size) ??
+                nextVariants.find((candidate) => candidate.ready) ??
+                nextVariants[0];
+              void session.command('assign_voice', {
+                passage_ids: selectedIds,
+                profile_id: event.target.value,
+                ...(variant?.model_size ? { model_size: variant.model_size } : {}),
+              });
+            }
+          }}
+        >
+          <option value="">Choose a voice</option>
+          {passage.profile_id && !profiles.some((p) => p.id === passage.profile_id) && (
+            <option value={passage.profile_id}>Saved voice (profile unavailable)</option>
+          )}
+          {profiles.map((profile) => (
+            <option key={profile.id} value={profile.id}>
+              {profile.name} · {profile.language}
+            </option>
+          ))}
+        </select>
+      </Field>
+      {!!variants.length && (
+        <Field
+          label="Voice model size"
+          hint="Reassigning snapshots this exact engine variant for the selected passages."
+        >
+          <select
+            aria-label="Voice model size"
+            value={String(passage.voice_snapshot?.model_size ?? '')}
+            disabled={disabled || studio.actionBusy || !profile}
+            onChange={(event) => {
+              if (variants.some((variant) => variant.model_size === event.target.value))
+                void session.command('assign_voice', {
+                  passage_ids: selectedIds,
+                  profile_id: passage.profile_id,
+                  model_size: event.target.value,
+                });
+            }}
+          >
+            <option value="">Choose a compatible variant</option>
+            {variants.map((variant) => (
+              <option key={variant.model_size} value={variant.model_size}>
+                {variant.name} · {variant.model_size} · {variant.ready ? 'Ready' : 'Not ready'}
+              </option>
+            ))}
+          </select>
+        </Field>
+      )}
+      {!profiles.length && (
+        <p className="studio-note">Create a voice in Voices, then return here to assign it.</p>
+      )}
+      {studio.capabilitiesError && (
+        <p aria-live="polite" className="studio-error">
+          {studio.capabilitiesError}
+        </p>
+      )}
+      <div className="studio-engine-card">
+        <span className="studio-eyebrow">ENGINE</span>
+        <strong>{engine?.name || 'No compatible engine reported'}</strong>
+        <small>
+          {engine
+            ? `${engine.ready ? 'Ready' : 'Not ready'} · ${engine.languages.join(', ') || 'Language support not reported'}`
+            : 'Assign a voice to inspect its actual capabilities.'}
+        </small>
+        {engine?.commercial_use !== 'allowed' && engine && (
+          <small className="studio-error">
+            Commercial use: {engine.commercial_use}. Review model terms before client use.
+          </small>
+        )}
+      </div>
+      <Field label="Passage language">
+        <Input
+          value={save.drafts[passage.id]?.language ?? passage.language}
+          disabled={editDisabled}
+          onChange={(event) => session.editPassage(passage.id, { language: event.target.value })}
+        />
+      </Field>
+      {(engine?.supports_instruct || direction.instruct) && (
+        <Field
+          label="Delivery direction"
+          hint={
+            incompatible
+              ? 'Inactive for this engine. Stored direction is retained; resolve it before generating.'
+              : 'Performance instructions supported by this engine.'
+          }
+        >
+          <Textarea
+            aria-label="Delivery direction"
+            value={direction.instruct}
+            disabled={editDisabled || !engine?.supports_instruct}
+            onChange={(event) =>
+              session.editPassage(passage.id, {
+                direction: { ...direction, instruct: event.target.value },
+              })
+            }
+            placeholder="Warm, unhurried, with a smile…"
+          />
+          {incompatible && (
+            <StudioButton
+              disabled={disabled}
+              onClick={() =>
+                session.editPassage(passage.id, { direction: { ...direction, instruct: '' } })
+              }
+            >
+              Clear inactive direction
+            </StudioButton>
+          )}
+        </Field>
+      )}
+      {!!engine?.expressive_tags.length && (
+        <p className="studio-note">
+          Supported expressive tags: {engine.expressive_tags.join(', ')}
+        </p>
+      )}
+      {(engine?.supports_seed || direction.seed !== null) && (
+        <Field label="Seed (optional)">
+          <Input
+            type="number"
+            aria-label="Seed"
+            value={direction.seed ?? ''}
+            disabled={editDisabled || !engine?.supports_seed}
+            onChange={(event) => {
+              const seed = event.target.value === '' ? null : event.target.valueAsNumber;
+              if (seed === null || Number.isInteger(seed))
+                session.editPassage(passage.id, { direction: { ...direction, seed } });
+            }}
+          />
+        </Field>
+      )}
+      {incompatibleSeed && (
+        <div className="studio-note">
+          Seed is inactive for this engine.{' '}
+          <StudioButton
+            disabled={editDisabled}
+            onClick={() =>
+              session.editPassage(passage.id, { direction: { ...direction, seed: null } })
+            }
+          >
+            Clear inactive seed
+          </StudioButton>
+        </div>
+      )}
+      {!!unsupportedTags.length && (
+        <p className="studio-error">
+          Unsupported stage tags: {unsupportedTags.join(', ')}. Remove them, or remove brackets if
+          these are spoken words.
+        </p>
+      )}
+      <details className="studio-advanced">
+        <summary>Chunk and transition settings</summary>
+        <NumberField
+          label="Maximum characters per chunk"
+          value={direction.max_chunk_chars}
+          min={1}
+          step={1}
+          disabled={editDisabled}
+          onCommit={(value) =>
+            session.editPassage(passage.id, {
+              direction: { ...direction, max_chunk_chars: Math.round(value) },
+            })
+          }
+        />
+        <NumberField
+          label="Chunk crossfade (ms)"
+          value={direction.crossfade_ms}
+          max={5000}
+          step={1}
+          disabled={editDisabled}
+          onCommit={(value) =>
+            session.editPassage(passage.id, { direction: { ...direction, crossfade_ms: value } })
+          }
+        />
+      </details>
+      <div className="studio-generate-box">
+        {submissionError && (
+          <p role="alert" className="studio-error">
+            {submissionError}
+          </p>
+        )}
+        {request && (
+          <p className="studio-note">
+            An earlier submission needs reconciliation. Retry sends its original passage selection,
+            count and adoption intent before a new request can be made.
+          </p>
+        )}
+        {rejected && (
+          <StudioButton disabled={studio.actionBusy} onClick={discardRejected}>
+            Dismiss rejected submission
+          </StudioButton>
+        )}
+        <Field label="Alternatives per passage">
+          <select
+            aria-label="Alternatives per passage"
+            value={count}
+            onChange={(event) => setCount(Number(event.target.value) as 1 | 2 | 3)}
+            disabled={studio.actionBusy || !!request}
+          >
+            <option value={1}>1 take</option>
+            <option value={2}>2 takes</option>
+            <option value={3}>3 takes</option>
+          </select>
+        </Field>
+        <label className="studio-check">
+          <input
+            type="checkbox"
+            checked={adopt}
+            disabled={studio.actionBusy || !!request}
+            onChange={(event) => setAdopt(event.target.checked)}
+          />{' '}
+          Generate and use when intent still matches
+        </label>
+        <StudioButton
+          primary
+          disabled={
+            studio.actionBusy ||
+            (!request &&
+              (disabled ||
+                !engine?.ready ||
+                !passage.profile_id ||
+                !currentText.trim() ||
+                studio.actionBusy ||
+                incompatible ||
+                incompatibleSeed ||
+                unsupportedTags.length > 0 ||
+                (engine.languages.length > 0 &&
+                  !engine.languages.includes(
+                    save.drafts[passage.id]?.language ?? passage.language,
+                  ))))
+          }
+          onClick={generate}
+        >
+          <Sparkles size={15} />
+          {studio.actionBusy
+            ? 'Submitting…'
+            : request
+              ? 'Retry same request'
+              : adopt
+                ? 'Generate and use'
+                : 'Generate alternatives'}
+        </StudioButton>
+        <p className="studio-note">
+          {(request?.passage_ids.length ?? selectedIds.length) * (request?.count ?? count)} jobs ·{' '}
+          {(request?.adopt ?? adopt)
+            ? 'Adoption checks editing and selection intent.'
+            : 'Keeps your current selected takes.'}
+        </p>
+      </div>
+      <div className="studio-section-title">
+        <h3>Takes</h3>
+        <span>{takes.length}</span>
+      </div>
+      {takes.length > 0 && (
+        <label className="studio-check">
+          <input
+            type="checkbox"
+            checked={replaceClips}
+            onChange={(event) => setReplaceClips(event.target.checked)}
+          />{' '}
+          Replace linked timeline clips when choosing
+        </label>
+      )}
+      {!takes.length && (
+        <p className="studio-note">
+          Completed performances appear here. Your existing take stays selected if a job fails.
+        </p>
+      )}
+      <div className="studio-takes">
+        {takes
+          .slice()
+          .reverse()
+          .map((take, index) => {
+            const asset = project.assets.find((a) => a.id === take.asset_id);
+            return (
+              <div
+                className={`studio-take ${passage.selected_take_id === take.id ? 'is-selected' : ''}`}
+                key={take.id}
+              >
+                <div className="studio-take-title">
+                  <strong>Take {takes.length - index}</strong>
+                  <span>{asset ? formatTime(asset.duration) : 'Audio missing'}</span>
+                </div>
+                <p>
+                  {take.engine}
+                  {take.model_size ? ` · ${take.model_size}` : ''}
+                </p>
+                {take.text !== currentText && (
+                  <span className="studio-status-chip">Different script</span>
+                )}
+                <div className="studio-action-row">
+                  <StudioButton
+                    disabled={!asset}
+                    onClick={() =>
+                      void studio.playback.audition(
+                        client.assetAudio(take.asset_id),
+                        `Take ${takes.length - index}`,
+                      )
+                    }
+                  >
+                    <Headphones size={14} /> Audition
+                  </StudioButton>
+                  <StudioButton
+                    disabled={disabled || passage.selected_take_id === take.id}
+                    onClick={() =>
+                      void session.command('select_take', {
+                        passage_id: passage.id,
+                        take_id: take.id,
+                        replace_clips: replaceClips,
+                      })
+                    }
+                  >
+                    {passage.selected_take_id === take.id ? (
+                      <>
+                        <Check size={14} /> Selected
+                      </>
+                    ) : (
+                      'Use take'
+                    )}
+                  </StudioButton>
+                </div>
+                <details>
+                  <summary>Performance snapshot</summary>
+                  <p className="studio-take-script">{take.text}</p>
+                  <pre>{JSON.stringify(take.request, null, 2)}</pre>
+                </details>
+              </div>
+            );
+          })}
+      </div>
+    </div>
+  );
+}

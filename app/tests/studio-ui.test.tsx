@@ -1,0 +1,569 @@
+import { afterEach, describe, expect, test } from 'bun:test';
+import {
+  isValidElement,
+  type ReactElement,
+  type ReactNode,
+  useState,
+  useSyncExternalStore,
+} from 'react';
+import { act, create, type ReactTestRenderer } from 'react-test-renderer';
+import { DialogContent } from '../src/components/ui/dialog';
+import { StudioClient } from '../src/features/studio/client';
+import { StudioContext, type StudioContextValue } from '../src/features/studio/context';
+import { Deliver } from '../src/features/studio/Deliver';
+import { Director } from '../src/features/studio/Director';
+import type { StudioPlayback } from '../src/features/studio/playback';
+import { Review } from '../src/features/studio/Review';
+import { ScriptEditor } from '../src/features/studio/ScriptEditor';
+import { ProjectSession } from '../src/features/studio/session';
+import { Timeline } from '../src/features/studio/Timeline';
+import type { StudioCommand, StudioEngine, StudioProject } from '../src/features/studio/types';
+import { PlatformProvider } from '../src/platform/PlatformContext';
+import type { Platform } from '../src/platform/types';
+
+let renderer: ReactTestRenderer;
+const sessions: ProjectSession[] = [];
+afterEach(() => {
+  act(() => renderer?.unmount());
+  for (const session of sessions.splice(0)) session.dispose();
+});
+function fixture(): StudioProject {
+  const passage = {
+    id: 'line',
+    text: 'A performance worth keeping.',
+    language: 'en',
+    profile_id: 'voice',
+    voice_snapshot: { name: 'Narrator', default_engine: 'engine' },
+    direction: { instruct: '', seed: null, max_chunk_chars: 500, crossfade_ms: 0 },
+    input_revision: 1,
+    selection_token: 1,
+    selected_take_id: 'take-a',
+    locked: false,
+  };
+  const document = {
+    schema_version: 1 as const,
+    sample_rate: 48000 as const,
+    channels: 2 as const,
+    language: 'en',
+    passages: [passage],
+    tracks: [
+      {
+        id: 'voice-track',
+        name: 'Narration',
+        kind: 'voice' as const,
+        gain: 1,
+        mute: false,
+        solo: false,
+      },
+    ],
+    clips: [
+      {
+        id: 'clip',
+        passage_id: 'line',
+        take_id: 'take-a',
+        asset_id: 'asset-a',
+        track_id: 'voice-track',
+        start_sample: 0,
+        trim_start_sample: 0,
+        trim_end_sample: 0,
+        gain: 1,
+        fade_in_samples: 0,
+        fade_out_samples: 0,
+      },
+    ],
+    mix: { normalize: false, target_lufs: -16, max_true_peak_dbtp: -1 },
+  };
+  return {
+    id: 'project',
+    name: 'Narration',
+    client_label: 'Client',
+    revision: 2,
+    created_at: '2026-10-28',
+    updated_at: '2026-10-28',
+    document,
+    takes: ['a', 'b'].map((id) => ({
+      id: `take-${id}`,
+      passage_id: 'line',
+      asset_id: `asset-${id}`,
+      text: passage.text,
+      engine: 'engine',
+      model_size: null,
+      created_at: '',
+      request: { text: passage.text },
+    })),
+    assets: ['a', 'b'].map((id) => ({
+      id: `asset-${id}`,
+      hash: 'hash',
+      sample_rate: 48000,
+      channels: 1,
+      frames: 96000,
+      duration: 2,
+      size_bytes: 10,
+    })),
+    jobs: [],
+    revisions: [
+      {
+        id: 'checkpoint',
+        name: 'Approved script',
+        created_at: '2026-10-28',
+        project_revision: 1,
+        document: structuredClone(document),
+      },
+    ],
+    approvals: [],
+    deliverables: [],
+  };
+}
+const engine: StudioEngine = {
+  id: 'engine',
+  name: 'Actual engine',
+  languages: ['en'],
+  supports_instruct: false,
+  supports_seed: false,
+  expressive_tags: [],
+  ready: true,
+  commercial_use: 'unknown',
+};
+async function mount(
+  component: ReactNode,
+  options: {
+    project?: StudioProject;
+    engines?: StudioEngine[];
+    conflict?: boolean;
+    failGenerate?: boolean;
+    failRender?: boolean;
+    store?: Map<string, string>;
+  } = {},
+) {
+  let current = options.project ?? fixture();
+  const commands: StudioCommand[] = [];
+  const approvals: unknown[] = [];
+  const generations: unknown[] = [];
+  const renders: unknown[] = [];
+  const auditions: string[] = [];
+  const client = new StudioClient('http://test', (async (url, init) => {
+    const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+    if (String(url).endsWith('/commands')) {
+      commands.push(body);
+      if (options.conflict)
+        return Response.json(
+          { detail: { message: 'Another window saved', current_revision: 4 } },
+          { status: 409 },
+        );
+      current = structuredClone(current);
+      current.revision++;
+      if (body.type === 'update_passage') Object.assign(current.document.passages[0], body.payload);
+      return Response.json(current);
+    }
+    if (String(url).endsWith('/approvals')) {
+      approvals.push(body);
+      return Response.json(current);
+    }
+    if (String(url).endsWith('/generation-jobs')) {
+      generations.push(body);
+      if (options.failGenerate && generations.length === 1) throw new Error('Uncertain response');
+      return Response.json({ jobs: [] });
+    }
+    if (String(url).endsWith('/render-jobs')) {
+      renders.push(body);
+      if (options.failRender && renders.length === 1) throw new Error('Render response lost');
+      return Response.json({ job: {} });
+    }
+    return Response.json(current);
+  }) as typeof fetch);
+  const store = options.store ?? new Map<string, string>();
+  const session = new ProjectSession(client, 'project', {
+    get length() {
+      return store.size;
+    },
+    key: (index: number) => [...store.keys()][index] ?? null,
+    getItem: (key) => store.get(key) ?? null,
+    setItem: (key, value) => {
+      store.set(key, value);
+    },
+    removeItem: (key) => {
+      store.delete(key);
+    },
+  });
+  sessions.push(session);
+  await session.load();
+  function Harness() {
+    const save = useSyncExternalStore(session.subscribe, session.getSnapshot);
+    const [revisionId, setRevisionId] = useState('checkpoint');
+    const [checkedPassages, setCheckedPassages] = useState<string[]>([]);
+    const context: StudioContextValue = {
+      client,
+      project: save.project!,
+      save,
+      session,
+      profiles: [
+        {
+          id: 'voice',
+          name: 'Narrator',
+          default_engine: 'engine',
+          language: 'en',
+          voice_type: 'preset',
+        },
+      ],
+      engines: options.engines ?? [engine],
+      capabilitiesError: null,
+      playback: {
+        getSnapshot: () => ({ mode: 'idle' }),
+        audition: async (url: string) => {
+          auditions.push(url);
+        },
+      } as unknown as StudioPlayback,
+      selectedPassageId: 'line',
+      selectedClipId: 'clip',
+      checkedPassages,
+      setCheckedPassages,
+      selectPassage: () => {},
+      selectClip: () => {},
+      playhead: 0.75,
+      setPlayhead: () => {},
+      revisionId,
+      setRevisionId,
+      actionBusy: false,
+      actionError: null,
+      runAction: async (action) => {
+        try {
+          await action();
+        } catch {
+          /* Production shell presents this error. */
+        }
+      },
+      canMutate: ['saved', 'dirty'].includes(save.status),
+    };
+    return (
+      <PlatformProvider platform={{ filesystem: {} } as Platform}>
+        <StudioContext.Provider value={context}>{component}</StudioContext.Provider>
+      </PlatformProvider>
+    );
+  }
+  act(() => {
+    renderer = create(<Harness />);
+  });
+  return { session, commands, approvals, generations, renders, auditions };
+}
+function button(text: string) {
+  const found = renderer.root
+    .findAllByType('button')
+    .find((node) => textContent(node.props.children) === text);
+  expect(found).toBeDefined();
+  return found!;
+}
+function textContent(value: ReactNode): string {
+  if (typeof value === 'string' || typeof value === 'number') return String(value);
+  if (Array.isArray(value)) return value.map(textContent).join('');
+  return '';
+}
+
+describe('connected studio controls', () => {
+  test('script input remains visible and recoverable after a revision conflict', async () => {
+    const { session, commands } = await mount(<ScriptEditor />, { conflict: true });
+    act(() =>
+      renderer.root
+        .findByType('textarea')
+        .props.onChange({ target: { value: 'My words stay here.' } }),
+    );
+    await act(async () => {
+      await session.flush();
+    });
+    expect(renderer.root.findByType('textarea').props.value).toBe('My words stay here.');
+    expect(session.getSnapshot().status).toBe('conflict');
+    expect(commands[0].expected_revision).toBe(2);
+    expect(session.recoveryCopy()).toContain('My words stay here.');
+  });
+  test('unsupported direction and seed controls stay absent and engine terms stay visible', async () => {
+    await mount(<Director />);
+    expect(renderer.root.findAllByProps({ 'aria-label': 'Delivery direction' })).toHaveLength(0);
+    expect(renderer.root.findAllByProps({ 'aria-label': 'Seed' })).toHaveLength(0);
+    expect(JSON.stringify(renderer.toJSON())).toContain('Commercial use: ');
+    expect(JSON.stringify(renderer.toJSON())).toContain('unknown');
+  });
+  test('take audition uses immutable source and selecting a take preserves explicit timeline replacement intent', async () => {
+    const { auditions, commands } = await mount(<Director />);
+    await act(async () => {
+      await button(' Audition').props.onClick();
+    });
+    expect(auditions[0]).toBe('http://test/studio/v1/assets/asset-b/audio');
+    const replace = renderer.root
+      .findAllByType('input')
+      .find(
+        (node) =>
+          node.props.type === 'checkbox' &&
+          node.parent?.props.className === 'studio-check' &&
+          textContent(node.parent.props.children).includes('Replace linked'),
+      );
+    expect(replace).toBeDefined();
+    act(() => replace!.props.onChange({ target: { checked: true } }));
+    await act(async () => {
+      await button('Use take').props.onClick();
+    });
+    expect(commands[0].type).toBe('select_take');
+    expect(commands[0].payload).toEqual({
+      passage_id: 'line',
+      take_id: 'take-b',
+      replace_clips: true,
+    });
+  });
+  test('generation retry preserves the original bounded alternative/adoption request', async () => {
+    const { generations } = await mount(<Director />, { failGenerate: true });
+    act(() =>
+      renderer.root
+        .findAllByType('select')
+        .find((node) => node.props['aria-label'] === 'Alternatives per passage')!
+        .props.onChange({ target: { value: '3' } }),
+    );
+    await act(async () => {
+      await button('Generate alternatives').props.onClick();
+    });
+    await act(async () => {
+      await button('Retry same request').props.onClick();
+    });
+    expect(generations).toHaveLength(2);
+    expect(generations[0]).toEqual(generations[1]);
+    expect(generations[0]).toMatchObject({ count: 3, adopt: false, passage_ids: ['line'] });
+  });
+  test('numeric placement, split and append send undoable project-sample commands', async () => {
+    const { commands } = await mount(<Timeline />);
+    const start = renderer.root
+      .findAllByType('input')
+      .find((node) => node.props['aria-label'] === 'Start (s)')!;
+    await act(async () => {
+      start.props.onBlur({ currentTarget: { valueAsNumber: 1.125 } });
+    });
+    await act(async () => {
+      await button(' Split at playhead').props.onClick();
+    });
+    await act(async () => {
+      await button('Append').props.onClick();
+    });
+    expect(commands.map((command) => [command.type, command.payload])).toEqual([
+      ['update_clip', { clip_id: 'clip', start_sample: 54000 }],
+      ['split_clip', { clip_id: 'clip', at_sample: 36000 }],
+      ['insert_passages', { passage_ids: ['line'], gap_ms: 200 }],
+    ]);
+  });
+  test('review text and approval stay bound to the selected immutable checkpoint', async () => {
+    const project = fixture();
+    project.document.passages[0].text = 'A later draft has different words.';
+    const { approvals } = await mount(<Review />, { project });
+    const content = JSON.stringify(renderer.toJSON());
+    expect(content).toContain('A performance worth keeping.');
+    expect(content).not.toContain('A later draft has different words.');
+    act(() =>
+      renderer.root.findByType('textarea').props.onChange({ target: { value: 'Pacing checked' } }),
+    );
+    await act(async () => {
+      await button(' Approve this checkpoint locally').props.onClick();
+    });
+    expect(approvals[0]).toMatchObject({ revision_id: 'checkpoint', note: 'Pacing checked' });
+  });
+});
+
+test('unsupported stage tags block generation with an explicit wording resolution', async () => {
+  const project = fixture();
+  project.document.passages[0].text = '[whisper] Private words';
+  const { generations } = await mount(<Director />, { project });
+  expect(button('Generate alternatives').props.disabled).toBe(true);
+  expect(JSON.stringify(renderer.toJSON())).toContain('Unsupported stage tags: ');
+  expect(generations).toHaveLength(0);
+});
+
+test('generation remount and restart replay the original identity and body before any new submission', async () => {
+  const store = new Map<string, string>();
+  const first = await mount(<Director />, { failGenerate: true, store });
+  act(() =>
+    renderer.root
+      .findByProps({ 'aria-label': 'Alternatives per passage' })
+      .props.onChange({ target: { value: '3' } }),
+  );
+  await act(async () => {
+    await button('Generate alternatives').props.onClick();
+  });
+  act(() => renderer.unmount());
+  first.session.dispose();
+  const reopened = await mount(<Director />, { store });
+  await act(async () => {
+    await button('Retry same request').props.onClick();
+  });
+  expect(reopened.generations).toEqual(first.generations);
+});
+
+test('generation fails visibly before issuing a mutation when durable storage rejects writes', async () => {
+  const store = new Map<string, string>();
+  store.set = () => {
+    throw new Error('Quota exceeded');
+  };
+  const { generations } = await mount(<Director />, { store });
+  await act(async () => {
+    await button('Generate alternatives').props.onClick();
+  });
+  expect(generations).toHaveLength(0);
+  expect(JSON.stringify(renderer.toJSON())).toContain('persist');
+});
+
+test('model-size selection reassigns the compatible profile with the chosen registry variant', async () => {
+  const p = fixture();
+  p.document.passages[0].voice_snapshot = { engine: 'engine', model_size: 'small' };
+  const { commands } = await mount(<Director />, {
+    project: p,
+    engines: [
+      { ...engine, model_size: 'small' },
+      { ...engine, model_size: 'large' },
+    ],
+  });
+  const select = renderer.root
+    .findAllByType('select')
+    .find((node) => node.props['aria-label'] === 'Voice model size');
+  expect(select).toBeDefined();
+  await act(async () => {
+    await select!.props.onChange({ target: { value: 'large' } });
+  });
+  expect(commands[0].payload).toEqual({
+    passage_ids: ['line'],
+    profile_id: 'voice',
+    model_size: 'large',
+  });
+});
+
+// Inspect the actual closed sheet's React elements; Radix portal/DOM behavior is outside this suite.
+interface SheetProps {
+  children: ReactNode;
+  value: string;
+  disabled: boolean;
+  'aria-label'?: string;
+  onClick: () => void | Promise<void>;
+  onChange: (event: { target: { value?: string; checked?: boolean } }) => void;
+}
+function sheetElements(): ReactElement<SheetProps>[] {
+  function visit(node: ReactNode): ReactElement<SheetProps>[] {
+    if (Array.isArray(node)) return node.flatMap(visit);
+    if (!isValidElement<SheetProps>(node)) return [];
+    return [node, ...visit(node.props.children)];
+  }
+  return visit(renderer.root.findByType(DialogContent).props.children);
+}
+function sheetButton(label: string) {
+  const item = sheetElements().find(
+    (node) =>
+      textContent(node.props.children) === label && typeof node.props.onClick === 'function',
+  );
+  expect(item).toBeDefined();
+  return item!;
+}
+test('render restart retains exact checkpoint, encoding and idempotency body', async () => {
+  const store = new Map<string, string>();
+  const project = fixture();
+  project.revisions.push({
+    ...project.revisions[0],
+    id: 'original-source',
+    name: 'Delivery source',
+    document: structuredClone(project.revisions[0].document),
+  });
+  project.revisions[1].document.passages[0].text = 'Corrected words after the recording.';
+  const first = await mount(<Deliver />, { store, failRender: true, project });
+  const changeSelect = (current: string, next: string) =>
+    act(() =>
+      sheetElements()
+        .find((node) => node.type === 'select' && node.props.value === current)!
+        .props.onChange({ target: { value: next } }),
+    );
+  changeSelect('checkpoint', 'original-source');
+  changeSelect('mix', 'stems');
+  changeSelect('wav', 'mp3');
+  act(() =>
+    sheetElements()
+      .find((node) => node.props['aria-label'] === 'Use earlier recording')!
+      .props.onChange({ target: { checked: true } }),
+  );
+  await act(async () => {
+    await sheetButton('Render dry stems').props.onClick();
+  });
+  act(() => renderer.unmount());
+  first.session.dispose();
+  const next = await mount(<Deliver />, { store });
+  await act(async () => {
+    await sheetButton('Retry same render request').props.onClick();
+  });
+  expect(next.renders).toEqual(first.renders);
+  expect(next.renders[0]).toMatchObject({
+    revision_id: 'original-source',
+    kind: 'stems',
+    format: 'mp3',
+    allow_stale_audio: true,
+  });
+});
+test('delivery stale consent is explicit, revision-bound and includes recorded versus script text', async () => {
+  const p = fixture();
+  p.revisions[0].document.passages[0].text = 'The corrected script.';
+  p.revisions.push({ ...p.revisions[0], id: 'second', name: 'Another checkpoint' });
+  const { renders } = await mount(<Deliver />, { project: p });
+  expect(sheetButton('Render mix').props.disabled).toBe(true);
+  expect(
+    sheetElements()
+      .map((node) => textContent(node.props.children))
+      .join(' '),
+  ).toContain('The corrected script.');
+  const consent = sheetElements().find(
+    (node) => node.props['aria-label'] === 'Use earlier recording',
+  );
+  expect(consent).toBeDefined();
+  act(() => consent!.props.onChange({ target: { checked: true } }));
+  expect(sheetButton('Render mix').props.disabled).toBe(false);
+  const select = sheetElements().find(
+    (node) => node.type === 'select' && node.props.value === 'checkpoint',
+  )!;
+  act(() => select.props.onChange({ target: { value: 'second' } }));
+  expect(sheetButton('Render mix').props.disabled).toBe(true);
+  expect(renders).toHaveLength(0);
+  const secondConsent = sheetElements().find(
+    (node) => node.props['aria-label'] === 'Use earlier recording',
+  )!;
+  act(() => secondConsent.props.onChange({ target: { checked: true } }));
+  await act(async () => {
+    await sheetButton('Render mix').props.onClick();
+  });
+  expect(renders[0]).toMatchObject({ revision_id: 'second', allow_stale_audio: true });
+});
+
+test('direction-only mismatch requires consent and structural errors remain blocking after consent', async () => {
+  const project = fixture();
+  project.takes[0].request = {
+    passage: { input_revision: 1, direction: project.document.passages[0].direction },
+  };
+  project.revisions[0].document.passages[0].input_revision = 2;
+  project.revisions[0].document.passages[0].direction.instruct = 'Different pacing';
+  project.revisions[0].document.clips[0].track_id = 'missing';
+  const { renders } = await mount(<Deliver />, { project });
+  const checkbox = sheetElements().find(
+    (node) => node.props['aria-label'] === 'Use earlier recording',
+  );
+  expect(checkbox).toBeDefined();
+  act(() => checkbox!.props.onChange({ target: { checked: true } }));
+  expect(sheetButton('Render mix').props.disabled).toBe(true);
+  expect(renders).toHaveLength(0);
+});
+
+test('Director exposes independent orphan choices and recovers only the chosen snapshot', async () => {
+  const store = new Map<string, string>();
+  const prefix = 'voicebox-studio:recovery:http%3A%2F%2Ftest:project:session:';
+  for (const id of ['first', 'second'])
+    store.set(
+      prefix + id,
+      JSON.stringify({
+        version: 1,
+        project_id: 'project',
+        base_revision: 2,
+        drafts: { line: { text: `${id} orphan` } },
+        queue: [],
+      }),
+    );
+  const { session } = await mount(<Director />, { store });
+  await act(async () => {
+    await button('Recover local copy 2 · draft 2').props.onClick();
+  });
+  expect(session.getSnapshot().drafts.line.text).toBe('second orphan');
+  expect(store.get(`${prefix}first`)).toContain('first orphan');
+});

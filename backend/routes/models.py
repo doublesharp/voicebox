@@ -13,6 +13,7 @@ from ..utils.platform_detect import get_backend_type
 from ..services.task_queue import create_background_task
 from ..utils.progress import get_progress_manager
 from ..utils.tasks import get_task_manager
+from ..utils.inference import serialized_inference
 
 router = APIRouter()
 
@@ -65,6 +66,7 @@ def _resolve_model_config(model_name: str):
 
 
 @router.post("/models/load")
+@serialized_inference
 async def load_model(
     request: models.ModelLoadRequest | None = None,
     model_size: str | None = None,
@@ -104,6 +106,7 @@ async def load_model(
 
 
 @router.post("/models/unload")
+@serialized_inference
 async def unload_model(request: models.ModelLoadRequest | None = None):
     """Unload a model from memory.
 
@@ -135,6 +138,7 @@ async def unload_model(request: models.ModelLoadRequest | None = None):
 
 
 @router.post("/models/{model_name}/unload")
+@serialized_inference
 async def unload_model_by_name(model_name: str):
     """Unload a specific model from memory without deleting it from disk."""
     from ..backends import get_model_config, unload_model_by_config
@@ -514,6 +518,7 @@ async def cancel_model_download(request: models.ModelDownloadRequest):
 
 
 @router.delete("/models/{model_name}")
+@serialized_inference
 async def delete_model(model_name: str):
     """Delete a downloaded model from the HuggingFace cache."""
     from huggingface_hub import constants as hf_constants
