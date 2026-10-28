@@ -13,6 +13,8 @@ mod input_monitoring;
 #[cfg(desktop)]
 mod key_codes;
 mod keyboard_layout;
+mod publication;
+mod publication_commands;
 mod speak_monitor;
 mod synthetic_keys;
 
@@ -1538,6 +1540,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            publication_commands::publish_file_bytes,
+            publication_commands::publish_file_url,
             start_server,
             stop_server,
             restart_server,
