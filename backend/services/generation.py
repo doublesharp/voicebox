@@ -21,6 +21,7 @@ import logging
 import traceback
 from typing import Literal, Optional
 
+from .inference_scheduler import check_inference_cancelled, serialized_inference
 from .. import config
 from . import history, profiles
 from ..database import get_db
@@ -43,6 +44,7 @@ def release_generation_memory(tts_model) -> None:
         logging.getLogger(__name__).debug("post-generation cache cleanup failed: %s", e)
 
 
+@serialized_inference
 async def run_generation(
     *,
     generation_id: str,
@@ -85,6 +87,7 @@ async def run_generation(
             await history.update_generation_status(generation_id, "loading_model", bg_db)
 
         await load_engine_model(engine, model_size)
+        check_inference_cancelled()
 
         voice_prompt = await profiles.create_voice_prompt_for_profile(
             profile_id,
@@ -268,6 +271,7 @@ def _save_retry(
     return config.to_storage_path(audio_path)
 
 
+@serialized_inference
 async def generate_audio_sync(
     *,
     profile_id: str,
@@ -308,6 +312,7 @@ async def generate_audio_sync(
     try:
         tts_model = get_tts_backend_for_engine(engine)
         await load_engine_model(engine, model_size)
+        check_inference_cancelled()
 
         voice_prompt = await profiles.create_voice_prompt_for_profile(
             profile_id,

@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
+from ..services.inference_scheduler import serialized_inference
 from .. import models
 from ..utils.platform_detect import get_backend_type
 from ..services.task_queue import create_background_task
@@ -65,6 +66,7 @@ def _resolve_model_config(model_name: str):
 
 
 @router.post("/models/load")
+@serialized_inference
 async def load_model(
     request: models.ModelLoadRequest | None = None,
     model_size: str | None = None,
@@ -104,6 +106,7 @@ async def load_model(
 
 
 @router.post("/models/unload")
+@serialized_inference
 async def unload_model(request: models.ModelLoadRequest | None = None):
     """Unload a model from memory.
 
@@ -135,6 +138,7 @@ async def unload_model(request: models.ModelLoadRequest | None = None):
 
 
 @router.post("/models/{model_name}/unload")
+@serialized_inference
 async def unload_model_by_name(model_name: str):
     """Unload a specific model from memory without deleting it from disk."""
     from ..backends import get_model_config, unload_model_by_config

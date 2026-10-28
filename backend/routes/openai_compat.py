@@ -45,6 +45,7 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy.orm import Session
 
+from ..services.inference_scheduler import check_inference_cancelled, serialized_inference
 from ..database import get_db
 
 logger = logging.getLogger(__name__)
@@ -284,6 +285,7 @@ async def create_speech(request: Request, db: Session = Depends(get_db)):
         return OpenAIError(e.status_code, detail).response()
 
 
+@serialized_inference
 async def _create_speech(request: Request, db: Session) -> Response:
     from ..backends import (
         engine_needs_trim,
@@ -355,6 +357,7 @@ async def _create_speech(request: Request, db: Session) -> Response:
             code="model_not_downloaded",
         ) from exc
     await load_engine_model(engine, model_size or "default")
+    check_inference_cancelled()
     tts_model = get_tts_backend_for_engine(engine)
 
     voice_prompt = await profiles.create_voice_prompt_for_profile(str(profile.id), db, engine=engine)

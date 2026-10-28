@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
+from ..services.inference_scheduler import check_inference_cancelled, serialized_inference
 from .. import config, models
 from ..services import history, personality, profiles, tts
 from ..database import Generation as DBGeneration, VoiceProfile as DBVoiceProfile, get_db
@@ -316,6 +317,7 @@ async def get_generation_status(generation_id: str, db: Session = Depends(get_db
 
 
 @router.post("/generate/stream")
+@serialized_inference
 async def stream_speech(
     data: models.GenerationRequest,
     db: Session = Depends(get_db),
@@ -343,6 +345,7 @@ async def stream_speech(
 
     await ensure_model_cached_or_raise(engine, model_size)
     await load_engine_model(engine, model_size)
+    check_inference_cancelled()
 
     voice_prompt = await profiles.create_voice_prompt_for_profile(
         data.profile_id,

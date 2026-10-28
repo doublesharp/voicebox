@@ -15,6 +15,8 @@ from typing import List, Tuple
 
 import numpy as np
 
+from ..services.inference_scheduler import check_inference_cancelled
+
 logger = logging.getLogger("voicebox.chunked-tts")
 
 # Default chunk size in characters.  Can be overridden per-request via
@@ -255,6 +257,7 @@ async def generate_chunked(
         chunk_seed: int | None,
         retry_depth: int = 0,
     ) -> tuple[np.ndarray, int]:
+        check_inference_cancelled()
         chunk_audio, chunk_sr = await backend.generate(
             chunk_text,
             voice_prompt,
@@ -263,6 +266,7 @@ async def generate_chunked(
             instruct,
         )
 
+        check_inference_cancelled()
         if runaway_detector is not None and runaway_detector(chunk_audio, chunk_sr):
             if retry_depth >= MAX_RUNAWAY_RETRIES or len(chunk_text) <= MIN_RUNAWAY_RETRY_CHARS:
                 if trim_fn is not None:
