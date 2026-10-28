@@ -74,6 +74,8 @@ class Generation(Base):
     instruct = Column(Text)
     engine = Column(String, default="qwen")
     model_size = Column(String, nullable=True)
+    # Effective per-generation processing settings; NULL marks legacy/imported rows.
+    synthesis_config = Column(Text, nullable=True)
     status = Column(String, default="completed", index=True)
     error = Column(Text, nullable=True)
     is_favorited = Column(Boolean, default=False)

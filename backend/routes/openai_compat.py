@@ -394,8 +394,10 @@ async def _create_speech(request: Request, db: Session) -> Response:
     _, audio = await asyncio.to_thread(
         process_generated_audio, audio, sample_rate, effects_chain=effects_chain_from_config(profile.effects_chain)
     )
+    check_inference_cancelled()
     # Time stretching may overshoot even when its input has safe peaks.
     audio = protect_audio_peak(await asyncio.to_thread(apply_speed, audio, sample_rate, data.speed))
+    check_inference_cancelled()
     content, media_type = await asyncio.to_thread(encode_audio, audio, sample_rate, data.response_format)
 
     logger.info(

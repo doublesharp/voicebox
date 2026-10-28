@@ -103,8 +103,8 @@ async def test_slow_stream_has_bounded_backpressure_and_disconnect_cleans_up():
 
 @pytest.mark.asyncio
 async def test_stream_failure_is_propagated_and_next_request_can_run():
-    from backend.utils.streaming_audio import serialized_byte_stream
     from backend.services.inference_scheduler import run_serialized_inference
+    from backend.utils.streaming_audio import serialized_byte_stream
 
     async def operation(send):
         await send(b'header')

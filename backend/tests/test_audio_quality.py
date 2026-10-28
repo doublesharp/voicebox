@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -121,9 +122,21 @@ def manifest(tmp_path):
     return path
 
 
-def test_cli_analyzes_existing_wav_and_keeps_proof_domains_explicit(tmp_path):
+@pytest.fixture
+def report_output():
+    if not Path("/Volumes/Scratch").is_mount():
+        pytest.skip("The quality CLI requires the Scratch volume")
+    reports = Path("/Volumes/Scratch/voicebox/reports")
+    reports.mkdir(parents=True, exist_ok=True)
+    # Exercise the real subprocess path policy independently of pytest's
+    # configurable temporary fixture directory. This directory is task-owned.
+    with tempfile.TemporaryDirectory(prefix="quality-cli-test-", dir=reports) as directory:
+        yield Path(directory) / "report"
+
+
+def test_cli_analyzes_existing_wav_and_keeps_proof_domains_explicit(tmp_path, report_output):
     input_path = manifest(tmp_path)
-    output = tmp_path / "report"
+    output = report_output
     absent_models = tmp_path / "no-models"
     env = {**os.environ, "VOICEBOX_MODELS_DIR": str(absent_models), "HF_HUB_OFFLINE": "1"}
     result = run_cli("--manifest", input_path, "--output-dir", output, env=env)

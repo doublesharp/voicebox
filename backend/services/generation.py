@@ -8,10 +8,10 @@ function parameterized by *mode*.
 Mode differences:
   - "generate"   : full pipeline -- save clean version, optionally apply
                     effects and create a processed version.
-  - "retry"      : re-runs a failed generation with the same seed.
-                    No effects, no version creation.
-  - "regenerate" : re-runs with seed=None for variation.  Creates a new
-                    version with an auto-incremented "take-N" label.
+  - "retry"      : re-runs a failed generation with the same seed/settings,
+                    preserving any existing clean or processed versions.
+  - "regenerate" : re-runs with seed=None for variation. Creates a clean
+                    take plus its effects render, retaining source provenance.
 """
 
 from __future__ import annotations
@@ -97,6 +97,7 @@ async def run_generation(
             engine=engine,
         )
 
+        check_inference_cancelled()
         await history.update_generation_status(generation_id, "generating", bg_db)
         trim_fn = trim_tts_output if engine_needs_trim(engine) else None
         runaway_detector = has_tts_runaway if engine_retries_runaway(engine) else None
@@ -125,8 +126,9 @@ async def run_generation(
                 effects_chain = None
         clean_audio, processed_audio = await asyncio.to_thread(
             process_generated_audio, audio, sample_rate,
-            normalize=normalize or mode == "regenerate", effects_chain=effects_chain,
+            normalize=normalize, effects_chain=effects_chain,
         )
+        check_inference_cancelled()
         duration = len(processed_audio) / sample_rate
 
         # --- Persist audio and update status -----------------------------
@@ -143,16 +145,21 @@ async def run_generation(
         elif mode == "retry":
             final_path = _save_retry(
                 generation_id=generation_id,
-                audio=processed_audio,
+                audio=clean_audio,
+                processed_audio=processed_audio,
                 sample_rate=sample_rate,
+                effects_chain=effects_chain,
                 save_audio=save_audio,
+                db=bg_db,
             )
         elif mode == "regenerate":
             final_path = _save_regenerate(
                 generation_id=generation_id,
                 version_id=version_id,
-                audio=processed_audio,
+                audio=clean_audio,
+                processed_audio=processed_audio,
                 sample_rate=sample_rate,
+                effects_chain=effects_chain,
                 save_audio=save_audio,
                 db=bg_db,
             )
@@ -213,6 +220,8 @@ def _save_generate(
     effects_chain: Optional[list],
     save_audio,
     db,
+    clean_label: str = "original",
+    filename_token: Optional[str] = None,
 ) -> str:
     """Save clean version and optionally an effects-processed version.
 
@@ -221,14 +230,15 @@ def _save_generate(
     """
     from . import versions as versions_mod
 
-    clean_audio_path = config.get_generations_dir() / f"{generation_id}.wav"
+    filename = f"{generation_id}_{filename_token}" if filename_token else generation_id
+    clean_audio_path = config.get_generations_dir() / f"{filename}.wav"
     save_audio(audio, str(clean_audio_path), sample_rate)
 
     has_effects = effects_chain and any(e.get("enabled", True) for e in effects_chain)
 
-    versions_mod.create_version(
+    clean_version = versions_mod.create_version(
         generation_id=generation_id,
-        label="original",
+        label=clean_label,
         audio_path=config.to_storage_path(clean_audio_path),
         db=db,
         effects_chain=None,
@@ -238,15 +248,16 @@ def _save_generate(
     final_audio_path = str(clean_audio_path)
 
     if has_effects:
-        processed_path = config.get_generations_dir() / f"{generation_id}_processed.wav"
+        processed_path = config.get_generations_dir() / f"{filename}_processed.wav"
         save_audio(processed_audio, str(processed_path), sample_rate)
         final_audio_path = str(processed_path)
         versions_mod.create_version(
             generation_id=generation_id,
-            label="version-2",
+            label="version-2" if clean_label == "original" else f"{clean_label}-effects",
             audio_path=config.to_storage_path(processed_path),
             db=db,
             effects_chain=effects_chain,
+            source_version_id=clean_version.id,
             is_default=True,
         )
 
@@ -257,16 +268,28 @@ def _save_retry(
     *,
     generation_id: str,
     audio,
+    processed_audio,
     sample_rate: int,
+    effects_chain: Optional[list],
     save_audio,
+    db,
 ) -> str:
-    """Save retry output -- single file, no versions.
+    """Retry with both clean and processed audio, preserving partial versions."""
+    from ..database import GenerationVersion as DBGenerationVersion
+    import uuid
 
-    Returns the audio path.
-    """
-    audio_path = config.get_generations_dir() / f"{generation_id}.wav"
-    save_audio(audio, str(audio_path), sample_rate)
-    return config.to_storage_path(audio_path)
+    count = db.query(DBGenerationVersion).filter_by(generation_id=generation_id).count()
+    return _save_generate(
+        generation_id=generation_id,
+        audio=audio,
+        processed_audio=processed_audio,
+        sample_rate=sample_rate,
+        effects_chain=effects_chain,
+        save_audio=save_audio,
+        db=db,
+        clean_label=f"retry-{count + 1}" if count else "original",
+        filename_token=uuid.uuid4().hex[:12] if count else None,
+    )
 
 
 @serialized_inference
@@ -320,6 +343,7 @@ async def generate_audio_sync(
             use_cache=True,
             engine=engine,
         )
+        check_inference_cancelled()
         if effects_chain is None:
             profile = await profiles.get_profile(profile_id, bg_db)
             effects_chain = effects_chain_from_config(profile.effects_chain if profile else None)
@@ -349,7 +373,10 @@ async def generate_audio_sync(
         _, processed_audio = await asyncio.to_thread(
             process_generated_audio, audio, sample_rate, normalize=normalize, effects_chain=effects_chain
         )
-        return tts.audio_to_wav_bytes(processed_audio, sample_rate)
+        check_inference_cancelled()
+        wav_bytes = await asyncio.to_thread(tts.audio_to_wav_bytes, processed_audio, sample_rate)
+        check_inference_cancelled()
+        return wav_bytes
     finally:
         release_generation_memory(tts_model)
 
@@ -359,35 +386,25 @@ def _save_regenerate(
     generation_id: str,
     version_id: Optional[str],
     audio,
+    processed_audio,
     sample_rate: int,
+    effects_chain: Optional[list],
     save_audio,
     db,
 ) -> str:
-    """Save regeneration output as a new version with auto-label.
-
-    Returns the audio path.
-    """
-    from . import versions as versions_mod
-
-    import uuid as _uuid
-
-    suffix = _uuid.uuid4().hex[:8]
-    audio_path = config.get_generations_dir() / f"{generation_id}_{suffix}.wav"
-    save_audio(audio, str(audio_path), sample_rate)
-
-    # Count via DB query rather than list length to avoid TOCTOU race
+    """Save an alternate clean take and its optional effects render."""
     from ..database import GenerationVersion as DBGenerationVersion
+    import uuid
 
     count = db.query(DBGenerationVersion).filter_by(generation_id=generation_id).count()
-    label = f"take-{count + 1}"
-
-    versions_mod.create_version(
+    return _save_generate(
         generation_id=generation_id,
-        label=label,
-        audio_path=config.to_storage_path(audio_path),
+        audio=audio,
+        processed_audio=processed_audio,
+        sample_rate=sample_rate,
+        effects_chain=effects_chain,
+        save_audio=save_audio,
         db=db,
-        effects_chain=None,
-        is_default=True,
+        clean_label=f"take-{count + 1}",
+        filename_token=uuid.uuid4().hex[:12],
     )
-
-    return config.to_storage_path(audio_path)

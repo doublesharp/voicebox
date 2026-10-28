@@ -23,6 +23,7 @@ from ..database import (
     StoryItem as DBStoryItem,
 )
 from ..models import EffectConfig, GenerationVersionResponse
+from ..utils.audio_metadata import audio_duration
 
 logger = logging.getLogger(__name__)
 
@@ -78,11 +79,18 @@ def replace_version_audio(
     version.source_version_id = source_version_id
     if version.is_default:
         generation = db.query(DBGeneration).filter_by(id=version.generation_id).one()
-        generation.audio_path = audio_path
+        _select_generation_audio(generation, audio_path)
     db.commit()
     db.refresh(version)
     _remove_unused_audio(previous_path, db)
     return _version_response(version)
+
+
+def _select_generation_audio(generation: DBGeneration, audio_path: str) -> None:
+    generation.audio_path = audio_path
+    duration = audio_duration(audio_path)
+    if duration is not None:
+        generation.duration = duration
 
 
 def _remove_unused_audio(audio_path: str, db: Session) -> None:
@@ -178,15 +186,12 @@ def create_version(
         is_default=is_default,
     )
     db.add(version)
-    db.commit()
-    db.refresh(version)
-
-    # If this version is the default, update the generation's audio_path
     if is_default:
         gen = db.query(DBGeneration).filter_by(id=generation_id).first()
         if gen:
-            gen.audio_path = audio_path
-            db.commit()
+            _select_generation_audio(gen, audio_path)
+    db.commit()
+    db.refresh(version)
 
     return _version_response(version)
 
@@ -199,14 +204,11 @@ def set_default_version(version_id: str, db: Session) -> Optional[GenerationVers
 
     _clear_defaults(version.generation_id, db)
     version.is_default = True
-    db.commit()
-    db.refresh(version)
-
-    # Update generation's audio_path to point to this version
     gen = db.query(DBGeneration).filter_by(id=version.generation_id).first()
     if gen:
-        gen.audio_path = version.audio_path
-        db.commit()
+        _select_generation_audio(gen, version.audio_path)
+    db.commit()
+    db.refresh(version)
 
     return _version_response(version)
 
@@ -266,7 +268,7 @@ def delete_version(version_id: str, db: Session) -> bool:
                 first.is_default = True
                 gen = db.query(DBGeneration).filter_by(id=gen_id).first()
                 if gen:
-                    gen.audio_path = first.audio_path
+                    _select_generation_audio(gen, first.audio_path)
         db.commit()
     except Exception:
         db.rollback()

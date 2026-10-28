@@ -165,6 +165,8 @@ def _migrate_profiles(engine, inspector, tables: set[str]) -> None:
 def _migrate_generations(engine, inspector, tables: set[str]) -> None:
     if "generations" not in tables:
         return
+    # Repeated recovery/startup passes may reuse an Inspector instance.
+    inspector.clear_cache()
     columns = _get_columns(inspector, "generations")
     if "status" not in columns:
         _add_column(engine, "generations", "status VARCHAR DEFAULT 'completed'", "status")
@@ -185,6 +187,8 @@ def _migrate_generations(engine, inspector, tables: set[str]) -> None:
             "source VARCHAR NOT NULL DEFAULT 'manual'",
             "source",
         )
+    if "synthesis_config" not in columns:
+        _add_column(engine, "generations", "synthesis_config TEXT", "synthesis_config")
 
 
 def _migrate_effect_presets(engine, inspector, tables: set[str]) -> None:
