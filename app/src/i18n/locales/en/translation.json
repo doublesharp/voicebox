@@ -1310,5 +1310,18 @@
       "migrationFailedGeneric": "Failed to migrate models",
       "migrationConnectionLost": "Lost connection during migration"
     }
+  },
+  "microphone": {
+    "label": "Microphone",
+    "systemDefault": "System default",
+    "recordingDefault": "Recording (default mic)",
+    "fallbackNotice": "The selected microphone is unavailable. Using the system default for this session. Your saved choice is unchanged.",
+    "enable": "Enable microphones",
+    "enabling": "Enabling…",
+    "refresh": "Refresh microphones",
+    "noAccess": "Microphone access is unavailable. Check your system or browser permissions.",
+    "input": "Microphone {{number}}",
+    "unavailable": "{{name}} (unavailable)",
+    "hint": "Used for recordings and dictation. Your choice is saved on this device."
   }
 }

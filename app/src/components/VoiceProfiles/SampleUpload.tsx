@@ -68,6 +68,9 @@ export function SampleUpload({ profileId, open, onOpenChange }: SampleUploadProp
 
   const {
     isRecording,
+    isStarting,
+    audioStream: recordingStream,
+    usingDefaultMicrophone,
     duration,
     error: recordingError,
     startRecording,
@@ -193,7 +196,7 @@ export function SampleUpload({ profileId, open, onOpenChange }: SampleUploadProp
     if (!newOpen) {
       form.reset();
       setMode('upload');
-      if (isRecording) {
+      if (isRecording || isStarting) {
         cancelRecording();
       }
       if (isSystemRecording) {
@@ -231,7 +234,12 @@ export function SampleUpload({ profileId, open, onOpenChange }: SampleUploadProp
 
         <Form {...form}>
           <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
-            <Tabs value={mode} onValueChange={(v) => setMode(v as 'upload' | 'record' | 'system')}>
+            <Tabs value={mode} onValueChange={(v) => {
+              const nextMode = v as 'upload' | 'record' | 'system';
+              if ((isRecording || isStarting) && nextMode !== 'record') cancelRecording();
+              if (isSystemRecording && nextMode !== 'system') cancelSystemRecording();
+              setMode(nextMode);
+            }}>
               <TabsList
                 className={`grid w-full ${platform.metadata.isTauri && isSystemAudioSupported ? 'grid-cols-3' : 'grid-cols-2'}`}
               >
@@ -277,6 +285,9 @@ export function SampleUpload({ profileId, open, onOpenChange }: SampleUploadProp
                     <AudioSampleRecording
                       file={selectedFile}
                       isRecording={isRecording}
+                      isStarting={isStarting}
+                      recordingStream={recordingStream}
+                      usingDefaultMicrophone={usingDefaultMicrophone}
                       duration={duration}
                       onStart={startRecording}
                       onStop={stopRecording}

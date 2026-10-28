@@ -231,6 +231,9 @@ export function ProfileForm() {
 
   const {
     isRecording,
+    isStarting,
+    audioStream: recordingStream,
+    usingDefaultMicrophone,
     duration,
     error: recordingError,
     startRecording,
@@ -852,7 +855,7 @@ export function ProfileForm() {
     if (!newOpen) {
       setEditingProfileId(null);
       // Don't reset form here - let the effect handle it based on draft state
-      if (isRecording) {
+      if (isRecording || isStarting) {
         cancelRecording();
       }
       if (isSystemRecording) {
@@ -1047,7 +1050,7 @@ export function ProfileForm() {
                             onValueChange={(v) => {
                               const newMode = v as 'upload' | 'record' | 'system';
                               // Cancel any active recordings when switching modes
-                              if (isRecording && newMode !== 'record') {
+                              if ((isRecording || isStarting) && newMode !== 'record') {
                                 cancelRecording();
                               }
                               if (isSystemRecording && newMode !== 'system') {
@@ -1106,6 +1109,9 @@ export function ProfileForm() {
                                   <AudioSampleRecording
                                     file={selectedFile}
                                     isRecording={isRecording}
+                                    isStarting={isStarting}
+                                    recordingStream={recordingStream}
+                                    usingDefaultMicrophone={usingDefaultMicrophone}
                                     duration={duration}
                                     onStart={startRecording}
                                     onStop={stopRecording}

@@ -289,6 +289,7 @@ export function DictateWindow() {
           state={effectiveState}
           elapsedMs={effectiveElapsed}
           errorMessage={session.errorMessage}
+          usingDefaultMicrophone={session.usingDefaultMicrophone}
           onDismiss={session.dismissError}
           onStop={session.isRecording ? session.stopRecording : undefined}
         />
