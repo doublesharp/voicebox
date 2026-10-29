@@ -6,6 +6,13 @@ This is the repository working view of Coordinate work
 Source behavior, model execution, listening quality, CUDA, native playback, and
 frozen-build qualification are separate evidence domains.
 
+Delivered to `doublesharp` in merge commit
+`fe2f8394961c7f85293cbede6d79c487d6e9cc86`, after independent round 2
+**ACCEPT** of candidate `3960bf65c5c610915c795603c7f02ce750ef5ddf`. The reviewer
+reran 60 focused tests successfully and matched all 11 production source hashes
+to the supplied coverage artifact. The merged tree matched that candidate exactly;
+preexisting target checkout edits and links were verified unchanged.
+
 ## Existing-engine improvements
 
 - Qwen CustomVoice and VoiceDesign select MLX on Apple Silicon, matching download,
