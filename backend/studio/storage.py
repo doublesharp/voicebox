@@ -194,6 +194,18 @@ class StudioStore:
         return response
 
     def command(self, project_id, operation_id, expected_revision, type, payload):
+        published = []
+        try:
+            return self._command(project_id, operation_id, expected_revision, type, payload, published)
+        except BaseException:
+            # _command has exited its transaction before checking uncertain commits.
+            from .publication import discard_unregistered
+
+            with self.connect() as db:
+                discard_unregistered(db, published)
+            raise
+
+    def _command(self, project_id, operation_id, expected_revision, type, payload, published):
         request = dict(expected_revision=expected_revision, type=type, payload=payload)
         voice_snapshot = None
         if type == "assign_voice":
@@ -254,7 +266,7 @@ class StudioStore:
                 redo.clear()
                 state = {**state, "document": restored}
             else:
-                self._apply(db, project_id, state, type, payload, voice_snapshot)
+                self._apply(db, project_id, state, type, payload, voice_snapshot, published)
                 undo.append(dict(document=doc, name=row["name"], client_label=row["client_label"]))
                 redo.clear()
             from .archive import _validate_document
@@ -293,7 +305,7 @@ class StudioStore:
             ).fetchone()
             p["selection_token"] = max(p["selection_token"], tokens.get(p["id"], 0), old["epoch"] if old else 0) + 1
 
-    def _apply(self, db, project_id, state, kind, payload, voice_snapshot=None):
+    def _apply(self, db, project_id, state, kind, payload, voice_snapshot=None, published=None):
         if not isinstance(payload, dict):
             raise ValueError("payload must be an object")
         doc = state["document"]
@@ -311,7 +323,19 @@ class StudioStore:
             ids = payload.get("passage_ids", []) if kind == "assign_voice" else [payload.get("passage_id")]
             if any(find(passages, ident)["locked"] for ident in ids):
                 raise ValueError("Passage is locked")
-        if kind == "update_project":
+        if kind == "set_pronunciation_rules":
+            from .pronunciation import apply_pronunciation_command
+
+            apply_pronunciation_command(doc, payload)
+        elif kind in ("set_video_reference", "set_scene_target", "estimate_captions", "set_captions"):
+            from .captions import apply_caption_command
+
+            apply_caption_command(self, db, project_id, doc, kind, payload)
+        elif kind == "compose_take":
+            from .phrase_repairs import compose_take
+
+            compose_take(self, db, project_id, doc, payload, published)
+        elif kind == "update_project":
             for key in ("name", "client_label"):
                 if key in payload:
                     if key == "name" and (not isinstance(payload[key], str) or not payload[key].strip()):
@@ -360,6 +384,7 @@ class StudioStore:
             p = find(passages, payload.get("passage_id"))
             passages.remove(p)
             doc["clips"] = [c for c in clips if c["passage_id"] != p["id"]]
+            doc.get("scene_targets", {}).pop(p["id"], None)
         elif kind == "reorder_passages":
             ids = payload.get("passage_ids")
             if not isinstance(ids, list) or len(ids) != len(passages) or set(ids) != {p["id"] for p in passages}:

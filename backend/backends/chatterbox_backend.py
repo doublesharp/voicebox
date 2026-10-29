@@ -177,6 +177,8 @@ class ChatterboxTTSBackend:
         language: str = "en",
         seed: Optional[int] = None,
         instruct: Optional[str] = None,
+        *,
+        generation_options: dict[str, float] | None = None,
     ) -> Tuple[np.ndarray, int]:
         """
         Generate audio using Chatterbox Multilingual TTS.
@@ -199,7 +201,10 @@ class ChatterboxTTSBackend:
             ref_audio = None
 
         # Merge language-specific defaults with global defaults
-        lang_defaults = self._LANG_DEFAULTS.get(language, self._GLOBAL_DEFAULTS)
+        lang_defaults = {
+            **self._LANG_DEFAULTS.get(language, self._GLOBAL_DEFAULTS),
+            **(generation_options or {}),
+        }
 
         def _generate_sync():
             import torch

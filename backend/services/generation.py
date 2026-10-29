@@ -56,6 +56,10 @@ async def run_generation(
     seed: Optional[int],
     normalize: bool = False,
     effects_chain: Optional[list] = None,
+    speed: float = 1.0,
+    chatterbox_temperature: float | None = None,
+    chatterbox_cfg_weight: float | None = None,
+    chatterbox_exaggeration: float | None = None,
     instruct: Optional[str] = None,
     mode: Literal["generate", "retry", "regenerate"],
     max_chunk_chars: Optional[int] = None,
@@ -82,6 +86,15 @@ async def run_generation(
     tts_model = None
 
     try:
+        from ..models import SpeechDeliverySettings
+
+        delivery = SpeechDeliverySettings(
+            speed=speed, chatterbox_temperature=chatterbox_temperature,
+            chatterbox_cfg_weight=chatterbox_cfg_weight,
+            chatterbox_exaggeration=chatterbox_exaggeration,
+        )
+        generation_options = delivery.chatterbox_options(engine)
+
         tts_model = get_tts_backend_for_engine(engine)
 
         if not tts_model.is_loaded():
@@ -109,6 +122,8 @@ async def run_generation(
             trim_fn=trim_fn,
             runaway_detector=runaway_detector,
         )
+        if generation_options:
+            gen_kwargs["generation_options"] = generation_options
         if max_chunk_chars is not None:
             gen_kwargs["max_chunk_chars"] = max_chunk_chars
         if crossfade_ms is not None:
@@ -126,7 +141,7 @@ async def run_generation(
                 effects_chain = None
         clean_audio, processed_audio = await asyncio.to_thread(
             process_generated_audio, audio, sample_rate,
-            normalize=normalize, effects_chain=effects_chain,
+            normalize=normalize, effects_chain=effects_chain, speed=speed,
         )
         check_inference_cancelled()
         duration = len(processed_audio) / sample_rate
@@ -306,6 +321,10 @@ async def generate_audio_sync(
     max_chunk_chars: Optional[int] = None,
     crossfade_ms: Optional[int] = None,
     effects_chain: Optional[list] = None,
+    speed: float = 1.0,
+    chatterbox_temperature: float | None = None,
+    chatterbox_cfg_weight: float | None = None,
+    chatterbox_exaggeration: float | None = None,
 ) -> bytes:
     """Run a TTS generation synchronously and return the resulting wav bytes.
 
@@ -330,6 +349,14 @@ async def generate_audio_sync(
     from ..utils.audio_processing import effects_chain_from_config, process_generated_audio
     from . import tts
 
+    from ..models import SpeechDeliverySettings
+
+    delivery = SpeechDeliverySettings(
+        speed=speed, chatterbox_temperature=chatterbox_temperature,
+        chatterbox_cfg_weight=chatterbox_cfg_weight,
+        chatterbox_exaggeration=chatterbox_exaggeration,
+    )
+    generation_options = delivery.chatterbox_options(engine)
     bg_db = next(get_db())
     tts_model = None
     try:
@@ -360,6 +387,8 @@ async def generate_audio_sync(
         trim_fn=trim_fn,
         runaway_detector=runaway_detector,
     )
+    if generation_options:
+        gen_kwargs["generation_options"] = generation_options
     if max_chunk_chars is not None:
         gen_kwargs["max_chunk_chars"] = max_chunk_chars
     if crossfade_ms is not None:
@@ -371,7 +400,7 @@ async def generate_audio_sync(
         )
 
         _, processed_audio = await asyncio.to_thread(
-            process_generated_audio, audio, sample_rate, normalize=normalize, effects_chain=effects_chain
+            process_generated_audio, audio, sample_rate, normalize=normalize, effects_chain=effects_chain, speed=speed
         )
         check_inference_cancelled()
         wav_bytes = await asyncio.to_thread(tts.audio_to_wav_bytes, processed_audio, sample_rate)
