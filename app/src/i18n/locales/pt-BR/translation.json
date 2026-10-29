@@ -917,6 +917,8 @@
           "change": "Alterar"
         },
         "chordPicker": {
+          "conflictTitle": "Atalho já em uso",
+          "conflictDescription": "Escolha atalhos diferentes para pressionar para falar e para alternar a gravação.",
           "pttTitle": "Definir atalho de apertar para falar",
           "pttDescription": "Segure as teclas que deseja usar, depois solte e clique em Salvar. O selo de modificador da direita mostra se a tecla é a variante esquerda ou direita.",
           "toggleTitle": "Definir atalho de alternância",

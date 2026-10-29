@@ -917,6 +917,8 @@
           "change": "變更"
         },
         "chordPicker": {
+          "conflictTitle": "快捷鍵已被使用",
+          "conflictDescription": "請為按住說話和切換錄音選擇不同的快捷鍵。",
           "pttTitle": "設定按住說話快捷鍵",
           "pttDescription": "按住您要使用的按鍵,然後放開並點選「儲存」。右側修飾鍵徽章會顯示按鍵是左側或右側的變體。",
           "toggleTitle": "設定切換快捷鍵",

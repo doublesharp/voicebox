@@ -917,6 +917,8 @@
           "change": "Cambiar"
         },
         "chordPicker": {
+          "conflictTitle": "Atajo ya en uso",
+          "conflictDescription": "Elige atajos diferentes para pulsar para hablar y grabación alternada.",
           "pttTitle": "Definir el atajo de pulsar para hablar",
           "pttDescription": "Mantén pulsadas las teclas que quieras usar, luego suéltalas y haz clic en Guardar. La insignia del modificador derecho muestra si una tecla es la variante izquierda o derecha.",
           "toggleTitle": "Definir el atajo de alternancia",

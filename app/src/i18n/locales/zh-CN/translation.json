@@ -917,6 +917,8 @@
           "change": "更改"
         },
         "chordPicker": {
+          "conflictTitle": "快捷键已被使用",
+          "conflictDescription": "请为按住说话和切换录音选择不同的快捷键。",
           "pttTitle": "设置按住说话快捷键",
           "pttDescription": "按住您要使用的按键,然后松开并点击「保存」。右侧的修饰键徽章会显示按键是左侧还是右侧的变体。",
           "toggleTitle": "设置切换快捷键",

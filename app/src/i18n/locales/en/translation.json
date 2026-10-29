@@ -942,6 +942,8 @@
           "change": "Change"
         },
         "chordPicker": {
+          "conflictTitle": "Shortcut already in use",
+          "conflictDescription": "Choose different shortcuts for push-to-talk and toggle recording.",
           "pttTitle": "Set push-to-talk shortcut",
           "pttDescription": "Hold the keys you want to use, then release and click Save. The right-hand modifier badge shows whether a key is the left or right variant.",
           "toggleTitle": "Set toggle shortcut",

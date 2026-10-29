@@ -7,12 +7,15 @@ let rejectSave: (error: Error) => void = () => {};
 const notifications: any[] = [];
 let serverUrl = 'http://localhost';
 const opened: string[] = [];
+const updateRequests: any[] = [];
 const api = {
   getCaptureSettings: async () => ({}),
-  updateCaptureSettings: () =>
-    new Promise((_resolve, reject) => {
+  updateCaptureSettings: (patch: any) => {
+    updateRequests.push(patch);
+    return new Promise((_resolve, reject) => {
       rejectSave = reject;
-    }),
+    });
+  },
 };
 mock.module('../src/lib/api/client', () => ({ apiClient: api }));
 mock.module('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
@@ -42,10 +45,11 @@ for (const [path, name] of [
   ['../src/components/InputMonitoringGate/InputMonitoringGate', 'InputMonitoringNotice'],
   ['../src/components/CapturePill/CapturePill', 'CapturePill'],
   ['../src/components/CapturesTab/DictationReadinessChecklist', 'DictationReadinessChecklist'],
-  ['../src/components/ChordPicker/ChordPicker', 'ChordPicker'],
   ['../src/components/MicrophoneSelector/MicrophoneSelector', 'MicrophoneSelector'],
 ] as const)
   mock.module(path, () => ({ [name]: empty }));
+const ChordPicker = (_props: any) => null;
+mock.module('../src/components/ChordPicker/ChordPicker', () => ({ ChordPicker }));
 mock.module('../src/components/ui/input', () => ({
   Input: (props: any) => createElement('input', props),
 }));
@@ -103,6 +107,7 @@ afterEach(() => {
   client?.clear();
   notifications.length = 0;
   opened.length = 0;
+  updateRequests.length = 0;
   serverUrl = 'http://localhost';
   globalThis.fetch = (async () => Response.json({ directories: [] })) as typeof fetch;
 });
@@ -277,4 +282,41 @@ test('folder discovery matches the capture directory, not a parent name', async 
     )!;
   await act(async () => button.props.onClick());
   expect(opened).toEqual(['/data/captures']);
+});
+
+
+test.each([
+  { mode: 'push', saved: ['MetaRight', 'AltRight'], candidate: ['AltGr', 'MetaRight'] },
+  { mode: 'toggle', saved: ['ControlRight', 'ShiftRight'], candidate: ['ShiftRight', 'ControlRight'] },
+])('rejects a conflicting $mode chord without saving', async ({ mode, saved, candidate }) => {
+  client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity }, mutations: { retry: false } } });
+  client.setQueryData(['settings', 'captures'], {
+    hotkey_enabled: true,
+    chord_push_to_talk_keys: mode === 'toggle' ? saved : ['ControlRight'],
+    chord_toggle_to_talk_keys: mode === 'push' ? saved : ['Space'],
+  });
+  await act(async () => { view = create(<QueryClientProvider client={client}><CapturesPage /></QueryClientProvider>); });
+  const title = mode === 'push' ? 'settings.captures.dictation.chordPicker.pttTitle' : 'settings.captures.dictation.chordPicker.toggleTitle';
+  const changeLabel = mode === 'push' ? 'settings.captures.dictation.pushToTalk.change' : 'settings.captures.dictation.toggle.change';
+  const button = view.root.findAllByType('button').find((item) => item.children.includes(changeLabel))!;
+  act(() => button.props.onClick());
+  const picker = view.root.findAllByType(ChordPicker).find((item) => item.props.title === title)!;
+  expect(picker.props.open).toBe(true);
+  act(() => picker.props.onSave(candidate));
+  await flush();
+  expect(picker.props.open).toBe(true);
+  expect(updateRequests).toEqual([]);
+  expect(notifications).toHaveLength(1);
+  expect(notifications[0].description).toBe('settings.captures.dictation.chordPicker.conflictDescription');
+});
+
+test('allows a toggle chord that extends the push-to-talk chord', async () => {
+  client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity }, mutations: { retry: false } } });
+  client.setQueryData(['settings', 'captures'], { hotkey_enabled: true, chord_push_to_talk_keys: ['MetaRight', 'AltGr'], chord_toggle_to_talk_keys: ['Space'] });
+  await act(async () => { view = create(<QueryClientProvider client={client}><CapturesPage /></QueryClientProvider>); });
+  const picker = view.root.findAllByType(ChordPicker).find((item) => item.props.title === 'settings.captures.dictation.chordPicker.toggleTitle')!;
+  act(() => picker.props.onSave(['MetaRight', 'AltRight', 'Space']));
+  await flush();
+  expect(updateRequests).toEqual([{ chord_toggle_to_talk_keys: ['MetaRight', 'AltRight', 'Space'] }]);
+  expect(notifications).toHaveLength(0);
 });
