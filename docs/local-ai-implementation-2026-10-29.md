@@ -54,14 +54,14 @@ its number formatting and punctuation artifacts reinforce the advisory label.
 The audited mlx-audio 0.4.1 word-timing head-name mismatch is handled by a scoped
 compatibility alias without editing the installed library.
 
-The final frozen backend matches all 146 bundled backend modules and the server
-entry point to current source. It passed real offline MOSS voice prewarming,
-ordinary cloned synthesis, repeated seeded PCM equality, unload, missing-graph
-refusal and recovery after restoring the graph. Studio readiness changed with
-the exact required checkpoint assets. The earlier dependency build also passed
-an initially empty MOSS download and real Qwen 4-bit synthesis. The final backend
-was refreshed through PyInstaller using the audited dependency analysis, with
-the new watchdog module explicitly included and complete code closure checked.
+Frozen qualification passed real offline MOSS voice prewarming, ordinary cloned
+synthesis, repeated seeded PCM equality, unload, missing-graph refusal and
+recovery after restoring the graph. Studio readiness changed with the exact
+required checkpoint assets. An initially empty MOSS download and real Qwen 4-bit
+synthesis also passed. The final saved-take backend refresh matches all 146
+bundled backend modules and the server entry point to current source. It uses
+the audited dependency analysis, with the watchdog module explicitly included
+and complete code closure checked.
 Packaged desktop interaction is recorded separately from backend inference.
 A task-isolated desktop bundle from `8692fbc` also passed the real webview
 Preview/Stop journey using Ryan and CustomVoice 0.6B. Native keyboard input
@@ -75,7 +75,7 @@ separate gates. See the [remaining work](plans/LOCAL_AI_FOLLOWUPS.md).
 
 ## Final Mac batch verification
 
-The merged backend and tooling suite passed **1,555 tests**, with nine skips and
+The consolidated backend and tooling suite passed **1,555 tests**, with nine skips and
 one slow test deselected. Actual threaded line tracing covered **1,837 / 1,918
 changed executable lines (95.78%)** across 31 production Python files against the
 published lifecycle baseline `01c9778`. Whole app-owned backend coverage was
@@ -87,15 +87,28 @@ A consolidated frontend run at `bac3af1` passed **760 tests in 116 isolated
 files** plus TypeScript, with **74.81% whole-frontend line coverage**. Later
 published profile and model-download UI fixes passed 19 profile and 31 model
 management integration tests, TypeScript and a fresh production frontend build
-after merging. The native suite
-passed **56 tests**, with two intentional host-only skips. Scoped independent review
+after merging. The native suite passed **77 tests**, with two intentional
+host-only skips. Scoped independent review
 accepted the preview ownership, portable speech-review and pinned-readiness
 fixes, including their backend merge interactions. The tracked-source audit
 found no developer home paths, fixed build-volume paths or private tracker IDs.
 See the [coverage guide](testing-coverage.md) for measurement boundaries.
 
-The final frozen backend executable has SHA-256
+The main frozen inference artifact has SHA-256
 `1b55a6ee6ccf23b8641b35fc9166ba4775cc90986d46a1b7efb1f73469638030`.
+The final saved-take backend refresh has SHA-256
+`0251f874f4b88cfdca97b435e78ec349597aba67881e81ac3095bf7608ab747b`.
+A later saved-take check reproduced MLX's decoder rejecting Studio's
+extensionless asset filenames. Detailed recognition now decodes file content to
+mono 16 kHz samples on the same owned worker before calling Whisper. All 59
+affected regressions passed, with all three changed executable decoding lines
+traced, and scoped independent review accepted the correction. The frozen Studio
+endpoint then returned eight validated word intervals from the real extensionless
+stereo asset without changing the project, take or revision. Recognition differences
+remain advisory. Later codec/coverage-tool integrations passed 17 focused tests.
+
+The earlier consolidated coverage percentages above belong to their measured
+source snapshot, preceding this decoder correction and the last upstream guards.
 Its real offline MOSS and Qwen 4-bit checks used synthetic reference speech.
 This establishes the tested macOS artifact; CUDA and other operating systems
 remain unqualified. Raw reports, audio, coverage and build artifacts stay outside Git.

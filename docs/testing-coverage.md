@@ -88,23 +88,23 @@ modules. Use `scripts/rust-production-coverage.py` to summarize LCOV after
 excluding syntax explicitly gated by `#[cfg(test)]` or `#[cfg(all(test, ...))]`.
 The helper uses `syn` to find Rust item spans instead of cutting off a file at
 its first test module; production code can occur after those modules. Build the
-helper and the desktop test target with Scratch output paths:
+helper and the desktop test target under a host-approved output root:
 
 ```sh
-export CARGO_TARGET_DIR=/Volumes/Scratch/voicebox/build/rust-coverage-helper
+export VOICEBOX_RUST_COVERAGE_ROOT="/absolute/approved-build-root"
+export TMPDIR="$VOICEBOX_RUST_COVERAGE_ROOT/tmp"
+mkdir -p "$TMPDIR" "$VOICEBOX_RUST_COVERAGE_ROOT/reports"
+export CARGO_TARGET_DIR="$VOICEBOX_RUST_COVERAGE_ROOT/helper"
 cargo build --locked --manifest-path scripts/rust-test-spans/Cargo.toml
-# Set the desktop build's own Scratch CARGO_TARGET_DIR before this run.
-export CARGO_TARGET_DIR=/Volumes/Scratch/voicebox/cargo/desktop-coverage
-export TMPDIR=/Volumes/Scratch/voicebox/tmp/desktop-coverage
-mkdir -p "$TMPDIR" /Volumes/Scratch/voicebox/reports/desktop-coverage
+export CARGO_TARGET_DIR="$VOICEBOX_RUST_COVERAGE_ROOT/desktop"
 TAURI_CONFIG='{"bundle":{"externalBin":[]}}' cargo llvm-cov \
   --manifest-path tauri/src-tauri/Cargo.toml --lib --bin voicebox --lcov \
-  --output-path /Volumes/Scratch/voicebox/reports/desktop-coverage/desktop.lcov
+  --output-path "$VOICEBOX_RUST_COVERAGE_ROOT/reports/desktop.lcov"
 python3 scripts/rust-production-coverage.py \
-  --lcov /Volumes/Scratch/voicebox/reports/desktop-coverage/desktop.lcov \
+  --lcov "$VOICEBOX_RUST_COVERAGE_ROOT/reports/desktop.lcov" \
   --root "$PWD" \
-  --span-tool /Volumes/Scratch/voicebox/build/rust-coverage-helper/debug/rust-test-spans \
-  > /Volumes/Scratch/voicebox/reports/desktop-coverage/production.json
+  --span-tool "$VOICEBOX_RUST_COVERAGE_ROOT/helper/debug/rust-test-spans" \
+  > "$VOICEBOX_RUST_COVERAGE_ROOT/reports/production.json"
 ```
 
 The source tree must match the one used for the LCOV run; LCOV does not record
