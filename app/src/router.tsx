@@ -116,6 +116,7 @@ function DownloadToastRestorer({
     modelName,
     displayName,
     enabled: true,
+    includeTerminalSnapshot: true,
   });
 
   return null;

@@ -249,6 +249,7 @@ export function ModelManagement() {
     modelName: downloadingModel || '',
     displayName: downloadingDisplayName || '',
     enabled: !!downloadingModel && !!downloadingDisplayName,
+    includeTerminalSnapshot: true,
     onComplete: handleDownloadComplete,
     onError: handleDownloadError,
   });

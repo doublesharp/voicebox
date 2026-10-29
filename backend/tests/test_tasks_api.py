@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from backend.routes import tasks
+from backend.routes import models as model_routes
 from backend.utils.progress import ProgressManager
 from backend.utils.tasks import TaskManager
 
@@ -107,3 +108,47 @@ async def test_slow_progress_subscriber_receives_terminal_event(terminal, thread
         assert received[-1]["status"] == terminal
     finally:
         await stream.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", ["complete", "error"])
+async def test_late_subscriber_can_request_terminal_snapshot(terminal):
+    progress = ProgressManager()
+    progress.update_progress("model", 0, 100)
+    if terminal == "complete":
+        progress.mark_complete("model")
+    else:
+        progress.mark_error("model", "load failed")
+    stream = progress.subscribe("model", include_terminal=True)
+    event = await asyncio.wait_for(anext(stream), timeout=1)
+    assert json.loads(event[6:])["status"] == terminal
+    with pytest.raises(StopAsyncIteration):
+        await anext(stream)
+
+
+@pytest.mark.asyncio
+async def test_default_subscription_ignores_stale_terminal_state():
+    progress = ProgressManager()
+    progress.update_progress("model", 0, 100)
+    progress.mark_complete("model")
+    stream = progress.subscribe("model")
+    next_event = asyncio.create_task(anext(stream))
+    try:
+        await asyncio.sleep(0)
+        progress.update_progress("model", 1, 100)
+        event = await asyncio.wait_for(next_event, timeout=1)
+        assert json.loads(event[6:])["status"] == "downloading"
+    finally:
+        await stream.aclose()
+
+
+@pytest.mark.asyncio
+async def test_progress_endpoint_can_report_completion_before_subscription(monkeypatch):
+    progress = ProgressManager()
+    progress.update_progress("model", 0, 100)
+    progress.mark_complete("model")
+    monkeypatch.setattr(model_routes, "get_progress_manager", lambda: progress)
+    response = await model_routes.get_model_progress("model", include_terminal=True)
+    event = await asyncio.wait_for(anext(response.body_iterator), timeout=1)
+    assert json.loads(event[6:])["status"] == "complete"
+    await response.body_iterator.aclose()

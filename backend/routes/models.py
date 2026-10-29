@@ -165,12 +165,12 @@ async def unload_model_by_name(model_name: str):
 
 
 @router.get("/models/progress/{model_name}")
-async def get_model_progress(model_name: str):
+async def get_model_progress(model_name: str, include_terminal: bool = False):
     """Get model download progress via Server-Sent Events."""
     progress_manager = get_progress_manager()
 
     async def event_generator():
-        async for event in progress_manager.subscribe(model_name):
+        async for event in progress_manager.subscribe(model_name, include_terminal=include_terminal):
             yield event
 
     return StreamingResponse(

@@ -205,7 +205,7 @@ class ProgressManager:
         
         return callback
     
-    async def subscribe(self, model_name: str):
+    async def subscribe(self, model_name: str, include_terminal: bool = False):
         """
         Subscribe to progress updates for a model.
 
@@ -238,11 +238,13 @@ class ProgressManager:
             
             if initial_progress:
                 status = initial_progress.get('status')
-                # Only send initial progress if download is actually in progress
-                # Don't send old 'complete' or 'error' status from previous downloads
-                if status in ('downloading', 'extracting'):
+                # Subscribers that just started a download can request its
+                # terminal snapshot, which may arrive before they connect.
+                if status in ('downloading', 'extracting') or (include_terminal and status in ('complete', 'error')):
                     logger.info(f"Sending initial progress for {model_name}: {status}")
                     yield f"data: {json.dumps(initial_progress)}\n\n"
+                    if status in ('complete', 'error'):
+                        return
                 else:
                     logger.info(f"Skipping initial progress for {model_name} (status: {status})")
             else:
