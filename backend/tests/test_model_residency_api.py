@@ -173,3 +173,30 @@ async def test_real_persisted_generation_service_accepts_single_model_none_size(
     assert row.status == "completed", row.error
     assert backend.loaded
     assert config.resolve_storage_path(row.audio_path).is_file()
+
+
+def test_api_budget_cache_and_profile_refusals_are_visible(api, monkeypatch):
+    client, db, backend, _ = api
+    assert client.post("/models/prewarm", json={"model_name": "moss-tts"}).status_code == 200
+    response = client.put("/models/residency", json={"max_resident_engines": 1, "estimated_weight_budget_mb": 512})
+    assert response.status_code == 400
+    assert "budget" in response.json()["detail"]
+    monkeypatch.setattr(backend, "_is_model_cached", lambda: False)
+    assert client.post("/models/prewarm", json={"model_name": "moss-tts"}).status_code == 400
+    db.add(
+        VoiceProfile(
+            id="preset",
+            name="Existing preset",
+            voice_type="preset",
+            preset_engine="kokoro",
+            preset_voice_id="af_heart",
+            language="en",
+        )
+    )
+    db.get(VoiceProfile, "exact").language = "fa"
+    db.commit()
+    response = client.post("/models/prewarm", json={"model_name": "moss-tts", "profile_id": "preset"})
+    assert response.status_code == 400
+    response = client.post("/models/prewarm", json={"model_name": "moss-tts", "profile_id": "exact"})
+    assert response.status_code == 400
+    assert "language" in response.json()["detail"]

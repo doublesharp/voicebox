@@ -14,8 +14,13 @@ export class IncrementalPlayback {
       apiClient.previewSpeech(data, signal),
   ) {}
 
-  async start(data: GenerationRequest, deviceIds: string[]): Promise<void> {
+  async start(
+    data: GenerationRequest,
+    deviceIds: string[],
+    stillCurrent: () => boolean = () => true,
+  ): Promise<void> {
     await this.stop();
+    if (!stillCurrent()) return;
     if (!this.audio.startPcmStream || !this.audio.appendPcmStream || !this.audio.finishPcmStream) {
       this.update(false, 'Speech preview is available in the desktop app');
       return;
@@ -47,7 +52,7 @@ export class IncrementalPlayback {
     };
     this.current = current;
     token.signal.addEventListener('abort', revoked, { once: true });
-    const valid = () => !stopped && token.valid() && this.current === current;
+    const valid = () => !stopped && stillCurrent() && token.valid() && this.current === current;
     this.update(true);
     try {
       await prepareLegacy(token, () => this.audio.stopPlayback());

@@ -11,7 +11,18 @@ def _ready(cfg):
     from ..backends.base import is_model_cached
 
     try:
-        return is_model_cached(cfg.hf_repo_id) and all(is_model_cached(repo) for repo in cfg.aux_hf_repo_ids)
+        return is_model_cached(
+            cfg.hf_repo_id,
+            revision=getattr(cfg, "revision", None),
+            required_files=list(getattr(cfg, "required_files", ())),
+        ) and all(
+            is_model_cached(
+                repo,
+                revision=getattr(cfg, "aux_revisions", {}).get(repo),
+                required_files=list(getattr(cfg, "aux_required_files", {}).get(repo, ())),
+            )
+            for repo in cfg.aux_hf_repo_ids
+        )
     except Exception:
         return False
 

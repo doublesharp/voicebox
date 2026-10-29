@@ -4,6 +4,7 @@ import { apiClient } from '@/lib/api/client';
 import type { GenerationRequest } from '@/lib/api/types';
 import { usePlatform } from '@/platform/PlatformContext';
 import { usePlayerStore } from '@/stores/playerStore';
+import { useServerStore } from '@/stores/serverStore';
 import { IncrementalPlayback } from './incrementalPlayback';
 
 export function useSpeechPreview(profileId: string | null, onError: (message: string) => void) {
@@ -37,6 +38,9 @@ export function useSpeechPreview(profileId: string | null, onError: (message: st
     };
   }, [controller, profileId]);
   useEffect(() => {
+    const unsubscribeServer = useServerStore.subscribe((state, previous) => {
+      if (state.serverUrl !== previous.serverUrl) void stop();
+    });
     const unsubscribePlayer = usePlayerStore.subscribe((state, previous) => {
       if (state.sourceGeneration !== previous.sourceGeneration) void stop();
     });
@@ -47,6 +51,7 @@ export function useSpeechPreview(profileId: string | null, onError: (message: st
         void stop();
     });
     return () => {
+      unsubscribeServer();
       unsubscribePlayer();
       unsubscribeRoutes();
     };
@@ -54,13 +59,17 @@ export function useSpeechPreview(profileId: string | null, onError: (message: st
   const start = async (data: GenerationRequest) => {
     await stop();
     const request = ++revision.current;
+    const serverUrl = useServerStore.getState().serverUrl;
+    const sameServer = () => useServerStore.getState().serverUrl === serverUrl;
+    const current = () => request === revision.current && sameServer();
     setActive(true);
     try {
       // Resolve only this voice's configured route; never substitute another
       // voice or output when assigned devices are missing.
       const assignments = await apiClient.getProfileChannels(data.profile_id);
+      if (!current()) return;
       const channels = assignments.channel_ids.length ? await apiClient.listChannels() : [];
-      if (request !== revision.current) return;
+      if (!current()) return;
       const assigned = channels.filter((channel) => assignments.channel_ids.includes(channel.id));
       if (assigned.length !== assignments.channel_ids.length)
         throw new Error('A voice output channel is unavailable');
@@ -73,10 +82,10 @@ export function useSpeechPreview(profileId: string | null, onError: (message: st
       // reset synchronously revokes older previews through the subscription.
       const selected = ++revision.current;
       setActive(true);
-      await controller.start(data, devices);
+      await controller.start(data, devices, () => selected === revision.current && sameServer());
       if (selected !== revision.current) return;
     } catch (error) {
-      if (request !== revision.current) return;
+      if (!current()) return;
       setActive(false);
       errorRef.current(error instanceof Error ? error.message : String(error));
     }

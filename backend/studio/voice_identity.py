@@ -42,6 +42,9 @@ def rekey_portable_tracks(before, after, old_assets, new_assets, identity_map=No
     """
     import hashlib
 
+    from .speech_review import rekey_portable_reviews
+
+    rekey_portable_reviews(before, after, old_assets, new_assets, identity_map)
     identity_map = identity_map or {}
     old_hashes = {asset["id"]: asset["hash"] for asset in old_assets}
     new_hashes = {asset["id"]: asset["hash"] for asset in new_assets}

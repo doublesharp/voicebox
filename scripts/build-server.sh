@@ -11,7 +11,19 @@ echo "Building Voicebox sidecars for platform: $PLATFORM"
 # Build Python binary
 # Resolve PATH to absolute paths before changing directory
 export PATH="$(cd "$(dirname "$0")/.." && pwd)/backend/venv/bin:$PATH"
+# Resolve overrides relative to the invoking directory, matching the Python
+# driver, before this wrapper changes into backend/.
+for output_variable in VOICEBOX_PYINSTALLER_DISTPATH VOICEBOX_PYINSTALLER_WORKPATH VOICEBOX_PYINSTALLER_SPECPATH; do
+    output_value="${!output_variable}"
+    if [ -n "$output_value" ]; then
+        case "$output_value" in
+            /*) ;;
+            *) export "$output_variable=$PWD/$output_value" ;;
+        esac
+    fi
+done
 cd backend
+DIST_DIR="${VOICEBOX_PYINSTALLER_DISTPATH:-$PWD/dist}"
 
 # Check if PyInstaller is installed
 if ! python -c "import PyInstaller" 2>/dev/null; then
@@ -32,7 +44,7 @@ copy_sidecar() {
         rm "$sidecar"
     fi
 
-    if [ "$name" = "voicebox-server" ] && [ -f "dist/${name}/${name}" ]; then
+    if [ "$name" = "voicebox-server" ] && [ -f "${DIST_DIR}/${name}/${name}" ]; then
         # The macOS backend runs from Resources/backend with its support files
         # beside it. Keep the small target-suffixed executable for Tauri's
         # sidecar declaration as well.
@@ -62,24 +74,24 @@ copy_sidecar() {
             fi
             rm -rf "$bundle_dir"
         fi
-        cp -R "dist/${name}" "$bundle_dir"
+        cp -R "${DIST_DIR}/${name}" "$bundle_dir"
         # PyInstaller re-signs Python's executable after rewriting its load
         # paths. Refresh the enclosing framework's resource seal as well.
         if [ "$(uname -s)" = "Darwin" ]; then
             codesign --force --deep --sign - --timestamp=none "$bundle_dir/_internal/Python.framework"
         fi
-        cp "dist/${name}/${name}" "$sidecar"
+        cp "${DIST_DIR}/${name}/${name}" "$sidecar"
         chmod +x "$sidecar"
         echo "Built ${name}-${PLATFORM} and its packaged support directory"
-    elif [ -f "dist/${name}" ]; then
-        cp "dist/${name}" "$sidecar"
+    elif [ -f "${DIST_DIR}/${name}" ]; then
+        cp "${DIST_DIR}/${name}" "$sidecar"
         chmod +x "$sidecar"
         echo "Built ${name}-${PLATFORM}"
-    elif [ -f "dist/${name}.exe" ]; then
-        cp "dist/${name}.exe" "../tauri/src-tauri/binaries/${name}-${PLATFORM}.exe"
+    elif [ -f "${DIST_DIR}/${name}.exe" ]; then
+        cp "${DIST_DIR}/${name}.exe" "../tauri/src-tauri/binaries/${name}-${PLATFORM}.exe"
         echo "Built ${name}-${PLATFORM}.exe"
     else
-        echo "Error: ${name} binary not found in dist/"
+        echo "Error: ${name} binary not found in ${DIST_DIR}/"
         exit 1
     fi
 }

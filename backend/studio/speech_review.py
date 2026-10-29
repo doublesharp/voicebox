@@ -59,7 +59,7 @@ def source_identity(project, take_id):
         "asset_hash": asset["hash"],
         "take_text": take["text"],
         "take_engine": take["engine"],
-        "take_model": take["model_size"],
+        "take_model": take.get("model_size"),
         "request_sha256": _digest(
             _portable_request(take["request"], {item["id"]: item["hash"] for item in project["assets"]})
         ),
@@ -68,6 +68,44 @@ def source_identity(project, take_id):
         "duration": asset["duration"],
     }
     return source, asset
+
+
+def rekey_portable_reviews(before, after, old_assets, new_assets, identity_map=None):
+    """Rebind validated reviews only during controlled archive transformations.
+
+    Reference omission and owned-ID remapping change request representation.
+    Keep its digest bound to the transformed request, while requiring the exact
+    prior report identity and unchanged recorded audio, script and performance.
+    """
+    import copy
+
+    identity_map = identity_map or {}
+    old_documents = [before["document"], *(item["document"] for item in before.get("revisions", []))]
+    new_documents = [after["document"], *(item["document"] for item in after.get("revisions", []))]
+    for old_document, new_document in zip(old_documents, new_documents, strict=True):
+        old_project = {**before, "assets": old_assets, "document": old_document}
+        new_project = {**after, "assets": new_assets, "document": new_document}
+        if not new_document.get("speech_reviews"):
+            continue
+        replacements = {}
+        for take in before.get("takes", []):
+            try:
+                old_source, _ = source_identity(old_project, take["id"])
+                new_source, _ = source_identity(new_project, identity_map.get(take["id"], take["id"]))
+            except NotFound:
+                continue
+            if {k: v for k, v in old_source.items() if k != "request_sha256"} != {
+                k: v for k, v in new_source.items() if k != "request_sha256"
+            }:
+                continue
+            replacements[review_key(old_source)] = (old_source, new_source)
+        for report in new_document.get("speech_reviews", []):
+            replacement = replacements.get(report["source_key"])
+            if replacement is None or report["source"] != replacement[0]:
+                continue
+            validate_report(report)
+            report["source"] = copy.deepcopy(replacement[1])
+            report["source_key"] = review_key(report["source"])
 
 
 def review_key(source):

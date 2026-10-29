@@ -262,3 +262,18 @@ async def test_none_size_normalizes_in_public_and_internal_load_hooks(engines):
     assert engines["moss_tts"].loaded
     await backends._load_engine_model_unmanaged("moss_tts", None)
     assert engines["moss_tts"].loads == 2
+
+
+@pytest.mark.asyncio
+async def test_failed_cached_model_load_restores_prior_selection(engines, monkeypatch):
+    await backends.load_engine_model("qwen", "1.7B")
+
+    async def fail():
+        raise RuntimeError("cached runtime failed to load")
+
+    monkeypatch.setattr(engines["moss_tts"], "load_model", fail)
+    with pytest.raises(RuntimeError, match="failed to load"):
+        await manager().prewarm(cfg("moss-tts"))
+    assert engines["qwen"].loaded
+    assert not engines["moss_tts"].loaded
+    assert manager().selected_model == "qwen-tts-1.7B"

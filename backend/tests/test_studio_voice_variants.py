@@ -1,13 +1,12 @@
+import numpy as np
+import pytest
+import soundfile as sf
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
-import numpy as np
-import soundfile as sf
-import pytest
 
-from backend import backends
-from backend.database import Base, VoiceProfile, ProfileSample
-from backend.studio.storage import StudioStore
+from backend.database import Base, ProfileSample, VoiceProfile
 from backend.studio import voices
+from backend.studio.storage import StudioStore
 
 
 def test_qwen_snapshot_uses_available_variant_and_freezes_explicit_choice(tmp_path, monkeypatch):
@@ -33,3 +32,33 @@ def test_qwen_snapshot_uses_available_variant_and_freezes_explicit_choice(tmp_pa
     assert explicit["model_size"] == "1.7B"
     with pytest.raises(ValueError, match="variant"):
         voices.snapshot_voice(store, p["id"], "voice", model_size="missing")
+
+
+def test_readiness_requires_exact_primary_and_auxiliary_manifests(monkeypatch):
+    from types import SimpleNamespace
+
+    from backend.backends import base
+    from backend.studio.voices import _ready
+
+    cfg = SimpleNamespace(
+        hf_repo_id="example/tts",
+        revision="a" * 40,
+        required_files=("model.onnx",),
+        aux_hf_repo_ids=["example/codec"],
+        aux_revisions={"example/codec": "b" * 40},
+        aux_required_files={"example/codec": ("codec.onnx",)},
+    )
+    calls = []
+
+    def cached(repo, **kwargs):
+        calls.append((repo, kwargs))
+        return kwargs.get("revision") == ("a" * 40 if repo == cfg.hf_repo_id else "b" * 40)
+
+    monkeypatch.setattr(base, "is_model_cached", cached)
+    assert _ready(cfg)
+    assert calls == [
+        ("example/tts", {"revision": "a" * 40, "required_files": ["model.onnx"]}),
+        ("example/codec", {"revision": "b" * 40, "required_files": ["codec.onnx"]}),
+    ]
+    cfg.aux_revisions["example/codec"] = "c" * 40
+    assert not _ready(cfg)

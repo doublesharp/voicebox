@@ -332,3 +332,15 @@ test('a different playback owner revokes the response and its output, including 
   expect(n.calls.stopPlayback.mock.calls.some(([id]) => id === 'session')).toBe(true);
   expect(n.unlisten).toHaveBeenCalledTimes(1);
 });
+
+test('revocation during controller handoff cannot issue a request or acquire a native owner', async () => {
+  const output = native();
+  const fetch = mock(async () => new Response(stream([wave()])));
+  const controller = new IncrementalPlayback(output.audio, () => {}, fetch);
+  let current = true;
+  const pending = controller.start(request, [], () => current);
+  current = false;
+  await pending;
+  expect(fetch).not.toHaveBeenCalled();
+  expect(output.audio.startPcmStream).not.toHaveBeenCalled();
+});

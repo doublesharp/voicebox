@@ -23,10 +23,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from utils.hf_offline_patch import force_offline_if_cached  # noqa: E402
+from utils.hf_offline_patch import force_offline_if_cached
 
 
-def _nest_opposite_modes_in_subprocess(queue):
+def _nest_opposite_modes_in_subprocess(queue, ready):
     """Module-level so it's picklable for multiprocessing's spawn start method.
 
     Runs in a fresh child process rather than a thread of the test process,
@@ -36,10 +36,9 @@ def _nest_opposite_modes_in_subprocess(queue):
     terminated by the parent after the timeout, and either way the test
     process's own state was never touched.
     """
+    ready.set()
     try:
-        with force_offline_if_cached(False, "outer-uncached"), force_offline_if_cached(
-            True, "inner-cached"
-        ):
+        with force_offline_if_cached(False, "outer-uncached"), force_offline_if_cached(True, "inner-cached"):
             pass
     except Exception as exc:
         queue.put(("exc", type(exc).__name__, str(exc)))
@@ -76,7 +75,7 @@ def test_mutates_cached_transformers_constant():
 def test_sets_env_variable():
     original = os.environ.get("HF_HUB_OFFLINE")
     with force_offline_if_cached(True, "t"):
-        assert "1" == os.environ.get("HF_HUB_OFFLINE")
+        assert os.environ.get("HF_HUB_OFFLINE") == "1"
     assert original == os.environ.get("HF_HUB_OFFLINE")
 
 
@@ -111,14 +110,14 @@ def test_concurrent_threads_share_offline_window():
                 barrier.wait(timeout=5)
                 assert fast_exited.wait(timeout=5), "fast thread did not exit"
                 observations.append(_hf_const().HF_HUB_OFFLINE)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             errors.append(exc)
 
     def fast():
         try:
             with force_offline_if_cached(True, "fast"):
                 barrier.wait(timeout=5)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             errors.append(exc)
         finally:
             fast_exited.set()
@@ -190,9 +189,14 @@ def test_nesting_opposite_mode_on_same_thread_raises_instead_of_deadlocking():
     """
     ctx = multiprocessing.get_context("spawn")
     queue = ctx.Queue()
-    proc = ctx.Process(target=_nest_opposite_modes_in_subprocess, args=(queue,))
+    ready = ctx.Event()
+    proc = ctx.Process(target=_nest_opposite_modes_in_subprocess, args=(queue, ready))
     proc.start()
-    proc.join(timeout=5)
+    # Spawn imports Torch/Transformers before entering the target. Bound startup
+    # separately so concurrent build load cannot masquerade as a guard deadlock.
+    started = ready.wait(timeout=30)
+    if started:
+        proc.join(timeout=5)
 
     if proc.is_alive():
         proc.terminate()
@@ -200,6 +204,8 @@ def test_nesting_opposite_mode_on_same_thread_raises_instead_of_deadlocking():
         if proc.is_alive():
             proc.kill()
             proc.join(timeout=2)
+        if not started:
+            pytest.fail("spawned test process did not finish importing within 30 seconds")
         pytest.fail(
             "nesting the opposite mode on the same thread hung instead of raising, "
             "this is the deadlock the per-thread mode-stack guard exists to prevent"

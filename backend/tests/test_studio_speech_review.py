@@ -1,5 +1,6 @@
 """Local recognition remains advisory and tied to the exact immutable source."""
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -296,3 +297,52 @@ def test_speech_review_provenance_is_preserved_in_portable_archives(tmp_path):
         take for take in imported["takes"] if take["asset_id"] == imported["document"]["clips"][0]["asset_id"]
     )
     assert review_key(source_identity(imported, imported_base["id"])[0]) == report["source_key"]
+
+
+@pytest.mark.parametrize("omit_mode", ["scope", "missing"])
+def test_saved_review_survives_reference_omission_and_id_remapping(tmp_path, omit_mode):
+    import copy
+
+    from backend.studio.archive import write_archive
+    from backend.studio.portability import import_archive
+    from backend.studio.speech_review import compare_speech, review_key, source_identity
+    from backend.studio.storage import StudioStore
+    from backend.tests.test_studio_archive_scope import prepared, rewrite_archive
+
+    project, paths, _ = prepared(tmp_path)
+    source, _ = source_identity(project, "take")
+    words = [{"word": "Hello", "start": 0.0, "end": 0.001}]
+    report = {
+        "version": 1,
+        "advisory": True,
+        "source": source,
+        "source_key": review_key(source),
+        "recognized_text": "Hello",
+        "words": words,
+        "differences": compare_speech("Hello", "Hello", words),
+        "recognizer": {"backend": "fixture"},
+    }
+    project["document"]["speech_reviews"] = [report]
+    project["revisions"][0]["document"]["speech_reviews"] = [copy.deepcopy(report)]
+    archive = tmp_path / "review.zip"
+    write_archive(
+        project, project["assets"], paths.__getitem__, archive, include_regeneration_references=omit_mode != "scope"
+    )
+    if omit_mode == "missing":
+        archive = rewrite_archive(archive, tmp_path / "missing.zip", omit={"reference"})
+    store = StudioStore(tmp_path / "restored-review")
+    imported = import_archive(store, archive)
+    current = imported["document"]["speech_reviews"][0]
+    take = imported["takes"][0]
+    assert current["source"] == source_identity(imported, take["id"])[0]
+    assert current["recognized_text"] == report["recognized_text"]
+    assert current["source"]["asset_hash"] == report["source"]["asset_hash"]
+    assert imported["revisions"][0]["document"]["speech_reviews"][0] == current
+    # A real performance-setting mutation must still invalidate the report.
+    changed = copy.deepcopy(imported)
+    changed["takes"][0]["request"]["passage"]["direction"]["seed"] = 42
+    assert review_key(source_identity(changed, take["id"])[0]) != current["source_key"]
+    second = tmp_path / "review-again.zip"
+    write_archive(imported, imported["assets"], store.asset_path, second)
+    again = import_archive(StudioStore(tmp_path / "twice"), second)
+    assert again["document"]["speech_reviews"][0]["source"] == source_identity(again, again["takes"][0]["id"])[0]

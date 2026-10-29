@@ -200,3 +200,65 @@ test('unmount aborts network and stops native; unavailable assigned channel fail
   expect(starts).not.toHaveBeenCalled();
   expect(errors).toEqual(['A voice output channel is unavailable']);
 });
+
+test('a backend switch revokes pending routing before any request reaches the new backend', async () => {
+  const { useServerStore } = await import('../src/stores/serverStore');
+  const originalServer = useServerStore.getState().serverUrl;
+  await mount();
+  let resolve!: (value: { channel_ids: string[] }) => void;
+  let channelRequests = 0;
+  apiClient.getProfileChannels = () =>
+    new Promise((done) => {
+      resolve = done;
+    });
+  apiClient.listChannels = async () => {
+    channelRequests++;
+    return [];
+  };
+  let playing!: Promise<void>;
+  try {
+    await act(async () => {
+      playing = hook.start(data);
+    });
+    await act(async () => {
+      useServerStore.getState().setServerUrl('http://new-backend.invalid');
+    });
+    await act(async () => {
+      resolve({ channel_ids: ['old-device'] });
+      await playing;
+    });
+    expect(channelRequests).toBe(0);
+    expect(requestCount).toBe(0);
+    expect(starts).not.toHaveBeenCalled();
+    expect(hook.active).toBe(false);
+  } finally {
+    await act(async () => {
+      useServerStore.getState().setServerUrl(originalServer);
+    });
+  }
+});
+
+test('a backend switch aborts an active response and its native device session', async () => {
+  const { useServerStore } = await import('../src/stores/serverStore');
+  const originalServer = useServerStore.getState().serverUrl;
+  await mount();
+  let playing!: Promise<void>;
+  try {
+    await act(async () => {
+      playing = hook.start(data);
+    });
+    await flush();
+    expect(signal!.aborted).toBe(false);
+    await act(async () => {
+      useServerStore.getState().setServerUrl('http://another-backend.invalid');
+      await playing;
+    });
+    expect(signal!.aborted).toBe(true);
+    expect(stops.mock.calls.some(([id]) => id === 'session')).toBe(true);
+    expect(hook.active).toBe(false);
+  } finally {
+    await act(async () => {
+      useServerStore.getState().setServerUrl(originalServer);
+    });
+  }
+});
