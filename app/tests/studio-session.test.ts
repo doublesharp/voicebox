@@ -177,6 +177,47 @@ function setup(withTake = false) {
   return { session, transport, requests, journal };
 }
 
+test('unchanged conditional polls leave mounted editor state untouched and deduplicate concurrent reads', async () => {
+  const { session, transport } = setup();
+  const initial = { ...project(), change_token: '"first"' };
+  transport.project = async () => initial;
+  const response = deferred<StudioProject | null>();
+  let polls = 0;
+  transport.refreshProject = async (_id, token) => {
+    expect(token).toBe('"first"');
+    polls++;
+    return response.promise;
+  };
+  await session.load();
+  const before = session.getSnapshot();
+  let notifications = 0;
+  session.subscribe(() => notifications++);
+  const a = session.refresh();
+  const b = session.refresh();
+  response.resolve(null);
+  await Promise.all([a, b]);
+  expect(polls).toBe(1);
+  expect(notifications).toBe(0);
+  expect(session.getSnapshot()).toBe(before);
+  session.dispose();
+});
+
+test('same-revision background changes still refresh while preserving local drafts', async () => {
+  const { session, transport } = setup();
+  transport.project = async () => ({ ...project(), change_token: '"first"' });
+  transport.refreshProject = async () => ({
+    ...project(),
+    change_token: '"second"',
+    jobs: [{ id: 'job', kind: 'generation', status: 'completed', created_at: '', updated_at: '' }],
+  });
+  await session.load();
+  session.editPassage('p', { text: 'Unsaved words' });
+  await session.refresh();
+  expect(session.getSnapshot().project?.jobs[0].status).toBe('completed');
+  expect(session.getSnapshot().drafts.p.text).toBe('Unsaved words');
+  session.dispose();
+});
+
 test('annotation keystrokes recover after restart with their original revision and command identity', async () => {
   const { session, transport, requests, journal } = setup(true);
   await session.load();

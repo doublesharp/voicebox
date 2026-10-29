@@ -5,7 +5,52 @@ import uuid
 from contextlib import closing
 from pathlib import Path
 
-CURRENT_VERSION = 5
+CURRENT_VERSION = 6
+
+
+def _project_change_triggers():
+    """Track every materialized project dependency in the writer's transaction."""
+    statements = [
+        "CREATE TABLE IF NOT EXISTS project_changes (project_id TEXT PRIMARY KEY, token TEXT NOT NULL)",
+        "INSERT OR IGNORE INTO project_changes SELECT id, lower(hex(randomblob(16))) FROM projects",
+    ]
+    dependencies = {
+        "projects": "{row}.id",
+        **{
+            table: "{row}.project_id"
+            for table in (
+                "takes",
+                "assets",
+                "jobs",
+                "revisions",
+                "approvals",
+                "deliverables",
+                "recording_acknowledgements",
+                "checkpoint_reviews",
+            )
+        },
+        "job_attempts": "(SELECT project_id FROM jobs WHERE id={row}.job_id)",
+        "job_phase_events": "(SELECT project_id FROM jobs WHERE id={row}.job_id)",
+    }
+    for table, expression in dependencies.items():
+        for operation, rows in (("INSERT", ("NEW",)), ("DELETE", ("OLD",)), ("UPDATE", ("OLD", "NEW"))):
+            updates = " ".join(
+                "INSERT INTO project_changes (project_id,token) "
+                f"SELECT {expression.format(row=row)}, lower(hex(randomblob(16))) "
+                f"WHERE {expression.format(row=row)} IS NOT NULL "
+                "ON CONFLICT(project_id) DO UPDATE SET token=excluded.token;"
+                for row in rows
+            )
+            statements.append(
+                f"CREATE TRIGGER IF NOT EXISTS project_change_{table}_{operation.lower()} AFTER {operation} ON {table} BEGIN {updates} END"
+            )
+        if table not in ("projects", "job_attempts", "job_phase_events"):
+            statements.append(f"CREATE INDEX IF NOT EXISTS ix_{table}_project ON {table}(project_id)")
+    statements.append(
+        "CREATE INDEX IF NOT EXISTS ix_job_phase_events_job_attempt ON job_phase_events(job_id,attempt,id)"
+    )
+    return tuple(statements)
+
 
 # Version 1 adopts the previously unversioned schema without replacing existing tables.
 MIGRATIONS = {
@@ -36,6 +81,7 @@ MIGRATIONS = {
     5: (
         "CREATE TABLE IF NOT EXISTS cleanup_trash (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, asset_id TEXT NOT NULL, metadata TEXT NOT NULL, path TEXT NOT NULL, created_at TEXT NOT NULL, restored_at TEXT);",
     ),
+    6: _project_change_triggers(),
 }
 
 

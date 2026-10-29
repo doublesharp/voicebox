@@ -1,4 +1,4 @@
-import { createContext, useContext } from 'react';
+import { createContext, useCallback, useContext, useSyncExternalStore } from 'react';
 import type { StudioClient, StudioProfile } from './client';
 import type { StudioPlayback } from './playback';
 import type { ReviewSessions } from './review-session';
@@ -34,4 +34,16 @@ export function useStudio() {
   const context = useContext(StudioContext);
   if (!context) throw new Error('Studio components require a project session.');
   return context;
+}
+
+/** Read at command boundaries without putting clock ticks into editor context. */
+export function readStudioPlayhead(studio: StudioContextValue) {
+  return studio.playback.getPlayhead?.() ?? studio.playhead;
+}
+
+/** Only controls that display the cursor subscribe to clock changes. */
+export function useStudioPlayhead() {
+  const studio = useStudio();
+  const snapshot = useCallback(() => readStudioPlayhead(studio), [studio]);
+  return useSyncExternalStore(studio.playback.subscribe, snapshot);
 }

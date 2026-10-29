@@ -19,9 +19,11 @@ import { isJobActive, preflight, staleRecordings } from './domain';
 import { operationId } from './session';
 import { useDurableSubmission } from './submissions';
 import { Field, StudioButton } from './ui';
+import { useRevisionDocument } from './useRevisionDocument';
 
 export function Deliver() {
   const studio = useStudio();
+  const [open, setOpen] = useState(false);
   const platform = usePlatform();
   const { project, client, session, revisionId, setRevisionId } = studio;
   const [kind, setKind] = useState<'mix' | 'stems'>('mix');
@@ -42,11 +44,17 @@ export function Deliver() {
     setAcknowledgedRevision(null);
   }, [revisionId, project.id]);
   const revision = project.revisions.find((r) => r.id === revisionId);
+  const checkpoint = useRevisionDocument(client, project.id, revision, open);
   const allowStale = acknowledgedRevision === `${project.id}:${revisionId}`;
-  const stale = revision ? staleRecordings(revision.document, project) : [];
-  const flight = revision
-    ? preflight(revision.document, project, allowStale)
-    : { errors: ['Choose a named checkpoint.'], warnings: [] };
+  const stale = checkpoint.document ? staleRecordings(checkpoint.document, project) : [];
+  const flight = checkpoint.document
+    ? preflight(checkpoint.document, project, allowStale)
+    : {
+        errors: [
+          checkpoint.error || (revision ? 'Loading checkpoint…' : 'Choose a named checkpoint.'),
+        ],
+        warnings: [],
+      };
   const jobs = project.jobs.filter(
     (j) => j.kind === 'render' || j.kind === 'mix' || j.kind === 'stems',
   );
@@ -69,7 +77,7 @@ export function Deliver() {
   };
   const safeName = project.name.replace(/[^a-zA-Z0-9._-]+/g, '-').slice(0, 100) || 'studio-project';
   return (
-    <Dialog>
+    <Dialog open={open} onOpenChange={setOpen}>
       <DialogTrigger asChild>
         <button type="button" className="studio-primary">
           <Download size={15} /> Deliver

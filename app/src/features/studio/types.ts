@@ -130,7 +130,7 @@ export interface StudioRevision {
   id: string;
   name: string;
   created_at: string;
-  document: StudioDocument;
+  document?: StudioDocument;
   project_revision: number;
 }
 export interface LocalApproval {
@@ -158,6 +158,7 @@ export interface StudioProjectSummary {
   updated_at: string;
 }
 export interface StudioProject extends StudioProjectSummary {
+  change_token?: string;
   document: StudioDocument;
   takes: StudioTake[];
   assets: StudioAsset[];
@@ -215,6 +216,7 @@ export type PassageEdit = Partial<Pick<StudioPassage, 'text' | 'language' | 'dir
 export interface StudioTransport {
   readonly baseUrl: string;
   project(id: string, signal?: AbortSignal): Promise<StudioProject>;
+  refreshProject?(id: string, token?: string, signal?: AbortSignal): Promise<StudioProject | null>;
   command(id: string, command: StudioCommand): Promise<StudioProject>;
   checkpoint(
     id: string,

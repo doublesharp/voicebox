@@ -137,7 +137,7 @@ class StudioStore:
                 )
             ]
 
-    def _project(self, db, project_id):
+    def _project(self, db, project_id, *, compact=False):
         row = db.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
         if row is None:
             raise NotFound("Project not found")
@@ -153,7 +153,8 @@ class StudioStore:
             "recording_acknowledgements",
         ):
             items = []
-            for item in db.execute(f"SELECT * FROM {table} WHERE project_id=?", (project_id,)):
+            columns = "id,project_id,name,created_at,project_revision" if compact and table == "revisions" else "*"
+            for item in db.execute(f"SELECT {columns} FROM {table} WHERE project_id=?", (project_id,)):
                 item = dict(item)
                 item.pop("project_id", None)
                 item.pop("path", None)
@@ -162,17 +163,46 @@ class StudioStore:
                         item[key] = json.loads(item[key])
                 if table == "deliverables":
                     item = {"id": item["id"], **item["data"]}
-                if table == "jobs":
-                    from .job_state import enrich_job
-
-                    item = enrich_job(db, item)
                 items.append(item)
+            if table == "jobs":
+                from .job_state import enrich_jobs
+
+                items = enrich_jobs(db, items)
             result[table] = items
         return result
 
     def get_project(self, project_id):
         with self.connect() as db:
             return self._project(db, project_id)
+
+    def poll_project(self, project_id, since=None):
+        """Read the token and projection from one snapshot, or skip the projection."""
+        with self.connect() as db:
+            db.execute("BEGIN")
+            row = db.execute(
+                "SELECT c.token FROM project_changes c JOIN projects p ON p.id=c.project_id WHERE p.id=?",
+                (project_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFound("Project not found")
+            token = '"' + row["token"] + '"'
+            if since == token:
+                return None, token
+            project = self._project(db, project_id, compact=True)
+            project["change_token"] = token
+            return project, token
+
+    def get_revision(self, project_id, revision_id):
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT id,name,created_at,project_revision,document FROM revisions WHERE project_id=? AND id=?",
+                (project_id, revision_id),
+            ).fetchone()
+            if row is None:
+                raise NotFound("Checkpoint not found")
+            result = dict(row)
+            result["document"] = json.loads(result["document"])
+            return result
 
     def _operation(self, db, project_id, operation_id, request):
         if not isinstance(operation_id, str) or not operation_id.strip():

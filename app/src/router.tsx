@@ -2,6 +2,7 @@ import {
   createRootRoute,
   createRoute,
   createRouter,
+  lazyRouteComponent,
   Outlet,
   redirect,
   useRouterState,
@@ -9,27 +10,11 @@ import {
 import { useEffect, useRef } from 'react';
 import './app-shell.css';
 import { AppFrame } from '@/components/AppFrame/AppFrame';
-import { CapturesTab } from '@/components/CapturesTab/CapturesTab';
-import { EffectsTab } from '@/components/EffectsTab/EffectsTab';
-import { MainEditor } from '@/components/MainEditor/MainEditor';
-import { ModelsTab } from '@/components/ModelsTab/ModelsTab';
-import { AboutPage } from '@/components/ServerTab/AboutPage';
-import { CapturesPage } from '@/components/ServerTab/CapturesPage';
-import { ChangelogPage } from '@/components/ServerTab/ChangelogPage';
-import { GeneralPage } from '@/components/ServerTab/GeneralPage';
-import { GenerationPage } from '@/components/ServerTab/GenerationPage';
-import { GpuPage } from '@/components/ServerTab/GpuPage';
-import { LogsPage } from '@/components/ServerTab/LogsPage';
-import { MCPPage } from '@/components/ServerTab/MCPPage';
-import { SettingsLayout } from '@/components/ServerTab/ServerTab';
-import { Sidebar } from '@/components/Sidebar';
 import { KeyboardShortcuts } from '@/components/KeyboardShortcuts';
-import { StoriesTab } from '@/components/StoriesTab/StoriesTab';
+import { MainEditor } from '@/components/MainEditor/MainEditor';
+import { Sidebar } from '@/components/Sidebar';
 import { Toaster } from '@/components/ui/toaster';
-import { VoicesTab } from '@/components/VoicesTab/VoicesTab';
-import { ProjectsPage } from '@/features/studio/ProjectsPage';
 import { StudioFrame } from '@/features/studio/StudioFrame';
-import { StudioProjectPage } from '@/features/studio/StudioProjectPage';
 import { isProjectWorkspacePath, observeGlobalPlayerHeight } from '@/lib/constants/ui';
 import { useGenerationProgress } from '@/lib/hooks/useGenerationProgress';
 import { useModelDownloadToast } from '@/lib/hooks/useModelDownloadToast';
@@ -137,104 +122,119 @@ const indexRoute = createRoute({
 const studioProjectsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/studio/projects',
-  component: ProjectsPage,
+  component: lazyRouteComponent(() => import('@/features/studio/ProjectsPage'), 'ProjectsPage'),
 });
 
 const studioProjectRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/studio/projects/$projectId/$workspace',
-  component: StudioProjectPage,
+  component: lazyRouteComponent(
+    () => import('@/features/studio/StudioProjectPage'),
+    'StudioProjectPage',
+  ),
 });
 
 // Stories route
 const storiesRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/stories',
-  component: StoriesTab,
+  component: lazyRouteComponent(() => import('@/components/StoriesTab/StoriesTab'), 'StoriesTab'),
 });
 
 // Voices route
 const voicesRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/voices',
-  component: VoicesTab,
+  component: lazyRouteComponent(() => import('@/components/VoicesTab/VoicesTab'), 'VoicesTab'),
 });
 
 // Captures route (prototype — will replace AudioTab once the new flow is ready)
 const capturesRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/captures',
-  component: CapturesTab,
+  component: lazyRouteComponent(
+    () => import('@/components/CapturesTab/CapturesTab'),
+    'CapturesTab',
+  ),
 });
 
 // Effects route
 const effectsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/effects',
-  component: EffectsTab,
+  component: lazyRouteComponent(() => import('@/components/EffectsTab/EffectsTab'), 'EffectsTab'),
 });
 
 // Models route
 const modelsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/models',
-  component: ModelsTab,
+  component: lazyRouteComponent(() => import('@/components/ModelsTab/ModelsTab'), 'ModelsTab'),
 });
 
 // Settings layout route (parent for sub-tabs)
 const settingsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/settings',
-  component: SettingsLayout,
+  component: lazyRouteComponent(() => import('@/components/ServerTab/ServerTab'), 'SettingsLayout'),
 });
 
 // Settings sub-routes
 const settingsGeneralRoute = createRoute({
   getParentRoute: () => settingsRoute,
   path: '/',
-  component: GeneralPage,
+  component: lazyRouteComponent(() => import('@/components/ServerTab/GeneralPage'), 'GeneralPage'),
 });
 
 const settingsGenerationRoute = createRoute({
   getParentRoute: () => settingsRoute,
   path: '/generation',
-  component: GenerationPage,
+  component: lazyRouteComponent(
+    () => import('@/components/ServerTab/GenerationPage'),
+    'GenerationPage',
+  ),
 });
 
 const settingsCapturesRoute = createRoute({
   getParentRoute: () => settingsRoute,
   path: '/captures',
-  component: CapturesPage,
+  component: lazyRouteComponent(
+    () => import('@/components/ServerTab/CapturesPage'),
+    'CapturesPage',
+  ),
 });
 
 const settingsMCPRoute = createRoute({
   getParentRoute: () => settingsRoute,
   path: '/mcp',
-  component: MCPPage,
+  component: lazyRouteComponent(() => import('@/components/ServerTab/MCPPage'), 'MCPPage'),
 });
 
 const settingsGpuRoute = createRoute({
   getParentRoute: () => settingsRoute,
   path: '/gpu',
-  component: GpuPage,
+  component: lazyRouteComponent(() => import('@/components/ServerTab/GpuPage'), 'GpuPage'),
 });
 
 const settingsChangelogRoute = createRoute({
   getParentRoute: () => settingsRoute,
   path: '/changelog',
-  component: ChangelogPage,
+  component: lazyRouteComponent(
+    () => import('@/components/ServerTab/ChangelogPage'),
+    'ChangelogPage',
+  ),
 });
 
 const settingsLogsRoute = createRoute({
   getParentRoute: () => settingsRoute,
   path: '/logs',
-  component: LogsPage,
+  component: lazyRouteComponent(() => import('@/components/ServerTab/LogsPage'), 'LogsPage'),
 });
 
 const settingsAboutRoute = createRoute({
   getParentRoute: () => settingsRoute,
   path: '/about',
-  component: AboutPage,
+  component: lazyRouteComponent(() => import('@/components/ServerTab/AboutPage'), 'AboutPage'),
 });
 
 // Redirect old /server path to /settings

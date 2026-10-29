@@ -278,6 +278,7 @@ async function mount(
       engines: options.engines ?? [engine],
       capabilitiesError: null,
       playback: {
+        subscribe: () => () => {},
         getSnapshot: () => ({ mode: 'idle' }),
         audition: async (url: string) => {
           auditions.push(url);
