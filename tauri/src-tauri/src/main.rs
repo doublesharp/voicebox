@@ -245,7 +245,7 @@ fn write_persisted_backend_override(data_dir: &std::path::Path, value: Option<&s
 }
 
 /// Run `<exe> --version` with a 10-second timeout to avoid hanging Tauri startup.
-/// Returns the last whitespace-delimited token from stdout (e.g. "0.4.4"), or None on any failure.
+/// Returns a version only for a successful process with one Voicebox version line.
 async fn probe_binary_version(exe: &std::path::Path, cwd: &std::path::Path) -> Option<String> {
     let mut cmd = tokio::process::Command::new(exe);
     cmd.arg("--version")
@@ -254,8 +254,22 @@ async fn probe_binary_version(exe: &std::path::Path, cwd: &std::path::Path) -> O
 
     match tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output()).await {
         Ok(Ok(output)) => {
-            let s = String::from_utf8_lossy(&output.stdout);
-            s.trim().split_whitespace().last().map(String::from)
+            if !output.status.success() {
+                return None;
+            }
+            let stdout = std::str::from_utf8(&output.stdout).ok()?;
+            let mut versions = stdout.lines().filter_map(|line| {
+                let mut words = line.split_whitespace();
+                match (words.next(), words.next(), words.next()) {
+                    (Some("voicebox-server"), Some(version), None) => Some(version),
+                    _ => None,
+                }
+            });
+            let version = versions.next()?;
+            if versions.next().is_some() {
+                return None;
+            }
+            Some(version.to_owned())
         }
         Ok(Err(e)) => {
             println!("Version probe failed: {}", e);
@@ -1733,4 +1747,69 @@ pub fn run() {
 
 fn main() {
     run();
+}
+
+#[cfg(all(test, unix))]
+mod backend_probe_tests {
+    use super::probe_binary_version;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new(script: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("voicebox-probe-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            fs::create_dir(&dir).unwrap();
+            let exe = dir.join("backend");
+            fs::write(&exe, format!("#!/bin/sh\n{script}\n")).unwrap();
+            fs::set_permissions(&exe, fs::Permissions::from_mode(0o700)).unwrap();
+            Self(dir)
+        }
+        async fn probe(&self) -> Option<String> {
+            probe_binary_version(&self.0.join("backend"), &self.0).await
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+    }
+
+    #[tokio::test]
+    async fn valid_server_version_is_read_from_successful_process() {
+        let f = Fixture::new("printf 'voicebox-server 0.6.0\\n'");
+        assert_eq!(f.probe().await.as_deref(), Some("0.6.0"));
+    }
+    #[tokio::test]
+    async fn unsuccessful_process_cannot_report_a_usable_version() {
+        let f = Fixture::new("printf 'voicebox-server 0.6.0\\n'; exit 3");
+        assert_eq!(f.probe().await, None);
+    }
+    #[tokio::test]
+    async fn unrelated_stdout_is_not_a_server_version() {
+        let f = Fixture::new("printf 'not-the-server 0.6.0\\n'");
+        assert_eq!(f.probe().await, None);
+    }
+    #[tokio::test]
+    async fn version_line_can_be_followed_by_unrelated_output() {
+        let f = Fixture::new("printf 'voicebox-server 0.6.0\\nwarning from startup\\n'");
+        assert_eq!(f.probe().await.as_deref(), Some("0.6.0"));
+    }
+    #[tokio::test]
+    async fn invalid_utf8_cannot_masquerade_as_version_output() {
+        let f = Fixture::new("printf 'voicebox-server 0.6.0\\377\\n'");
+        assert_eq!(f.probe().await, None);
+    }
+    #[tokio::test]
+    async fn ambiguous_version_lines_are_rejected() {
+        let f = Fixture::new("printf 'voicebox-server 0.6.0\\nvoicebox-server 0.7.0\\n'");
+        assert_eq!(f.probe().await, None);
+    }
+    #[tokio::test]
+    async fn missing_executable_and_empty_output_are_not_versions() {
+        let f = Fixture::new("exit 0");
+        assert_eq!(f.probe().await, None);
+        assert_eq!(probe_binary_version(&f.0.join("missing"), &f.0).await, None);
+    }
 }
