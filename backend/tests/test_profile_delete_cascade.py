@@ -158,6 +158,61 @@ def _lock(monkeypatch, locked: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["generation", "failed", "profile_generations", "profile"])
+async def test_failed_delete_preserves_generation_version_audio_and_story(db, monkeypatch, operation):
+    _make_profile(db)
+    gen_file, gen_stored = _write_wav("gen.wav")
+    version_file, version_stored = _write_wav("gen-take.wav")
+    db.add(Generation(id="gen-1", profile_id="profile-1", text="hello", audio_path=gen_stored, status="failed"))
+    db.add(GenerationVersion(id="version-1", generation_id="gen-1", label="Take", audio_path=version_stored))
+    db.add(Story(id="story-1", name="Story"))
+    db.add(StoryItem(id="item-1", story_id="story-1", generation_id="gen-1"))
+    db.commit()
+    gen_bytes, version_bytes = gen_file.read_bytes(), version_file.read_bytes()
+
+    def fail_commit():
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(db, "commit", fail_commit)
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        if operation == "generation":
+            await history.delete_generation("gen-1", db)
+        elif operation == "failed":
+            await history.delete_failed_generations(db)
+        elif operation == "profile_generations":
+            await history.delete_generations_by_profile("profile-1", db)
+        else:
+            await profiles.delete_profile("profile-1", db)
+    db.rollback()
+    assert db.get(VoiceProfile, "profile-1") is not None
+    assert db.get(Generation, "gen-1") is not None
+    assert db.get(GenerationVersion, "version-1") is not None
+    assert db.get(StoryItem, "item-1") is not None
+    assert gen_file.read_bytes() == gen_bytes
+    assert version_file.read_bytes() == version_bytes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reference", ["generation", "version", "sample"])
+async def test_deleting_generation_preserves_audio_referenced_by_other_rows(db, reference):
+    _make_profile(db)
+    shared, stored = _write_wav("shared.wav")
+    db.add_all([
+        Generation(id="gen-1", profile_id="profile-1", text="one", audio_path=stored),
+        Generation(id="gen-2", profile_id="profile-1", text="two", audio_path=str(shared) if reference == "generation" else None),
+    ])
+    db.add(GenerationVersion(id="version-1", generation_id="gen-1", label="Take", audio_path=stored))
+    if reference == "version":
+        db.add(GenerationVersion(id="version-2", generation_id="gen-2", label="Take", audio_path=str(shared)))
+    elif reference == "sample":
+        db.add(ProfileSample(id="sample-1", profile_id="profile-1", audio_path=str(shared), reference_text="hello"))
+    db.commit()
+    assert await history.delete_generation("gen-1", db) is True
+    assert db.get(Generation, "gen-2") is not None
+    assert shared.read_bytes() == b"RIFF placeholder"
+
+
+@pytest.mark.asyncio
 async def test_delete_profile_survives_unremovable_audio(db, monkeypatch):
     """A file locked by playback must not abort the delete half-way through."""
     _make_profile(db)

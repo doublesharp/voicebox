@@ -492,7 +492,10 @@ async def delete_profile(
     # Generations carry a non-null FK to the profile and the history query
     # inner-joins profiles, so anything left behind here becomes a row the UI
     # can never show and a .wav in data/generations the user can never reclaim.
-    deleted_generations = await history.delete_generations_by_profile(profile_id, db, commit=False)
+    pending_audio_paths = set()
+    deleted_generations = await history.delete_generations_by_profile(
+        profile_id, db, commit=False, pending_audio_paths=pending_audio_paths,
+    )
     if deleted_generations:
         logger.info("Deleted %d generations belonging to profile %s", deleted_generations, profile_id)
 
@@ -508,11 +511,20 @@ async def delete_profile(
     )
 
     db.delete(profile)
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    history._remove_deleted_audio(pending_audio_paths, db)
 
     profile_dir = config.get_profiles_dir() / profile_id
     if profile_dir.exists():
-        shutil.rmtree(profile_dir)
+        try:
+            shutil.rmtree(profile_dir)
+        except OSError:
+            logger.warning("Could not remove deleted profile directory %s", profile_dir, exc_info=True)
 
     # Clean up combined audio cache files for this profile
     clear_profile_cache(profile_id)
