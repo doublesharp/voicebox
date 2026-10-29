@@ -27,7 +27,7 @@ jobs:
 
       - name: Voice, story and model regressions
         run: |
-          for test in app/tests/profile-form-coverage.test.tsx app/tests/story-track-editor-coverage.test.tsx app/tests/model-management-coverage.test.tsx app/tests/*-priority*.test.tsx; do
+          for test in app/tests/profile-form-coverage.test.tsx app/tests/story-track-editor-coverage.test.tsx app/tests/model-management-coverage.test.tsx app/tests/*-priority*.test.tsx app/tests/studio-project-regressions.test.tsx app/tests/audio-dictation-regressions.test.tsx app/tests/key-codes-regressions.test.ts; do
             bun test "$test"
           done
 

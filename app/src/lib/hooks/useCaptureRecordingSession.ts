@@ -125,10 +125,8 @@ export function useCaptureRecordingSession(
   const onFinalTextRef = useRef(options.onFinalText);
   onFinalTextRef.current = options.onFinalText;
 
-  // Snapshot of ``allow_auto_paste`` from the capture-create response —
-  // held so the refine onSuccess (which only sees the plain CaptureResponse)
-  // can still pass the original setting through to onFinalText.
-  const allowAutoPasteRef = useRef<boolean>(true);
+  // Preserve the last capture setting for explicit manual refinements.
+  const allowAutoPasteRef = useRef(true);
 
   const clearRestTimer = useCallback(() => {
     if (restTimerRef.current !== null) {
@@ -189,14 +187,15 @@ export function useCaptureRecordingSession(
 
   const refineMutation = useMutation({
     // Empty body — backend resolves flags and model from capture_settings.
-    mutationFn: async (captureId: string) => apiClient.refineCapture(captureId, {}),
-    onSuccess: (data, captureId) => {
+    mutationFn: async ({ captureId }: { captureId: string; allowAutoPaste: boolean }) =>
+      apiClient.refineCapture(captureId, {}),
+    onSuccess: (data, { captureId, allowAutoPaste }) => {
       queryClient.invalidateQueries({ queryKey: ['captures'] });
       broadcastUpdated(captureId);
       if (pillStateRef.current === 'refining') scheduleHidePill();
       const finalText = data.transcript_refined ?? data.transcript_raw;
       if (finalText) {
-        onFinalTextRef.current?.(finalText, data, allowAutoPasteRef.current);
+        onFinalTextRef.current?.(finalText, data, allowAutoPaste);
       }
     },
     onError: (err: Error) => {
@@ -219,7 +218,7 @@ export function useCaptureRecordingSession(
       allowAutoPasteRef.current = capture.allow_auto_paste;
       if (capture.auto_refine) {
         setPillState('refining');
-        refineMutation.mutate(capture.id);
+        refineMutation.mutate({ captureId: capture.id, allowAutoPaste: capture.allow_auto_paste });
       } else {
         if (pillStateRef.current === 'transcribing') scheduleHidePill();
         if (capture.transcript_raw) {
@@ -282,10 +281,12 @@ export function useCaptureRecordingSession(
   const startRecording = useCallback(() => {
     if (isRecording) return;
     clearRestTimer();
+    clearErrorTimer();
+    setErrorMessage(null);
     setFrozenElapsedMs(0);
     setPillState('recording');
     beginAudioRecording();
-  }, [isRecording, beginAudioRecording, clearRestTimer]);
+  }, [isRecording, beginAudioRecording, clearRestTimer, clearErrorTimer]);
 
   const toggleRecording = useCallback(() => {
     if (isRecording) {
@@ -304,7 +305,7 @@ export function useCaptureRecordingSession(
 
   const refine = useCallback(
     (captureId: string) => {
-      refineMutation.mutate(captureId);
+      refineMutation.mutate({ captureId, allowAutoPaste: allowAutoPasteRef.current });
     },
     [refineMutation],
   );
