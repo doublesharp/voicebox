@@ -11,6 +11,21 @@ import type {
 const CAPTURE_SETTINGS_KEY = ['settings', 'captures'] as const;
 const GENERATION_SETTINGS_KEY = ['settings', 'generation'] as const;
 
+type GenerationPending = { patch: GenerationSettingsUpdate };
+type GenerationWrites = { confirmed: GenerationSettings | undefined; pending: GenerationPending[] };
+const generationWrites = new WeakMap<QueryClient, GenerationWrites>();
+
+function renderGenerationWrites(client: QueryClient, writes: GenerationWrites) {
+  if (!writes.confirmed) return;
+  client.setQueryData<GenerationSettings>(
+    GENERATION_SETTINGS_KEY,
+    writes.pending.reduce(
+      (settings, pending) => ({ ...settings, ...pending.patch }),
+      writes.confirmed,
+    ),
+  );
+}
+
 type CapturePending = { patch: Partial<CaptureSettings> };
 type CaptureWrites = { confirmed: CaptureSettings | undefined; pending: CapturePending[] };
 const captureWrites = new WeakMap<QueryClient, CaptureWrites>();
@@ -130,7 +145,7 @@ export function useCaptureSettings(options?: { onError?: () => void }) {
  * Hook for long-form TTS generation defaults. Same optimistic pattern as
  * ``useCaptureSettings``.
  */
-export function useGenerationSettings() {
+export function useGenerationSettings(options?: { onError?: () => void }) {
   const queryClient = useQueryClient();
 
   const query = useQuery({
@@ -140,25 +155,30 @@ export function useGenerationSettings() {
   });
 
   const mutation = useMutation({
+    scope: { id: 'generation-settings' },
     mutationFn: (patch: GenerationSettingsUpdate) => apiClient.updateGenerationSettings(patch),
     onMutate: async (patch) => {
       await queryClient.cancelQueries({ queryKey: GENERATION_SETTINGS_KEY });
-      const previous = queryClient.getQueryData<GenerationSettings>(GENERATION_SETTINGS_KEY);
-      if (previous) {
-        queryClient.setQueryData<GenerationSettings>(GENERATION_SETTINGS_KEY, {
-          ...previous,
-          ...patch,
-        });
+      let writes = generationWrites.get(queryClient);
+      if (!writes) {
+        writes = {
+          confirmed: queryClient.getQueryData<GenerationSettings>(GENERATION_SETTINGS_KEY),
+          pending: [],
+        };
+        generationWrites.set(queryClient, writes);
       }
-      return { previous };
+      const pending: GenerationPending = { patch };
+      writes.pending.push(pending);
+      renderGenerationWrites(queryClient, writes);
+      return { writes, pending };
     },
-    onError: (_err, _patch, ctx) => {
-      if (ctx?.previous) {
-        queryClient.setQueryData(GENERATION_SETTINGS_KEY, ctx.previous);
-      }
-    },
-    onSettled: (data) => {
-      if (data) queryClient.setQueryData(GENERATION_SETTINGS_KEY, data);
+    onError: () => options?.onError?.(),
+    onSettled: (data, _error, _patch, context) => {
+      if (!context) return;
+      if (data) context.writes.confirmed = data;
+      context.writes.pending = context.writes.pending.filter((item) => item !== context.pending);
+      renderGenerationWrites(queryClient, context.writes);
+      if (context.writes.pending.length === 0) generationWrites.delete(queryClient);
     },
   });
 
