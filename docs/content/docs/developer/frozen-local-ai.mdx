@@ -65,8 +65,14 @@ loaded state. Its standalone binary started from a read-only working directory
 with host `PYTHONPATH` removed. The bundle retained the ONNX Runtime native
 library and extension, SentencePiece extension, and MOSS license metadata.
 
-Further inference and final source-closure results belong to their recorded
-artifact hashes. Packaged backend inference, Tauri launch, webview interaction,
-physical audio-device changes, release signing, and other operating systems
-remain separate checks. Raw receipts and generated artifacts belong outside
+The final backend refresh used the retained dependency analysis with a fresh
+PyInstaller code archive and the new watchdog module explicitly included.
+Normalized embedded code matched all 146 backend modules and the server entry
+point to final source. Offline MOSS profile prewarming, ordinary cloned synthesis,
+repeatable seeded PCM, unload, missing-required-graph refusal and restored-graph
+recovery passed on that artifact. Studio readiness followed the exact graph
+availability. These checks supersede the intermediate ordinary-generation result.
+
+Tauri launch, webview interaction, physical audio-device changes, release signing,
+and other operating systems remain separate checks. Raw receipts and generated artifacts belong outside
 Git; retain only short maintained results in documentation.

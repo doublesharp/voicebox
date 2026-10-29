@@ -54,12 +54,41 @@ its number formatting and punctuation artifacts reinforce the advisory label.
 The audited mlx-audio 0.4.1 word-timing head-name mismatch is handled by a scoped
 compatibility alias without editing the installed library.
 
-An intermediate frozen backend passed clean-cache MOSS download/load and Qwen
-4-bit synthesis. MOSS ordinary generation exposed a model-selection defect that
-was repaired in source; final rebuilt-artifact synthesis/recovery and packaged UI
-qualification must be checked against the final artifact before distribution.
+The final frozen backend matches all 146 bundled backend modules and the server
+entry point to current source. It passed real offline MOSS voice prewarming,
+ordinary cloned synthesis, repeated seeded PCM equality, unload, missing-graph
+refusal and recovery after restoring the graph. Studio readiness changed with
+the exact required checkpoint assets. The earlier dependency build also passed
+an initially empty MOSS download and real Qwen 4-bit synthesis. The final backend
+was refreshed through PyInstaller using the audited dependency analysis, with
+the new watchdog module explicitly included and complete code closure checked.
+Packaged desktop interaction is recorded separately from backend inference.
 Windows/Linux devices, signing/notarization, blind listening and CUDA remain
 separate gates. See the [remaining work](plans/LOCAL_AI_FOLLOWUPS.md).
+
+## Final Mac batch verification
+
+The merged backend and tooling suite passed **1,555 tests**, with nine skips and
+one slow test deselected. Actual threaded line tracing covered **1,837 / 1,918
+changed executable lines (95.78%)** across 31 production Python files against the
+published lifecycle baseline `01c9778`. Whole app-owned backend coverage was
+**13,566 / 16,601 lines (81.72%)** across 150 files. These are line measurements,
+not branch, subprocess or native-model coverage; real inference was checked
+separately. Production and test sources remained stable during the run.
+
+The final frontend suite passed **760 tests in 116 isolated files** plus
+TypeScript, with **74.81% whole-frontend line coverage**. The native suite passed
+**56 tests**, with two intentional host-only skips. Scoped independent review
+accepted the preview ownership, portable speech-review and pinned-readiness
+fixes, including their backend merge interactions. The tracked-source audit
+found no developer home paths, fixed build-volume paths or private tracker IDs.
+See the [coverage guide](testing-coverage.md) for measurement boundaries.
+
+The final frozen backend executable has SHA-256
+`1b55a6ee6ccf23b8641b35fc9166ba4775cc90986d46a1b7efb1f73469638030`.
+Its real offline MOSS and Qwen 4-bit checks used synthetic reference speech.
+This establishes the tested macOS artifact; CUDA and other operating systems
+remain unqualified. Raw reports, audio, coverage and build artifacts stay outside Git.
 
 ## Earlier integration
 
@@ -141,7 +170,7 @@ conditioning reuse applies before device restoration and can benefit CUDA, but
 no NVIDIA measurements or CUDA qualification were available during this run. The
 MLX routing, codec reuse and streaming changes are Apple Silicon improvements.
 
-## Integration evidence
+## Earlier integration evidence
 
 The final combined deterministic suite passed **274 tests**. Actual threaded
 line tracing covered **975 / 986 changed executable source lines (98.88%)**
