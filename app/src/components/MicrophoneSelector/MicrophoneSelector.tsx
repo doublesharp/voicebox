@@ -20,7 +20,8 @@ export function MicrophoneSelector({ disabled = false }: { disabled?: boolean })
   const id = useId();
   const { deviceId, deviceLabel, setMicrophone } = useMicrophoneStore();
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
-  const [error, setError] = useState<string | null>(null);
+  const [enumerationError, setEnumerationError] = useState<string | null>(null);
+  const [permissionError, setPermissionError] = useState<string | null>(null);
   const [requesting, setRequesting] = useState(false);
   const refreshVersion = useRef(0);
   const permissionRequest = useRef<AbortController | null>(null);
@@ -40,9 +41,9 @@ export function MicrophoneSelector({ disabled = false }: { disabled?: boolean })
             device.deviceId !== 'communications',
         ),
       );
-      setError(null);
+      setEnumerationError(null);
     } catch (cause) {
-      if (refreshVersion.current === version) setError(microphoneErrorMessage(cause));
+      if (refreshVersion.current === version) setEnumerationError(microphoneErrorMessage(cause));
     }
   }, []);
 
@@ -64,6 +65,7 @@ export function MicrophoneSelector({ disabled = false }: { disabled?: boolean })
     const controller = new AbortController();
     permissionRequest.current = controller;
     setRequesting(true);
+    setPermissionError(null);
     try {
       if (!navigator.mediaDevices?.getUserMedia) throw new Error(t('microphone.noAccess'));
       const stream = await requestMicrophone(navigator.mediaDevices, null, controller.signal);
@@ -72,13 +74,14 @@ export function MicrophoneSelector({ disabled = false }: { disabled?: boolean })
       });
       if (!controller.signal.aborted) await refresh();
     } catch (cause) {
-      if (!controller.signal.aborted) setError(microphoneErrorMessage(cause));
+      if (!controller.signal.aborted) setPermissionError(microphoneErrorMessage(cause));
     } finally {
       if (!controller.signal.aborted) setRequesting(false);
       if (permissionRequest.current === controller) permissionRequest.current = null;
     }
   };
 
+  const error = permissionError ?? enumerationError;
   const selectedUnavailable = deviceId && !devices.some((device) => device.deviceId === deviceId);
   const needsPermission = !devices.some((device) => device.label);
 
