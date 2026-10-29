@@ -4,17 +4,24 @@ Run test files in separate Bun processes. Module mocks in the existing tests can
 leak between files in a single process. The runner also checks TypeScript and
 fails if production source changes during the run.
 
+Choose absolute paths for disposable run output and an isolated coverage-tooling
+installation, following the current host's storage policy:
+
 ```sh
+export VOICEBOX_REPORTS_ROOT="/absolute/disposable-reports"
+export VOICEBOX_COVERAGE_TOOLS="/absolute/coverage-tooling"
 python3 scripts/test-frontend.py \
   --coverage \
-  --instrumentation-root /Volumes/Scratch/voicebox/tmp/coverage-instrumentation-20261029 \
-  --output /Volumes/Scratch/voicebox/reports/new-coverage-run
+  --instrumentation-root "$VOICEBOX_COVERAGE_TOOLS" \
+  --output "$VOICEBOX_REPORTS_ROOT/new-coverage-run"
 ```
 
-The output directory must be new and under mounted Scratch. The instrumentation
+The output directory must be new, absolute, and have no `..` or symlink
+components. The guard requires POSIX directory-relative no-follow IO; unsupported
+hosts fail explicitly. Follow any host-specific mount requirement before running. The instrumentation
 directory must contain `istanbul-lib-instrument@6.0.3` and
 `istanbul-lib-coverage@3.2.2` in its own `node_modules`. These tools are installed
-separately on Scratch; they do not modify the application's dependencies.
+separately in the chosen tooling directory; they do not modify the application's dependencies.
 Use `--test <basename>` repeatedly for a focused run. Omit `--coverage` for a
 normal regression run.
 

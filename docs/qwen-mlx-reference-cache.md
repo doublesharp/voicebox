@@ -9,7 +9,7 @@ disables codec-cache reads and writes for that returned prompt.
 
 ## Installed API audit
 
-Audited the existing read-only environment's **mlx-audio 0.4.1**, MLX 0.32.4,
+Audited **mlx-audio 0.4.1**, MLX 0.32.4,
 without a dependency change or downloads:
 
 - `tts/models/qwen3_tts/qwen3_tts.py:862`: `Model.generate` accepts `ref_audio`
@@ -94,7 +94,7 @@ in-flight encode. Existing affinity and unload regressions run alongside them.
 Coverage uses the existing tools package with `timid=True, concurrency=["thread"]`
 against the changed source, including the worker closures. Final result:
 **44 passed**; new helper **156/165 lines (94.55%)**, added executable backend
-lines **16/16 (100%)**, combined changed source **172/181 (95.03%)**. Exact suite:
+lines **16/16 (100%)**, combined changed source **172/181 (95.03%)**. Exact suite (set `VOICEBOX_WORK_DIR` to an approved absolute disposable directory):
 
 ```sh
 python -m pytest -q \
@@ -102,7 +102,7 @@ python -m pytest -q \
   backend/tests/test_mlx_thread_affinity.py \
   backend/tests/test_mlx_unload_clears_cache.py \
   backend/tests/test_prompt_cache_reuse.py \
-  --basetemp=/Volumes/Scratch/voicebox/tmp/local-ai-20261029/track-d/pytest-final \
+  --basetemp="$VOICEBOX_WORK_DIR/pytest-reference-cache" \
   -p no:cacheprovider
 ```
 
@@ -129,14 +129,11 @@ loaded backend's cache context directly around `model.generate(max_tokens=16)`;
 backend `generate` integration is covered by deterministic tests. Upstream
 printed a tokenizer-regex warning; no dependency/config changes were made.
 
-Machine evidence is outside Git under
-`/Volumes/Scratch/voicebox/reports/local-ai-20261029/track-d/`:
-`real-check.json`, `real-check.log`, and `coverage.json`. The existing environment
-is `/Volumes/Scratch/voicebox/tmp/edit-delete-audio-versions/build-venv/bin/python`;
-all runs set `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1`, Scratch `TMPDIR` and
-`PYTHONPYCACHEPREFIX`. No shared environment or model cache was modified.
-`verify.py`, `test-coverage.log`, and `changed-coverage.json` preserve the exact
-coverage runner, final result and executable-line accounting for parent review.
+Run provenance, logs, audio and coverage were retained outside Git. All runs
+set `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1` and explicitly redirected temporary
+files and bytecode to task-owned disposable storage. No shared environment or
+model cache was modified. Coverage used `timid=True` and thread tracing against
+the actual changed source, including worker closures.
 
 Parent integration also exercised the actual native Base adapter offline, using
 seed 42, the same checkpoint/reference and `max_tokens=16` on the loaded model.
@@ -144,5 +141,4 @@ Encoder calls were **1, 1, 0, 0** for bypass, miss, same-text hit and different-
 hit. Bypass/miss/hit returned exactly equal seeded audio; changing target text
 changed the output. Each run emitted four native frames and retained only
 **5,120 bytes** of CPU codes. This bounded run is evidence of integration and
-parity, not a statistically established speedup. Its separate artifact is
-`/Volumes/Scratch/voicebox/reports/local-ai-20261029/native-cache-runtime.json`.
+parity, not a statistically established speedup. Its run report was retained outside Git.

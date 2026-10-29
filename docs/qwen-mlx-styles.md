@@ -35,7 +35,7 @@ audio result streams and inconsistent sample rates are errors.
 `backend/tests/test_qwen_mlx_styles.py` exercises these application contracts with
 offline CPU fakes, local cache fixtures, and the actual shared executor.
 On 2026-10-29, real offline synthesis also passed for CustomVoice 0.6B and
-VoiceDesign 1.7B on Apple M2 Max, using mlx-audio 0.4.1 and BF16 checkpoints.
+VoiceDesign 1.7B on Apple Silicon, using mlx-audio 0.4.1 and BF16 checkpoints.
 Both produced finite 24 kHz native audio frames. CustomVoice 1.7B, listening
 quality, cross-backend/repeated-seed waveform equality, packaged macOS, and real
 non-Mac PyTorch synthesis remain separate gates. See

@@ -35,7 +35,7 @@ Eight focused upstream changes were integrated into the working checkout after i
 - #1205 and #1183: packaging-only fixes need the relevant frozen Qwen/CUDA build environments. No packaging changes were included.
 - Larger playback, Studio and engine features from the queue remain separate work; existing in-progress UI/audio changes were preserved.
 
-Raw upstream responses, the baseline hashes, integration-only patch, and check logs are under `/Volumes/Scratch/voicebox/reports/upstream-integration-20261028/`. No raw evidence is committed to the repository.
+Raw upstream responses, the baseline hashes, integration-only patch, and check logs were retained outside Git in the integration run reports. No raw evidence is committed to the repository.
 
 ## Playback repair and publish validation — 2026-10-29
 

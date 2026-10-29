@@ -45,7 +45,7 @@ model download is needed for the deterministic test suite.
 
 A bounded offline check used `ResembleAI/chatterbox-turbo` revision
 `749d1c1a46eb10492095d68fbcf55691ccf137cd`, Chatterbox 0.1.7 and PyTorch 2.15.0
-on Apple M2 Max CPU with six Torch threads. The 6.35-second reference was macOS
+on an Apple Silicon CPU with six Torch threads. The 6.35-second reference was macOS
 Samantha synthetic speech, not a personal recording. Actual conditioning
 creation took 3.21 seconds on the initial miss; the next memory hit took
 1.52 ms and a hit after clearing the memory cache took 3.84 ms. Both hits skipped
@@ -56,5 +56,5 @@ Generation took 13.07 seconds cached and 15.97 seconds bypassed in this one
 sequence. This pair does not establish a general latency percentage or GPU
 performance: process/kernel warmup and run order were not controlled. CUDA/XPU,
 other references, listening fidelity and frozen packaging remain unqualified.
-Raw provenance, timings and audio are on Scratch under
-`reports/local-ai-20261029/turbo-runtime/`; the backend was unloaded afterward.
+Raw provenance, timings and audio were retained outside Git; the backend was
+unloaded afterward.

@@ -94,14 +94,15 @@ Captures should explain missing prerequisites with the existing readiness checkl
 2. Resolve the three material Terra review findings: refresh profile caches after effects saves; distinguish automatic profile effects from deliberate composer overrides; retain a created preset ID when later edits need a second save.
 3. Implement the shared navigation/layout tokens and page hierarchy, then the Generate workspace and consistent library/inspector forms. Preserve existing routes and data contracts.
 4. Extend focused tests for routing/selection, draft lifecycle, automatic versus explicit defaults, save/refetch ordering, keyboard actions and help accessibility. Keep deterministic seeded sequences bounded and reproducible.
-5. Typecheck and build the frozen candidate; run relevant suites in isolated Bun processes to avoid cross-file mock leakage. Use Scratch for build output and evidence.
+5. Typecheck and build the frozen candidate; run relevant suites in isolated Bun processes to avoid cross-file mock leakage. Use the current host's approved task-owned disposable storage for build output and evidence.
 6. Verify the real macOS app at 1200 by 800 and 800 by 600, including player open, long text, dialogs, scrolling, focused controls, tooltips/help, empty states and dirty forms. Reuse the packaged backend; preserve voice/history data and unrelated source edits. Install only a verified local update.
 
 The pre-refresh candidate passed 306 tests in 39 isolated frontend files. Its independent Terra review found three P2 issues above; it is not installed and is not accepted as complete. Source/test passes do not establish native visual or live mutation behavior.
 
 ## Opus consultation and decisions
 
-Consultation: [Opus 5.5 review](t3-thread://v1/thread:delegated-task:command%3Amcp%3A4c8d0f50-6c91-4d7e-8103-8181602be128%3Adelegate-task%3Aeec7a9ce-f643-4a5b-9d65-8add4d1394ec), completed 2026-10-29. The source-only critique did not establish rendered appearance or native acceptance. The full response is retained on Scratch at `reports/ui-review-20261029/opus-5.5-ia-review.md`.
+Consultation: an independent source review completed on 2026-10-29. The source-only critique did not establish rendered appearance or native acceptance. The full response was retained outside Git in the run evidence.
+
 
 Decisions adopted:
 

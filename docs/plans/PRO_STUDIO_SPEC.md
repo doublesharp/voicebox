@@ -262,7 +262,7 @@ Publish by writing to task-owned staging, closing and validating the audio, comp
 
 Garbage collection considers active drafts, named revisions, undo/redo history, generation inputs/results, review copies, and active render leases. Legacy delete/profile cleanup must never delete studio-owned assets. Studio checkpoints must not refer to mutable legacy version paths.
 
-Persistent user project assets live in the configured application data location. Disposable builds, waveforms/captures used as engineering evidence, benchmarks, and test fixtures generated during development follow the repository's Scratch-volume instructions. No run evidence or model weights belong in Git.
+Persistent user project assets live in the configured application data location. Disposable builds, waveforms/captures used as engineering evidence, benchmarks, and test fixtures generated during development follow the current host's approved disposable-storage instructions. No run evidence or model weights belong in Git.
 
 ## 8. Video production and later extensions
 
@@ -327,7 +327,7 @@ These are requirements for future implementation, not checks completed while wri
 
 Record performance on an explicit reference machine using a proposed workload of 100 passages, 200 clips, and a 30-minute project. Measure editor responsiveness, memory, waveform loading, and render resource use; do not invent generation-speed or GPU-concurrency claims. Interactive editing must not wait on inference; long audio loads and renders must remain cancellable and visibly progressing.
 
-Source tests, browser/rendered behavior, actual model output, database migration, native playback, packaged installation/signing, and external provider operation are separate gates. Passing one does not qualify the others. Engineering evidence belongs on Scratch; only concise maintained conclusions belong in repository documentation.
+Source tests, browser/rendered behavior, actual model output, database migration, native playback, packaged installation/signing, and external provider operation are separate gates. Passing one does not qualify the others. Engineering evidence belongs in task-owned disposable storage outside Git; only concise maintained conclusions belong in repository documentation.
 
 ## 11. Decisions remaining before dependent work
 

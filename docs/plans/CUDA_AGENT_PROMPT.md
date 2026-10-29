@@ -3,8 +3,8 @@
 Implement and verify NVIDIA CUDA improvements for Voicebox. Work in bounded
 batches with branches/worktrees, behavioral RED/GREEN tests, runtime coverage,
 real GPU benchmarks, updated docs and an independent correctness review. Return
-integration-ready commits and evidence. The requester has an Apple Silicon Mac
-and cannot validate CUDA themselves. This is an implementation task: do not stop
+integration-ready commits and evidence. The integration owner validates non-CUDA
+behavior; this track owns real NVIDIA qualification. This is an implementation task: do not stop
 at research or a performance proposal when a compatible improvement can be
 implemented and verified.
 
@@ -12,29 +12,19 @@ implemented and verified.
 
 Repository: https://github.com/doublesharp/voicebox.git . Use an existing checkout
 if provided. Read all applicable AGENTS.md instructions and local skills. Do not
-discard unrelated edits. The required local AI baseline is merge
-`fe2f8394961c7f85293cbede6d79c487d6e9cc86`; documentation baseline is
-`a614d08afbe1d142fec62cef3d395eed27b7e05b`. A normal clone of the remote branch
-may not include these local commits. Do not implement against an older baseline.
+discard unrelated edits. Agree the integration source ref with the
+integration owner and record `git rev-parse HEAD` before editing. Confirm it
+contains the current local AI adapters, conditioning/cache helpers, streaming
+ownership fixes and offline benchmark. Do not assume a branch name establishes
+that baseline.
 
-An incremental `voicebox-cuda-handoff.bundle` may be supplied with this prompt.
-Verify its SHA-256 against the separately supplied manifest. From an existing
-repository containing prerequisite commit
-`a5632679f8e37bdd71b4a99d78929902b58ff6df`, import it as follows, substituting the
-actual bundle path (not an untrusted shell-interpolated string):
-
-```bash
-git bundle verify /path/to/voicebox-cuda-handoff.bundle
-git fetch /path/to/voicebox-cuda-handoff.bundle refs/heads/docs/local-ai-followup-plan-20261029:refs/remotes/voicebox-handoff/local-ai-followups
-git merge-base --is-ancestor fe2f8394961c7f85293cbede6d79c487d6e9cc86 refs/remotes/voicebox-handoff/local-ai-followups
-```
-
-Create your own `improve/cuda-local-ai-<date>` worktree/branch from that imported
-ref using the active harness's worktree procedure. If the baseline is already
-present without a bundle, use a source ref containing it. If prerequisites are
-missing, fetch the fork's history where authorized or report the exact missing
-commit; continue the independent hardware/dependency audit while source transfer
-is resolved. Never reset an existing `doublesharp` or remote-tracking branch.
+If a source bundle is supplied, verify its SHA-256 against the separate manifest,
+run `git bundle verify` on the explicitly supplied local file, and fetch its
+agreed ref into a new remote-tracking ref. Create an isolated implementation
+branch/worktree from that verified commit using the host's worktree procedure.
+If prerequisites are missing, report the exact missing source while continuing
+independent hardware/dependency inspection. Never reset an existing integration
+or remote-tracking branch.
 
 Read these repo-relative files first:
 
@@ -58,11 +48,11 @@ this qualification. Use driver-compatible official Torch wheels in task-owned
 environments; do not change system drivers or shared environments. Treat GPUs
 with insufficient memory or unsupported BF16 as explicit hardware constraints.
 
-Follow the CUDA host's approved scratch-volume policy. Do not assume this Mac's
-`/Volumes/Scratch` exists on Linux or Windows; do not silently substitute system
-temporary directories. If applicable instructions require a specific mount,
+Follow the CUDA host's approved disposable-storage policy. Do not assume any
+particular mount name exists on another host or silently substitute storage
+outside its approved policy. If applicable instructions require a specific mount,
 stop disposable-output work when it is missing. Put environments, models, build
-outputs, audio, logs and coverage under the approved task-owned scratch root.
+outputs, audio, logs and coverage under the approved task-owned storage root.
 Set TMPDIR/TEMP and Python/library cache paths explicitly. Check free capacity
 before downloads/builds and budget simultaneous workers. Download only the
 checkpoints/codecs needed for the current batch, at pinned revisions.
@@ -73,10 +63,12 @@ First establish a reliable baseline before optimization.
 
 The existing CLI `scripts/benchmark-local-tts.py` admits Qwen Base, CustomVoice
 and VoiceDesign only. It pins assets, refuses missing caches, blocks networking
-during inference and records partial failure reports. It currently hardcodes
-`/Volumes/Scratch` and calls complete-array generation. Adapt or extend it for
-an explicit approved host scratch root, required CUDA device selection and CUDA
-telemetry, preserving exclusive/no-symlink writes and existing Mac behavior.
+during inference and records partial failure reports. It uses explicit
+output/cache roots and calls complete-array generation. Extend
+it for required CUDA device selection and CUDA telemetry, preserving
+exclusive/no-symlink writes and existing Mac behavior. The safe output helper
+requires POSIX directory-relative no-follow IO; native Windows is currently
+refused until an equally safe implementation is qualified there.
 Never invent a first-frame measurement from complete-array elapsed time. Add
 streaming measurements only when a real frame boundary exists. Turbo requires
 an audited complete asset-admission policy or a separate equally strict runner.
@@ -210,17 +202,18 @@ Keep CUDA-specific adapters/helpers/tests and a CUDA report in focused commits.
 Avoid unrelated cleanup. Keep shared registry, scheduler, benchmark, requirements
 and build-file changes minimal and in separate commits: the Mac owner is working
 on MLX/CPU/UI tracks. Coordinate shared-file ownership through the existing task
-mechanism; do not launch overlapping writers. Parallelize independent source
-review, deterministic tests and docs only; serialize expensive GPU execution.
-Use one independent reviewer after verification, with at most two scoped
-material-fix rechecks. Fix small findings yourself.
+mechanism; do not launch overlapping writers. If parallel agents are authorized,
+limit them to independent source review,
+deterministic tests and docs; serialize expensive GPU execution. Use an
+independent reviewer after verification, with at most two scoped material-fix
+rechecks. Fix small findings yourself.
 
 Return branch name, base/head hashes, commit list and integration order; exact
 setup/test/coverage/benchmark/build commands; GPU/driver/runtime/dependency and
 checkpoint revisions; baseline/candidate timing, VRAM and quality results;
 real-vs-fake and packaged-vs-development proof; unresolved gates and rollback/
 opt-out behavior. Keep short maintained summaries in docs and all raw logs,
-JSON, traces, audio and build artifacts on approved scratch storage, never Git.
+JSON, traces, audio and build artifacts on approved disposable storage, never Git.
 Provide patches/bundle for the integration owner to transfer. Do not push,
 release, deploy or merge into `doublesharp` from this CUDA track. The Mac owner
 will review and run non-CUDA regressions before merging your accepted commits.

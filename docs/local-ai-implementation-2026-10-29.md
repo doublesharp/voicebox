@@ -1,8 +1,6 @@
 # Local AI improvements — 2026-10-29
 
-This is the repository working view of Coordinate work
-`work_63df15bc-24a9-4144-a668-678954461549`, implementation plan
-`artifact_a3fb6e56-b90e-4312-89f5-0eb03f30d483`. Integration target: `doublesharp`.
+This report describes the local AI implementation integrated into `doublesharp`.
 Source behavior, model execution, listening quality, CUDA, native playback, and
 frozen-build qualification are separate evidence domains.
 
@@ -54,7 +52,7 @@ Threaded coverage.py line tracing covered all 172 changed executable streaming
 lines, including the complete 67-line worker bridge. This is scoped line coverage;
 it is not whole-backend or branch coverage.
 
-Real offline adapter synthesis passed on Apple M2 Max / 96 GiB unified memory:
+Real offline adapter synthesis passed on Apple Silicon:
 
 | Adapter | Checkpoint revision | Observation |
 | --- | --- | --- |
@@ -69,7 +67,7 @@ first-audible-device measurements. Initial kernels and runtime state differed
 between runs, so their timings do not establish comparative speedups.
 
 Raw commands, line coverage, checkpoint provenance, memory observations, logs and
-audio remain under `/Volumes/Scratch/voicebox/reports/local-ai-20261029/`.
+audio were retained outside Git in task-owned run reports.
 No raw evidence or downloaded model weights belong in Git.
 
 ## Remaining research qualification
@@ -80,7 +78,7 @@ advertised by this change. Each needs its own dependency audit, compatible runti
 checkpoint-specific license check, real synthesis, and frozen-build acceptance.
 Qwen CUDA graphs/fused kernels/quantization are also separate trials. Turbo
 conditioning reuse applies before device restoration and can benefit CUDA, but
-no NVIDIA measurements or CUDA qualification were available on this Mac. The
+no NVIDIA measurements or CUDA qualification were available during this run. The
 MLX routing, codec reuse and streaming changes are Apple Silicon improvements.
 
 ## Integration evidence
@@ -97,7 +95,7 @@ Exact command: the existing Python environment ran the retained
 `merge-coverage/verify-merge.py` harness with `timid=True` and thread tracing,
 covering 14 focused backend suites plus the benchmark suite. Raw results are
 `merge-coverage.log`, `merge-coverage/coverage.json` and
-`merge-coverage/changed-source-coverage.json` under the Scratch report root.
+`merge-coverage/changed-source-coverage.json` in the retained external report directory.
 
 Real Turbo CPU encoding and synthesis passed with memory/disk reuse and exact
 seeded parity against bypass. Initial preparation was 3.21 seconds versus
@@ -116,8 +114,6 @@ and GREEN checks cover repeated cancellation and drain ordering. Native cache
 regressions also cover partial close, failure, unload and repeated cancellation.
 
 The merge candidate starts from `doublesharp` and contains only this task's
-scoped changes. Unrelated newer development commits and the target checkout's
-local packaging edits were excluded from this implementation. Coordinate's
-latest source/log checkpoint was rejected by automatic approval review because
-external export was not explicitly authorized; local source and Scratch proof
-remain the current integration record.
+scoped changes. Unrelated development and local packaging edits were excluded
+from this implementation. Source, logs and run reports were retained locally
+outside Git; this report does not imply external publication of raw evidence.

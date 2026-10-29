@@ -8,6 +8,7 @@ Unimported source files are listed explicitly, never treated as covered.
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -15,6 +16,10 @@ import subprocess
 import sys
 import time
 from types import SimpleNamespace
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from scripts.portable_output import Output  # noqa: E402
 
 
 def source_snapshot(root):
@@ -93,25 +98,21 @@ def run_check(command, *, cwd, env, timeout):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, default=Path(__file__).resolve().parent.parent)
-    parser.add_argument("--output", type=Path, required=True, help="New directory under Scratch")
+    parser.add_argument("--output", type=Path, required=True, help="New absolute output directory (no symlink components)")
     parser.add_argument("--coverage", action="store_true")
     parser.add_argument("--instrumentation-root", type=Path,
-                        help="Scratch tooling directory with Istanbul instrument 6.0.3 and coverage 3.2.2")
+                        help="Tooling directory with Istanbul instrument 6.0.3 and coverage 3.2.2")
     parser.add_argument("--test", action="append", help="Explicit app/tests basename; repeat to select files")
     parser.add_argument("--timeout-seconds", type=float, default=30,
                         help="Maximum time for one check (default: 30 seconds)")
     parser.add_argument("--max-seconds", type=float, default=180,
                         help="Maximum total check time (default: 180 seconds)")
     args = parser.parse_args()
-    if args.timeout_seconds <= 0 or args.max_seconds <= 0:
-        parser.error("Timeouts must be positive")
-    scratch = Path("/Volumes/Scratch")
-    if not scratch.is_mount():
-        parser.error("Scratch is not mounted; refusing to write disposable output elsewhere")
+    if any(not math.isfinite(value) or value <= 0 for value in (args.timeout_seconds, args.max_seconds)):
+        parser.error("Timeouts must be finite and positive")
+    if args.instrumentation_root and not args.coverage:
+        parser.error("--instrumentation-root requires --coverage")
     root = args.source_root.resolve()
-    output = args.output.resolve()
-    if not output.is_relative_to(scratch / "voicebox") or output.exists():
-        parser.error("--output must be a new directory under /Volumes/Scratch/voicebox")
     tests = sorted((root / "app/tests").glob("*.test.*"))
     if args.test:
         tests = [p for p in tests if p.name in args.test]
@@ -119,14 +120,21 @@ def main():
             parser.error("At least one selected test file does not exist")
     if not tests:
         parser.error("No test files found")
+    try:
+        owned = Output(args.output)
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
+    with owned:
+        return run_suite(args, root, tests, owned)
+
+
+def run_suite(args, root, tests, owned):
+    output = owned.path
     before = source_snapshot(root)
-    output.mkdir(parents=True)
     temporary = output / "tmp"
     temporary.mkdir()
     env = {**os.environ, "TMPDIR": str(temporary)}
     if args.instrumentation_root:
-        if not args.coverage:
-            parser.error("--instrumentation-root requires --coverage")
         env.update(VOICEBOX_COVERAGE_TOOLS=str(args.instrumentation_root.resolve()),
                    VOICEBOX_COVERAGE_SOURCE=str(root))
     checks = [("typecheck", ["bun", "run", "typecheck"], root / "app")]
@@ -149,7 +157,7 @@ def main():
         run_env = {**env, "VOICEBOX_COVERAGE_FILE": str(output / f"{name}.coverage.json")}
         result = run_check(command, cwd=cwd, env=run_env, timeout=min(args.timeout_seconds, remaining))
         log = result.stdout + result.stderr
-        (output / f"{name}.log").write_text(log)
+        owned.write_text(f"{name}.log", log)
         count = re.search(r"(\d+) pass", log)
         results.append({
             "check": name,
@@ -174,7 +182,7 @@ def main():
         merge = run_check(["bun", str(root / "scripts/coverage-merge.ts"), str(root),
                            str(output), str(args.instrumentation_root.resolve())],
                           cwd=root, env=env, timeout=args.timeout_seconds)
-        (output / "coverage-merge.log").write_text(merge.stderr)
+        owned.write_text("coverage-merge.log", merge.stderr)
         if merge.returncode:
             summary["failedChecks"].append("coverage-merge")
         else:
@@ -183,8 +191,8 @@ def main():
         missing = [p.stem for p in tests if not (output / p.stem / "lcov.info").is_file()]
         summary["missingCoverageFiles"] = missing
         summary.update(merge_lines(sorted(output.glob("*/lcov.info")), root, before))
-    (output / "source-hashes.json").write_text(json.dumps(before, indent=2) + "\n")
-    (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    owned.write_text("source-hashes.json", json.dumps(before, indent=2) + "\n")
+    owned.write_text("summary.json", json.dumps(summary, indent=2) + "\n")
     print(json.dumps({key: value for key, value in summary.items()
                       if key not in ("results", "files", "unimportedSourceFiles")}))
     return 1 if summary["failedChecks"] or not stable or summary.get("missingCoverageFiles") else 0

@@ -29,8 +29,10 @@ New engines only need to touch `backends/` and `models.py` on the backend side â
 ### 0.1 Clone and Inspect the Model Library
 
 ```bash
-# Create a throwaway workspace
-mkdir /tmp/engine-research && cd /tmp/engine-research
+# Choose an absolute disposable workspace under your host's approved storage root
+export VOICEBOX_ENGINE_WORK_DIR="/absolute/disposable-engine-work"
+mkdir -p "$VOICEBOX_ENGINE_WORK_DIR/research"
+cd "$VOICEBOX_ENGINE_WORK_DIR/research"
 
 # Clone the model library
 git clone https://github.com/org/model-library.git
@@ -95,8 +97,8 @@ grep -r "from_pretrained\|tokenizer_name\|AutoTokenizer" . | grep -i "llama\|met
 
 ```bash
 # Create isolated venv
-python -m venv /tmp/engine-venv
-source /tmp/engine-venv/bin/activate
+python -m venv "$VOICEBOX_ENGINE_WORK_DIR/venv"
+source "$VOICEBOX_ENGINE_WORK_DIR/venv/bin/activate"
 
 # Install the package (try normally first)
 pip install model-package

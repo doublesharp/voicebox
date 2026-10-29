@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark existing Qwen TTS adapters using cached weights and Scratch only.
+"""Benchmark existing Qwen TTS adapters using cached weights and explicit output paths.
 
 Importing is inert. main() is a standalone entry point: it installs a permanent
 network audit guard before importing adapters. See the developer benchmark guide.
@@ -26,8 +26,9 @@ import time
 import wave
 
 
-SCRATCH = Path("/Volumes/Scratch")
 REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
+from scripts.portable_output import Output  # noqa: E402
 LANGUAGES = ("zh", "en", "ja", "ko", "de", "fr", "ru", "pt", "es", "it")
 PRESETS = ("Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric", "Ryan", "Aiden", "Ono_Anna", "Sohee")
 MAX_ARTIFACT_BYTES = 128 * 1024 * 1024
@@ -86,48 +87,6 @@ def validate(settings):
         raise ValueError("VoiceDesign requires --design-prompt and no preset")
     if not settings.cache_root.is_absolute() or not settings.cache_root.is_dir():
         raise ValueError("cache root must be an existing absolute Hugging Face hub directory")
-
-
-class Output:
-    """Fresh directory and exclusive, directory-relative artifact writes."""
-
-    def __init__(self, path):
-        if not SCRATCH.is_mount():
-            raise ValueError("/Volumes/Scratch is not mounted")
-        if not path.is_absolute() or ".." in path.parts:
-            raise ValueError("output root must be an absolute path under /Volumes/Scratch")
-        try:
-            parts = path.relative_to(SCRATCH).parts
-        except ValueError as exc:
-            raise ValueError("output root must be under /Volumes/Scratch") from exc
-        if not parts:
-            raise ValueError("output root must be a fresh subdirectory of Scratch")
-        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-        current = os.open(SCRATCH, flags)
-        try:
-            for index, part in enumerate(parts):
-                try:
-                    os.mkdir(part, mode=0o700, dir_fd=current)
-                except FileExistsError:
-                    if index == len(parts) - 1:
-                        raise ValueError("output root already exists; choose a fresh run path")
-                child = os.open(part, flags, dir_fd=current)
-                os.close(current)
-                current = child
-            self.fd, self.path = current, path
-        except BaseException:
-            os.close(current)
-            raise
-
-    def open(self, name):
-        if Path(name).name != name:
-            raise ValueError("artifact name must be a single filename")
-        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                     0o600, dir_fd=self.fd)
-        return os.fdopen(fd, "wb")
-
-    def close(self):
-        os.close(self.fd)
 
 
 def read_json(path):

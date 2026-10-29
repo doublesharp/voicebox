@@ -149,7 +149,7 @@ On timeout: cancel the SSE stream, mark the row `timeout`, and continue to the n
       "was_cached": true,
       "elapsed_seconds": 12.4,
       "audio_duration": 3.1,
-      "audio_path": "/tmp/.../gen.wav",
+      "audio_path": "/absolute/quality-run/gen.wav",
       "error": null,
       "server_log_tail": null
     }
@@ -227,13 +227,14 @@ The maintained small corpus covers names, numbers, abbreviations, pauses,
 narration, Spanish, Chinese and Japanese:
 
 ```sh
+export VOICEBOX_REPORTS_ROOT="/absolute/disposable-reports"
 PYTHONDONTWRITEBYTECODE=1 python scripts/evaluate-audio-quality.py --list-corpus
 ```
 
 Generate or export matching samples separately with an already cached model,
 recording the exact engine, model, seed and configuration. Generation is not
 part of this command, and no uncached model should be downloaded for a quality
-run. Keep samples, manifests and output on Scratch. An example manifest shape
+run. Keep samples, manifests and output in approved disposable storage outside Git. An example manifest shape
 (maintain the actual JSON as run evidence outside git) is:
 
 ```json
@@ -260,15 +261,15 @@ reviewed canonical transcript (for example, spelling out a number);
 `transcript_unit: "character"` selects CER for languages without word spaces.
 
 ```sh
+export VOICEBOX_REPORTS_ROOT="/absolute/disposable-reports"
 PYTHONDONTWRITEBYTECODE=1 python scripts/evaluate-audio-quality.py \
-  --manifest /Volumes/Scratch/voicebox/reports/my-quality-run/input.json \
-  --reports-root /Volumes/Scratch/voicebox/reports \
-  --output-dir /Volumes/Scratch/voicebox/reports/my-quality-run/analysis
+  --manifest "$VOICEBOX_REPORTS_ROOT/my-quality-run/input.json" \
+  --reports-root "$VOICEBOX_REPORTS_ROOT" \
+  --output-dir "$VOICEBOX_REPORTS_ROOT/my-quality-run/analysis"
 ```
 
 Choose a disposable reports root with `--reports-root` and a new task directory
-below it with `--output-dir`. These paths work on any platform; the example
-uses our local Scratch volume. Existing report files are never overwritten. Output is
+below it with `--output-dir`. Choose paths according to the host's disposable-storage policy. Existing report files are never overwritten. Output is
 `report.json` plus an unscored `listening-worksheet.md`; neither belongs in git.
 WAVs are read in bounded blocks. The report records sample hashes, provenance,
 duration, channels, peak/RMS, nonfinite/full-scale samples and energy-based

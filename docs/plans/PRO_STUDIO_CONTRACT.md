@@ -1,12 +1,12 @@
 # Studio S1 implementation contract
 
-Date: 2026-10-28. Implements [the specification](PRO_STUDIO_SPEC.md) after the user's explicit implementation request. Coordinate project `project_14a676bd-5cff-4ffe-ad9c-9aa08abc554e` is the authoritative task/artifact/ownership record; this file is the shared source interface view.
+Date: 2026-10-28. Implements [the specification](PRO_STUDIO_SPEC.md) after the user's explicit implementation request. This file is the shared source interface view; active ownership and run evidence belong in the current project workflow.
 
 ## Parallel ownership
 
-Current task-specific file ownership and parallel workstreams live in local Coordinate. Preparation tasks own their assigned feature files; only root integrates and pushes Git branches. Reserving the same integration target for multiple preparation tasks unnecessarily serializes them. Root owns backend registration, central contract changes, cross-domain checks and the final merge.
+Record task-specific file ownership before starting parallel workstreams. Preparation tasks own their assigned feature files; only root integrates and pushes Git branches. Reserving the same integration target for multiple preparation tasks unnecessarily serializes them. Root owns backend registration, central contract changes, cross-domain checks and the final merge.
 
-Workers share this checkout with strict ownership to preserve the existing uncommitted branding and playback work. No worker resets, checks out, commits, stages, or rewrites another owner's files. Dependencies, model caches, and native identities remain unchanged. No new framework or package installation is planned.
+Workers follow strict file ownership and preserve unrelated changes in shared checkouts. No worker resets, checks out, commits, stages, or rewrites another owner's files. Dependencies, model caches, and native identities remain unchanged. No new framework or package installation is planned.
 
 ## Transport
 

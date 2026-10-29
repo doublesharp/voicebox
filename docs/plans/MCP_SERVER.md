@@ -317,7 +317,7 @@ Claude Code can call `voicebox.speak` after step 4 (direct HTTP, manual config).
 - **Per-client:** open two Inspector sessions with different `X-Voicebox-Client-Id` headers, bind each to a different profile in Settings, verify distinct voices without `profile` arg.
 - **Claude Code end-to-end (HTTP):** `claude mcp add voicebox --transport http --url http://127.0.0.1:17493/mcp --header "X-Voicebox-Client-Id: claude-code"`, then ask Claude Code to speak. Pill shows `speaking: <profile>`, audio plays, capture appears in history.
 - **Stdio fallback:** manually paste the stdio snippet from Settings into a client's config, verify same behavior. `VOICEBOX_CLIENT_ID=claude-code python -m backend.mcp_shim` while backend is up; pipe a tools/list JSON-RPC in, verify response over stdout.
-- **Transcribe:** point at `/tmp/test.wav`; diff against `POST /transcribe` response.
+- **Transcribe:** point at an explicitly chosen local WAV such as `/absolute/test.wav`; diff against `POST /transcribe` response.
 - **Failure modes:** kill backend mid-speak — shim must surface a JSON-RPC error, not deadlock. When backend isn't running, HTTP clients should get a clear connection-refused surfaced by the client.
 
 ## Risks / open decisions

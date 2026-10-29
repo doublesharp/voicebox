@@ -10,7 +10,7 @@ To reduce repeated work, the workflow caches Python downloads, Rust dependencies
 
 ## macOS
 
-The artifact contains a zipped Apple Silicon `Voicebox.app`. It is a local test build without Developer ID notarization. The local workstation build also preserves this installation's Scratch runtime/model environment; those machine-specific paths are not part of the shared GitHub configuration.
+The artifact contains a zipped Apple Silicon `Voicebox.app`. It is a local test build without Developer ID notarization. Runtime/model locations come from the target installation's configuration; build and deployment instructions must use explicit portable paths.
 
 ## Windows and CUDA
 

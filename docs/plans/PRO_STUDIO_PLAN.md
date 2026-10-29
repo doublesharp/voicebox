@@ -4,15 +4,15 @@
 **Date:** 2026-10-29
 **Specification:** [PRO_STUDIO_SPEC.md](PRO_STUDIO_SPEC.md)
 
-This plan decomposes the specification into deliverable slices. Local Coordinate is the authoritative task and evidence record: Voicebox DS project `project_14a676bd-5cff-4ffe-ad9c-9aa08abc554e`, S1 effort `effort_efc6c236-4604-4cb2-95ee-f1e66c8e6320`. This file is a working view. Source implementation, fixture checks, native/model qualification, and distribution acceptance are separate gates.
+This plan decomposes the specification into deliverable slices. Track active task ownership and evidence in the current project workflow. This file is a working view. Source implementation, fixture checks, native/model qualification, and distribution acceptance are separate gates.
 
 ## Working rules
 
 - Preserve existing Quick Generate, Stories, Captures, Voices, Effects, REST/MCP, and native audio behavior.
 - Keep new domain code under `backend/studio/` and `app/src/features/studio/`; use small explicit integration points in shared routing, database startup, engine access, and the application shell.
 - Do not repurpose the existing generic `Project` JSON table or rewrite legacy Story data in place.
-- Use task-owned Scratch directories for all disposable outputs. Confirm `/Volumes/Scratch` is mounted before builds, test captures, benchmark data, or generated audio. If unavailable, stop those operations.
-- During future verification, use a task-specific `TMPDIR`, `PYTHONDONTWRITEBYTECODE=1`, and explicit Scratch test-cache/build paths where required. Do not use literal `/tmp` or create a second shared build/cache owner.
+- Use approved task-owned disposable storage for builds, test captures, benchmark data and generated audio. Follow the current host's mount and capacity policy; stop if a required volume is unavailable.
+- During future verification, use a task-specific `TMPDIR`, `PYTHONDONTWRITEBYTECODE=1`, and explicit test-cache/build paths where required. Do not create a second shared build/cache owner.
 - Write behavior regressions before substantive behavior changes; avoid tests that merely duplicate static branding copy or implementation structure.
 - Each slice includes its own API, UI, and persistence work needed for a reviewable user outcome. Native/model/release qualification occurs at its actual boundary.
 
@@ -137,16 +137,16 @@ bunx tsc -p app/tsconfig.json --noEmit
 bunx tsc -p web/tsconfig.json --noEmit
 bunx biome check <changed-source-files>
 
-# Use the existing backend environment and task-owned Scratch temp/cache paths.
+# Use the existing backend environment and approved task-owned temp/cache paths.
 # Select existing regression files and the new owning tests for the slice.
-PYTHONDONTWRITEBYTECODE=1 TMPDIR=<scratch-task-temp> <existing-python> -m pytest \
+PYTHONDONTWRITEBYTECODE=1 TMPDIR=<task-temp-directory> <existing-python> -m pytest \
   <owning-test-files> -p no:cacheprovider
 
 # Frontend behavior tests use the existing Bun runner and owning test files.
-TMPDIR=<scratch-task-temp> bun test <owning-frontend-test-files>
+TMPDIR=<task-temp-directory> bun test <owning-frontend-test-files>
 ```
 
-Do not install dependencies, bootstrap environments, download models, or trigger large builds merely to execute a documentation-only change. Verify actual command paths and output routing before each future implementation run. Production build/package commands need explicit Scratch output overrides and the platform-specific release workflow.
+Do not install dependencies, bootstrap environments, download models, or trigger large builds merely to execute a documentation-only change. Verify actual command paths and output routing before each future implementation run. Production build/package commands need explicit disposable output overrides and the platform-specific release workflow.
 
 ## Follow-on planning
 
@@ -160,6 +160,6 @@ The selected editing tools below were requested and implemented while S1 runtime
 - **Phrase repair and comping:** Takes exposes replacement-phrase generation, source-range audition, word/phrase replacement, ordered source ranges, and adjustable join crossfades. Composition publishes a new alternative with source hashes and ranges, preserving selected takes and timeline audio until the user chooses it. Crossfades overlap the joins and shorten the result. Sources are limited to 32 ranges and 30 minutes per composition; no automatic word-boundary detection or time stretching is claimed.
 - **Keyboard:** The sidebar Shortcuts button or Command/Control+/ opens the reference. Command/Control+K opens app commands or the existing Studio commands; Command/Control+Alt+1 through 7 navigates workspaces, Command/Control+, opens Settings, and Command/Control+Shift+G opens Generate and focuses its script. Studio adds Command/Control+S. Text editing, dialogs, IME composition, and held-key guards protect existing playback/clip actions.
 
-**Verified:** 255 Studio/reference-quality backend tests; 227 frontend tests in 30 isolated files on the clean commit candidate; app/web typechecks; web production build with output on Scratch; focused Biome/Ruff checks. Regression coverage includes composition archive import/re-export in both scopes, rollback cleanup, caption review identity after arrangement changes, narration playback inside the caption dialog, and shortcut ownership. Independent source review findings were fixed and exercised by regressions.
+**Verified:** 255 Studio/reference-quality backend tests; 227 frontend tests in 30 isolated files on the clean commit candidate; app/web typechecks; web production build with output in task-owned disposable storage; focused Biome/Ruff checks. Regression coverage includes composition archive import/re-export in both scopes, rollback cleanup, caption review identity after arrangement changes, narration playback inside the caption dialog, and shortcut ownership. Independent source review findings were fixed and exercised by regressions.
 
 **Open qualification:** Browser appearance, native media/device behavior, packaged runtime, actual Whisper/TTS output, and listening checks. Estimated captions and manual source boundaries require user review; passing fixture tests does not qualify speech alignment or repair sound quality.

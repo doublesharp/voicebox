@@ -24,33 +24,39 @@ There is no automatic backend, language, preset or reference fallback.
 
 ## Run using existing local dependencies
 
-Confirm `/Volumes/Scratch` is mounted first. Do not install packages into a
-shared environment. This example uses the existing research environment and
-cached MLX Qwen Base 1.7B. The explicit reference must already exist; the CLI
-accepts nonempty PCM WAV up to 30 seconds and 16 MiB.
+Use an existing compatible Python environment and an approved disposable storage
+location for your host. Follow any local mount/capacity policy before running;
+the tool does not choose a disk or require a particular volume name. Do not
+install packages into a shared environment. The explicit reference must already
+exist; the CLI accepts nonempty PCM WAV up to 30 seconds and 16 MiB.
+
+This example uses cached MLX Qwen Base 1.7B. Replace all four absolute paths:
 
 ```bash
-mount | rg '/Volumes/Scratch'
-mkdir -p /Volumes/Scratch/voicebox/tmp/local-ai-20261029/track-c
+export VOICEBOX_WORK_DIR="/absolute/disposable-work"
+export VOICEBOX_HUB_CACHE="/absolute/model-cache/hub"
+export VOICEBOX_REFERENCE="/absolute/reference.wav"
+export VOICEBOX_PYTHON="/absolute/environment/bin/python"
+mkdir -p "$VOICEBOX_WORK_DIR/tmp"
 
-PYTHONDONTWRITEBYTECODE=1 \
-TMPDIR=/Volumes/Scratch/voicebox/tmp/local-ai-20261029/track-c \
-/Volumes/Scratch/voicebox/tmp/edit-delete-audio-versions/build-venv/bin/python -B \
-  scripts/benchmark-local-tts.py \
+PYTHONDONTWRITEBYTECODE=1 TMPDIR="$VOICEBOX_WORK_DIR/tmp" \
+"$VOICEBOX_PYTHON" -B scripts/benchmark-local-tts.py \
   --engine qwen --backend mlx --model 1.7B --language en \
-  --cache-root /Volumes/Scratch/voicebox/cache/huggingface/hub \
-  --reference /Volumes/Scratch/voicebox/tmp/local-ai-20261029/track-c/reference.wav \
+  --cache-root "$VOICEBOX_HUB_CACHE" \
+  --reference "$VOICEBOX_REFERENCE" \
   --reference-text "The exact transcript of the local reference." \
   --text "The quick brown fox jumps over the lazy dog." \
   --seed 42 --warm-repeats 3 --max-audio-seconds 30 \
-  --output-root /Volumes/Scratch/voicebox/reports/local-ai-20261029/track-c/qwen-run-001
+  --output-root "$VOICEBOX_WORK_DIR/reports/qwen-run-001"
 ```
 
-Choose a **new** output directory for every attempt, including retries after a
-failure. The CLI refuses existing output roots and symlink components. Artifact
-files use exclusive, directory-relative opens; they cannot overwrite existing
-files or follow artifact symlinks. Scratch must be mounted, and the output root
-must be an absolute subdirectory of `/Volumes/Scratch` without `..` components.
+Choose a **new absolute** output directory for every attempt, including retries
+after a failure. The CLI refuses existing output roots, `..` components and
+symlink components, including aliases in parent directories. Use a canonical
+storage path. Artifact files use exclusive, directory-relative opens; they cannot
+overwrite existing files or follow artifact symlinks. Safe output currently
+requires POSIX directory-relative and no-follow IO (macOS/Linux); hosts without
+these primitives, including native Windows, are explicitly refused.
 Runtime data, Python bytecode configuration, library caches and temporary files
 are redirected beneath the run's `runtime/` directory. No model weights are
 copied. Never commit run outputs.
@@ -127,12 +133,10 @@ the report itself.
 The deterministic suite uses safe adapters and small generated PCM references:
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 \
-TMPDIR=/Volumes/Scratch/voicebox/tmp/local-ai-20261029/track-c \
-/Volumes/Scratch/voicebox/tmp/edit-delete-audio-versions/build-venv/bin/python -B \
-  -m pytest -q -p no:cacheprovider \
-  --basetemp=/Volumes/Scratch/voicebox/tmp/local-ai-20261029/track-c/pytest-check \
-  scripts/tests/test_benchmark_local_tts.py
+PYTHONDONTWRITEBYTECODE=1 TMPDIR="$VOICEBOX_WORK_DIR/tmp" \
+"$VOICEBOX_PYTHON" -B -m pytest -q -p no:cacheprovider \
+  --basetemp="$VOICEBOX_WORK_DIR/tmp/pytest-benchmark" \
+  scripts/tests/test_benchmark_local_tts.py scripts/tests/test_portable_output.py
 ```
 
 It verifies calculations, configuration/asset admission, snapshot pinning, WAV
@@ -147,12 +151,11 @@ or their model libraries.
 ## Recorded integration smoke
 
 The integrated runner completed CustomVoice **0.6B MLX BF16**, revision
-`6415d95f88be018ff9e46813119dc3bc12261328`, offline on Apple M2 Max / 96 GiB.
+`6415d95f88be018ff9e46813119dc3bc12261328`, offline on Apple Silicon.
 For “Hello from Voicebox. This speech was generated locally.”, Ryan, seed 42
 and “Speak clearly and calmly.”, the first generation took 7.38 seconds and the
 three warm generations had p50 **6.13 seconds**, p95 **6.35 seconds**. All returned
 4.96 seconds of finite mono 24 kHz audio. This tiny smoke sample qualifies the
 runner/checkpoint integration, not comparative model quality, reliable tail
 latency, CUDA performance or first audible device latency. Exact source hashes,
-configuration, timings and WAVs remain on Scratch at
-`reports/local-ai-20261029/benchmark-custom-001/`.
+configuration, timings and WAVs were retained outside Git in the run report.

@@ -1,4 +1,4 @@
-"""Deterministic benchmark behavior; all disposable files belong on Scratch."""
+"""Deterministic offline benchmark behavior with caller-selected output paths."""
 
 import os
 import asyncio
@@ -310,13 +310,11 @@ def test_cache_file_symlink_escape_is_refused(settings, cached, tmp_path):
         bench.admit_cached_model(settings)
 
 
-def test_outputs_require_scratch_fresh_directory_and_no_symlinks(tmp_path):
-    with pytest.raises(ValueError, match="under /Volumes/Scratch"):
-        bench.Output(Path("/Users/justin/unsafe-benchmark"))
+def test_outputs_require_fresh_absolute_directory_and_no_symlinks(tmp_path):
     with pytest.raises(ValueError, match="absolute"):
         bench.Output(Path("relative"))
     with pytest.raises(ValueError, match="fresh subdirectory"):
-        bench.Output(bench.SCRATCH)
+        bench.Output(Path(tmp_path.anchor))
     with pytest.raises(ValueError, match="absolute"):
         bench.Output(tmp_path / ".." / "unsafe")
     output = bench.Output(tmp_path / "safe")
@@ -337,10 +335,11 @@ def test_outputs_require_scratch_fresh_directory_and_no_symlinks(tmp_path):
     assert not (tmp_path / "safe" / "escape").exists()
 
 
-def test_missing_scratch_mount_is_a_hard_refusal(settings, monkeypatch):
+def test_output_root_is_selected_by_caller_without_a_mount_requirement(settings, monkeypatch):
     monkeypatch.setattr(Path, "is_mount", lambda _: False)
-    with pytest.raises(ValueError, match="not mounted"):
-        bench.Output(settings.output_root)
+    output = bench.Output(settings.output_root)
+    output.close()
+    assert settings.output_root.is_dir()
 
 
 def test_reference_bounds_and_empty_audio(settings, tmp_path):
@@ -419,9 +418,9 @@ def test_cli_help_and_unsafe_output_refusal(tmp_path):
     result = subprocess.run([sys.executable, "-B", str(SCRIPT), "--engine", "qwen_custom_voice",
                              "--backend", "pytorch", "--model", "1.7B", "--language", "en",
                              "--preset-voice", "Ryan", "--text", "Offline test.",
-                             "--cache-root", str(tmp_path), "--output-root", "/Users/justin/unsafe-benchmark"],
+                             "--cache-root", str(tmp_path), "--output-root", "relative-benchmark"],
                             capture_output=True, text=True, timeout=10)
-    assert result.returncode == 2 and "under /Volumes/Scratch" in result.stderr
+    assert result.returncode == 2 and "absolute" in result.stderr
 
 
 def test_main_entry_point_failure_is_nonzero_and_closes_output(settings, monkeypatch):
