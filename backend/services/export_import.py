@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from ..models import VoiceProfileResponse
 from ..database import VoiceProfile as DBVoiceProfile, ProfileSample as DBProfileSample, Generation as DBGeneration, GenerationVersion as DBGenerationVersion
 from .profiles import create_profile, add_profile_sample
-from ..models import VoiceProfileCreate
+from ..models import EffectConfig, VoiceProfileCreate
 from .. import config
 
 
@@ -87,7 +87,7 @@ def export_profile_to_zip(profile_id: str, db: Session) -> bytes:
     
     # Get all samples
     samples = db.query(DBProfileSample).filter_by(profile_id=profile_id).all()
-    if not samples:
+    if not samples and (profile.voice_type or "cloned") == "cloned":
         raise ValueError(f"Profile {profile_id} has no samples")
     
     # Create ZIP in memory
@@ -111,6 +111,13 @@ def export_profile_to_zip(profile_id: str, db: Session) -> bytes:
                 "name": profile.name,
                 "description": profile.description,
                 "language": profile.language,
+                "voice_type": profile.voice_type or "cloned",
+                "preset_engine": profile.preset_engine,
+                "preset_voice_id": profile.preset_voice_id,
+                "design_prompt": profile.design_prompt,
+                "default_engine": profile.default_engine,
+                "personality": profile.personality,
+                "effects_chain": json.loads(profile.effects_chain) if profile.effects_chain is not None else None,
             },
             "has_avatar": has_avatar,
         }
@@ -118,7 +125,7 @@ def export_profile_to_zip(profile_id: str, db: Session) -> bytes:
 
         # Create samples.json mapping
         samples_data = {}
-        profile_dir = config.get_profiles_dir() / profile_id
+        used_filenames = set()
 
         for sample in samples:
             # Get filename from audio_path (should be {sample_id}.wav)
@@ -126,6 +133,11 @@ def export_profile_to_zip(profile_id: str, db: Session) -> bytes:
             if audio_path is None:
                 raise ValueError(f"Audio file not found: {sample.audio_path}")
             filename = audio_path.name
+            suffix = 1
+            while filename in used_filenames:
+                filename = f"{audio_path.stem}-{suffix}{audio_path.suffix}"
+                suffix += 1
+            used_filenames.add(filename)
 
             # Read audio file
             if not audio_path.exists():
@@ -181,7 +193,13 @@ async def import_profile_from_zip(file_bytes: bytes, db: Session) -> VoiceProfil
                 raise ValueError("Invalid manifest.json: missing profile")
             
             profile_data = manifest_data["profile"]
-            
+            if not isinstance(profile_data, dict):
+                raise ValueError("Invalid manifest.json: profile must be an object")
+            raw_effects = profile_data.get("effects_chain")
+            if raw_effects is not None and not isinstance(raw_effects, list):
+                raise ValueError("Invalid profile effects chain")
+            effects = None if raw_effects is None else [EffectConfig.model_validate(item) for item in raw_effects]
+
             # Read samples mapping
             samples_data = json.loads(zip_file.read("samples.json"))
             
@@ -205,12 +223,22 @@ async def import_profile_from_zip(file_bytes: bytes, db: Session) -> VoiceProfil
                 name=unique_name,
                 description=profile_data.get("description"),
                 language=profile_data.get("language", "en"),
+                voice_type=profile_data.get("voice_type", "cloned"),
+                preset_engine=profile_data.get("preset_engine"),
+                preset_voice_id=profile_data.get("preset_voice_id"),
+                design_prompt=profile_data.get("design_prompt"),
+                default_engine=profile_data.get("default_engine"),
+                personality=profile_data.get("personality"),
             )
             
             profile_dir = None
             try:
                 profile = await create_profile(profile_create, db, commit=False)
                 profile_dir = config.get_profiles_dir() / profile.id
+                if effects is not None:
+                    db_profile = db.query(DBVoiceProfile).filter_by(id=profile.id).one()
+                    db_profile.effects_chain = json.dumps([effect.model_dump() for effect in effects])
+                    profile.effects_chain = effects
                 for filename, reference_text in samples_data.items():
                     import tempfile
                     tmp_path = None
@@ -245,13 +273,14 @@ async def import_profile_from_zip(file_bytes: bytes, db: Session) -> VoiceProfil
                             with zip_file.open(avatar_file) as source:
                                 shutil.copyfileobj(source, tmp, length=IMPORT_COPY_CHUNK_BYTES)
                         from .profiles import upload_avatar
-                        await upload_avatar(profile.id, tmp_path, db)
+                        profile = await upload_avatar(profile.id, tmp_path, db)
                     finally:
                         if tmp_path is not None:
                             Path(tmp_path).unlink(missing_ok=True)
                 except Exception:
                     pass
 
+            profile.sample_count = len(samples_data)
             return profile
             
     except zipfile.BadZipFile:

@@ -659,3 +659,131 @@ async def test_forward_source_import_succeeds_with_sqlite_foreign_keys_enabled(d
     rows = {v.label: v for v in db.query(GenerationVersion).filter_by(generation_id=result['id']).all()}
     assert rows['Derived'].source_version_id == rows['Original'].id
     assert db.execute(text('PRAGMA foreign_key_check')).all() == []
+
+
+@pytest.mark.asyncio
+async def test_cloned_profile_archive_roundtrip_preserves_voice_settings_and_samples(db, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, '_data_dir', tmp_path)
+    audio = tmp_path / 'sample.wav'
+    audio.write_bytes(reference_wav())
+    db.add(VoiceProfile(id='voice', name='Voice', language='en', voice_type='cloned',
+                        default_engine='chatterbox', personality='Warm storyteller',
+                        effects_chain=json.dumps([{'type': 'gain', 'enabled': True, 'params': {'gain_db': -4}}])))
+    db.add(ProfileSample(id='sample', profile_id='voice', audio_path='sample.wav', reference_text='Hello'))
+    db.commit()
+    result = await export_import.import_profile_from_zip(export_import.export_profile_to_zip('voice', db), db)
+    restored = db.get(VoiceProfile, result.id)
+    assert result.name == 'Voice (1)'
+    assert restored.voice_type == 'cloned'
+    assert restored.default_engine == 'chatterbox'
+    assert restored.personality == 'Warm storyteller'
+    assert json.loads(restored.effects_chain) == [{'type': 'gain', 'enabled': True, 'params': {'gain_db': -4}}]
+    assert result.effects_chain[0].type == 'gain'
+    assert result.sample_count == 1
+    assert db.query(ProfileSample).filter_by(profile_id=result.id).one().reference_text == 'Hello'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('fields', [
+    {'voice_type': 'preset', 'preset_engine': 'kokoro', 'preset_voice_id': 'af_heart', 'default_engine': 'kokoro'},
+    {'voice_type': 'designed', 'design_prompt': 'A warm, calm narrator', 'default_engine': 'qwen_voice_design'},
+])
+async def test_sample_free_preset_and_designed_profiles_can_roundtrip(fields, db, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, '_data_dir', tmp_path)
+    db.add(VoiceProfile(id='voice', name='Voice', language='en', personality='Tell stories', **fields))
+    db.commit()
+    result = await export_import.import_profile_from_zip(export_import.export_profile_to_zip('voice', db), db)
+    restored = db.get(VoiceProfile, result.id)
+    assert result.name == 'Voice (1)'
+    for key, value in fields.items():
+        assert getattr(restored, key) == value
+    assert restored.personality == 'Tell stories'
+    assert db.query(ProfileSample).filter_by(profile_id=result.id).count() == 0
+
+
+@pytest.mark.asyncio
+async def test_profile_export_preserves_samples_with_identical_basenames(db, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, '_data_dir', tmp_path)
+    (tmp_path / 'one').mkdir()
+    (tmp_path / 'two').mkdir()
+    (tmp_path / 'one' / 'sample.wav').write_bytes(reference_wav())
+    (tmp_path / 'two' / 'sample.wav').write_bytes(reference_wav())
+    db.add(VoiceProfile(id='voice', name='Voice'))
+    db.add_all([
+        ProfileSample(id='one', profile_id='voice', audio_path='one/sample.wav', reference_text='One'),
+        ProfileSample(id='two', profile_id='voice', audio_path='two/sample.wav', reference_text='Two'),
+    ])
+    db.commit()
+    result = await export_import.import_profile_from_zip(export_import.export_profile_to_zip('voice', db), db)
+    restored = db.query(ProfileSample).filter_by(profile_id=result.id).all()
+    assert {sample.reference_text for sample in restored} == {'One', 'Two'}
+    assert result.sample_count == 2
+
+
+@pytest.mark.asyncio
+async def test_profile_import_response_includes_successfully_restored_avatar(db, monkeypatch, tmp_path):
+    from PIL import Image
+    monkeypatch.setattr(config, '_data_dir', tmp_path)
+    audio = tmp_path / 'sample.wav'
+    audio.write_bytes(reference_wav())
+    Image.new('RGB', (32, 32), 'red').save(tmp_path / 'avatar.png')
+    db.add(VoiceProfile(id='voice', name='Voice', avatar_path='avatar.png'))
+    db.add(ProfileSample(id='sample', profile_id='voice', audio_path='sample.wav', reference_text='Hello'))
+    db.commit()
+    result = await export_import.import_profile_from_zip(export_import.export_profile_to_zip('voice', db), db)
+    assert result.avatar_path is not None
+    assert result.avatar_path == db.get(VoiceProfile, result.id).avatar_path
+    assert config.resolve_storage_path(result.avatar_path).is_file()
+    assert result.sample_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('profile_fields', [
+    {'voice_type': 'preset'},
+    {'voice_type': 'designed'},
+    {'voice_type': 'cloned', 'preset_engine': 'kokoro', 'preset_voice_id': 'af_heart'},
+    {'voice_type': 'cloned', 'default_engine': 'qwen_voice_design'},
+    {'voice_type': 'unknown'},
+    {'effects_chain': {'type': 'gain'}},
+    {'effects_chain': [{'params': {}}]},
+    {'personality': 'x' * 2001},
+])
+async def test_invalid_profile_archive_settings_leave_no_profile_or_files(profile_fields, db, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, '_data_dir', tmp_path)
+    data = archive({'version': '1.0', 'profile': {'name': 'Bad', **profile_fields}}, {})
+    with pytest.raises(ValueError):
+        await export_import.import_profile_from_zip(data, db)
+    assert db.query(VoiceProfile).count() == 0
+    assert db.query(ProfileSample).count() == 0
+    assert list(config.get_profiles_dir().iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_profile_archive_without_new_fields_imports_as_cloned(db, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, '_data_dir', tmp_path)
+    data = archive({'version': '1.0', 'profile': {'name': 'Legacy', 'language': 'en'}}, {})
+    result = await export_import.import_profile_from_zip(data, db)
+    restored = db.get(VoiceProfile, result.id)
+    assert restored.voice_type == 'cloned'
+    assert restored.effects_chain is None
+    assert restored.default_engine is None
+    assert result.sample_count == 0
+
+
+@pytest.mark.asyncio
+async def test_empty_effects_chain_survives_sample_free_profile_roundtrip(db, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, '_data_dir', tmp_path)
+    db.add(VoiceProfile(id='voice', name='Voice', voice_type='preset', preset_engine='kokoro',
+                        preset_voice_id='af_heart', default_engine='kokoro', effects_chain='[]'))
+    db.commit()
+    result = await export_import.import_profile_from_zip(export_import.export_profile_to_zip('voice', db), db)
+    assert json.loads(db.get(VoiceProfile, result.id).effects_chain) == []
+    assert result.effects_chain == []
+
+
+def test_cloned_profile_without_samples_still_cannot_export(db, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, '_data_dir', tmp_path)
+    db.add(VoiceProfile(id='voice', name='Voice', voice_type='cloned'))
+    db.commit()
+    with pytest.raises(ValueError, match='no samples'):
+        export_import.export_profile_to_zip('voice', db)
