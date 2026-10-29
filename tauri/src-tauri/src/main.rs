@@ -180,6 +180,7 @@ fn find_voicebox_pid_on_port(port: u16) -> Option<u32> {
 fn check_health(port: u16) -> bool {
     let url = format!("http://127.0.0.1:{}/health", port);
     match reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(3))
         .build()
     {
@@ -1811,5 +1812,55 @@ mod backend_probe_tests {
         let f = Fixture::new("exit 0");
         assert_eq!(f.probe().await, None);
         assert_eq!(probe_binary_version(&f.0.join("missing"), &f.0).await, None);
+    }
+}
+
+#[cfg(test)]
+mod server_health_tests {
+    use super::check_health;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn serve(status: &str, headers: &str, body: &str) -> (u16, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let response = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n{headers}\r\n{body}", body.len());
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(3))).unwrap();
+            let mut buf = [0; 1024];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(response.as_bytes());
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn valid_health_requires_expected_fields_and_success_status() {
+        for (status, body, expected) in [
+            ("200 OK", r#"{"status":"healthy","model_loaded":false,"gpu_available":true}"#, true),
+            ("200 OK", r#"{"status":"healthy","model_loaded":true}"#, false),
+            ("200 OK", r#"{"status":"healthy","model_loaded":1,"gpu_available":true}"#, false),
+            ("200 OK", r#"{"status":"degraded","model_loaded":true,"gpu_available":false}"#, false),
+            ("200 OK", "not json", false),
+            ("503 Service Unavailable", r#"{"status":"healthy","model_loaded":true,"gpu_available":true}"#, false),
+        ] {
+            let (port, handle) = serve(status, "", body);
+            assert_eq!(check_health(port), expected, "{status}: {body}");
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn redirect_must_not_turn_an_unrelated_service_into_a_healthy_backend() {
+        let (target, target_handle) = serve("200 OK", "", r#"{"status":"healthy","model_loaded":true,"gpu_available":false}"#);
+        let (source, source_handle) = serve("302 Found", &format!("Location: http://127.0.0.1:{target}/health\r\n"), "");
+        let healthy = check_health(source);
+        source_handle.join().unwrap();
+        // Release the target listener whether or not the client followed the redirect.
+        let _ = std::net::TcpStream::connect(("127.0.0.1", target));
+        target_handle.join().unwrap();
+        assert!(!healthy);
     }
 }
