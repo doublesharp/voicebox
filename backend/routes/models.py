@@ -480,14 +480,23 @@ async def trigger_model_download(request: models.ModelDownloadRequest):
     if not config:
         raise HTTPException(status_code=400, detail=f"Unknown model: {request.model_name}")
 
+    existing = next((task for task in task_manager.get_active_downloads()
+                     if task.model_name == request.model_name), None)
+    progress = progress_manager.get_progress(request.model_name)
+    if ((existing is not None and existing.status in ("downloading", "extracting"))
+            or (existing is None and progress and progress.get("status") in ("downloading", "extracting"))):
+        raise HTTPException(status_code=409, detail=f"Model {request.model_name} is already downloading")
+
     load_func = get_model_load_func(config)
 
     async def download_in_background():
         try:
             await _run_model_work(config, load_func)
+            progress_manager.mark_complete(request.model_name)
             task_manager.complete_download(request.model_name)
         except Exception as e:
             task_manager.error_download(request.model_name, str(e))
+            progress_manager.mark_error(request.model_name, str(e))
 
     task_manager.start_download(request.model_name)
 
