@@ -150,3 +150,232 @@ def test_unknown_model_size_is_rejected(backend_cls):
     backend = backend_cls()
     with pytest.raises(ValueError, match='Unknown Qwen3 size'):
         backend._get_model_path('unsupported')
+
+
+@pytest.mark.asyncio
+async def test_torch_generation_retains_requested_model_until_worker_finishes(monkeypatch):
+    import threading
+    backend = qwen.PyTorchQwenLLMBackend()
+    entered = threading.Event()
+    release = threading.Event()
+    def load(size):
+        backend.model = object()
+        backend.tokenizer = object()
+        backend._current_model_size = size
+        backend.model_size = size
+    def generate(prompt, *_args):
+        if prompt == 'first':
+            entered.set()
+            assert release.wait(timeout=5)
+        return backend._current_model_size
+    monkeypatch.setattr(backend, '_load_model_sync', load)
+    monkeypatch.setattr(backend, '_generate_sync', generate)
+    monkeypatch.setattr(qwen, 'empty_device_cache', lambda _device: None)
+    first = asyncio.create_task(backend.generate('first', model_size='0.6B'))
+    assert await asyncio.to_thread(entered.wait, 5)
+    second = asyncio.create_task(backend.generate('second', model_size='1.7B'))
+    try:
+        await asyncio.sleep(0.1)
+    finally:
+        release.set()
+    assert await first == '0.6B'
+    assert await second == '1.7B'
+
+
+@pytest.mark.asyncio
+async def test_cancelled_torch_generation_drains_before_another_model_load(monkeypatch):
+    import threading
+    backend = qwen.PyTorchQwenLLMBackend()
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+    def load(size):
+        calls.append(size)
+        backend.model = object()
+        backend.tokenizer = object()
+        backend._current_model_size = size
+        backend.model_size = size
+    def generate(prompt, *_args):
+        if prompt == 'first':
+            entered.set()
+            assert release.wait(timeout=5)
+        return backend._current_model_size
+    monkeypatch.setattr(backend, '_load_model_sync', load)
+    monkeypatch.setattr(backend, '_generate_sync', generate)
+    monkeypatch.setattr(qwen, 'empty_device_cache', lambda _device: None)
+    first = asyncio.create_task(backend.generate('first', model_size='0.6B'))
+    assert await asyncio.to_thread(entered.wait, 5)
+    first.cancel()
+    second = asyncio.create_task(backend.generate('second', model_size='1.7B'))
+    try:
+        await asyncio.sleep(0.1)
+        assert calls == ['0.6B']
+        assert not first.done()
+    finally:
+        release.set()
+        results = await asyncio.gather(first, second, return_exceptions=True)
+    assert isinstance(results[0], asyncio.CancelledError)
+    assert results[1] == '1.7B'
+
+
+@pytest.mark.asyncio
+async def test_cancelled_torch_load_drains_before_subsequent_load(monkeypatch):
+    import threading
+    backend = qwen.PyTorchQwenLLMBackend()
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+    def load(size):
+        calls.append(size)
+        if size == '0.6B':
+            entered.set()
+            assert release.wait(timeout=5)
+        backend.model = object()
+        backend.tokenizer = object()
+        backend._current_model_size = size
+        backend.model_size = size
+    monkeypatch.setattr(backend, '_load_model_sync', load)
+    monkeypatch.setattr(qwen, 'empty_device_cache', lambda _device: None)
+    first = asyncio.create_task(backend.load_model('0.6B'))
+    assert await asyncio.to_thread(entered.wait, 5)
+    first.cancel()
+    second = asyncio.create_task(backend.load_model('1.7B'))
+    try:
+        await asyncio.sleep(0.1)
+        assert calls == ['0.6B']
+        assert not first.done()
+    finally:
+        release.set()
+        results = await asyncio.gather(first, second, return_exceptions=True)
+    assert isinstance(results[0], asyncio.CancelledError)
+    assert results[1] is None
+    assert calls == ['0.6B', '1.7B']
+    assert backend._current_model_size == '1.7B'
+
+
+@pytest.mark.asyncio
+async def test_unload_endpoint_waits_for_active_torch_generation(monkeypatch):
+    import threading
+    from backend import backends
+    from backend.routes import models as model_routes
+
+    backend = qwen.PyTorchQwenLLMBackend()
+    backend.model = object()
+    backend.tokenizer = object()
+    backend._current_model_size = backend.model_size = '0.6B'
+    entered, release = threading.Event(), threading.Event()
+    def generate(*_args):
+        entered.set()
+        assert release.wait(timeout=5)
+        return 'ready' if backend.model is not None else 'unloaded'
+    monkeypatch.setattr(backend, '_generate_sync', generate)
+    monkeypatch.setattr(qwen, 'empty_device_cache', lambda _device: None)
+    monkeypatch.setattr(backends, 'get_llm_backend_for_engine', lambda _engine: backend)
+    first = asyncio.create_task(backend.generate('speak', model_size='0.6B'))
+    assert await asyncio.to_thread(entered.wait, 5)
+    unload = asyncio.create_task(model_routes.unload_model_by_name('qwen3-0.6b'))
+    try:
+        await asyncio.sleep(0.1)
+        assert backend.is_loaded()
+        assert not unload.done()
+    finally:
+        release.set()
+        results = await asyncio.gather(first, unload, return_exceptions=True)
+    assert results[0] == 'ready'
+    assert results[1] == {'message': 'Model qwen3-0.6b unloaded successfully'}
+    assert not backend.is_loaded()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_mlx_generation_keeps_lock_until_worker_finishes(monkeypatch):
+    backend = qwen.MLXQwenLLMBackend()
+    backend.model = object()
+    backend.tokenizer = object()
+    backend._current_model_size = '0.6B'
+    entered, release = asyncio.Event(), asyncio.Event()
+    async def run_on_thread(fn, *args):
+        entered.set()
+        await release.wait()
+        return fn(*args)
+    monkeypatch.setattr(mlx_backend, '_run_on_mlx_thread', run_on_thread)
+    monkeypatch.setattr(backend, '_generate_sync', lambda *_args: 'done')
+    first = asyncio.create_task(backend.generate('first'))
+    await entered.wait()
+    first.cancel()
+    try:
+        await asyncio.sleep(0)
+        assert not first.done()
+        assert backend._op_lock.locked()
+    finally:
+        release.set()
+        result = await asyncio.gather(first, return_exceptions=True)
+    assert isinstance(result[0], asyncio.CancelledError)
+    assert not backend._op_lock.locked()
+
+
+@pytest.mark.asyncio
+async def test_delete_endpoint_waits_for_active_torch_generation(tmp_path, monkeypatch):
+    import threading
+    from backend import backends
+    from backend.routes import models as model_routes
+    from huggingface_hub import constants
+
+    backend = qwen.PyTorchQwenLLMBackend()
+    backend.model = object()
+    backend.tokenizer = object()
+    backend._current_model_size = backend.model_size = '0.6B'
+    entered, release = threading.Event(), threading.Event()
+    def generate(*_args):
+        entered.set()
+        assert release.wait(timeout=5)
+        return 'ready' if backend.model is not None else 'unloaded'
+    monkeypatch.setattr(backend, '_generate_sync', generate)
+    monkeypatch.setattr(qwen, 'empty_device_cache', lambda _device: None)
+    monkeypatch.setattr(backends, 'get_llm_backend_for_engine', lambda _engine: backend)
+    monkeypatch.setattr(constants, 'HF_HUB_CACHE', str(tmp_path))
+    config = backends.get_model_config('qwen3-0.6b')
+    cache = tmp_path / ('models--' + config.hf_repo_id.replace('/', '--'))
+    cache.mkdir()
+    first = asyncio.create_task(backend.generate('speak', model_size='0.6B'))
+    assert await asyncio.to_thread(entered.wait, 5)
+    deleting = asyncio.create_task(model_routes.delete_model('qwen3-0.6b'))
+    try:
+        await asyncio.sleep(0.1)
+        assert cache.exists() and backend.is_loaded()
+        assert not deleting.done()
+    finally:
+        release.set()
+        results = await asyncio.gather(first, deleting, return_exceptions=True)
+    assert results[0] == 'ready'
+    assert results[1] == {'message': 'Model qwen3-0.6b deleted successfully'}
+    assert not cache.exists() and not backend.is_loaded()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_unload_waits_for_active_torch_generation(monkeypatch):
+    import threading
+    from backend.services import llm
+
+    backend = qwen.PyTorchQwenLLMBackend()
+    backend.model = object()
+    backend.tokenizer = object()
+    backend._current_model_size = backend.model_size = '0.6B'
+    entered, release = threading.Event(), threading.Event()
+    def generate(*_args):
+        entered.set()
+        assert release.wait(timeout=5)
+        return 'ready' if backend.model is not None else 'unloaded'
+    monkeypatch.setattr(backend, '_generate_sync', generate)
+    monkeypatch.setattr(qwen, 'empty_device_cache', lambda _device: None)
+    monkeypatch.setattr(llm, 'get_llm_backend', lambda: backend)
+    first = asyncio.create_task(backend.generate('speak', model_size='0.6B'))
+    assert await asyncio.to_thread(entered.wait, 5)
+    shutdown = asyncio.create_task(llm.unload_llm_model_async())
+    try:
+        await asyncio.sleep(0.1)
+        assert backend.is_loaded()
+        assert not shutdown.done()
+    finally:
+        release.set()
+        results = await asyncio.gather(first, shutdown, return_exceptions=True)
+    assert results == ['ready', None]
+    assert not backend.is_loaded()

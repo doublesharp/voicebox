@@ -87,7 +87,9 @@ async def test_shutdown_unloads_remaining_models_even_if_one_fails(monkeypatch):
         raise RuntimeError('unload failed')
     monkeypatch.setattr(app_module.tts, 'unload_tts_model', fail)
     monkeypatch.setattr(app_module.transcribe, 'unload_whisper_model', lambda: calls.append('stt'))
-    monkeypatch.setattr(app_module.llm, 'unload_llm_model', lambda: calls.append('llm'))
+    async def unload_llm():
+        calls.append('llm')
+    monkeypatch.setattr(app_module.llm, 'unload_llm_model_async', unload_llm)
     await app_module._unload_models()
     assert calls == ['tts', 'stt', 'llm']
 

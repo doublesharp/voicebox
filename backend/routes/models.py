@@ -1,6 +1,7 @@
 """Model management endpoints."""
 
 import asyncio
+from contextlib import AsyncExitStack
 import os
 import shutil
 from pathlib import Path
@@ -104,6 +105,19 @@ async def _run_model_work(configuration, operation):
     return await invoke()
 
 
+async def _unload_model_work(configuration):
+    """Wait for an active local LLM operation before unloading its model."""
+    from ..backends import get_llm_backend_for_engine, unload_model_by_config
+
+    if configuration.engine == "qwen_llm":
+        backend = get_llm_backend_for_engine("qwen_llm")
+        lock = getattr(backend, "_op_lock", None)
+        if lock is not None:
+            async with lock:
+                return unload_model_by_config(configuration)
+    return await _run_model_work(configuration, lambda: unload_model_by_config(configuration))
+
+
 def _resolve_model_config(model_name: str):
     """Look up a model config by name or raise a 400 listing the valid ids."""
     from ..backends import get_all_model_configs, get_model_config
@@ -176,7 +190,7 @@ async def unload_model(request: models.ModelLoadRequest | None = None):
     if requested_name is not None:
         config = _resolve_model_config(requested_name)
         try:
-            was_loaded = await _run_model_work(config, lambda: unload_model_by_config(config))
+            was_loaded = await _unload_model_work(config)
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e)) from e
         if not was_loaded:
@@ -200,7 +214,7 @@ async def unload_model_by_name(model_name: str):
         raise HTTPException(status_code=400, detail=f"Unknown model: {model_name}")
 
     try:
-        was_loaded = await _run_model_work(config, lambda: unload_model_by_config(config))
+        was_loaded = await _unload_model_work(config)
         if not was_loaded:
             return {"message": f"Model {model_name} is not loaded"}
         return {"message": f"Model {model_name} unloaded successfully"}
@@ -547,7 +561,7 @@ async def delete_model(model_name: str):
     """Delete a downloaded model from the HuggingFace cache."""
     from huggingface_hub import constants as hf_constants
 
-    from ..backends import get_model_config, unload_model_by_config
+    from ..backends import get_llm_backend_for_engine, get_model_config, unload_model_by_config
 
     config = get_model_config(model_name)
     if not config:
@@ -557,24 +571,30 @@ async def delete_model(model_name: str):
     model_inventory.invalidate()
 
     try:
-        unload_model_by_config(config)
+        async with AsyncExitStack() as stack:
+            if config.engine == "qwen_llm":
+                backend = get_llm_backend_for_engine("qwen_llm")
+                lock = getattr(backend, "_op_lock", None)
+                if lock is not None:
+                    await stack.enter_async_context(lock)
+            unload_model_by_config(config)
 
-        cache_dir = hf_constants.HF_HUB_CACHE
-        repo_cache_dir = Path(cache_dir) / ("models--" + hf_repo_id.replace("/", "--"))
+            cache_dir = hf_constants.HF_HUB_CACHE
+            repo_cache_dir = Path(cache_dir) / ("models--" + hf_repo_id.replace("/", "--"))
 
-        if not repo_cache_dir.exists():
-            raise HTTPException(status_code=404, detail=f"Model {model_name} not found in cache")
+            if not repo_cache_dir.exists():
+                raise HTTPException(status_code=404, detail=f"Model {model_name} not found in cache")
 
-        try:
-            shutil.rmtree(repo_cache_dir)
-            for aux_repo_id in config.aux_hf_repo_ids:
-                aux_cache_dir = Path(cache_dir) / ("models--" + aux_repo_id.replace("/", "--"))
-                if aux_cache_dir.exists():
-                    shutil.rmtree(aux_cache_dir)
-        except OSError as e:
-            raise HTTPException(status_code=500, detail=f"Failed to delete model cache directory: {str(e)}")
+            try:
+                shutil.rmtree(repo_cache_dir)
+                for aux_repo_id in config.aux_hf_repo_ids:
+                    aux_cache_dir = Path(cache_dir) / ("models--" + aux_repo_id.replace("/", "--"))
+                    if aux_cache_dir.exists():
+                        shutil.rmtree(aux_cache_dir)
+            except OSError as e:
+                raise HTTPException(status_code=500, detail=f"Failed to delete model cache directory: {str(e)}")
 
-        return {"message": f"Model {model_name} deleted successfully"}
+            return {"message": f"Model {model_name} deleted successfully"}
 
     except HTTPException:
         raise

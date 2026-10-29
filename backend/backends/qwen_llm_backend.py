@@ -11,6 +11,8 @@ import asyncio
 import logging
 from typing import Optional
 
+from ..utils.async_work import run_blocking, run_owned
+
 from . import LLMBackend, DEFAULT_LLM_MAX_TOKENS, DEFAULT_LLM_TEMPERATURE
 from .base import (
     is_model_cached,
@@ -66,6 +68,7 @@ class PyTorchQwenLLMBackend:
         self.model_size = model_size
         self._current_model_size: Optional[str] = None
         self.device = self._get_device()
+        self._op_lock = asyncio.Lock()
 
     def _get_device(self) -> str:
         return get_torch_device(allow_xpu=True, allow_directml=True, allow_mps=True)
@@ -82,6 +85,10 @@ class PyTorchQwenLLMBackend:
         return is_model_cached(self._get_model_path(model_size))
 
     async def load_model(self, model_size: Optional[str] = None) -> None:
+        async with self._op_lock:
+            await self._load_model_owned(model_size)
+
+    async def _load_model_owned(self, model_size: Optional[str]) -> None:
         if model_size is None:
             model_size = self.model_size
 
@@ -91,7 +98,7 @@ class PyTorchQwenLLMBackend:
         if self.model is not None and self._current_model_size != model_size:
             self.unload_model()
 
-        await asyncio.to_thread(self._load_model_sync, model_size)
+        await run_blocking(self._load_model_sync, model_size)
 
     def _load_model_sync(self, model_size: str) -> None:
         import torch
@@ -150,10 +157,13 @@ class PyTorchQwenLLMBackend:
         model_size: Optional[str] = None,
         examples: Optional[list[tuple[str, str]]] = None,
     ) -> str:
-        await self.load_model(model_size)
-        return await asyncio.to_thread(
-            self._generate_sync, prompt, system, max_tokens, temperature, examples
-        )
+        # Keep the selected model stable until the blocking worker has
+        # actually finished, including after caller cancellation.
+        async with self._op_lock:
+            await self._load_model_owned(model_size)
+            return await run_blocking(
+                self._generate_sync, prompt, system, max_tokens, temperature, examples
+            )
 
     def _generate_sync(
         self,
@@ -234,7 +244,7 @@ class MLXQwenLLMBackend:
             # Another request may have loaded this size while we waited.
             if self.model is not None and self._current_model_size == model_size:
                 return
-            await _run_on_mlx_thread(self._reload_sync, model_size)
+            await run_owned(_run_on_mlx_thread(self._reload_sync, model_size))
 
     def _reload_sync(self, model_size: str) -> None:
         """Unload a mismatched model and load the requested one, in one MLX-thread op."""
@@ -303,7 +313,7 @@ class MLXQwenLLMBackend:
                     empty_mlx_cache()
 
         async with self._op_lock:
-            return await _run_on_mlx_thread(_reload_and_generate_sync)
+            return await run_owned(_run_on_mlx_thread(_reload_and_generate_sync))
 
     def _generate_sync(
         self,

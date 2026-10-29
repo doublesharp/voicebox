@@ -385,7 +385,7 @@ async def _unload_models() -> None:
     except Exception:
         logger.exception("Failed to unload Whisper model")
     try:
-        llm.unload_llm_model()
+        await llm.unload_llm_model_async()
     except Exception:
         logger.exception("Failed to unload LLM model")
 
