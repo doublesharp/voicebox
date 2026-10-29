@@ -249,6 +249,8 @@ async def export_story_audio(
         except RuntimeError as e:
             # Most likely: ffmpeg missing, timed out, or returned non-zero.
             raise HTTPException(status_code=503, detail=str(e)) from e
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
 
         if not audio_bytes:
             raise HTTPException(status_code=400, detail="Story has no audio items")

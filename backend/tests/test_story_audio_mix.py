@@ -6,12 +6,14 @@ import io
 import numpy as np
 import pytest
 import soundfile as sf
+from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from backend import config
 from backend.database import Base, Generation, GenerationVersion, Story, StoryItem, VoiceProfile
 from backend.services.stories import export_story_audio
+from backend.routes.stories import export_story_audio as export_story_endpoint
 
 
 @pytest.fixture
@@ -92,3 +94,35 @@ def test_version_audio_duration_is_not_cut_to_generation_metadata(story_db, tmp_
     assert sample_rate == 24000
     assert len(audio) == 7200
     assert audio[-1, 0] == pytest.approx(0.1, abs=4e-5)
+
+
+@pytest.mark.parametrize("failure", ["missing", "corrupt", "missing_version", "wrong_version", "missing_generation", "empty_trim"])
+def test_export_rejects_story_with_unusable_clip(story_db, tmp_path, failure):
+    add_clip(story_db, tmp_path, "good", np.full(2400, 0.2), 24000)
+    add_clip(story_db, tmp_path, "bad", np.full(2400, 0.2), 24000, start_time_ms=200)
+    item = story_db.get(StoryItem, "item-bad")
+    if failure == "missing":
+        (tmp_path / "bad.wav").unlink()
+    elif failure == "corrupt":
+        (tmp_path / "bad.wav").write_bytes(b"not a wav")
+    elif failure == "missing_version":
+        item.version_id = "missing-version"
+    elif failure == "wrong_version":
+        story_db.add(GenerationVersion(id="other-version", generation_id="good", label="Other", audio_path="good.wav"))
+        item.version_id = "other-version"
+    elif failure == "missing_generation":
+        story_db.delete(story_db.get(Generation, "bad"))
+    else:
+        item.trim_start_ms = 1000
+    story_db.commit()
+    with pytest.raises(ValueError, match="item-bad"):
+        asyncio.run(export_story_audio("story", story_db))
+
+
+def test_export_endpoint_reports_missing_audio_as_bad_request(story_db, tmp_path):
+    add_clip(story_db, tmp_path, "bad", np.full(2400, 0.2), 24000)
+    (tmp_path / "bad.wav").unlink()
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(export_story_endpoint("story", "wav", "none", story_db))
+    assert error.value.status_code == 400
+    assert "item-bad" in error.value.detail

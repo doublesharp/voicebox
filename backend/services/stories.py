@@ -1025,10 +1025,11 @@ async def export_story_audio(
     if not story:
         return None
 
-    # Get all items ordered by start_time_ms
+    # Get all items ordered by start_time_ms, including dangling rows so an
+    # incomplete story cannot be exported as if it were complete.
     items = (
         db.query(DBStoryItem, DBGeneration)
-        .join(DBGeneration, DBStoryItem.generation_id == DBGeneration.id)
+        .outerjoin(DBGeneration, DBStoryItem.generation_id == DBGeneration.id)
         .filter(DBStoryItem.story_id == story_id)
         .order_by(DBStoryItem.start_time_ms)
         .all()
@@ -1041,21 +1042,29 @@ async def export_story_audio(
     audio_data = []
 
     for item, generation in items:
+        if generation is None:
+            raise ValueError(f"Story item {item.id} references a missing generation")
         # Resolve audio path: use pinned version if set, otherwise generation default
         resolved_audio_path = generation.audio_path
         if getattr(item, "version_id", None):
             from ..database import GenerationVersion as DBGenerationVersion
 
-            version = db.query(DBGenerationVersion).filter_by(id=item.version_id).first()
-            if version:
-                resolved_audio_path = version.audio_path
+            version = db.query(DBGenerationVersion).filter_by(
+                id=item.version_id, generation_id=generation.id,
+            ).first()
+            if version is None:
+                raise ValueError(f"Story item {item.id} references a missing audio version")
+            resolved_audio_path = version.audio_path
 
         audio_path = config.resolve_storage_path(resolved_audio_path)
-        if audio_path is None or not audio_path.exists():
-            continue
+        if audio_path is None or not audio_path.is_file():
+            raise ValueError(f"Story item {item.id} audio file is missing")
 
         try:
             audio, sr = await asyncio.to_thread(load_audio, str(audio_path), sample_rate=None, mono=False)
+        except Exception as exc:
+            raise ValueError(f"Story item {item.id} audio could not be read") from exc
+        try:
             # librosa uses (channels, frames), while soundfile writes
             # (frames, channels). Mono is kept as a single channel here.
             audio = audio[:, np.newaxis] if audio.ndim == 1 else audio.T
@@ -1076,7 +1085,7 @@ async def export_story_audio(
             else:
                 trimmed_audio = audio[trim_start_sample:]
             if len(trimmed_audio) == 0:
-                continue
+                raise ValueError(f"Story item {item.id} has no audio after trimming")
 
             # Apply per-clip volume to the export mix.
             stored_volume = getattr(item, "volume", None)
@@ -1096,9 +1105,10 @@ async def export_story_audio(
                     "text": generation.text,
                 }
             )
-        except Exception:
-            # Skip files that can't be loaded
-            continue
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(f"Story item {item.id} audio could not be processed") from exc
 
     if not audio_data:
         return None
