@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { AlertTriangle, ExternalLink } from 'lucide-react';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Trans, useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
 import { usePlatform } from '@/platform/PlatformContext';
@@ -24,19 +24,21 @@ export function useAccessibilityPermission() {
   const platform = usePlatform();
   const [needsPermission, setNeedsPermission] = useState(false);
   const [checking, setChecking] = useState(false);
+  const checkVersion = useRef(0);
 
   const recheck = useCallback(async (): Promise<boolean> => {
     if (!platform.metadata.isTauri) return true;
+    const version = ++checkVersion.current;
     setChecking(true);
     try {
       const trusted = await invoke<boolean>('check_accessibility_permission');
-      setNeedsPermission(!trusted);
+      if (checkVersion.current === version) setNeedsPermission(!trusted);
       return trusted;
     } catch (err) {
       console.warn('[accessibility] check failed:', err);
       return false;
     } finally {
-      setChecking(false);
+      if (checkVersion.current === version) setChecking(false);
     }
   }, [platform.metadata.isTauri]);
 
@@ -47,20 +49,29 @@ export function useAccessibilityPermission() {
       recheck();
     };
     window.addEventListener('focus', onFocus);
-    return () => window.removeEventListener('focus', onFocus);
+    return () => {
+      ++checkVersion.current;
+      window.removeEventListener('focus', onFocus);
+    };
   }, [platform.metadata.isTauri, recheck]);
 
   useEffect(() => {
     if (!platform.metadata.isTauri) return;
     let unlisten: UnlistenFn | null = null;
+    let active = true;
     listen('system:accessibility-missing', () => {
+      if (!active) return;
+      ++checkVersion.current;
+      setChecking(false);
       setNeedsPermission(true);
     })
       .then((fn) => {
-        unlisten = fn;
+        if (active) unlisten = fn;
+        else fn();
       })
       .catch(() => {});
     return () => {
+      active = false;
       if (unlisten) unlisten();
     };
   }, [platform.metadata.isTauri]);
