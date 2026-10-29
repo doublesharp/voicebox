@@ -8,6 +8,7 @@ voice prompt combination, and model loading progress tracking.
 import logging
 import os
 import platform
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
@@ -21,6 +22,28 @@ from ..utils.hf_progress import HFProgressTracker, create_hf_progress_callback
 from ..utils.tasks import get_task_manager
 
 logger = logging.getLogger(__name__)
+
+# Chatterbox loaders temporarily patch the process-wide torch.load function.
+_chatterbox_load_lock = threading.Lock()
+
+
+@contextmanager
+def chatterbox_cpu_load():
+    """Apply and restore Chatterbox's CPU mapping under one shared lock."""
+    import torch
+
+    with _chatterbox_load_lock:
+        original = torch.load
+
+        def patched(*args, **kwargs):
+            kwargs.setdefault("map_location", "cpu")
+            return original(*args, **kwargs)
+
+        torch.load = patched
+        try:
+            yield
+        finally:
+            torch.load = original
 
 
 def has_in_progress_download(blobs_dir: Path) -> bool:
