@@ -95,32 +95,54 @@ async fn stream_once(
     url: &str,
     app: &AppHandle,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    let mut resp = client
-        .get(url)
-        .header("Accept", "text/event-stream")
-        .send()
-        .await?;
-    if !resp.status().is_success() {
+    stream_once_with(client, url, STREAM_IDLE_TIMEOUT, |event, data| {
+        dispatch(app, event, data);
+    })
+    .await
+}
+
+async fn stream_once_with(
+    client: &reqwest::Client,
+    url: &str,
+    idle_timeout: Duration,
+    mut on_event: impl FnMut(&str, &str),
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let mut resp = tokio::time::timeout(
+        idle_timeout,
+        client.get(url).header("Accept", "text/event-stream").send(),
+    )
+    .await
+    .map_err(|_| format!("no response headers for {:?}", idle_timeout))??;
+    if resp.status() != reqwest::StatusCode::OK {
         return Err(format!("speak_monitor: backend returned {}", resp.status()).into());
+    }
+    let is_event_stream = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
+    if !is_event_stream {
+        return Err("speak_monitor: backend did not return an event stream".into());
     }
     let mut buf = FrameBuffer::default();
     let mut saw_data = false;
     loop {
-        let chunk = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, resp.chunk()).await {
+        let chunk = match tokio::time::timeout(idle_timeout, resp.chunk()).await {
             Ok(Ok(Some(chunk))) => chunk,
             Ok(Ok(None)) => return Ok(saw_data),
             Ok(Err(e)) => return Err(Box::new(e)),
             Err(_) => {
                 return Err(format!(
                     "no data for {:?} (heartbeat should arrive every 15 s)",
-                    STREAM_IDLE_TIMEOUT
+                    idle_timeout
                 )
                 .into())
             }
         };
         saw_data = true;
         for (event, data) in buf.push(&chunk)? {
-            dispatch(app, &event, &data);
+            on_event(&event, &data);
         }
     }
 }
@@ -140,5 +162,158 @@ fn dispatch(app: &AppHandle, event: &str, data: &str) {
         }
         // `ready` and `ping` are heartbeats; ignore.
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn serve(
+        response: &'static [u8],
+        delay: Duration,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/events/speak", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).await;
+            if !response.is_empty() {
+                let _ = stream.write_all(response).await;
+            }
+            tokio::time::sleep(delay).await;
+        });
+        (url, task)
+    }
+
+    #[tokio::test]
+    async fn silent_server_must_not_block_before_response_headers() {
+        let (url, task) = serve(b"", Duration::from_millis(250)).await;
+        let result = tokio::time::timeout(
+            Duration::from_millis(150),
+            stream_once_with(
+                &reqwest::Client::new(),
+                &url,
+                Duration::from_millis(30),
+                |_, _| {},
+            ),
+        )
+        .await;
+        assert!(result.is_ok(), "initial connection exceeded its timeout");
+        assert!(result.unwrap().is_err());
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn event_stream_dispatches_ordered_frames() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\nevent: speak-start\ndata: one\n\nevent: speak-end\ndata: two\n\n";
+        let (url, task) = serve(response, Duration::ZERO).await;
+        let mut events = Vec::new();
+        let result = stream_once_with(
+            &reqwest::Client::new(),
+            &url,
+            Duration::from_secs(1),
+            |e, d| events.push((e.to_string(), d.to_string())),
+        )
+        .await
+        .unwrap();
+        assert!(result);
+        assert_eq!(
+            events,
+            [
+                ("speak-start".into(), "one".into()),
+                ("speak-end".into(), "two".into())
+            ]
+        );
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_body_fails_instead_of_waiting_forever() {
+        let (url, task) = serve(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
+            Duration::from_millis(150),
+        )
+        .await;
+        let result = stream_once_with(
+            &reqwest::Client::new(),
+            &url,
+            Duration::from_millis(30),
+            |_, _| {},
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("no data"));
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_response_is_not_reported_as_productive() {
+        let (url, task) = serve(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\n\r\n",
+            Duration::ZERO,
+        )
+        .await;
+        assert!(!stream_once_with(
+            &reqwest::Client::new(),
+            &url,
+            Duration::from_secs(1),
+            |_, _| {}
+        )
+        .await
+        .unwrap());
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_error_status_and_invalid_utf8() {
+        for response in [b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\n\r\n".as_slice(), b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\nevent: x\ndata: \xff\n\n".as_slice()] {
+            let (url, task) = serve(response, Duration::ZERO).await;
+            assert!(stream_once_with(&reqwest::Client::new(), &url, Duration::from_secs(1), |_, _| {}).await.is_err());
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_success_responses_that_are_not_event_streams() {
+        for response in [
+            b"HTTP/1.1 204 No Content\r\n\r\n".as_slice(),
+            b"HTTP/1.1 206 Partial Content\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 5\r\n\r\nhello"
+                .as_slice(),
+        ] {
+            let (url, task) = serve(response, Duration::ZERO).await;
+            assert!(stream_once_with(
+                &reqwest::Client::new(),
+                &url,
+                Duration::from_secs(1),
+                |_, _| {}
+            )
+            .await
+            .is_err());
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn accepts_content_type_parameters_and_heartbeat_frames() {
+        let (url, task) = serve(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nConnection: close\r\n\r\n: ping\r\n\r\nevent: speak-end\r\ndata: done\r\n\r\n",
+            Duration::ZERO,
+        ).await;
+        let mut events = Vec::new();
+        let productive = stream_once_with(
+            &reqwest::Client::new(),
+            &url,
+            Duration::from_secs(1),
+            |event, data| events.push((event.to_string(), data.to_string())),
+        )
+        .await
+        .unwrap();
+        assert!(productive);
+        assert_eq!(events, [("speak-end".into(), "done".into())]);
+        task.await.unwrap();
     }
 }
