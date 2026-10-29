@@ -2,6 +2,8 @@
 
 import copy
 
+from .voice_identity import rekey_portable_tracks
+
 
 def asset_references(value):
     found = set()
@@ -196,6 +198,7 @@ def prepare_export(project, assets, *, take_scope="all", include_regeneration_re
     selected = [copy.deepcopy(asset) for asset in assets if asset["id"] in kept]
     if isinstance(result.get("assets"), list):
         result["assets"] = [asset for asset in result["assets"] if asset["id"] in kept]
+    rekey_portable_tracks(project, result, assets, selected)
     scope = dict(
         schema_version=1,
         take_scope=take_scope,
