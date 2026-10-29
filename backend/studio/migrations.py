@@ -5,7 +5,7 @@ import uuid
 from contextlib import closing
 from pathlib import Path
 
-CURRENT_VERSION = 4
+CURRENT_VERSION = 5
 
 # Version 1 adopts the previously unversioned schema without replacing existing tables.
 MIGRATIONS = {
@@ -32,6 +32,9 @@ MIGRATIONS = {
     4: (
         "CREATE TABLE IF NOT EXISTS checkpoint_reviews (project_id TEXT NOT NULL, revision_id TEXT NOT NULL, version INTEGER NOT NULL, note TEXT NOT NULL, checklist TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(project_id, revision_id));",
         "CREATE TABLE IF NOT EXISTS review_operations (project_id TEXT NOT NULL, operation_id TEXT NOT NULL, request TEXT NOT NULL, response TEXT NOT NULL, PRIMARY KEY(project_id, operation_id));",
+    ),
+    5: (
+        "CREATE TABLE IF NOT EXISTS cleanup_trash (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, asset_id TEXT NOT NULL, metadata TEXT NOT NULL, path TEXT NOT NULL, created_at TEXT NOT NULL, restored_at TEXT);",
     ),
 }
 
