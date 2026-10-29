@@ -41,7 +41,7 @@ frozen-build qualification are separate evidence domains.
 ## Verification
 
 The native preview regressions first reproduced ignored native frames, missing
-within-utterance rate validation, and premature worker closure. The final combined
+within-utterance rate validation, and premature worker closure. An earlier
 streaming, style, API-processing, scheduler, and lifecycle run passed 118 tests.
 Threaded coverage.py line tracing covered all 172 changed executable streaming
 lines, including the complete 67-line worker bridge. This is scoped line coverage;
@@ -77,6 +77,20 @@ no NVIDIA measurements or CUDA qualification were available on this Mac. The
 MLX routing, codec reuse and streaming changes are Apple Silicon improvements.
 
 ## Integration evidence
+
+The final combined deterministic suite passed **274 tests**. Actual threaded
+line tracing covered **975 / 986 changed executable source lines (98.88%)**
+against the `doublesharp` baseline `a563267`. All changed native-stream bridge,
+style adapter, MLX backend, endpoint closure and audio-joining lines executed.
+The remaining 11 lines are defensive reference-cache paths (9), Turbo’s
+non-Tensor audio conversion fallback (1), and the benchmark CLI’s outer refusal
+exception return (1). This is changed-source line coverage, not a claim about
+whole-backend coverage, branch coverage or native hardware qualification.
+Exact command: the existing Python environment ran the retained
+`merge-coverage/verify-merge.py` harness with `timid=True` and thread tracing,
+covering 14 focused backend suites plus the benchmark suite. Raw results are
+`merge-coverage.log`, `merge-coverage/coverage.json` and
+`merge-coverage/changed-source-coverage.json` under the Scratch report root.
 
 Real Turbo CPU encoding and synthesis passed with memory/disk reuse and exact
 seeded parity against bypass. Initial preparation was 3.21 seconds versus
