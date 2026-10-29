@@ -50,6 +50,25 @@ export interface StudioDocument {
   passages: StudioPassage[];
   tracks: StudioTrack[];
   clips: StudioClip[];
+  pronunciation_rules?: import('./pronunciation').PronunciationRule[];
+  video_reference?: {
+    name: string;
+    frame_rate: number;
+    time_origin_sample: number;
+    duration_seconds: number | null;
+  } | null;
+  scene_targets?: Record<string, { start_sample: number; end_sample: number }>;
+  captions?: {
+    source_fingerprint: string;
+    reviewed: boolean;
+    cues: Array<{
+      id: string;
+      clip_id: string | null;
+      start_sample: number;
+      end_sample: number;
+      text: string;
+    }>;
+  };
   take_annotations?: Record<string, { name: string; note: string }>;
   mix: {
     target_lufs: number;
@@ -160,6 +179,12 @@ export interface StudioEngine {
   commercial_use: 'allowed' | 'restricted' | 'unknown';
 }
 export type StudioCommandType =
+  | 'set_pronunciation_rules'
+  | 'set_video_reference'
+  | 'set_scene_target'
+  | 'estimate_captions'
+  | 'set_captions'
+  | 'compose_take'
   | 'update_project'
   | 'add_passages'
   | 'update_passage'

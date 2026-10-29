@@ -499,6 +499,7 @@ export function FloatingGenerateBox({
                     ) : (
                       <Textarea
                         {...field}
+                        aria-label="Script"
                         ref={(node: HTMLTextAreaElement | null) => {
                           textareaRef.current = node;
                           field.ref(node);

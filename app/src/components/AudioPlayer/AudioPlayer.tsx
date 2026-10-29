@@ -515,13 +515,22 @@ function AudioPlayerSession() {
   // Spacebar to play/pause (capture phase so it fires before focused elements)
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.code !== 'Space') return;
+      if (
+        e.code !== 'Space' ||
+        e.defaultPrevented ||
+        e.repeat ||
+        e.isComposing ||
+        e.metaKey ||
+        e.ctrlKey ||
+        e.altKey
+      )
+        return;
       // Let focused controls handle Space, including history cards and sliders.
       const target = e.target as HTMLElement | null;
       if (
         target?.isContentEditable ||
         target?.closest?.(
-          'button, input, textarea, select, a[href], [role="button"], [role="slider"], [role="menuitem"], [role="checkbox"], [role="radio"], [role="switch"], [role="tab"], [role="option"], [role="combobox"], [role="textbox"]',
+          'button, input, textarea, select, a[href], [role="dialog"], [role="alertdialog"], [role="menu"], [role="button"], [role="slider"], [role="menuitem"], [role="checkbox"], [role="radio"], [role="switch"], [role="tab"], [role="option"], [role="combobox"], [role="textbox"], [data-shortcut-capture]',
         )
       ) {
         return;

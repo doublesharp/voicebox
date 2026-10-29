@@ -23,6 +23,7 @@ import { LogsPage } from '@/components/ServerTab/LogsPage';
 import { MCPPage } from '@/components/ServerTab/MCPPage';
 import { SettingsLayout } from '@/components/ServerTab/ServerTab';
 import { Sidebar } from '@/components/Sidebar';
+import { KeyboardShortcuts } from '@/components/KeyboardShortcuts';
 import { StoriesTab } from '@/components/StoriesTab/StoriesTab';
 import { Toaster } from '@/components/ui/toaster';
 import { VoicesTab } from '@/components/VoicesTab/VoicesTab';
@@ -62,6 +63,7 @@ function RootLayout() {
   return (
     <div ref={shellRef} className="app-shell" data-project-workspace={isProjectWorkspace}>
       <Frame>
+        <KeyboardShortcuts />
         <div className="flex flex-1 min-h-0 overflow-hidden">
           <Sidebar isMacOS={isMacOS()} />
 

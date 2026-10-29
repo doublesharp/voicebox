@@ -107,6 +107,11 @@ def _validate_document(doc, assets, takes):
     passages = _records(doc.get("passages"), "passage")
     tracks = _records(doc.get("tracks"), "track")
     clips = _records(doc.get("clips"), "clip")
+    from .captions import validate_caption_document
+    from .pronunciation import validate_rules
+
+    validate_rules(doc.get("pronunciation_rules", []))
+    validate_caption_document(doc, assets, takes)
     annotations = doc.get("take_annotations", {})
     if not isinstance(annotations, dict):
         raise ValueError("invalid take annotations")

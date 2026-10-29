@@ -63,6 +63,7 @@ import { AudioSampleRecording } from './AudioSampleRecording';
 import { AudioSampleSystem } from './AudioSampleSystem';
 import { AudioSampleUpload } from './AudioSampleUpload';
 import { SampleList } from './SampleList';
+import { SampleQuality } from './SampleQuality';
 
 const MAX_AUDIO_DURATION_SECONDS = 30;
 const MAX_DESIGN_PROMPT_LENGTH = 500;
@@ -1177,6 +1178,13 @@ export function ProfileForm() {
                               </FormItem>
                             )}
                           />
+                          {open && selectedFile && (
+                            <SampleQuality
+                              file={selectedFile}
+                              referenceText={form.watch('referenceText') ?? ''}
+                              language={form.watch('language')}
+                            />
+                          )}
                         </>
                       )}
                     </>
