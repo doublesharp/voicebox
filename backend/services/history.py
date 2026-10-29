@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 import logging
 import uuid
 import shutil
+import os
 from pathlib import Path
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
@@ -36,6 +37,35 @@ def _delete_generation_children(generation_id: str, db: Session) -> set[Path]:
     return paths
 
 
+def _saved_file_paths(db: Session):
+    """Yield both stored and resolved paths of files referenced by saved rows."""
+    for column in (DBGeneration.audio_path, DBGenerationVersion.audio_path,
+                   DBProfileSample.audio_path, DBCapture.audio_path, DBVoiceProfile.avatar_path):
+        for (stored_path,) in db.query(column).filter(column.isnot(None)).yield_per(1000):
+            yield stored_path, config.resolve_storage_path(stored_path)
+
+
+def _directory_has_saved_files(directory: Path, db: Session) -> bool:
+    """Fail closed if a surviving reference may live under this directory."""
+    root = Path(os.path.abspath(directory))
+    resolved_root = directory.resolve()
+    try:
+        for stored, resolved in _saved_file_paths(db):
+            raw = Path(stored)
+            if not raw.is_absolute():
+                if raw.parts and raw.parts[0] == "data":
+                    raw = Path(*raw.parts[1:])
+                raw = config.get_data_dir() / raw
+            lexical = Path(os.path.abspath(raw))
+            if lexical.is_relative_to(root) or (resolved is not None and resolved.is_relative_to(resolved_root)):
+                return True
+    except Exception:
+        db.rollback()
+        logger.warning("Could not verify saved files in profile directory %s; retaining it", directory, exc_info=True)
+        return True
+    return False
+
+
 def _remove_deleted_audio(paths: set[Path], db: Session) -> None:
     """Clean up after commit, preserving paths still referenced by saved data."""
     if not paths:
@@ -44,12 +74,10 @@ def _remove_deleted_audio(paths: set[Path], db: Session) -> None:
     try:
         # Resolve legacy and absolute spellings too; comparing database strings
         # alone can miss two rows that point at the same file.
-        for column in (DBGeneration.audio_path, DBGenerationVersion.audio_path,
-                       DBProfileSample.audio_path, DBCapture.audio_path, DBVoiceProfile.avatar_path):
-            for (stored_path,) in db.query(column).filter(column.isnot(None)).yield_per(1000):
-                remaining.discard(config.resolve_storage_path(stored_path))
-                if not remaining:
-                    return
+        for _, resolved in _saved_file_paths(db):
+            remaining.discard(resolved)
+            if not remaining:
+                return
     except Exception:
         db.rollback()
         logger.warning("Could not verify surviving audio references; retaining deleted audio", exc_info=True)

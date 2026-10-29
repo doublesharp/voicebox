@@ -519,12 +519,17 @@ async def delete_profile(
 
     history._remove_deleted_audio(pending_audio_paths, db)
 
-    profile_dir = config.get_profiles_dir() / profile_id
+    profiles_dir = config.get_profiles_dir()
+    profile_dir = profiles_dir / profile_id
     if profile_dir.exists():
-        try:
-            shutil.rmtree(profile_dir)
-        except OSError:
-            logger.warning("Could not remove deleted profile directory %s", profile_dir, exc_info=True)
+        if (profile_dir.is_symlink() or profile_dir.resolve().parent != profiles_dir.resolve()
+                or history._directory_has_saved_files(profile_dir, db)):
+            logger.warning("Retaining deleted profile directory %s because it may contain saved data", profile_dir)
+        else:
+            try:
+                shutil.rmtree(profile_dir)
+            except OSError:
+                logger.warning("Could not remove deleted profile directory %s", profile_dir, exc_info=True)
 
     # Clean up combined audio cache files for this profile
     clear_profile_cache(profile_id)

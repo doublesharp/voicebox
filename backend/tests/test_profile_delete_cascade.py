@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from backend import config
 from backend.database import (
     Base,
+    Capture,
     CaptureSettings,
     Generation,
     GenerationVersion,
@@ -210,6 +211,87 @@ async def test_deleting_generation_preserves_audio_referenced_by_other_rows(db, 
     assert await history.delete_generation("gen-1", db) is True
     assert db.get(Generation, "gen-2") is not None
     assert shared.read_bytes() == b"RIFF placeholder"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reference", ["generation", "version", "sample", "capture", "avatar"])
+async def test_delete_profile_preserves_files_referenced_by_other_records(db, reference):
+    _make_profile(db)
+    _make_profile(db, "other")
+    directory = config.get_profiles_dir() / "profile-1"
+    directory.mkdir()
+    shared = directory / "shared.wav"
+    shared.write_bytes(b"saved audio")
+    stored = str(shared)
+    db.add(ProfileSample(id="owned-sample", profile_id="profile-1", audio_path=stored, reference_text="owned"))
+    if reference in ("generation", "version"):
+        db.add(Generation(id="other-generation", profile_id="other", text="other", audio_path=stored if reference == "generation" else None))
+        if reference == "version":
+            db.add(GenerationVersion(id="other-version", generation_id="other-generation", label="Take", audio_path=stored))
+    elif reference == "sample":
+        db.add(ProfileSample(id="other-sample", profile_id="other", audio_path=stored, reference_text="other"))
+    elif reference == "capture":
+        db.add(Capture(id="other-capture", audio_path=stored, transcript_raw="other"))
+    else:
+        db.get(VoiceProfile, "other").avatar_path = stored
+    db.commit()
+
+    assert await profiles.delete_profile("profile-1", db) is True
+    assert db.get(VoiceProfile, "profile-1") is None
+    assert db.get(VoiceProfile, "other") is not None
+    assert shared.read_bytes() == b"saved audio"
+
+
+@pytest.mark.asyncio
+async def test_delete_profile_removes_unshared_profile_directory(db):
+    _make_profile(db)
+    directory = config.get_profiles_dir() / "profile-1"
+    directory.mkdir()
+    (directory / "sample.wav").write_bytes(b"audio")
+    db.add(ProfileSample(id="owned", profile_id="profile-1", audio_path=str(directory / "sample.wav"), reference_text="owned"))
+    db.commit()
+    assert await profiles.delete_profile("profile-1", db) is True
+    assert not directory.exists()
+
+
+@pytest.mark.asyncio
+async def test_profile_directory_keeps_symlink_used_by_another_generation(db, tmp_path):
+    _make_profile(db)
+    _make_profile(db, "other")
+    directory = config.get_profiles_dir() / "profile-1"
+    directory.mkdir()
+    target = tmp_path / "external.wav"
+    target.write_bytes(b"audio")
+    link = directory / "link.wav"
+    link.symlink_to(target)
+    db.add(Generation(id="other-generation", profile_id="other", text="other", audio_path=str(link)))
+    db.commit()
+    assert await profiles.delete_profile("profile-1", db) is True
+    assert link.is_symlink()
+    assert link.read_bytes() == b"audio"
+
+
+@pytest.mark.asyncio
+async def test_profile_directory_is_retained_if_reference_check_fails(db, monkeypatch):
+    _make_profile(db)
+    directory = config.get_profiles_dir() / "profile-1"
+    directory.mkdir()
+    (directory / "audio.wav").write_bytes(b"audio")
+    def fail_lookup(_db):
+        raise RuntimeError("database unavailable")
+    monkeypatch.setattr(history, "_saved_file_paths", fail_lookup)
+    assert await profiles.delete_profile("profile-1", db) is True
+    assert (directory / "audio.wav").read_bytes() == b"audio"
+
+
+@pytest.mark.asyncio
+async def test_profile_deletion_does_not_remove_path_outside_profiles_directory(db, tmp_path):
+    _make_profile(db, "../outside")
+    protected = tmp_path / "outside"
+    protected.mkdir()
+    (protected / "file.wav").write_bytes(b"keep")
+    assert await profiles.delete_profile("../outside", db) is True
+    assert (protected / "file.wav").read_bytes() == b"keep"
 
 
 @pytest.mark.asyncio
