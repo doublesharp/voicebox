@@ -17,6 +17,30 @@ interface UseAudioRecordingOptions {
   onRecordingComplete?: (blob: Blob, duration?: number) => void;
 }
 
+interface RecordingSession {
+  controller: AbortController;
+  recorder: MediaRecorder | null;
+  stream: MediaStream | null;
+  chunks: Blob[];
+  timer: number | null;
+  startedAt: number | null;
+  stoppedAt: number | null;
+  cancelled: boolean;
+}
+
+function releaseStream(session: RecordingSession) {
+  const stream = session.stream;
+  session.stream = null;
+  stream?.getTracks().forEach((track) => track.stop());
+}
+
+function clearSessionTimer(session: RecordingSession) {
+  if (session.timer !== null) {
+    clearInterval(session.timer);
+    session.timer = null;
+  }
+}
+
 export function useAudioRecording({
   maxDurationSeconds,
   deviceId,
@@ -27,241 +51,208 @@ export function useAudioRecording({
   const [isRecording, setIsRecording] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
   const [audioStream, setAudioStream] = useState<MediaStream | null>(null);
-  const requestRef = useRef<AbortController | null>(null);
   const [duration, setDuration] = useState(0);
   const [usingDefaultMicrophone, setUsingDefaultMicrophone] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
-  const streamRef = useRef<MediaStream | null>(null);
-  const timerRef = useRef<number | null>(null);
-  const startTimeRef = useRef<number | null>(null);
-  const cancelledRef = useRef<boolean>(false);
+  const currentRef = useRef<RecordingSession | null>(null);
+  const sessionsRef = useRef(new Set<RecordingSession>());
 
   const startRecording = useCallback(async () => {
-    if (requestRef.current || mediaRecorderRef.current?.state === 'recording') return;
-    const controller = new AbortController();
-    requestRef.current = controller;
+    const current = currentRef.current;
+    if (
+      current &&
+      !current.cancelled &&
+      (!current.recorder || current.recorder.state !== 'inactive')
+    )
+      return;
+    const session: RecordingSession = {
+      controller: new AbortController(),
+      recorder: null,
+      stream: null,
+      chunks: [],
+      timer: null,
+      startedAt: null,
+      stoppedAt: null,
+      cancelled: false,
+    };
+    currentRef.current = session;
+    sessionsRef.current.add(session);
     setIsStarting(true);
+    setError(null);
+    setUsingDefaultMicrophone(false);
+    setDuration(0);
+
     try {
-      setError(null);
-      setUsingDefaultMicrophone(false);
-      chunksRef.current = [];
-      cancelledRef.current = false;
-      setDuration(0);
-
-      // Check if getUserMedia is available
-      // In Tauri, navigator.mediaDevices might not be available immediately
       if (typeof navigator === 'undefined') {
-        const errorMsg =
-          'Navigator API is not available. This might be a Tauri configuration issue.';
-        setError(errorMsg);
-        throw new Error(errorMsg);
+        throw new Error(
+          'Navigator API is not available. This might be a Tauri configuration issue.',
+        );
       }
-
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        // Try waiting a bit for Tauri webview to initialize
+        // Tauri's webview may expose media devices shortly after initialization.
         await new Promise((resolve) => setTimeout(resolve, 100));
-
+        session.controller.signal.throwIfAborted();
         if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-          console.error('MediaDevices check:', {
-            hasNavigator: typeof navigator !== 'undefined',
-            hasMediaDevices: !!navigator?.mediaDevices,
-            hasGetUserMedia: !!navigator?.mediaDevices?.getUserMedia,
-            isTauri: platform.metadata.isTauri,
-          });
-
           const errorMsg = platform.metadata.isTauri
             ? 'Microphone access is not available. Please ensure:\n1. The app has microphone permissions in System Settings (macOS: System Settings > Privacy & Security > Microphone)\n2. You restart the app after granting permissions\n3. You are using Tauri v2 with a webview that supports getUserMedia'
             : 'Microphone access is not available. Please ensure you are using a secure context (HTTPS or localhost) and that your browser has microphone permissions enabled.';
-          setError(errorMsg);
           throw new Error(errorMsg);
         }
       }
 
-      // Request microphone access
       const stream = await requestMicrophone(
         navigator.mediaDevices,
         deviceId !== undefined ? deviceId : useMicrophoneStore.getState().deviceId,
-        controller.signal,
-        () => setUsingDefaultMicrophone(true),
+        session.controller.signal,
+        () => {
+          if (!session.cancelled && currentRef.current === session) setUsingDefaultMicrophone(true);
+        },
         processing,
       );
-
-      if (controller.signal.aborted) {
-        stream.getTracks().forEach((track) => {
-          track.stop();
-        });
+      if (session.cancelled || currentRef.current !== session) {
+        stream.getTracks().forEach((track) => track.stop());
         return;
       }
-      streamRef.current = stream;
+      session.stream = stream;
       setAudioStream(stream);
+      const options: MediaRecorderOptions = { mimeType: 'audio/webm;codecs=opus' };
+      if (!MediaRecorder.isTypeSupported(options.mimeType!)) delete options.mimeType;
+      const recorder = new MediaRecorder(stream, options);
+      session.recorder = recorder;
 
-      // Create MediaRecorder with preferred MIME type
-      const options: MediaRecorderOptions = {
-        mimeType: 'audio/webm;codecs=opus',
+      recorder.ondataavailable = (event) => {
+        if (!session.cancelled && event.data.size > 0) session.chunks.push(event.data);
       };
-
-      // Fallback to default if webm not supported
-      if (!MediaRecorder.isTypeSupported(options.mimeType!)) {
-        delete options.mimeType;
-      }
-
-      const mediaRecorder = new MediaRecorder(stream, options);
-      mediaRecorderRef.current = mediaRecorder;
-
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          chunksRef.current.push(event.data);
-        }
-      };
-
-      mediaRecorder.onstop = async () => {
-        // Snapshot the cancellation flag and recorded duration immediately —
-        // cancelRecording() clears chunks and sets cancelledRef synchronously
-        // before this async handler runs, so we must check it first.
-        const wasCancelled = cancelledRef.current;
-        const recordedDuration = startTimeRef.current
-          ? (Date.now() - startTimeRef.current) / 1000
-          : undefined;
-
-        const webmBlob = new Blob(chunksRef.current, {
-          type: mediaRecorder.mimeType || options.mimeType || 'audio/webm',
+      recorder.onstop = async () => {
+        const recordedDuration =
+          session.startedAt === null
+            ? undefined
+            : Math.max(0, (session.stoppedAt ?? Date.now()) - session.startedAt) / 1000;
+        const webmBlob = new Blob(session.chunks, {
+          type: recorder.mimeType || options.mimeType || 'audio/webm',
         });
-
-        // Stop all tracks now that we have the data
-        stream.getTracks().forEach((track) => {
-          track.stop();
-        });
-        if (streamRef.current === stream) {
-          streamRef.current = null;
+        session.chunks = [];
+        releaseStream(session);
+        clearSessionTimer(session);
+        if (currentRef.current === session) {
           setAudioStream(null);
           setIsRecording(false);
-          if (timerRef.current !== null) {
-            clearInterval(timerRef.current);
-            timerRef.current = null;
-          }
         }
-
-        // Don't fire completion callback if the recording was cancelled
-        if (wasCancelled) return;
-
-        // Convert to WAV format to avoid needing ffmpeg on backend
         try {
-          const wavBlob = await convertToWav(webmBlob);
-          onRecordingComplete?.(wavBlob, recordedDuration);
-        } catch (err) {
-          console.error('Error converting audio to WAV:', err);
-          // Fallback to original blob if conversion fails
-          onRecordingComplete?.(webmBlob, recordedDuration);
+          if (session.cancelled) return;
+          let result: Blob;
+          try {
+            result = await convertToWav(webmBlob);
+          } catch (err) {
+            console.error('Error converting audio to WAV:', err);
+            result = webmBlob;
+          }
+          if (!session.cancelled) onRecordingComplete?.(result, recordedDuration);
+        } finally {
+          sessionsRef.current.delete(session);
+          if (currentRef.current === session) currentRef.current = null;
         }
       };
-
-      mediaRecorder.onerror = (event) => {
-        setError('Recording error occurred');
-        console.error('MediaRecorder error:', event);
+      recorder.onerror = (event) => {
+        if (session.cancelled) return;
+        session.cancelled = true;
+        session.controller.abort();
+        session.chunks = [];
+        if (currentRef.current === session) {
+          currentRef.current = null;
+          setError('Recording error occurred');
+          setIsStarting(false);
+          setIsRecording(false);
+          setAudioStream(null);
+          console.error('MediaRecorder error:', event);
+        }
+        try {
+          if (recorder.state !== 'inactive') recorder.stop();
+        } catch (err) {
+          console.error('Unable to stop failed recorder:', err);
+        }
+        releaseStream(session);
+        clearSessionTimer(session);
+        sessionsRef.current.delete(session);
       };
 
-      // WebKit's MediaRecorder drops the WebM EBML header from chunks when
-      // started with a timeslice, so concatenated blobs fail to parse in
-      // both AudioContext and ffmpeg. Starting with no timeslice produces
-      // exactly one dataavailable on stop() with a valid container.
-      mediaRecorder.start();
+      // A single final chunk preserves the WebM header in WebKit.
+      recorder.start();
+      if (session.cancelled || currentRef.current !== session) return;
+      session.startedAt = Date.now();
       setIsRecording(true);
-      startTimeRef.current = Date.now();
-
-      // Start timer
-      timerRef.current = window.setInterval(() => {
-        if (startTimeRef.current) {
-          const elapsed = (Date.now() - startTimeRef.current) / 1000;
-          setDuration(elapsed);
-
-          // Auto-stop at max duration when the caller opts in — dictation
-          // sessions pass undefined and run until the user releases the
-          // chord or hits stop; voice-clone sample recorders pass 29s to
-          // keep reference clips short.
-          if (maxDurationSeconds !== undefined && elapsed >= maxDurationSeconds) {
-            if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-              mediaRecorderRef.current.stop();
-              setIsRecording(false);
-              if (timerRef.current !== null) {
-                clearInterval(timerRef.current);
-                timerRef.current = null;
-              }
-            }
-          }
+      session.timer = window.setInterval(() => {
+        if (session.startedAt === null || session.cancelled || currentRef.current !== session)
+          return;
+        const elapsed = (Date.now() - session.startedAt) / 1000;
+        setDuration(elapsed);
+        if (
+          maxDurationSeconds !== undefined &&
+          elapsed >= maxDurationSeconds &&
+          recorder.state !== 'inactive'
+        ) {
+          session.stoppedAt = Date.now();
+          recorder.stop();
+          setIsRecording(false);
+          clearSessionTimer(session);
         }
       }, 100);
     } catch (err) {
-      if (controller.signal.aborted) return;
-      streamRef.current?.getTracks().forEach((track) => {
-        track.stop();
-      });
-      streamRef.current = null;
-      if (!controller.signal.aborted) {
+      releaseStream(session);
+      clearSessionTimer(session);
+      sessionsRef.current.delete(session);
+      if (!session.cancelled && currentRef.current === session) {
+        currentRef.current = null;
+        setIsStarting(false);
         setAudioStream(null);
         setError(microphoneErrorMessage(err));
         setIsRecording(false);
       }
     } finally {
-      if (requestRef.current === controller) {
-        requestRef.current = null;
-        setIsStarting(false);
-      }
+      if (currentRef.current === session) setIsStarting(false);
     }
   }, [deviceId, maxDurationSeconds, onRecordingComplete, platform.metadata.isTauri, processing]);
 
   const stopRecording = useCallback(() => {
-    if (mediaRecorderRef.current && isRecording) {
-      if (mediaRecorderRef.current.state !== 'inactive') mediaRecorderRef.current.stop();
-      setIsRecording(false);
-
-      if (timerRef.current !== null) {
-        clearInterval(timerRef.current);
-        timerRef.current = null;
-      }
-    }
-  }, [isRecording]);
+    const session = currentRef.current;
+    if (!session?.recorder || session.recorder.state === 'inactive') return;
+    session.stoppedAt = Date.now();
+    session.recorder.stop();
+    setIsRecording(false);
+    clearSessionTimer(session);
+  }, []);
 
   const cancelRecording = useCallback(() => {
-    requestRef.current?.abort();
-    requestRef.current = null;
+    const session = currentRef.current;
+    if (!session) return;
+    session.cancelled = true;
+    session.controller.abort();
+    session.chunks = [];
+    if (session.recorder && session.recorder.state !== 'inactive') session.recorder.stop();
+    releaseStream(session);
+    clearSessionTimer(session);
+    sessionsRef.current.delete(session);
+    currentRef.current = null;
     setIsStarting(false);
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      cancelledRef.current = true; // Must be set before stop() triggers onstop
-      chunksRef.current = [];
-      mediaRecorderRef.current.stop();
-      setIsRecording(false);
-      setDuration(0);
-    }
-
-    // Stop all tracks
-    streamRef.current?.getTracks().forEach((track) => {
-      track.stop();
-    });
-    streamRef.current = null;
+    setIsRecording(false);
+    setDuration(0);
     setAudioStream(null);
-
-    if (timerRef.current !== null) {
-      clearInterval(timerRef.current);
-      timerRef.current = null;
-    }
   }, []);
 
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      cancelledRef.current = true;
-      requestRef.current?.abort();
-      requestRef.current = null;
-      if (timerRef.current !== null) {
-        clearInterval(timerRef.current);
+  useEffect(
+    () => () => {
+      for (const session of sessionsRef.current) {
+        session.cancelled = true;
+        session.controller.abort();
+        if (session.recorder && session.recorder.state !== 'inactive') session.recorder.stop();
+        releaseStream(session);
+        clearSessionTimer(session);
       }
-      streamRef.current?.getTracks().forEach((track) => {
-        track.stop();
-      });
-    };
-  }, []);
+      sessionsRef.current.clear();
+      currentRef.current = null;
+    },
+    [],
+  );
 
   return {
     isRecording,
