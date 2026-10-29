@@ -240,6 +240,19 @@ test('unsupported capture does not call the native start', async () => {
   expect(hook.error).toContain('not supported');
 });
 
+test('support probe failure leaves capture disabled', async () => {
+  supported.mockImplementation(async () => {
+    throw new Error('probe failed');
+  });
+  await mount();
+  expect(hook.isSupported).toBe(false);
+  await act(async () => {
+    await hook.startRecording();
+  });
+  expect(start).not.toHaveBeenCalled();
+  expect(hook.error).toContain('not supported');
+});
+
 test('duration limit stops once and publishes the result', async () => {
   const originalNow = Date.now;
   let now = 1000;
