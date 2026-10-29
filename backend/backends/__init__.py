@@ -287,13 +287,16 @@ def _get_qwen_model_configs() -> list[ModelConfig]:
 
 
 def _get_qwen_custom_voice_configs() -> list[ModelConfig]:
-    """Return Qwen CustomVoice model configs."""
+    """Return CustomVoice downloads matching the selected platform adapter."""
+    on_mlx = get_backend_type() == "mlx"
+    prefix = "mlx-community" if on_mlx else "Qwen"
+    suffix = "-bf16" if on_mlx else ""
     return [
         ModelConfig(
             model_name="qwen-custom-voice-1.7B",
             display_name="Qwen CustomVoice 1.7B",
             engine="qwen_custom_voice",
-            hf_repo_id="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+            hf_repo_id=f"{prefix}/Qwen3-TTS-12Hz-1.7B-CustomVoice{suffix}",
             model_size="1.7B",
             size_mb=3500,
             supports_instruct=True,
@@ -303,7 +306,7 @@ def _get_qwen_custom_voice_configs() -> list[ModelConfig]:
             model_name="qwen-custom-voice-0.6B",
             display_name="Qwen CustomVoice 0.6B",
             engine="qwen_custom_voice",
-            hf_repo_id="Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+            hf_repo_id=f"{prefix}/Qwen3-TTS-12Hz-0.6B-CustomVoice{suffix}",
             model_size="0.6B",
             size_mb=1200,
             supports_instruct=True,
@@ -317,12 +320,15 @@ def _get_qwen_voice_design_configs() -> list[ModelConfig]:
 
     Upstream ships a single 1.7B checkpoint — there is no 0.6B VoiceDesign.
     """
+    on_mlx = get_backend_type() == "mlx"
+    prefix = "mlx-community" if on_mlx else "Qwen"
+    suffix = "-bf16" if on_mlx else ""
     return [
         ModelConfig(
             model_name="qwen-voice-design-1.7B",
             display_name="Qwen VoiceDesign 1.7B",
             engine="qwen_voice_design",
-            hf_repo_id="Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+            hf_repo_id=f"{prefix}/Qwen3-TTS-12Hz-1.7B-VoiceDesign{suffix}",
             model_size="1.7B",
             size_mb=3500,
             supports_instruct=True,
@@ -843,13 +849,23 @@ def get_tts_backend_for_engine(engine: str) -> TTSBackend:
 
             backend = OmniVoiceBackend()
         elif engine == "qwen_custom_voice":
-            from .qwen_custom_voice_backend import QwenCustomVoiceBackend
+            if get_backend_type() == "mlx":
+                from .qwen_mlx_styles_backend import QwenMLXCustomVoiceBackend
 
-            backend = QwenCustomVoiceBackend()
+                backend = QwenMLXCustomVoiceBackend()
+            else:
+                from .qwen_custom_voice_backend import QwenCustomVoiceBackend
+
+                backend = QwenCustomVoiceBackend()
         elif engine == "qwen_voice_design":
-            from .qwen_voice_design_backend import QwenVoiceDesignBackend
+            if get_backend_type() == "mlx":
+                from .qwen_mlx_styles_backend import QwenMLXVoiceDesignBackend
 
-            backend = QwenVoiceDesignBackend()
+                backend = QwenMLXVoiceDesignBackend()
+            else:
+                from .qwen_voice_design_backend import QwenVoiceDesignBackend
+
+                backend = QwenVoiceDesignBackend()
         else:
             raise ValueError(f"Unknown TTS engine: {engine}. Supported: {list(TTS_ENGINES.keys())}")
 
