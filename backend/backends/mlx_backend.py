@@ -40,6 +40,7 @@ from .base import (  # noqa: E402
     empty_mlx_cache,
 )
 from ..utils.cache import get_cache_key, get_cached_voice_prompt, cache_voice_prompt  # noqa: E402
+from ..utils.mlx_reference_cache import MLXReferenceCache  # noqa: E402
 
 
 class VoiceCloningError(RuntimeError):
@@ -53,6 +54,7 @@ class MLXTTSBackend:
         self.model = None
         self.model_size = model_size
         self._current_model_size = None
+        self._reference_cache = MLXReferenceCache()
         # Guards the whole load-then-use sequence in generate()/create_voice_prompt()
         # so a concurrent request for a different model_size can't swap self.model
         # out from under an in-flight request between its load and its inference.
@@ -124,6 +126,7 @@ class MLXTTSBackend:
 
     def _load_model_sync(self, model_size: str):
         """Synchronous model loading."""
+        self._reference_cache.clear()
         model_path = self._get_model_path(model_size)
         model_name = f"qwen-tts-{model_size}"
         is_cached = self._is_model_cached(model_size)
@@ -134,6 +137,8 @@ class MLXTTSBackend:
             logger.info("Loading MLX TTS model %s...", model_size)
 
             self.model = load(model_path)
+
+        self._reference_cache.bind(self.model)
 
         self._current_model_size = model_size
         self.model_size = model_size
@@ -154,6 +159,9 @@ class MLXTTSBackend:
         self._unload_model_sync()
 
     def _unload_model_sync(self):
+        # Invalidate even if an in-flight worker still holds the old model.
+        # Its epoch cannot publish encoded reference state after this point.
+        self._reference_cache.clear()
         if self.model is not None:
             del self.model
             self.model = None
@@ -170,8 +178,8 @@ class MLXTTSBackend:
         """
         Create voice prompt from reference audio.
 
-        MLX backend stores voice prompt as a dict with audio path and text.
-        The actual voice prompt processing happens during generation.
+        Metadata is cached here; bounded codec reuse happens on the MLX worker
+        during generation, keyed by the actual normalized encoder input.
 
         Args:
             audio_path: Path to reference audio file
@@ -189,10 +197,11 @@ class MLXTTSBackend:
         def _reference_prompt():
             if not Path(audio_path).is_file():
                 raise VoiceCloningError("Voice reference audio is missing. Re-add the sample before generating speech.")
-            # MLX still encodes this reference inside generate(). This cache
-            # stores metadata only, and must always use the caller's current
+            # This metadata cache must always use the caller's current
             # path even when identical content was cached from another path.
             prompt = {"ref_audio": str(audio_path), "ref_text": reference_text}
+            if not use_cache:
+                prompt["_mlx_reference_cache"] = False
             cache_key = get_cache_key(audio_path, reference_text, namespace=namespace) if use_cache else None
             cached = get_cached_voice_prompt(cache_key) if cache_key is not None else None
             was_cached = isinstance(cached, dict) and cached.get("ref_text") == reference_text
@@ -273,9 +282,12 @@ class MLXTTSBackend:
                         )
                         if accepts_reference:
                             # Generate with voice cloning
-                            for result in model.generate(text, ref_audio=ref_audio, ref_text=ref_text, lang_code=lang):
-                                audio_chunks.append(np.array(result.audio))
-                                sample_rate = result.sample_rate
+                            with self._reference_cache.encoding(
+                                model, enabled=voice_prompt.get("_mlx_reference_cache", True)
+                            ):
+                                for result in model.generate(text, ref_audio=ref_audio, ref_text=ref_text, lang_code=lang):
+                                    audio_chunks.append(np.array(result.audio))
+                                    sample_rate = result.sample_rate
                         else:
                             raise VoiceCloningError(
                                 "This model does not support voice references. Select a voice-cloning model."
@@ -332,7 +344,13 @@ class MLXTTSBackend:
                     empty_mlx_cache()
 
         async with self._op_lock:
-            audio, sample_rate = await _run_on_mlx_thread(_reload_and_generate_sync)
+            try:
+                audio, sample_rate = await _run_on_mlx_thread(_reload_and_generate_sync)
+            except asyncio.CancelledError:
+                # The executor cannot interrupt MLX. Invalidate its pending
+                # publication while it finishes on the dedicated worker.
+                self._reference_cache.clear(keep_model=True)
+                raise
 
         return audio, sample_rate
 
