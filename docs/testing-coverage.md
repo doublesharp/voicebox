@@ -52,6 +52,8 @@ and 31 model-management integration tests, TypeScript and production bundling
 after merging. That focused run does
 not establish a new whole-frontend coverage percentage; the table below belongs
 to the consolidated source snapshot above.
+A later server-session integration also passed 93 affected frontend tests,
+TypeScript and a fresh production build, including preview-cancellation checks.
 
 | Scope | Lines | Statements | Functions | Branches |
 | --- | ---: | ---: | ---: | ---: |
