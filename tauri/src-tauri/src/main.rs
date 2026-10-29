@@ -17,6 +17,7 @@ mod publication;
 mod publication_commands;
 mod server_process;
 mod speak_monitor;
+mod sse_frames;
 mod synthetic_keys;
 
 use std::sync::Mutex;

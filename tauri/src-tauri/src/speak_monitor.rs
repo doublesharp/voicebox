@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use tauri::{AppHandle, Emitter};
 
-use crate::{ensure_dictate_window, SERVER_PORT};
+use crate::{ensure_dictate_window, sse_frames::FrameBuffer, SERVER_PORT};
 
 const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -103,7 +103,7 @@ async fn stream_once(
     if !resp.status().is_success() {
         return Err(format!("speak_monitor: backend returned {}", resp.status()).into());
     }
-    let mut buf = String::new();
+    let mut buf = FrameBuffer::default();
     let mut saw_data = false;
     loop {
         let chunk = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, resp.chunk()).await {
@@ -119,46 +119,10 @@ async fn stream_once(
             }
         };
         saw_data = true;
-        buf.push_str(std::str::from_utf8(&chunk)?);
-        // sse-starlette emits CRLF framing; the spec also permits LF, so
-        // handle either. Drain whichever separator appears first.
-        loop {
-            let crlf = buf.find("\r\n\r\n");
-            let lf = buf.find("\n\n");
-            let (end, sep_len) = match (crlf, lf) {
-                (Some(c), Some(l)) if c <= l => (c, 4),
-                (Some(c), None) => (c, 4),
-                (_, Some(l)) => (l, 2),
-                (None, None) => break,
-            };
-            let frame: String = buf.drain(..end + sep_len).collect();
-            if let Some((event, data)) = parse_frame(&frame) {
-                dispatch(app, &event, &data);
-            }
+        for (event, data) in buf.push(&chunk)? {
+            dispatch(app, &event, &data);
         }
     }
-}
-
-/// Parse a single SSE frame into (event_name, data_json).
-///
-/// Returns None for comment-only frames (lines starting with `:`) and
-/// for frames without a recognizable `event:` or `data:` line.
-fn parse_frame(frame: &str) -> Option<(String, String)> {
-    let mut event: Option<String> = None;
-    let mut data_lines: Vec<&str> = Vec::new();
-    for line in frame.lines() {
-        if line.is_empty() || line.starts_with(':') {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("event:") {
-            event = Some(rest.trim().to_string());
-        } else if let Some(rest) = line.strip_prefix("data:") {
-            data_lines.push(rest.trim_start());
-        }
-    }
-    let event = event?;
-    let data = data_lines.join("\n");
-    Some((event, data))
 }
 
 fn dispatch(app: &AppHandle, event: &str, data: &str) {
