@@ -10,6 +10,8 @@ from ..backends import get_llm_model_configs
 from ..services import llm
 from ..services.task_queue import create_background_task
 from ..utils.tasks import get_task_manager
+from ..utils.progress import get_progress_manager
+from ..utils.async_work import run_owned
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +28,16 @@ async def llm_generate(request: models.LLMGenerateRequest):
     validation / download-progress plumbing below is skipped.
     """
     from ..backends.openai_compat_backend import OpenAICompatLLMBackend
+
+    examples: list[tuple[str, str]] | None = None
+    if request.examples:
+        for pair in request.examples:
+            if len(pair) != 2:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Each example must be a [user, assistant] pair",
+                )
+        examples = [(pair[0], pair[1]) for pair in request.examples]
 
     backend = llm.get_llm_model()
 
@@ -50,13 +62,35 @@ async def llm_generate(request: models.LLMGenerateRequest):
 
             async def download_llm_background():
                 try:
-                    await backend.load_model(model_size)
+                    await run_owned(backend.load_model(model_size))
                     task_manager.complete_download(progress_model_name)
                 except Exception as e:
                     task_manager.error_download(progress_model_name, str(e))
 
-            task_manager.start_download(progress_model_name)
-            create_background_task(download_llm_background())
+            existing = next(
+                (task for task in task_manager.get_active_downloads() if task.model_name == progress_model_name),
+                None,
+            )
+            progress = get_progress_manager().get_progress(progress_model_name)
+            pending = (
+                existing is not None and existing.status in ("downloading", "extracting")
+            ) or (
+                existing is None and progress and progress.get("status") in ("downloading", "extracting")
+            )
+            if not pending:
+                task_manager.start_download(progress_model_name)
+                owned = next(task for task in task_manager.get_active_downloads() if task.model_name == progress_model_name)
+                work = download_llm_background()
+                try:
+                    task = create_background_task(work)
+                    def mark_cancelled(done):
+                        if done.cancelled() and any(item is owned for item in task_manager.get_active_downloads()):
+                            task_manager.error_download(progress_model_name, "Download cancelled")
+                    task.add_done_callback(mark_cancelled)
+                except Exception as e:
+                    work.close()
+                    task_manager.error_download(progress_model_name, str(e))
+                    raise HTTPException(status_code=500, detail="LLM download could not be started") from e
 
             return JSONResponse(
                 status_code=202,
@@ -66,16 +100,6 @@ async def llm_generate(request: models.LLMGenerateRequest):
                     "downloading": True,
                 },
             )
-
-    examples: list[tuple[str, str]] | None = None
-    if request.examples:
-        for pair in request.examples:
-            if len(pair) != 2:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Each example must be a [user, assistant] pair",
-                )
-        examples = [(pair[0], pair[1]) for pair in request.examples]
 
     try:
         text = await backend.generate(
