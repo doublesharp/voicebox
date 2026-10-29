@@ -339,7 +339,7 @@ async def get_model_status():
     cache_info = None
     if use_scan_cache:
         try:
-            cache_info = scan_cache_dir()
+            cache_info = scan_cache_dir(hf_constants.HF_HUB_CACHE)
         except Exception:
             pass
 
