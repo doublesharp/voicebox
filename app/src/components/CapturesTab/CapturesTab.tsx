@@ -451,7 +451,7 @@ export function CapturesTab() {
       />
 
       {/* Left: capture list */}
-      <div className="w-[340px] shrink-0">
+      <div className="w-[280px] min-[1100px]:w-[340px] shrink-0">
         <ListPane>
           <ListPaneHeader>
             <ListPaneTitleRow>
@@ -539,7 +539,7 @@ export function CapturesTab() {
 
         {/* Top action bar */}
         <div className="absolute top-0 left-0 right-0 z-20 px-8">
-          <div className="flex items-center gap-3 py-4">
+          <div className="flex flex-wrap items-center gap-2 py-4">
             <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
               <span className="w-1.5 h-1.5 rounded-full bg-accent" />
               <span>
@@ -843,7 +843,7 @@ export function CapturesTab() {
                 <Captions className="h-10 w-10 mx-auto opacity-40" />
                 <p className="text-sm">{t('captures.empty.pickOne')}</p>
               </div>
-            ) : hotkeyEnabled && !readiness.canRecord ? (
+            ) : !readiness.canRecord ? (
               <DictationReadinessChecklist readiness={readiness} />
             ) : hotkeyEnabled && (pushToTalkKeys.length || toggleToTalkKeys.length) ? (
               <div className="max-w-sm mx-auto text-center space-y-5">

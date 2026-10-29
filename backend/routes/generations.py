@@ -73,6 +73,7 @@ async def generate_speech(
     engine = _resolve_generation_engine(data, profile)
     try:
         profiles.validate_profile_engine(profile, engine)
+        data.chatterbox_options(engine)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -109,6 +110,7 @@ async def generate_speech(
         "max_chunk_chars": data.max_chunk_chars,
         "crossfade_ms": data.crossfade_ms,
         "effects_chain": effects_chain_config,
+        **{name: getattr(data, name) for name in models.SPEECH_DELIVERY_FIELDS},
     }
 
     generation = await history.create_generation(
@@ -150,6 +152,7 @@ async def generate_speech(
             mode="generate",
             max_chunk_chars=data.max_chunk_chars,
             crossfade_ms=data.crossfade_ms,
+            **{name: getattr(data, name) for name in models.SPEECH_DELIVERY_FIELDS},
         )
     )
 
@@ -165,7 +168,7 @@ def _replay_synthesis_config(generation: DBGeneration) -> dict:
     """
     options = {
         name: models.GenerationRequest.model_fields[name].default
-        for name in ("normalize", "max_chunk_chars", "crossfade_ms", "effects_chain")
+        for name in ("normalize", "max_chunk_chars", "crossfade_ms", "effects_chain", *models.SPEECH_DELIVERY_FIELDS)
     }
     saved = getattr(generation, "synthesis_config", None)
     if saved is None:
@@ -181,6 +184,9 @@ def _replay_synthesis_config(generation: DBGeneration) -> dict:
             value = options[name]
             if type(value) is not int or not lower <= value <= upper:
                 raise ValueError(f"Invalid {name} setting")
+        delivery = models.SpeechDeliverySettings(**{name: options[name] for name in models.SPEECH_DELIVERY_FIELDS})
+        delivery.chatterbox_options(generation.engine or "qwen")
+        options.update(delivery.model_dump())
         effects = options["effects_chain"]
         if effects is not None and (not isinstance(effects, list) or any(not isinstance(effect, dict) for effect in effects)):
             raise ValueError("Invalid effects settings")
@@ -406,15 +412,18 @@ async def _incremental_speech(data: models.GenerationRequest, db: Session):
         [effect.model_dump() for effect in data.effects_chain]
         if data.effects_chain is not None else effects_chain_from_config(profile.effects_chain)
     )
-    if data.normalize or any(effect.get("enabled", True) for effect in chain or []):
+    if (data.normalize or any(effect.get("enabled", True) for effect in chain or [])
+            or data.speed != 1.0
+            or any(getattr(data, name) is not None for name in models.SPEECH_DELIVERY_FIELDS[1:])):
         raise HTTPException(
             status_code=400,
-            detail="Incremental preview requires normalize=false and no enabled effects; use effects_chain=[] "
+            detail="Incremental preview requires normalize=false, speed=1, default delivery, and no enabled effects; use effects_chain=[] "
                    "to override profile effects. Buffered mode supports whole-file mastering.",
         )
     engine = _resolve_generation_engine(data, profile)
     try:
         profiles.validate_profile_engine(profile, engine)
+        data.chatterbox_options(engine)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     model_size = data.model_size or "1.7B"
@@ -476,6 +485,7 @@ async def _buffered_speech(
     engine = _resolve_generation_engine(data, profile)
     try:
         profiles.validate_profile_engine(profile, engine)
+        generation_options = data.chatterbox_options(engine)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     tts_model = get_tts_backend_for_engine(engine)
@@ -516,6 +526,7 @@ async def _buffered_speech(
             crossfade_ms=data.crossfade_ms,
             trim_fn=trim_fn,
             runaway_detector=runaway_detector,
+            **({"generation_options": generation_options} if generation_options else {}),
         )
     finally:
         release_generation_memory(tts_model)
@@ -529,7 +540,7 @@ async def _buffered_speech(
         effects_chain_config = effects_chain_from_config(profile.effects_chain)
 
     _, audio = await asyncio.to_thread(
-        process_generated_audio, audio, sample_rate, normalize=data.normalize, effects_chain=effects_chain_config
+        process_generated_audio, audio, sample_rate, normalize=data.normalize, effects_chain=effects_chain_config, speed=data.speed
     )
 
     check_inference_cancelled()

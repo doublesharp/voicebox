@@ -15,6 +15,7 @@ mod key_codes;
 mod keyboard_layout;
 mod publication;
 mod publication_commands;
+mod server_process;
 mod speak_monitor;
 mod synthetic_keys;
 
@@ -282,8 +283,15 @@ async fn start_server(
         }
     }
     // Check if server is already running (managed by this app instance)
-    if state.child.lock().unwrap().is_some() {
-        return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
+    let has_managed_child = state.child.lock().unwrap().is_some();
+    if has_managed_child {
+        let ready = tokio::task::spawn_blocking(|| check_health(SERVER_PORT))
+            .await
+            .unwrap_or(false);
+        if ready {
+            return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
+        }
+        return Err("The bundled server is still starting. Please try again shortly.".to_string());
     }
 
     // Check if a voicebox server is already running on our port (from previous session with keep_running=true,
@@ -540,6 +548,23 @@ async fn start_server(
         }
     };
 
+    // macOS ships the large Python runtime as an onedir resource. Launch it
+    // beside its support files instead of extracting a onefile archive on
+    // every launch. Older bundles and development stubs retain the sidecar.
+    #[cfg(target_os = "macos")]
+    {
+        let backend_dir = app
+            .path()
+            .resource_dir()
+            .map_err(|e| format!("Failed to locate bundled backend: {}", e))?
+            .join("backend");
+        let backend_exe = backend_dir.join("voicebox-server");
+        if backend_exe.is_file() {
+            println!("Using unpacked macOS backend: {:?}", backend_exe);
+            sidecar = app.shell().command(&backend_exe).current_dir(&backend_dir);
+        }
+    }
+
     println!("Sidecar command created successfully");
 
     // Build common args
@@ -680,8 +705,12 @@ async fn start_server(
 
     // Store child process and PID
     let process_pid = child.pid();
-    *state.server_pid.lock().unwrap() = Some(process_pid);
-    *state.child.lock().unwrap() = Some(child);
+    {
+        let mut pid = state.server_pid.lock().unwrap();
+        let mut managed_child = state.child.lock().unwrap();
+        *pid = Some(process_pid);
+        *managed_child = Some(child);
+    }
 
     // Wait for server to be ready by listening for startup log
     // PyInstaller bundles can be slow on first import, especially torch/transformers
@@ -714,7 +743,10 @@ async fn start_server(
                 }
             }
 
-            return Err("Server startup timeout - check Console.app for detailed logs".to_string());
+            // Do not retain a failed startup as a managed, ready server.
+            // Stop only this launch if it still owns the stored process.
+            stop_server_if_owned(state.clone(), Some(process_pid)).await?;
+            return Err("Server startup timed out. Please retry; check Console.app if the problem persists.".to_string());
         }
 
         match tokio::time::timeout(tokio::time::Duration::from_millis(100), rx.recv()).await {
@@ -790,6 +822,7 @@ async fn start_server(
                     eprintln!("Server process ended unexpectedly during startup!");
                     eprintln!("The server binary may have crashed or exited with an error.");
                     eprintln!("Check Console.app logs for more details (search for 'voicebox')");
+                    server_process::take_process(&state.server_pid, &state.child, Some(process_pid));
                     return Err("Server process ended unexpectedly".to_string());
                 }
             }
@@ -831,51 +864,51 @@ async fn start_server(
 
 #[command]
 async fn stop_server(state: State<'_, ServerState>) -> Result<(), String> {
-    let pid = state.server_pid.lock().unwrap().take();
-    let _child = state.child.lock().unwrap().take();
-    
-    if let Some(pid) = pid {
-        println!("stop_server: Stopping server with PID: {}", pid);
-        
-        #[cfg(unix)]
-        {
-            use std::process::Command;
-            // Kill process group with SIGTERM first
-            let _ = Command::new("kill")
-                .args(["-TERM", "--", &format!("-{}", pid)])
-                .output();
-            
-            // Brief wait then force kill
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            
-            let _ = Command::new("kill")
-                .args(["-9", "--", &format!("-{}", pid)])
-                .output();
-            let _ = Command::new("kill")
-                .args(["-9", &pid.to_string()])
-                .output();
-            
-            println!("stop_server: Process group kill completed");
-        }
-        
-        #[cfg(windows)]
-        {
-            // Send graceful shutdown via HTTP — the server's parent-pid watchdog
-            // will also handle cleanup if this app process exits.
-            println!("Sending graceful shutdown via HTTP...");
-            let client = reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(2))
-                .build()
-                .unwrap();
+    stop_server_if_owned(state, None).await
+}
 
-            let _ = client
-                .post(&format!("http://127.0.0.1:{}/shutdown", SERVER_PORT))
-                .send();
+async fn stop_server_if_owned(
+    state: State<'_, ServerState>,
+    expected: Option<u32>,
+) -> Result<(), String> {
+    if let Some((pid, child)) =
+        server_process::take_process(&state.server_pid, &state.child, expected)
+    {
+        tokio::task::spawn_blocking(move || {
+            let _child = child;
+            println!("stop_server: Stopping server with PID: {}", pid);
 
-            println!("Shutdown request sent (server watchdog will handle cleanup)");
-        }
+            #[cfg(unix)]
+            {
+                use std::process::Command;
+                // Kill process group with SIGTERM first
+                let _ = Command::new("kill")
+                    .args(["-TERM", "--", &format!("-{}", pid)])
+                    .output();
+
+                // Brief wait then force kill
+                std::thread::sleep(std::time::Duration::from_millis(100));
+
+                let _ = Command::new("kill")
+                    .args(["-9", "--", &format!("-{}", pid)])
+                    .output();
+                let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
+
+                println!("stop_server: Process group kill completed");
+            }
+
+            #[cfg(windows)]
+            {
+                // Terminate the captured process tree, never a replacement
+                // server that may have acquired the fixed HTTP port.
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/T", "/F"])
+                    .output();
+            }
+        })
+        .await
+        .map_err(|error| format!("Failed to stop server: {}", error))?;
     }
-    
     Ok(())
 }
 

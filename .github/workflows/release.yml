@@ -109,7 +109,13 @@ jobs:
           suffix=""
           if [ "$RUNNER_OS" = "Windows" ]; then suffix=".exe"; fi
           for name in voicebox-server voicebox-mcp; do
-            cp "backend/dist/${name}${suffix}" "tauri/src-tauri/binaries/${name}-${TARGET}${suffix}"
+            if [ "$RUNNER_OS" = "macOS" ] && [ "$name" = "voicebox-server" ]; then
+              cp -R "backend/dist/${name}" "tauri/src-tauri/binaries/${name}"
+              codesign --force --deep --sign - --timestamp=none "tauri/src-tauri/binaries/${name}/_internal/Python.framework"
+              cp "backend/dist/${name}/${name}" "tauri/src-tauri/binaries/${name}-${TARGET}"
+            else
+              cp "backend/dist/${name}${suffix}" "tauri/src-tauri/binaries/${name}-${TARGET}${suffix}"
+            fi
           done
 
       - name: Build CUDA backend

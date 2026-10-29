@@ -243,3 +243,45 @@ test('autoplay respects native routing and native completion advances only once'
   expect(finish).toHaveBeenCalledTimes(1);
   expect(usePlayerStore.getState().isPlaying).toBe(false);
 });
+
+test('a delayed native pause cannot change a later selection of the same clip', async () => {
+  let session = 0;
+  playToDevices.mockImplementation(async () => ({
+    session_id: `selection-${++session}`,
+    duration: 5,
+    position: 0,
+  }));
+  usePlayerStore.getState().setAudioWithAutoPlay('/audio/a', 'a', 'profile');
+  await act(async () => {
+    renderer = create(<AudioPlayer />, {
+      createNodeMock: () => ({ getBoundingClientRect: () => ({ width: 800, height: 80 }) }),
+    });
+  });
+  let resolvePause!: () => void;
+  controlPlayback.mockImplementationOnce(
+    () =>
+      new Promise<void>((resolve) => {
+        resolvePause = resolve;
+      }),
+  );
+  let pause: Promise<void>;
+  await act(async () => {
+    pause = renderer!.root
+      .findAllByType('button')
+      .find((node) => node.props['aria-label'] === 'Pause')!
+      .props.onClick();
+    await Promise.resolve();
+  });
+  await act(async () => {
+    usePlayerStore.getState().setAudioWithAutoPlay('/audio/b', 'b', 'profile');
+  });
+  await act(async () => {
+    usePlayerStore.getState().setAudioWithAutoPlay('/audio/a', 'a', 'profile');
+  });
+  expect(usePlayerStore.getState().isPlaying).toBe(true);
+  await act(async () => {
+    resolvePause();
+    await pause;
+  });
+  expect(usePlayerStore.getState()).toMatchObject({ audioId: 'a', isPlaying: true, duration: 5 });
+});

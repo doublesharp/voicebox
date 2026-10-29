@@ -88,6 +88,12 @@ export interface GenerationRequest {
   crossfade_ms?: number;
   normalize?: boolean;
   effects_chain?: EffectConfig[];
+  /** Pitch-preserving speaking rate applied to generated audio. */
+  speed?: number;
+  /** Optional original Chatterbox sampling overrides; omitted preserves model defaults. */
+  chatterbox_temperature?: number;
+  chatterbox_cfg_weight?: number;
+  chatterbox_exaggeration?: number;
 }
 
 export interface GenerationVersionResponse {

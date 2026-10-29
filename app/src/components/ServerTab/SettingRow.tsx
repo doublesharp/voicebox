@@ -13,13 +13,15 @@ export function SettingSection({
   children: ReactNode;
 }) {
   return (
-    <div className="space-y-1">
-      {title && <h3 className="text-lg font-semibold">{title}</h3>}
-      {description && <p className="text-sm text-muted-foreground">{description}</p>}
-      <div className={`${title || description ? 'pt-3' : ''} space-y-0 divide-y divide-border/60`}>
+    <section className="space-y-2.5">
+      {title && <h3 className="text-sm font-semibold tracking-tight">{title}</h3>}
+      {description && (
+        <p className="text-xs leading-relaxed text-muted-foreground">{description}</p>
+      )}
+      <div className="overflow-hidden rounded-xl border border-border/70 bg-card/50 px-4 divide-y divide-border/50">
         {children}
       </div>
-    </div>
+    </section>
   );
 }
 
@@ -43,16 +45,20 @@ export function SettingRow({
   children?: ReactNode;
 }) {
   return (
-    <div className="py-3">
-      <div className="flex items-center justify-between gap-8">
+    <div className="py-4">
+      <div className="flex flex-wrap items-center justify-between gap-x-5 gap-y-3">
         <div className="min-w-0">
           <label
             htmlFor={htmlFor}
-            className={`text-sm font-medium leading-none select-none ${htmlFor ? 'cursor-pointer' : ''}`}
+            className={`text-sm font-medium leading-5 select-none ${htmlFor ? 'cursor-pointer' : ''}`}
           >
             {title}
           </label>
-          {description && <p className="text-sm text-muted-foreground mt-0.5">{description}</p>}
+          {description && (
+            <p className="text-xs leading-relaxed text-muted-foreground mt-1 break-words">
+              {description}
+            </p>
+          )}
         </div>
         {action && <div className="shrink-0">{action}</div>}
       </div>

@@ -34,6 +34,12 @@ export function CaptureInlinePlayer({
     const container = waveformRef.current;
     if (!container) return;
 
+    let active = true;
+    setIsLoading(true);
+    setError(null);
+    setCurrentTime(0);
+    setDuration(0);
+    setIsPlaying(false);
     const root = document.documentElement;
     const cssHsla = (varName: string, alpha: number) => {
       const value = getComputedStyle(root).getPropertyValue(varName).trim();
@@ -60,19 +66,30 @@ export function CaptureInlinePlayer({
     });
 
     ws.on('ready', () => {
+      if (!active) return;
       setDuration(ws.getDuration());
       setIsLoading(false);
       setError(null);
     });
-    ws.on('play', () => setIsPlaying(true));
-    ws.on('pause', () => setIsPlaying(false));
+    ws.on('play', () => {
+      if (active) setIsPlaying(true);
+    });
+    ws.on('pause', () => {
+      if (active) setIsPlaying(false);
+    });
     ws.on('finish', () => {
+      if (!active) return;
       setIsPlaying(false);
       setCurrentTime(ws.getDuration());
     });
-    ws.on('timeupdate', (t) => setCurrentTime(t));
-    ws.on('seeking', (t) => setCurrentTime(t));
+    ws.on('timeupdate', (t) => {
+      if (active) setCurrentTime(t);
+    });
+    ws.on('seeking', (t) => {
+      if (active) setCurrentTime(t);
+    });
     ws.on('error', (err) => {
+      if (!active) return;
       debug.error('Inline waveform error', err);
       setError(err instanceof Error ? err.message : String(err));
       setIsLoading(false);
@@ -80,35 +97,22 @@ export function CaptureInlinePlayer({
 
     wavesurferRef.current = ws;
 
+    ws.load(audioUrl).catch((err) => {
+      if (!active) return;
+      debug.error('Inline waveform load failed', err);
+      setError(err instanceof Error ? err.message : String(err));
+      setIsLoading(false);
+    });
+
     return () => {
+      active = false;
       try {
         ws.destroy();
       } catch (err) {
         debug.error('Failed to destroy inline waveform', err);
       }
-      wavesurferRef.current = null;
+      if (wavesurferRef.current === ws) wavesurferRef.current = null;
     };
-  }, []);
-
-  useEffect(() => {
-    const ws = wavesurferRef.current;
-    if (!ws) return;
-    setIsLoading(true);
-    setError(null);
-    setCurrentTime(0);
-    setDuration(0);
-    setIsPlaying(false);
-    try {
-      if (ws.isPlaying()) ws.pause();
-      ws.seekTo(0);
-    } catch (err) {
-      debug.error('Failed to reset inline waveform before load', err);
-    }
-    ws.load(audioUrl).catch((err) => {
-      debug.error('Inline waveform load failed', err);
-      setError(err instanceof Error ? err.message : String(err));
-      setIsLoading(false);
-    });
   }, [audioUrl]);
 
   const handlePlayPause = () => {
@@ -118,6 +122,7 @@ export function CaptureInlinePlayer({
       ws.pause();
     } else {
       ws.play().catch((err) => {
+        if (wavesurferRef.current !== ws) return;
         debug.error('Inline play failed', err);
         setError(err instanceof Error ? err.message : String(err));
       });

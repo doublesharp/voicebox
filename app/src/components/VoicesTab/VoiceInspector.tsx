@@ -1,6 +1,6 @@
 import { zodResolver } from '@hookform/resolvers/zod';
 import { Edit2, Mic, X } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
+import { type Ref, useEffect, useId, useImperativeHandle, useRef, useState } from 'react';
 import { useForm } from 'react-hook-form';
 import { useTranslation } from 'react-i18next';
 import * as z from 'zod';
@@ -14,7 +14,9 @@ import {
   FormLabel,
   FormMessage,
 } from '@/components/ui/form';
+import { FormSection } from '@/components/ui/form-section';
 import { Input } from '@/components/ui/input';
+import { InspectorPanel } from '@/components/ui/inspector-panel';
 import {
   Select,
   SelectContent,
@@ -25,18 +27,15 @@ import {
 import { Textarea } from '@/components/ui/textarea';
 import { useToast } from '@/components/ui/use-toast';
 import { SampleList } from '@/components/VoiceProfiles/SampleList';
-import { apiClient } from '@/lib/api/client';
-import type { EffectConfig } from '@/lib/api/types';
+import type { EffectConfig, VoiceProfileResponse } from '@/lib/api/types';
 import { LANGUAGE_CODES, LANGUAGE_OPTIONS, type LanguageCode } from '@/lib/constants/languages';
-import { BOTTOM_SAFE_AREA_PADDING } from '@/lib/constants/ui';
 import {
   useDeleteAvatar,
   useProfile,
   useUpdateProfile,
+  useUpdateProfileEffects,
   useUploadAvatar,
 } from '@/lib/hooks/useProfiles';
-import { cn } from '@/lib/utils/cn';
-import { usePlayerStore } from '@/stores/playerStore';
 import { useServerStore } from '@/stores/serverStore';
 
 function makeProfileSchema(t: (key: string) => string) {
@@ -55,14 +54,33 @@ type ProfileFormValues = {
 
 interface VoiceInspectorProps {
   profileId: string;
+  profileSummary?: Pick<VoiceProfileResponse, 'id' | 'sample_count' | 'generation_count'>;
+  overlay?: boolean;
+  onDirtyChange?: (dirty: boolean) => void;
+  onSavingChange?: (saving: boolean) => void;
+  actionsRef?: Ref<VoiceInspectorActions>;
 }
 
-export function VoiceInspector({ profileId }: VoiceInspectorProps) {
+export interface VoiceInspectorActions {
+  save: () => Promise<boolean>;
+  discard: () => void;
+  isSaving: () => boolean;
+}
+
+export function VoiceInspector({
+  profileId,
+  profileSummary,
+  overlay = false,
+  onDirtyChange,
+  onSavingChange,
+  actionsRef,
+}: VoiceInspectorProps) {
+  const formId = useId();
   const { t } = useTranslation();
   const { data: profile } = useProfile(profileId);
-  const audioUrl = usePlayerStore((state) => state.audioUrl);
-  const isPlayerVisible = !!audioUrl;
+  const summary = profileSummary?.id === profileId ? profileSummary : undefined;
   const updateProfile = useUpdateProfile();
+  const updateEffects = useUpdateProfileEffects();
   const uploadAvatar = useUploadAvatar();
   const deleteAvatar = useDeleteAvatar();
   const serverUrl = useServerStore((state) => state.serverUrl);
@@ -74,6 +92,24 @@ export function VoiceInspector({ profileId }: VoiceInspectorProps) {
 
   const [effectsChain, setEffectsChain] = useState<EffectConfig[]>([]);
   const [effectsDirty, setEffectsDirty] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const pendingSave = useRef<Promise<boolean> | null>(null);
+  const identity = useRef({ id: profileId, epoch: 0, mounted: true });
+  if (identity.current.id !== profileId) {
+    identity.current = { id: profileId, epoch: identity.current.epoch + 1, mounted: true };
+  }
+  const effectsRevision = useRef(0);
+  const initializedProfile = useRef<string | null>(null);
+  const savedEffectsAwaitingRefetch = useRef<EffectConfig[] | null>(null);
+  const savedFormAwaitingRefetch = useRef<ProfileFormValues | null>(null);
+  const isCurrent = (epoch: number) => identity.current.mounted && identity.current.epoch === epoch;
+  useEffect(() => {
+    identity.current.mounted = true;
+    return () => {
+      identity.current.mounted = false;
+      identity.current.epoch++;
+    };
+  }, []);
 
   const form = useForm<ProfileFormValues>({
     resolver: zodResolver(makeProfileSchema(t)),
@@ -84,18 +120,41 @@ export function VoiceInspector({ profileId }: VoiceInspectorProps) {
     },
   });
 
-  // Populate form when profile loads
+  // Refetches may update clean data, but must never discard a draft.
   useEffect(() => {
-    if (profile) {
-      form.reset({
-        name: profile.name,
-        description: profile.description || '',
-        language: profile.language as LanguageCode,
-      });
-      setEffectsChain(profile.effects_chain ?? []);
+    if (!profile || profile.id !== profileId) return;
+    const changedProfile = initializedProfile.current !== profileId;
+    if (changedProfile) {
+      savedFormAwaitingRefetch.current = null;
+      savedEffectsAwaitingRefetch.current = null;
+    }
+    const refetchedForm = {
+      name: profile.name,
+      description: profile.description || '',
+      language: profile.language as LanguageCode,
+    };
+    const awaitingForm = savedFormAwaitingRefetch.current;
+    const confirmedForm =
+      awaitingForm && JSON.stringify(awaitingForm) === JSON.stringify(refetchedForm);
+    if (confirmedForm) savedFormAwaitingRefetch.current = null;
+    if (changedProfile || (!form.formState.isDirty && (!awaitingForm || confirmedForm))) {
+      form.reset(refetchedForm);
+    }
+    const refetchedEffects = profile.effects_chain ?? [];
+    const awaitingEffects = savedEffectsAwaitingRefetch.current;
+    const confirmedEffects =
+      awaitingEffects && JSON.stringify(awaitingEffects) === JSON.stringify(refetchedEffects);
+    if (confirmedEffects) savedEffectsAwaitingRefetch.current = null;
+    if (changedProfile || (!effectsDirty && (!awaitingEffects || confirmedEffects))) {
+      setEffectsChain(refetchedEffects);
       setEffectsDirty(false);
     }
-  }, [profile, form]);
+    if (changedProfile) {
+      initializedProfile.current = profileId;
+      effectsRevision.current++;
+      setSaving(false);
+    }
+  }, [profile, profileId, form, effectsDirty]);
 
   // Avatar preview
   useEffect(() => {
@@ -126,14 +185,17 @@ export function VoiceInspector({ profileId }: VoiceInspectorProps) {
       });
       return;
     }
+    const epoch = identity.current.epoch;
     uploadAvatar.mutate(
       { profileId, file },
       {
         onSuccess: () => {
+          if (!isCurrent(epoch)) return;
           setAvatarPreview(URL.createObjectURL(file));
           toast({ title: t('voiceInspector.toast.avatarUpdated') });
         },
         onError: (err) => {
+          if (!isCurrent(epoch)) return;
           toast({
             title: t('profileForm.toast.avatarUploadFailed'),
             description: err instanceof Error ? err.message : t('common.unknownError'),
@@ -145,23 +207,31 @@ export function VoiceInspector({ profileId }: VoiceInspectorProps) {
   }
 
   async function handleRemoveAvatar() {
+    const epoch = identity.current.epoch;
     if (profile?.avatar_path) {
       try {
         await deleteAvatar.mutateAsync(profileId);
+        if (!isCurrent(epoch)) return;
         toast({ title: t('profileForm.toast.avatarRemoved') });
       } catch (err) {
+        if (!isCurrent(epoch)) return;
         toast({
           title: t('profileForm.toast.avatarRemoveFailed'),
           description: err instanceof Error ? err.message : t('common.unknownError'),
           variant: 'destructive',
         });
+        return;
       }
     }
+    if (!isCurrent(epoch)) return;
     setAvatarPreview(null);
     if (avatarInputRef.current) avatarInputRef.current.value = '';
   }
 
-  async function onSubmit(data: ProfileFormValues) {
+  async function persistProfile(data: ProfileFormValues): Promise<boolean> {
+    const epoch = identity.current.epoch;
+    const revision = effectsRevision.current;
+    setSaving(true);
     try {
       await updateProfile.mutateAsync({
         profileId,
@@ -172,14 +242,29 @@ export function VoiceInspector({ profileId }: VoiceInspectorProps) {
         },
       });
 
+      if (isCurrent(epoch)) {
+        savedFormAwaitingRefetch.current = { ...data, description: data.description || '' };
+        // Rebase against the acknowledged write while preserving any newer
+        // typing, including a return to the original value during the request.
+        const latest = form.getValues();
+        form.reset(data, { keepErrors: true, keepTouched: true });
+        form.setValue('name', latest.name, { shouldDirty: true });
+        form.setValue('description', latest.description, { shouldDirty: true });
+        form.setValue('language', latest.language, { shouldDirty: true });
+      }
+
       if (effectsDirty) {
         try {
-          await apiClient.updateProfileEffects(
+          await updateEffects.mutateAsync({
             profileId,
-            effectsChain.length > 0 ? effectsChain : null,
-          );
-          setEffectsDirty(false);
+            effectsChain: effectsChain.length > 0 ? effectsChain : null,
+          });
+          if (isCurrent(epoch)) {
+            savedEffectsAwaitingRefetch.current = effectsChain;
+            if (effectsRevision.current === revision) setEffectsDirty(false);
+          }
         } catch (fxError) {
+          if (!identity.current.mounted) return false;
           toast({
             title: t('profileForm.toast.effectsUpdateFailed'),
             description:
@@ -188,24 +273,72 @@ export function VoiceInspector({ profileId }: VoiceInspectorProps) {
                 : t('profileForm.toast.effectsUpdateFailedFallback'),
             variant: 'destructive',
           });
-          return;
+          return false;
         }
       }
 
+      if (!isCurrent(epoch)) return false;
       toast({
         title: t('profileForm.toast.voiceUpdated'),
         description: t('voiceInspector.toast.savedDescription', { name: data.name }),
       });
+      return (
+        JSON.stringify(form.getValues()) === JSON.stringify(data) &&
+        effectsRevision.current === revision
+      );
     } catch (error) {
+      if (!identity.current.mounted) return false;
       toast({
         title: t('common.error'),
         description: error instanceof Error ? error.message : t('profileForm.toast.saveFailed'),
         variant: 'destructive',
       });
+      return false;
+    } finally {
+      if (isCurrent(epoch)) setSaving(false);
     }
   }
 
-  if (!profile) {
+  function onSubmit(data: ProfileFormValues): Promise<boolean> {
+    // Footer, Enter and navigation confirmation share one synchronous lock.
+    if (pendingSave.current) return pendingSave.current.then(() => false);
+    const operation = persistProfile(data).finally(() => {
+      if (pendingSave.current === operation) pendingSave.current = null;
+    });
+    pendingSave.current = operation;
+    return operation;
+  }
+
+  const isDirty = form.formState.isDirty || effectsDirty || saving;
+  useEffect(() => onDirtyChange?.(isDirty), [isDirty, onDirtyChange]);
+  useEffect(() => onSavingChange?.(saving), [saving, onSavingChange]);
+  function discard() {
+    if (pendingSave.current) return;
+    if (!profile || profile.id !== profileId) return;
+    form.reset(
+      savedFormAwaitingRefetch.current ?? {
+        name: profile.name,
+        description: profile.description || '',
+        language: profile.language as LanguageCode,
+      },
+    );
+    effectsRevision.current++;
+    setEffectsChain(savedEffectsAwaitingRefetch.current ?? profile.effects_chain ?? []);
+    setEffectsDirty(false);
+  }
+  useImperativeHandle(actionsRef, () => ({
+    discard,
+    isSaving: () => !!pendingSave.current,
+    save: async () => {
+      let saved = false;
+      await form.handleSubmit(async (data) => {
+        saved = await onSubmit(data);
+      })();
+      return saved;
+    },
+  }));
+
+  if (!profile || profile.id !== profileId) {
     return (
       <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
         {t('voiceInspector.loading')}
@@ -213,67 +346,110 @@ export function VoiceInspector({ profileId }: VoiceInspectorProps) {
     );
   }
 
-  const isDirty = form.formState.isDirty || effectsDirty;
-
   return (
-    <div className="h-full flex flex-col overflow-hidden">
-      <div className={cn('flex-1 overflow-y-auto', isPlayerVisible && BOTTOM_SAFE_AREA_PADDING)}>
-        <Form {...form}>
-          <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-0">
-            {/* Avatar */}
-            <div className="flex justify-center pt-5 pb-3">
-              <div className="relative group">
-                <div className="h-20 w-20 rounded-full bg-muted flex items-center justify-center shrink-0 overflow-hidden border-2 border-border">
-                  {avatarPreview && !avatarError ? (
-                    <img
-                      src={avatarPreview}
-                      alt={profile.name}
-                      className="h-full w-full object-cover"
-                      onError={() => setAvatarError(true)}
-                    />
-                  ) : (
-                    <Mic className="h-8 w-8 text-muted-foreground" />
-                  )}
-                </div>
-                <button
-                  type="button"
-                  onClick={() => avatarInputRef.current?.click()}
-                  className="absolute inset-0 rounded-full bg-accent/60 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center cursor-pointer"
-                >
-                  <Edit2 className="h-5 w-5 text-accent-foreground" />
-                </button>
-                {avatarPreview && (
-                  <button
-                    type="button"
-                    onClick={handleRemoveAvatar}
-                    disabled={deleteAvatar.isPending}
-                    className="absolute bottom-0 right-0 h-5 w-5 rounded-full bg-background/60 backdrop-blur-sm text-muted-foreground flex items-center justify-center hover:bg-background/80 hover:text-foreground transition-colors shadow-sm border border-border/50"
-                  >
-                    <X className="h-3 w-3" />
-                  </button>
-                )}
-              </div>
-              <input
-                ref={avatarInputRef}
-                type="file"
-                accept="image/png,image/jpeg,image/webp"
-                onChange={handleAvatarFileChange}
-                className="hidden"
-              />
-            </div>
-
-            {/* Fields */}
-            <div className="space-y-3 px-5">
+    <InspectorPanel
+      title={profile.name}
+      subtitle={[
+        profile.language.toUpperCase(),
+        // The detail endpoint uses zero defaults rather than aggregate counts.
+        // Only the matching library summary establishes samples and take totals.
+        ...(summary
+          ? [`${summary.sample_count} samples`, `${summary.generation_count} takes`]
+          : []),
+      ].join(' · ')}
+      overlay={overlay}
+      icon={
+        <button
+          type="button"
+          onClick={() => avatarInputRef.current?.click()}
+          aria-label={t('voiceInspector.changeAvatar', { defaultValue: 'Change avatar' })}
+          title={t('voiceInspector.changeAvatar', { defaultValue: 'Change avatar' })}
+          className="relative flex h-10 w-10 items-center justify-center rounded-xl border border-accent/20 bg-accent/10 text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+        >
+          {avatarPreview && !avatarError ? (
+            <img
+              src={avatarPreview}
+              alt=""
+              className="h-full w-full rounded-xl object-cover"
+              onError={() => setAvatarError(true)}
+            />
+          ) : (
+            <Mic className="h-5 w-5" />
+          )}
+          <Edit2 className="absolute -bottom-1 -right-1 h-4 w-4 rounded bg-background p-0.5" />
+        </button>
+      }
+      actions={
+        avatarPreview && (
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-7 w-7"
+            onClick={handleRemoveAvatar}
+            disabled={deleteAvatar.isPending}
+            aria-label={t('voiceInspector.removeAvatar', { defaultValue: 'Remove avatar' })}
+          >
+            <X className="h-3.5 w-3.5" />
+          </Button>
+        )
+      }
+      footer={
+        <>
+          <span className="text-xs text-muted-foreground">
+            {isDirty
+              ? t('voiceInspector.unsaved', { defaultValue: 'Unsaved changes' })
+              : t('voiceInspector.saved', { defaultValue: 'All changes saved' })}
+          </span>
+          <div className="flex items-center gap-1.5">
+            {isDirty && (
+              <Button
+                type="button"
+                size="sm"
+                variant="ghost"
+                disabled={saving || updateProfile.isPending}
+                onClick={discard}
+              >
+                {t('voiceInspector.discard', { defaultValue: 'Discard' })}
+              </Button>
+            )}
+            <Button
+              form={formId}
+              type="submit"
+              size="sm"
+              disabled={!isDirty || saving || updateProfile.isPending}
+            >
+              {saving || updateProfile.isPending
+                ? t('profileForm.actions.saving')
+                : t('common.save')}
+            </Button>
+          </div>
+        </>
+      }
+    >
+      <input
+        ref={avatarInputRef}
+        type="file"
+        accept="image/png,image/jpeg,image/webp"
+        onChange={handleAvatarFileChange}
+        className="hidden"
+      />
+      <Form {...form}>
+        <form id={formId} onSubmit={form.handleSubmit(onSubmit)} className="space-y-0">
+          {/* Fields */}
+          <div className="space-y-5 px-5 py-5">
+            <FormSection
+              title={t('profileForm.sections.identity', { defaultValue: 'Profile details' })}
+            >
               <FormField
                 control={form.control}
                 name="name"
                 render={({ field }) => (
-                  <FormItem>
+                  <FormItem className="grid grid-cols-[80px_minmax(0,1fr)] items-center gap-x-3 space-y-0">
                     <FormLabel>{t('profileForm.fields.name')}</FormLabel>
                     <FormControl>
                       <Input placeholder={t('profileForm.fields.namePlaceholder')} {...field} />
                     </FormControl>
-                    <FormMessage />
+                    <FormMessage className="col-start-2" />
                   </FormItem>
                 )}
               />
@@ -300,7 +476,7 @@ export function VoiceInspector({ profileId }: VoiceInspectorProps) {
                 control={form.control}
                 name="language"
                 render={({ field }) => (
-                  <FormItem>
+                  <FormItem className="grid grid-cols-[80px_minmax(0,1fr)] items-center gap-x-3 space-y-0">
                     <FormLabel>{t('profileForm.fields.language')}</FormLabel>
                     <Select onValueChange={field.onChange} value={field.value}>
                       <FormControl>
@@ -316,44 +492,43 @@ export function VoiceInspector({ profileId }: VoiceInspectorProps) {
                         ))}
                       </SelectContent>
                     </Select>
-                    <FormMessage />
+                    <FormMessage className="col-start-2" />
                   </FormItem>
                 )}
               />
-
-              {/* Effects */}
-              <div className="space-y-2">
-                <FormLabel>{t('profileForm.fields.defaultEffects')}</FormLabel>
-                <p className="text-xs text-muted-foreground">
-                  {t('voiceInspector.defaultEffectsHint')}
-                </p>
-                <EffectsChainEditor
-                  value={effectsChain}
-                  onChange={(chain) => {
-                    setEffectsChain(chain);
-                    setEffectsDirty(true);
-                  }}
-                  compact
-                />
-              </div>
-
-              {/* Save */}
-              {isDirty && (
-                <Button type="submit" className="w-full" disabled={updateProfile.isPending}>
-                  {updateProfile.isPending
-                    ? t('profileForm.actions.saving')
-                    : t('profileForm.actions.saveChanges')}
-                </Button>
-              )}
-            </div>
-
-            {/* Samples */}
-            <div className="px-5 pb-5">
+            </FormSection>
+            <FormSection
+              title={t('voiceInspector.samples', { defaultValue: 'Reference samples' })}
+              description={t('voiceInspector.samplesHelp', {
+                defaultValue:
+                  'Use clean speech from one speaker, without music or background noise.',
+              })}
+              className="border-t border-border/60 pt-5"
+            >
               <SampleList profileId={profileId} />
-            </div>
-          </form>
-        </Form>
-      </div>
-    </div>
+            </FormSection>
+            {/* Effects */}
+            <FormSection
+              title={t('profileForm.fields.defaultEffects')}
+              description={t('voiceInspector.effectsHelp', {
+                defaultValue:
+                  'Applied automatically with this voice. A preset selected in Generate replaces them for that take.',
+              })}
+              className="border-t border-border/60 pt-5"
+            >
+              <EffectsChainEditor
+                value={effectsChain}
+                onChange={(chain) => {
+                  effectsRevision.current++;
+                  setEffectsChain(chain);
+                  setEffectsDirty(true);
+                }}
+                compact
+              />
+            </FormSection>
+          </div>
+        </form>
+      </Form>
+    </InspectorPanel>
   );
 }

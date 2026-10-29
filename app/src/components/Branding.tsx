@@ -1,22 +1,13 @@
 import '@/features/studio/visuals.css';
 import doubleSharpLogo from '@/assets/doublesharp-logo.png';
+import doubleSharpMark from '@/assets/doublesharp-mark.png';
 import { APP_BRANDING } from '@/lib/constants/branding';
 import { cn } from '@/lib/utils/cn';
 
 export function DoubleSharpMark({ className }: { className?: string }) {
   return (
-    <span
-      aria-hidden="true"
-      className={cn(
-        'doublesharp-pulse relative inline-block h-7 w-7 shrink-0 overflow-hidden rounded-full bg-black',
-        className,
-      )}
-    >
-      <img
-        src={doubleSharpLogo}
-        alt=""
-        className="absolute top-0 left-0 h-full w-auto max-w-none"
-      />
+    <span aria-hidden="true" className={cn('inline-block h-7 w-7 shrink-0', className)}>
+      <img src={doubleSharpMark} alt="" className="h-full w-full object-contain" />
     </span>
   );
 }

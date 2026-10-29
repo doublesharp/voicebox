@@ -192,7 +192,10 @@ export function EffectsChainEditor({
               if (preset) loadPreset(preset);
             }}
           >
-            <SelectTrigger className="h-8 flex-1 text-xs focus:ring-0 focus:ring-offset-0">
+            <SelectTrigger
+              aria-label={t('effects.chain.loadPreset')}
+              className="h-9 flex-1 text-xs"
+            >
               <SelectValue placeholder={t('effects.chain.loadPreset')} />
             </SelectTrigger>
             <SelectContent>
@@ -256,7 +259,10 @@ export function EffectsChainEditor({
       {/* Add effect */}
       {availableEffects && (
         <Select onValueChange={addEffect} disabled={disabled}>
-          <SelectTrigger className="h-8 border-dashed text-xs text-muted-foreground focus:ring-0 focus:ring-offset-0">
+          <SelectTrigger
+            aria-label={t('effects.chain.addEffect')}
+            className="h-9 border-dashed bg-transparent text-xs text-muted-foreground hover:bg-muted/40"
+          >
             <Plus className="mr-1 h-3.5 w-3.5" />
             <SelectValue placeholder={t('effects.chain.addEffect')} />
           </SelectTrigger>
@@ -295,6 +301,7 @@ interface SortableEffectItemProps {
 
 function SortableEffectItem({
   id,
+  index,
   effect,
   effectDef,
   isExpanded,
@@ -326,15 +333,23 @@ function SortableEffectItem({
       ref={setNodeRef}
       style={style}
       className={cn(
-        'rounded-md border',
+        'rounded-lg border overflow-hidden',
         effect.enabled ? 'border-border bg-card' : 'border-border/50 bg-muted/30',
         isDragging && 'opacity-80 shadow-lg',
       )}
     >
       {/* Header */}
       <div className="flex items-center gap-1 px-2 py-1.5">
+        <span
+          aria-hidden="true"
+          className="mr-1 flex h-4 w-4 shrink-0 items-center justify-center rounded bg-accent/10 font-mono text-[10px] text-accent"
+        >
+          {index + 1}
+        </span>
         <button
           type="button"
+          aria-expanded={isExpanded}
+          aria-label={`${isExpanded ? t('effects.chain.collapse', { defaultValue: 'Collapse' }) : t('effects.chain.expand', { defaultValue: 'Expand' })} ${label}`}
           className="p-0.5 text-muted-foreground hover:text-foreground"
           onClick={onToggleExpand}
         >
@@ -347,6 +362,7 @@ function SortableEffectItem({
 
         <button
           type="button"
+          aria-label={t('effects.chain.reorder', { defaultValue: 'Reorder effect' })}
           className="p-0.5 text-muted-foreground/50 hover:text-muted-foreground cursor-grab active:cursor-grabbing touch-none"
           {...attributes}
           {...listeners}

@@ -6,6 +6,7 @@ from typing import Any
 import numpy as np
 
 from .audio import normalize_audio, protect_audio_peak
+from .speech_delivery import apply_speed
 
 
 def effects_chain_from_config(value: Any) -> list[dict[str, Any]] | None:
@@ -33,6 +34,7 @@ def process_generated_audio(
     *,
     normalize: bool = True,
     effects_chain: list[dict[str, Any]] | None = None,
+    speed: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return clean and processed versions using the same output policy.
 
@@ -40,6 +42,7 @@ def process_generated_audio(
     and attenuate hot peaks before either version is encoded as integer PCM.
     Normalization disabled still means no automatic boost to quiet recordings.
     """
+    audio = apply_speed(audio, sample_rate, speed)
     clean = normalize_audio(audio) if normalize else protect_audio_peak(audio)
     if not effects_chain or not any(effect.get("enabled", True) for effect in effects_chain):
         return clean, clean

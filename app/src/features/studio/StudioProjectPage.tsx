@@ -31,6 +31,8 @@ import {
   DialogTrigger,
 } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
+import { Hint } from '@/components/ui/Hint';
+import { HelpButton } from '@/components/ui/HelpButton';
 import { stopNative } from '@/lib/audio/playbackOwnership';
 import { usePlatform } from '@/platform/PlatformContext';
 import { usePlayerStore } from '@/stores/playerStore';
@@ -581,16 +583,33 @@ function ProjectWorkspace({
         <div className="studio-workspace-bar">
           <nav className="studio-workspace-tabs" aria-label="Project workspace">
             {(['edit', 'mix', 'review'] as const).map((mode, index) => (
-              <Link
+              <Hint
                 key={mode}
-                to="/studio/projects/$projectId/$workspace"
-                params={{ projectId, workspace: mode }}
-                className={workspace === mode ? 'is-active' : ''}
-                aria-current={workspace === mode ? 'page' : undefined}
+                content={
+                  { edit: 'Script & takes', mix: 'Arrange & mix', review: 'Review & approve' }[mode]
+                }
               >
-                <span className="studio-workspace-number">0{index + 1}</span>
-                {mode[0].toUpperCase() + mode.slice(1)}
-              </Link>
+                <Link
+                  to="/studio/projects/$projectId/$workspace"
+                  params={{ projectId, workspace: mode }}
+                  className={workspace === mode ? 'is-active' : ''}
+                  aria-current={workspace === mode ? 'page' : undefined}
+                >
+                  <span className="studio-workspace-number">0{index + 1}</span>
+                  <span>
+                    {mode[0].toUpperCase() + mode.slice(1)}
+                    <small className="app-workspace-description">
+                      {
+                        {
+                          edit: 'Script & takes',
+                          mix: 'Arrange & mix',
+                          review: 'Review & approve',
+                        }[mode]
+                      }
+                    </small>
+                  </span>
+                </Link>
+              </Hint>
             ))}
           </nav>
           <select
@@ -606,6 +625,9 @@ function ProjectWorkspace({
               </option>
             ))}
           </select>
+          <HelpButton label="About checkpoints">
+            A checkpoint is a saved, unchangeable version you can review, restore or deliver.
+          </HelpButton>
           <div className="studio-action-row">
             <button
               type="button"

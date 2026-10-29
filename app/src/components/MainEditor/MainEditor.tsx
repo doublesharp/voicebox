@@ -1,6 +1,7 @@
 import { Sparkles, Upload } from 'lucide-react';
 import { useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { DoubleSharpMark } from '@/components/Branding';
 import { FloatingGenerateBox } from '@/components/Generation/FloatingGenerateBox';
 import { HistoryTable } from '@/components/History/HistoryTable';
 import { Button } from '@/components/ui/button';
@@ -13,18 +14,14 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { useToast } from '@/components/ui/use-toast';
-import { ProfileList } from '@/components/VoiceProfiles/ProfileList';
+import { ProfileForm } from '@/components/VoiceProfiles/ProfileForm';
 
-import { useImportProfile } from '@/lib/hooks/useProfiles';
-import { cn } from '@/lib/utils/cn';
-import { usePlayerStore } from '@/stores/playerStore';
+import { useImportProfile, useProfiles } from '@/lib/hooks/useProfiles';
 import { useUIStore } from '@/stores/uiStore';
 
 export function MainEditor() {
   const { t } = useTranslation();
-  const audioUrl = usePlayerStore((state) => state.audioUrl);
-  const isPlayerVisible = !!audioUrl;
-  const scrollRef = useRef<HTMLDivElement>(null);
+  const { data: profiles, isLoading: profilesLoading, error: profilesError } = useProfiles();
   const setDialogOpen = useUIStore((state) => state.setProfileDialogOpen);
   const importProfile = useImportProfile();
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -79,54 +76,69 @@ export function MainEditor() {
 
   return (
     <div
-      className={cn(
-        'grid grid-cols-1 lg:grid-cols-2 lg:gap-6 h-full min-h-0 overflow-y-auto lg:overflow-hidden relative lg:pb-0',
-        isPlayerVisible ? 'pb-64' : 'pb-36',
-      )}
+      className="h-full min-h-0 overflow-y-auto"
+      style={{ paddingBottom: 'calc(var(--app-player-height) + 1.5rem)' }}
     >
-      <div className="flex flex-col min-h-[300px] lg:min-h-0 overflow-hidden relative lg:overflow-hidden">
-        <div className="absolute top-0 left-0 right-0 h-16 bg-gradient-to-b from-background to-transparent z-0 pointer-events-none" />
-
-        <div className="absolute top-0 left-0 right-0 z-10">
-          <div className="flex items-center justify-between mb-4 px-1">
-            <h2 className="text-2xl font-bold">Voicebox</h2>
-            <div className="flex gap-2">
-              <Button variant="outline" onClick={handleImportClick}>
-                <Upload className="mr-2 h-4 w-4" />
-                {t('main.importVoice')}
-              </Button>
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept=".voicebox.zip"
-                onChange={handleFileChange}
-                className="hidden"
-              />
-              <Button onClick={() => setDialogOpen(true)}>
-                <Sparkles className="mr-2 h-4 w-4" />
-                {t('main.createVoice')}
+      <header className="mb-5 flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <h1 className="text-xl font-semibold">Generate</h1>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Create speech and listen to your recent takes.
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Button variant="outline" className="h-9 rounded-lg" onClick={handleImportClick}>
+            <Upload className="mr-2 h-4 w-4" />
+            {t('main.importVoice')}
+          </Button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".voicebox.zip"
+            onChange={handleFileChange}
+            className="hidden"
+          />
+          <Button variant="outline" className="h-9 rounded-lg" onClick={() => setDialogOpen(true)}>
+            <Sparkles className="mr-2 h-4 w-4" />
+            {t('main.createVoice')}
+          </Button>
+        </div>
+      </header>
+      <div className="grid grid-cols-1 gap-6 min-[1100px]:grid-cols-[minmax(0,1.1fr)_minmax(0,1fr)]">
+        <section className="min-w-0" aria-label="Generate speech">
+          {profilesError && (
+            <p role="alert" className="mb-4 text-sm text-destructive">
+              {t('profiles.list.errorLoading', { message: profilesError.message })}
+            </p>
+          )}
+          {!profilesLoading && !profilesError && profiles?.length === 0 && (
+            <div className="mb-4 flex items-center gap-3 rounded-[10px] border border-border/60 bg-card/40 p-4">
+              <DoubleSharpMark className="h-10 w-10 opacity-60" />
+              <div>
+                <p className="text-sm font-medium">Create your first voice</p>
+                <p className="text-xs text-muted-foreground">
+                  Create or import a voice to start generating speech.
+                </p>
+              </div>
+              <Button
+                variant="outline"
+                className="ml-auto h-9 rounded-lg"
+                onClick={() => setDialogOpen(true)}
+              >
+                Create voice
               </Button>
             </div>
-          </div>
-        </div>
-
-        <div
-          ref={scrollRef}
-          className={cn('flex-1 min-h-0 overflow-y-auto pt-14 pb-4', isPlayerVisible && 'lg:pb-32')}
-        >
-          <div className="flex flex-col gap-6">
-            <div className="shrink-0 flex flex-col">
-              <ProfileList />
-            </div>
-          </div>
-        </div>
+          )}
+          <FloatingGenerateBox layout="docked" />
+        </section>
+        <section className="min-w-0" aria-labelledby="recent-takes-title">
+          <h2 id="recent-takes-title" className="mb-3 text-[15px] font-semibold">
+            Recent takes
+          </h2>
+          <HistoryTable embedded />
+        </section>
       </div>
-
-      <div className="flex flex-col min-h-[160px] lg:min-h-0 overflow-hidden">
-        <HistoryTable />
-      </div>
-
-      <FloatingGenerateBox isPlayerOpen={!!audioUrl} />
+      <ProfileForm />
 
       <Dialog open={importDialogOpen} onOpenChange={setImportDialogOpen}>
         <DialogContent>
