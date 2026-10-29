@@ -47,8 +47,9 @@ All 117 checks completed and production source remained stable during the run.
 This includes local AI preview, model management, speech review, shortcut-conflict
 handling and existing Studio/upstream regressions.
 
-Subsequent published model-download UI changes passed 31 affected integration
-tests, TypeScript and production bundling after merging. That focused run does
+Subsequent published profile and model-download UI changes passed 19 profile
+and 31 model-management integration tests, TypeScript and production bundling
+after merging. That focused run does
 not establish a new whole-frontend coverage percentage; the table below belongs
 to the consolidated source snapshot above.
 

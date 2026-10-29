@@ -85,8 +85,9 @@ separately. Production and test sources remained stable during the run.
 
 A consolidated frontend run at `bac3af1` passed **760 tests in 116 isolated
 files** plus TypeScript, with **74.81% whole-frontend line coverage**. Later
-published model-download UI fixes passed 31 affected integration tests,
-TypeScript and a fresh production frontend build after merging. The native suite
+published profile and model-download UI fixes passed 19 profile and 31 model
+management integration tests, TypeScript and a fresh production frontend build
+after merging. The native suite
 passed **56 tests**, with two intentional host-only skips. Scoped independent review
 accepted the preview ownership, portable speech-review and pinned-readiness
 fixes, including their backend merge interactions. The tracked-source audit
