@@ -756,10 +756,7 @@ async def upload_avatar(
     if not is_valid:
         raise ValueError(error_msg)
 
-    if profile.avatar_path:
-        old_avatar = config.resolve_storage_path(profile.avatar_path)
-        if old_avatar is not None and old_avatar.exists():
-            old_avatar.unlink()
+    old_avatar = config.resolve_storage_path(profile.avatar_path)
 
     # Determine file extension from uploaded file
     from PIL import Image
@@ -775,14 +772,20 @@ async def upload_avatar(
 
     profile_dir = config.get_profiles_dir() / profile_id
     profile_dir.mkdir(parents=True, exist_ok=True)
-    output_path = profile_dir / f"avatar{ext}"
+    output_path = profile_dir / f"avatar-{uuid.uuid4().hex}{ext}"
 
-    process_avatar(image_path, str(output_path))
+    try:
+        process_avatar(image_path, str(output_path))
+        profile.avatar_path = config.to_storage_path(output_path)
+        profile.updated_at = datetime.now(UTC)
+        db.commit()
+    except Exception:
+        db.rollback()
+        output_path.unlink(missing_ok=True)
+        raise
 
-    profile.avatar_path = config.to_storage_path(output_path)
-    profile.updated_at = datetime.now(UTC)
-
-    db.commit()
+    if old_avatar is not None:
+        history._remove_deleted_audio({old_avatar}, db)
     db.refresh(profile)
 
     return _profile_to_response(profile)
@@ -807,12 +810,14 @@ async def delete_avatar(
         return False
 
     avatar_path = config.resolve_storage_path(profile.avatar_path)
-    if avatar_path is not None and avatar_path.exists():
-        avatar_path.unlink()
-
     profile.avatar_path = None
     profile.updated_at = datetime.now(UTC)
-
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    if avatar_path is not None:
+        history._remove_deleted_audio({avatar_path}, db)
 
     return True
