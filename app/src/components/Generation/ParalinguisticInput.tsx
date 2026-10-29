@@ -64,19 +64,48 @@ function textToHTML(text: string): string {
 /** Serialize the contentEditable innerHTML back to plain text with [tag] syntax. */
 function htmlToText(container: HTMLElement): string {
   let result = '';
+  let previousBlock = false;
+  let previousBlockEmpty = false;
+  const separateBlock = () => {
+    if ((result.length > 0 || previousBlock) && (!result.endsWith('\n') || previousBlockEmpty)) {
+      result += '\n';
+    }
+  };
   for (const node of container.childNodes) {
     if (node.nodeType === Node.TEXT_NODE) {
-      // Strip zero-width spaces we added around badges
-      result += (node.textContent ?? '').replace(/\u200B/g, '');
+      const content = (node.textContent ?? '').replace(/\u200B/g, '');
+      if (!content) continue;
+      if (previousBlock) separateBlock();
+      result += content;
+      previousBlock = false;
+      previousBlockEmpty = false;
     } else if (node.nodeType === Node.ELEMENT_NODE) {
       const el = node as HTMLElement;
       if (el.hasAttribute(BADGE_ATTR)) {
+        if (previousBlock) separateBlock();
         result += el.getAttribute(BADGE_ATTR) ?? '';
+        previousBlock = false;
+        previousBlockEmpty = false;
       } else if (el.tagName === 'BR') {
         result += '\n';
+        previousBlock = false;
+        previousBlockEmpty = false;
+      } else if (el.tagName === 'DIV' || el.tagName === 'P') {
+        separateBlock();
+        // Browsers use a lone BR as a placeholder for an empty editable line.
+        const placeholder =
+          el.childNodes.length === 1 && (el.childNodes[0] as HTMLElement).tagName === 'BR';
+        const content = placeholder ? '' : htmlToText(el);
+        result += content;
+        previousBlock = true;
+        previousBlockEmpty = content.length === 0;
       } else {
-        // Recurse for nested elements (e.g. spans from paste)
-        result += htmlToText(el);
+        const content = htmlToText(el);
+        if (!content) continue;
+        if (previousBlock) separateBlock();
+        result += content;
+        previousBlock = false;
+        previousBlockEmpty = false;
       }
     }
   }
@@ -150,6 +179,14 @@ export const ParalinguisticInput = forwardRef<ParalinguisticInputRef, Paralingui
     const menuListRef = useRef<HTMLDivElement | null>(null);
     const lastSerializedRef = useRef<string>('');
     const isComposingRef = useRef(false);
+
+    useEffect(() => {
+      if (disabled) {
+        isComposingRef.current = false;
+        triggerRangeRef.current = null;
+        setShowMenu(false);
+      }
+    }, [disabled]);
 
     useImperativeHandle(ref, () => ({
       focus: () => editorRef.current?.focus(),
@@ -386,13 +423,21 @@ export const ParalinguisticInput = forwardRef<ParalinguisticInputRef, Paralingui
             setShowMenu(false);
             triggerRangeRef.current = null;
           }}
-          onCompositionStart={() => {
-            isComposingRef.current = true;
-          }}
-          onCompositionEnd={() => {
-            isComposingRef.current = false;
-            handleInput();
-          }}
+          onCompositionStart={
+            !disabled
+              ? () => {
+                  isComposingRef.current = true;
+                }
+              : undefined
+          }
+          onCompositionEnd={
+            !disabled
+              ? () => {
+                  isComposingRef.current = false;
+                  handleInput();
+                }
+              : undefined
+          }
         />
 
         {/* Autocomplete dropdown — portalled to body, positioned above the caret */}
