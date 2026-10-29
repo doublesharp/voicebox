@@ -1,11 +1,26 @@
 import { invoke } from '@tauri-apps/api/core';
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { toast } from '@/components/ui/use-toast';
 import { chordKeysEqual } from '@/lib/utils/keyCodes';
 import { useDictationReadiness } from '@/lib/hooks/useDictationReadiness';
 import { useCaptureSettings } from '@/lib/hooks/useSettings';
 import { usePlatform } from '@/platform/PlatformContext';
+
+// A shared queue keeps teardown and a subsequent mount ordered, including
+// native calls already in flight when the component is replaced.
+let nativeQueue: Promise<void> = Promise.resolve();
+
+function enqueueNative(command: string, args: Record<string, unknown>, current: () => boolean = () => true) {
+  nativeQueue = nativeQueue.then(async () => {
+    if (!current()) return;
+    try {
+      await invoke(command, args);
+    } catch (err) {
+      console.warn(`[chord-sync] ${command} failed:`, err);
+    }
+  });
+}
 
 /**
  * Spawn (or quiet) the global hotkey monitor based on the saved
@@ -29,6 +44,7 @@ import { usePlatform } from '@/platform/PlatformContext';
  * Call once from the main app shell.
  */
 export function useChordSync() {
+  const revision = useRef(0);
   const platform = usePlatform();
   const { t } = useTranslation();
   const { settings } = useCaptureSettings();
@@ -36,6 +52,14 @@ export function useChordSync() {
   const enabled = settings?.hotkey_enabled;
   const pushKeys = settings?.chord_push_to_talk_keys;
   const toggleKeys = settings?.chord_toggle_to_talk_keys;
+
+  useEffect(() => {
+    if (!platform.metadata.isTauri) return;
+    return () => {
+      revision.current++;
+      enqueueNative('disable_hotkey', {});
+    };
+  }, [platform.metadata.isTauri]);
 
   useEffect(() => {
     if (!platform.metadata.isTauri) return;
@@ -51,9 +75,13 @@ export function useChordSync() {
     }
     const command = shouldArm ? 'enable_hotkey' : 'disable_hotkey';
     const args = shouldArm ? { pushToTalk: pushKeys, toggleToTalk: toggleKeys } : {};
-    invoke(command, args).catch((err) => {
-      console.warn(`[chord-sync] ${command} failed:`, err);
-    });
+    const current = ++revision.current;
+    // Native commands can finish out of order. Keep issued commands ordered,
+    // and drop an obsolete command before it reaches the native layer.
+    enqueueNative(command, args, () => revision.current === current);
+    return () => {
+      if (revision.current === current) revision.current++;
+    };
   }, [
     platform.metadata.isTauri,
     enabled,
