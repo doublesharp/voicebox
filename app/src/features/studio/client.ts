@@ -110,6 +110,7 @@ export class StudioClient implements StudioTransport {
       count: 1 | 2 | 3;
       adopt: boolean;
       commercial_only?: boolean;
+      phrase_text?: string;
     },
   ) {
     return this.post<{ jobs: StudioJob[] }>(

@@ -32,6 +32,7 @@ import { useMicrophoneStore } from '@/stores/microphoneStore';
 import { AudioSampleRecording } from './AudioSampleRecording';
 import { AudioSampleSystem } from './AudioSampleSystem';
 import { AudioSampleUpload } from './AudioSampleUpload';
+import { SampleQuality } from './SampleQuality';
 
 const sampleSchema = z.object({
   file: z.instanceof(File, { message: 'Please select an audio file' }),
@@ -348,6 +349,14 @@ export function SampleUpload({ profileId, open, onOpenChange }: SampleUploadProp
                 </FormItem>
               )}
             />
+
+            {open && selectedFile && (
+              <SampleQuality
+                file={selectedFile}
+                referenceText={form.watch('referenceText') ?? ''}
+                language={profile?.language}
+              />
+            )}
 
             <div className="flex gap-2 justify-end">
               <Button type="button" variant="outline" onClick={() => handleOpenChange(false)}>

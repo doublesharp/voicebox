@@ -758,17 +758,27 @@ export const StoryTrackEditor = memo(function StoryTrackEditor({
   // Keyboard shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.repeat || e.isComposing) return;
+      const target = e.target as HTMLElement | null;
+      if (
+        target?.isContentEditable ||
+        target?.closest?.(
+          'select, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="combobox"], [role="dialog"], [role="alertdialog"], [role="menu"], [data-shortcut-capture]',
+        )
+      )
+        return;
       // Only handle shortcuts when editor is focused or no input is focused
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
         return;
       }
 
-      if (e.key === ' ') {
+      if (e.key === ' ' && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        if (target?.closest?.('button, a[href], summary, [role="button"], [role="slider"]')) return;
         e.preventDefault();
         handlePlayPause();
       } else if (e.key === 'Escape') {
         setSelectedClipId(null);
-      } else if (e.key === 's' || e.key === 'S') {
+      } else if ((e.key === 's' || e.key === 'S') && !e.metaKey && !e.ctrlKey && !e.altKey) {
         if (selectedClipId) {
           e.preventDefault();
           handleSplit();
@@ -778,7 +788,12 @@ export const StoryTrackEditor = memo(function StoryTrackEditor({
           e.preventDefault();
           handleDuplicate();
         }
-      } else if (e.key === 'Delete' || e.key === 'Backspace') {
+      } else if (
+        (e.key === 'Delete' || e.key === 'Backspace') &&
+        !e.metaKey &&
+        !e.ctrlKey &&
+        !e.altKey
+      ) {
         if (selectedClipId) {
           e.preventDefault();
           handleDelete();

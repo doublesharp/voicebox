@@ -123,9 +123,8 @@ export function ProjectsPage() {
     <section className="studio studio-projects" aria-label="Studio projects">
       <header className="studio-landing-header">
         <div>
-          <p className="studio-eyebrow">VOICEBOX DS / STUDIO</p>
-          <h1>Your next great take starts here.</h1>
-          <p>Script, performance, and delivery. Everything stays with the project.</p>
+          <h1 className="text-xl font-semibold">Projects</h1>
+          <p>Bring your script, performances, and delivery together.</p>
         </div>
         <Dialog open={createOpen} onOpenChange={setCreateOpen}>
           <DialogTrigger asChild>
@@ -226,16 +225,30 @@ export function ProjectsPage() {
             onChange={(e) => setSearch(e.target.value)}
           />
         </div>
-        <StudioButton onClick={() => archiveInput.current?.click()} disabled={busy}>
-          <FileArchive size={15} /> Import archive
-        </StudioButton>
-        <StorageCleanupDialog key={client.baseUrl} baseUrl={client.baseUrl} projects={projects} />
+        <details className="relative">
+          <summary className="studio-quiet">Import</summary>
+          <div className="absolute right-0 z-20 mt-1 flex min-w-48 flex-col gap-1 rounded-lg border bg-popover p-2 shadow-md">
+            <StudioButton onClick={() => archiveInput.current?.click()} disabled={busy}>
+              <FileArchive size={15} /> Project archive…
+            </StudioButton>
+            <StudioButton onClick={() => setStoryOpen(true)} disabled={busy}>
+              <Upload size={15} /> Copy from Story…
+            </StudioButton>
+          </div>
+        </details>
+        <details className="relative">
+          <summary className="studio-quiet" aria-label="More project actions">
+            •••
+          </summary>
+          <div className="absolute right-0 z-20 mt-1 rounded-lg border bg-popover p-2 shadow-md">
+            <StorageCleanupDialog
+              key={client.baseUrl}
+              baseUrl={client.baseUrl}
+              projects={projects}
+            />
+          </div>
+        </details>
         <Dialog open={storyOpen} onOpenChange={setStoryOpen}>
-          <DialogTrigger asChild>
-            <button type="button" className="studio-quiet">
-              <Upload size={15} /> Import Story
-            </button>
-          </DialogTrigger>
           <DialogContent className="studio studio-modal">
             <DialogHeader>
               <DialogTitle>Create a studio copy</DialogTitle>
@@ -259,7 +272,7 @@ export function ProjectsPage() {
               </select>
             </Field>
             {!storiesLoading && !stories.length && (
-              <p>No Stories yet. Existing Stories remain available from the sidebar.</p>
+              <p>No Stories yet. You can open the earlier Stories workspace from this page.</p>
             )}
             {error && (
               <p role="alert" className="studio-error">
@@ -331,25 +344,32 @@ export function ProjectsPage() {
           ))}
         </div>
       ) : (
-        <EmptyState
-          title={search ? 'No matching projects' : 'Make room for your next idea'}
-          action={
-            !search && (
-              <StudioButton primary onClick={() => setCreateOpen(true)}>
-                <Plus size={15} /> Create your first project
-              </StudioButton>
-            )
-          }
-        >
+        <EmptyState title={search ? 'No matching projects' : 'No projects yet'}>
           {search
             ? 'Try another title or client label.'
             : 'Start with a script, import a Story, or reopen a complete project archive.'}
         </EmptyState>
       )}
-      <footer className="studio-landing-footer">
-        <span>Local projects. Lasting performances.</span>
-        <span>DoubleSharp Edition</span>
-      </footer>
+      <section
+        className="mt-10 rounded-lg border bg-card/40 p-4"
+        aria-labelledby="earlier-stories-heading"
+      >
+        <h2 id="earlier-stories-heading" className="text-base font-semibold">
+          Earlier Stories
+        </h2>
+        <p className="mt-2 text-muted-foreground">
+          Stories are the earlier arrangement workspace. They still work. Copy one into a project to
+          use Edit, Mix, Review and Deliver.
+        </p>
+        <div className="mt-3 flex flex-wrap gap-2">
+          <Link to="/stories" className="studio-quiet">
+            Open Stories
+          </Link>
+          <StudioButton onClick={() => setStoryOpen(true)} disabled={busy}>
+            Copy into project
+          </StudioButton>
+        </div>
+      </section>
     </section>
   );
 }

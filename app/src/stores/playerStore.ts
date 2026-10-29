@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 
 interface PlayerState {
+  sourceGeneration: number;
   audioUrl: string | null;
   audioId: string | null;
   profileId: string | null;
@@ -29,6 +30,7 @@ interface PlayerState {
 }
 
 export const usePlayerStore = create<PlayerState>((set) => ({
+  sourceGeneration: 0,
   audioUrl: null,
   audioId: null,
   profileId: null,
@@ -43,27 +45,31 @@ export const usePlayerStore = create<PlayerState>((set) => ({
   onFinish: null,
 
   setAudio: (url, id, profileId, title) =>
-    set({
+    set((state) => ({
+      sourceGeneration: state.sourceGeneration + 1,
       audioUrl: url,
       audioId: id,
       profileId: profileId || null,
       title: title || null,
       currentTime: 0,
+      duration: 0,
       isPlaying: false,
       shouldRestart: false,
       shouldAutoPlay: false,
-    }),
+    })),
   setAudioWithAutoPlay: (url, id, profileId, title) =>
-    set({
+    set((state) => ({
+      sourceGeneration: state.sourceGeneration + 1,
       audioUrl: url,
       audioId: id,
       profileId: profileId || null,
       title: title || null,
       currentTime: 0,
+      duration: 0,
       isPlaying: false,
       shouldRestart: false,
       shouldAutoPlay: true,
-    }),
+    })),
   setIsPlaying: (playing) => set({ isPlaying: playing }),
   setCurrentTime: (time) => set({ currentTime: time }),
   setDuration: (duration) => set({ duration }),
@@ -74,7 +80,8 @@ export const usePlayerStore = create<PlayerState>((set) => ({
   clearAutoPlayFlag: () => set({ shouldAutoPlay: false }),
   setOnFinish: (callback) => set({ onFinish: callback }),
   reset: () =>
-    set({
+    set((state) => ({
+      sourceGeneration: state.sourceGeneration + 1,
       audioUrl: null,
       audioId: null,
       profileId: null,
@@ -86,5 +93,5 @@ export const usePlayerStore = create<PlayerState>((set) => ({
       shouldRestart: false,
       shouldAutoPlay: false,
       onFinish: null,
-    }),
+    })),
 }));

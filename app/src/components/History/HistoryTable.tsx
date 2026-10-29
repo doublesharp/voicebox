@@ -17,9 +17,9 @@ import {
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
-import { AudioBars } from '@/components/AudioBars';
 import { EffectsChainEditor } from '@/components/Effects/EffectsChainEditor';
 import { Button } from '@/components/ui/button';
+import { Hint } from '@/components/ui/Hint';
 import {
   Dialog,
   DialogContent,
@@ -64,12 +64,11 @@ import { formatDate, formatDuration, formatEngineName } from '@/lib/utils/format
 import { useGenerationStore } from '@/stores/generationStore';
 import { usePlayerStore } from '@/stores/playerStore';
 
-export function HistoryTable() {
+export function HistoryTable({ embedded = false }: { embedded?: boolean }) {
   const { t } = useTranslation();
   const [page, setPage] = useState(0);
   const [allHistory, setAllHistory] = useState<HistoryResponse[]>([]);
   const [total, setTotal] = useState(0);
-  const [isScrolled, setIsScrolled] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const loadMoreRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -133,8 +132,7 @@ export function HistoryTable() {
   const restartCurrentAudio = usePlayerStore((state) => state.restartCurrentAudio);
   const currentAudioId = usePlayerStore((state) => state.audioId);
   const isPlaying = usePlayerStore((state) => state.isPlaying);
-  const audioUrl = usePlayerStore((state) => state.audioUrl);
-  const isPlayerVisible = !!audioUrl;
+  const isPlayerVisible = !!usePlayerStore((state) => state.audioUrl);
 
   // Update accumulated history when new data arrives
   useEffect(() => {
@@ -144,11 +142,18 @@ export function HistoryTable() {
         // Reset to first page
         setAllHistory(historyData.items);
       } else {
-        // Append new items, avoiding duplicates
+        // A refetch can update rows already accumulated on this page.
         setAllHistory((prev) => {
+          const incoming = new Map(historyData.items.map((item) => [item.id, item]));
+          const merged = prev.map((item) => incoming.get(item.id) ?? item);
           const existingIds = new Set(prev.map((item) => item.id));
-          const newItems = historyData.items.filter((item) => !existingIds.has(item.id));
-          return [...prev, ...newItems];
+          for (const item of historyData.items) {
+            if (!existingIds.has(item.id)) {
+              merged.push(item);
+              existingIds.add(item.id);
+            }
+          }
+          return merged;
         });
       }
     }
@@ -160,7 +165,6 @@ export function HistoryTable() {
   useEffect(() => {
     if (deleteGeneration.isSuccess || importGeneration.isSuccess || clearFailed.isSuccess) {
       setPage(0);
-      setAllHistory([]);
     }
   }, [deleteGeneration.isSuccess, importGeneration.isSuccess, clearFailed.isSuccess]);
 
@@ -172,7 +176,6 @@ export function HistoryTable() {
       page !== 0
     ) {
       setPage(0);
-      setAllHistory([]);
     }
     prevPendingCountRef.current = pendingCount;
   }, [pendingCount, page]);
@@ -190,7 +193,7 @@ export function HistoryTable() {
         }
       },
       {
-        root: scrollRef.current,
+        root: embedded ? null : scrollRef.current,
         rootMargin: '100px',
         threshold: 0.1,
       },
@@ -198,29 +201,22 @@ export function HistoryTable() {
 
     observer.observe(loadMoreEl);
     return () => observer.disconnect();
-  }, [isFetching, allHistory.length, total]);
-
-  // Track scroll position for gradient effect
-  useEffect(() => {
-    const scrollEl = scrollRef.current;
-    if (!scrollEl) return;
-
-    const handleScroll = () => {
-      setIsScrolled(scrollEl.scrollTop > 0);
-    };
-
-    scrollEl.addEventListener('scroll', handleScroll);
-    return () => scrollEl.removeEventListener('scroll', handleScroll);
-  }, []);
+  }, [isFetching, allHistory.length, total, embedded]);
 
   const handlePlay = (audioId: string, text: string, profileId: string) => {
-    // If clicking the same audio, restart it from the beginning
-    if (currentAudioId === audioId) {
+    const generation = allHistory.find((item) => item.id === audioId);
+    const version = generation?.versions?.find((item) => item.is_default);
+    const revision = generation?.audio_path;
+    const desiredUrl = version
+      ? apiClient.getVersionAudioUrl(version.id, version.audio_path)
+      : `${apiClient.getAudioUrl(audioId)}${revision ? `?revision=${encodeURIComponent(revision)}` : ''}`;
+    // Read at the gesture boundary: rapid A → B → A clicks can precede a
+    // React render, and one generation may have several distinct takes.
+    const player = usePlayerStore.getState();
+    if (player.audioId === audioId && player.audioUrl === desiredUrl) {
       restartCurrentAudio();
     } else {
-      // Otherwise, load the new audio and auto-play it
-      const audioUrl = apiClient.getAudioUrl(audioId);
-      setAudioWithAutoPlay(audioUrl, audioId, profileId, text.substring(0, 50));
+      setAudioWithAutoPlay(desiredUrl, audioId, profileId, text.substring(0, 50));
     }
   };
 
@@ -356,11 +352,18 @@ export function HistoryTable() {
     const wasSelected = player.audioId === target.generation_id;
     // Release the media file before deletion, particularly on Windows.
     if (wasSelected) player.reset();
+    const releasedSourceGeneration = usePlayerStore.getState().sourceGeneration;
+    const mayRestorePlayer = () => {
+      const current = usePlayerStore.getState();
+      return (
+        wasSelected && !current.audioId && current.sourceGeneration === releasedSourceGeneration
+      );
+    };
     try {
       const versions = await apiClient.deleteGenerationVersion(target.generation_id, target.id);
       updateVersions(target.generation_id, versions);
       const active = versions.find((version) => version.is_default);
-      if (wasSelected && active && !usePlayerStore.getState().audioId) {
+      if (active && mayRestorePlayer()) {
         usePlayerStore
           .getState()
           .setAudio(
@@ -373,7 +376,7 @@ export function HistoryTable() {
       setVersionToDelete(null);
       toast({ title: t('history.versions.deleted') });
     } catch (error) {
-      if (wasSelected && player.audioUrl && !usePlayerStore.getState().audioId) {
+      if (player.audioUrl && mayRestorePlayer()) {
         usePlayerStore
           .getState()
           .setAudio(
@@ -456,8 +459,22 @@ export function HistoryTable() {
 
   const handleSwitchVersion = async (generationId: string, versionId: string) => {
     try {
-      await apiClient.setDefaultVersion(generationId, versionId);
+      const active = await apiClient.setDefaultVersion(generationId, versionId);
+      setAllHistory((previous) =>
+        previous.map((generation) =>
+          generation.id === generationId
+            ? {
+                ...generation,
+                audio_path: active.audio_path,
+                versions: generation.versions?.map((version) =>
+                  version.id === versionId ? active : { ...version, is_default: false },
+                ),
+              }
+            : generation,
+        ),
+      );
       queryClient.invalidateQueries({ queryKey: ['history'] });
+      queryClient.invalidateQueries({ queryKey: ['stories'] });
     } catch (error) {
       toast({
         title: 'Failed to switch version',
@@ -538,7 +555,12 @@ export function HistoryTable() {
   };
 
   return (
-    <div className="flex flex-col h-full min-h-0 relative">
+    <div className={cn('flex flex-col min-h-0', !embedded && 'h-full')}>
+      {embedded && (
+        <p className="mb-2 text-xs text-muted-foreground">
+          {total} {total === 1 ? 'take' : 'takes'}
+        </p>
+      )}
       {history.length === 0 ? (
         <div className="text-center py-12 pt-4 lg:pt-12 px-5 border-2 border-dashed mb-5 border-muted rounded-md text-muted-foreground flex-1 flex items-start lg:items-center justify-center">
           {t('history.empty')}
@@ -562,17 +584,16 @@ export function HistoryTable() {
               </Button>
             </div>
           )}
-          {isScrolled && (
-            <div className="absolute top-0 left-0 right-0 h-16 bg-gradient-to-b from-background to-transparent z-10 pointer-events-none" />
-          )}
           <div
             ref={scrollRef}
             className={cn(
-              'flex-1 min-h-0 overflow-y-auto space-y-2 pb-4',
-              isPlayerVisible && BOTTOM_SAFE_AREA_PADDING,
+              'space-y-2',
+              !embedded && 'flex-1 min-h-0 overflow-y-auto pb-4',
+              !embedded && isPlayerVisible && BOTTOM_SAFE_AREA_PADDING,
             )}
           >
             {history.map((gen) => {
+              const isSelected = currentAudioId === gen.id;
               const isCurrentlyPlaying = currentAudioId === gen.id && isPlaying;
               const isInProgress = gen.status === 'loading_model' || gen.status === 'generating';
               const isGenerating = isInProgress;
@@ -587,126 +608,135 @@ export function HistoryTable() {
                   key={gen.id}
                   className={cn(
                     'border rounded-md bg-card transition-colors text-left w-full',
-                    isCurrentlyPlaying && 'bg-muted/70',
+                    isSelected && 'border-accent/60 bg-muted/70',
                   )}
                 >
                   {/* Main row */}
-                  {/* biome-ignore lint/a11y/useSemanticElements: The row contains a transcript and action buttons, which cannot be nested inside a native button. */}
-                  <div
-                    role="button"
-                    aria-disabled={!isPlayable}
-                    tabIndex={isPlayable ? 0 : undefined}
-                    className={cn(
-                      'flex items-stretch gap-4 h-26 p-3 outline-none',
-                      isPlayable && 'hover:bg-muted/70 cursor-pointer rounded-md',
-                      isVersionsExpanded && 'rounded-b-none',
-                    )}
-                    aria-label={
-                      isGenerating
-                        ? `Generating speech for ${gen.profile_name}...`
-                        : isFailed
-                          ? `Generation failed for ${gen.profile_name}`
-                          : isCurrentlyPlaying
-                            ? `Sample from ${gen.profile_name}, ${formatDuration(gen.duration ?? 0)}, ${formatDate(gen.created_at)}. Playing. Press Enter to restart.`
-                            : `Sample from ${gen.profile_name}, ${formatDuration(gen.duration ?? 0)}, ${formatDate(gen.created_at)}. Press Enter to play.`
-                    }
-                    onMouseDown={(e) => {
-                      if (!isPlayable) return;
-                      const target = e.target as HTMLElement;
-                      if (
-                        target.closest('textarea, button, [role="menuitem"]') ||
-                        window.getSelection()?.toString()
-                      ) {
-                        return;
+                  <div className="flex items-stretch">
+                    {/* biome-ignore lint/a11y/useSemanticElements: The playable area includes a selectable, read-only transcript. Its action buttons are separate siblings. */}
+                    <div
+                      role="button"
+                      aria-disabled={!isPlayable}
+                      aria-pressed={isSelected}
+                      tabIndex={isPlayable ? 0 : undefined}
+                      className={cn(
+                        'flex flex-1 min-w-0 flex-col gap-2 p-3 outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-inset',
+                        isPlayable && 'hover:bg-muted/70 cursor-pointer rounded-md',
+                        isVersionsExpanded && 'rounded-b-none',
+                      )}
+                      aria-label={
+                        isGenerating
+                          ? `Generating speech for ${gen.profile_name}...`
+                          : isFailed
+                            ? `Generation failed for ${gen.profile_name}`
+                            : isCurrentlyPlaying
+                              ? `Sample from ${gen.profile_name}, ${formatDuration(gen.duration ?? 0)}, ${formatDate(gen.created_at)}. Playing. Press Enter to restart.`
+                              : `Sample from ${gen.profile_name}, ${formatDuration(gen.duration ?? 0)}, ${formatDate(gen.created_at)}. Press Enter to play.`
                       }
-                      handlePlay(gen.id, gen.text, gen.profile_id);
-                    }}
-                    onKeyDown={(e) => {
-                      if (!isPlayable) return;
-                      const target = e.target as HTMLElement;
-                      if (target.closest('textarea') || target.closest('button')) return;
-                      if (e.key === 'Enter' || e.key === ' ') {
-                        e.preventDefault();
+                      onClick={(e) => {
+                        if (!isPlayable || e.button !== 0) return;
+                        const target = e.target as HTMLElement;
+                        if (target.closest('button, [role="menuitem"]')) return;
+                        const transcript = target.closest('textarea') as HTMLTextAreaElement | null;
+                        if (transcript) {
+                          if (transcript.selectionStart !== transcript.selectionEnd) return;
+                        } else {
+                          const selection = window.getSelection();
+                          if (
+                            selection?.toString() &&
+                            e.currentTarget.contains(selection.anchorNode)
+                          )
+                            return;
+                        }
                         handlePlay(gen.id, gen.text, gen.profile_id);
-                      }
-                    }}
-                  >
-                    {/* Status icon */}
-                    <div className="flex items-center shrink-0 w-10 justify-center overflow-hidden">
-                      <AudioBars
-                        mode={isGenerating ? 'generating' : isCurrentlyPlaying ? 'playing' : 'idle'}
-                      />
-                    </div>
-
-                    {/* Left side - Meta information */}
-                    <div className="flex flex-col gap-1.5 w-48 shrink-0 justify-center">
-                      <div className="font-medium text-sm truncate" title={gen.profile_name}>
-                        {gen.profile_name}
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <span className="text-xs text-muted-foreground">{gen.language}</span>
-                        <span className="text-xs text-muted-foreground">
-                          {formatEngineName(gen.engine, gen.model_size)}
-                        </span>
-                        {isFailed ? (
-                          <span className="text-xs text-destructive">Failed</span>
-                        ) : !isGenerating ? (
-                          <span className="text-xs text-muted-foreground">
-                            {formatDuration(gen.duration ?? 0)}
-                          </span>
-                        ) : null}
-                      </div>
-                      <div className="text-xs text-muted-foreground">
-                        {isInProgress ? (
-                          <span className="text-accent">
-                            {gen.status === 'loading_model' ? 'Loading model...' : 'Generating...'}
-                          </span>
-                        ) : (
-                          formatDate(gen.created_at)
-                        )}
-                      </div>
-                    </div>
-
-                    {/* Right side - Transcript textarea */}
-                    <div className="flex-1 min-w-0 flex">
+                      }}
+                      onKeyDown={(e) => {
+                        if (!isPlayable) return;
+                        const target = e.target as HTMLElement;
+                        if (target.closest('textarea') || target.closest('button')) return;
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          e.preventDefault();
+                          handlePlay(gen.id, gen.text, gen.profile_id);
+                        }
+                      }}
+                    >
                       <Textarea
                         value={gen.text}
-                        className="flex-1 resize-none text-sm text-muted-foreground select-text"
+                        className="min-h-[3rem] w-full resize-y border-0 bg-transparent p-0 text-sm select-text focus-visible:ring-0"
                         readOnly
                         aria-label={`Transcript for sample from ${gen.profile_name}, ${formatDuration(gen.duration ?? 0)}`}
                       />
+                      <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-muted-foreground">
+                        <span>{gen.profile_name}</span>
+                        <span aria-hidden="true">·</span>
+                        <span>{formatEngineName(gen.engine, gen.model_size)}</span>
+                        <span aria-hidden="true">·</span>
+                        <span>
+                          {isFailed
+                            ? 'Failed'
+                            : isInProgress
+                              ? gen.status === 'loading_model'
+                                ? 'Loading model...'
+                                : 'Generating...'
+                              : formatDuration(gen.duration ?? 0)}
+                        </span>
+                        <span aria-hidden="true">·</span>
+                        <span>{formatDate(gen.created_at)}</span>
+                        {isCurrentlyPlaying && (
+                          <span className="font-medium text-accent">Playing</span>
+                        )}
+                      </div>
                     </div>
 
                     {/* Far right - Actions */}
-                    <div className="shrink-0 flex flex-col justify-center items-center gap-0.5">
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className={cn(
-                          'h-6 w-6 text-muted-foreground/50 hover:bg-muted-foreground/20 hover:text-muted-foreground',
-                          gen.is_favorited && 'text-accent hover:text-accent',
-                        )}
-                        aria-label={gen.is_favorited ? 'Unfavorite' : 'Favorite'}
-                        onClick={() => handleToggleFavorite(gen.id)}
-                      >
-                        <Star
-                          className="h-2 w-2"
-                          fill={gen.is_favorited ? 'currentColor' : 'none'}
-                        />
-                      </Button>
-                      {hasVersions && (
+                    <div className="shrink-0 flex flex-col items-center gap-1 px-2 py-3">
+                      {isPlayable && (
+                        <Hint content={isCurrentlyPlaying ? 'Restart playback' : 'Play take'}>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className={cn('h-8 w-8', isCurrentlyPlaying && 'text-accent')}
+                            aria-label={isCurrentlyPlaying ? 'Restart playback' : 'Play take'}
+                            onClick={() => handlePlay(gen.id, gen.text, gen.profile_id)}
+                          >
+                            <Play className="h-4 w-4" />
+                          </Button>
+                        </Hint>
+                      )}
+                      <Hint content={gen.is_favorited ? 'Remove favorite' : 'Favorite'}>
                         <Button
                           variant="ghost"
                           size="icon"
                           className={cn(
-                            'h-6 w-6 text-muted-foreground/50 hover:bg-muted-foreground/20 hover:text-muted-foreground',
-                            isVersionsExpanded && 'text-accent hover:text-accent',
+                            'h-8 w-8 text-muted-foreground hover:bg-muted',
+                            gen.is_favorited && 'text-accent hover:text-accent',
                           )}
-                          aria-label="Toggle versions"
-                          onClick={() => setExpandedVersionsId(isVersionsExpanded ? null : gen.id)}
+                          aria-label={gen.is_favorited ? 'Unfavorite' : 'Favorite'}
+                          onClick={() => handleToggleFavorite(gen.id)}
                         >
-                          <AudioLines className="h-2 w-2" />
+                          <Star
+                            className="h-4 w-4"
+                            fill={gen.is_favorited ? 'currentColor' : 'none'}
+                          />
                         </Button>
+                      </Hint>
+                      {hasVersions && (
+                        <Hint content="Show versions">
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className={cn(
+                              'h-8 w-8 text-muted-foreground hover:bg-muted',
+                              isVersionsExpanded && 'text-accent hover:text-accent',
+                            )}
+                            aria-label="Toggle versions"
+                            onClick={() =>
+                              setExpandedVersionsId(isVersionsExpanded ? null : gen.id)
+                            }
+                          >
+                            <AudioLines className="h-4 w-4" />
+                          </Button>
+                        </Hint>
                       )}
 
                       {isFailed ? (
@@ -714,36 +744,36 @@ export function HistoryTable() {
                           <Button
                             variant="ghost"
                             size="icon"
-                            className="h-6 w-6 text-muted-foreground/50 hover:bg-muted-foreground/20 hover:text-muted-foreground"
+                            className="h-8 w-8 text-muted-foreground hover:bg-muted"
                             aria-label="Retry generation"
                             onClick={() => handleRetry(gen.id)}
                           >
-                            <RotateCcw className="h-2 w-2" />
+                            <RotateCcw className="h-4 w-4" />
                           </Button>
                           <Button
                             variant="ghost"
                             size="icon"
-                            className="h-6 w-6 text-muted-foreground/50 hover:bg-muted-foreground/20 hover:text-muted-foreground"
+                            className="h-8 w-8 text-muted-foreground hover:bg-muted"
                             aria-label="Delete generation"
                             disabled={deleteGeneration.isPending}
                             onClick={() => handleDeleteClick(gen.id, gen.profile_name)}
                           >
-                            <Trash2 className="h-2 w-2" />
+                            <Trash2 className="h-4 w-4" />
                           </Button>
                         </>
                       ) : isGenerating ? (
                         <Button
                           variant="ghost"
                           size="icon"
-                          className="h-6 w-6 text-muted-foreground/50 hover:bg-muted-foreground/20 hover:text-muted-foreground"
+                          className="h-8 w-8 text-muted-foreground hover:bg-muted"
                           aria-label="Cancel generation"
                           disabled={isCancelling}
                           onClick={() => cancelGeneration.mutate(gen.id)}
                         >
                           {isCancelling ? (
-                            <Loader2 className="h-2 w-2 animate-spin" />
+                            <Loader2 className="h-4 w-4 animate-spin" />
                           ) : (
-                            <Square className="h-2 w-2" />
+                            <Square className="h-4 w-4" />
                           )}
                         </Button>
                       ) : (
@@ -752,11 +782,11 @@ export function HistoryTable() {
                             <Button
                               variant="ghost"
                               size="icon"
-                              className="h-6 w-6 text-muted-foreground/50 hover:bg-muted-foreground/20 hover:text-muted-foreground"
+                              className="h-8 w-8 text-muted-foreground hover:bg-muted"
                               aria-label={t('history.actions.menu')}
                               disabled={isGenerating}
                             >
-                              <MoreHorizontal className="h-2 w-2" />
+                              <MoreHorizontal className="h-4 w-4" />
                             </Button>
                           </DropdownMenuTrigger>
                           <DropdownMenuContent align="end">

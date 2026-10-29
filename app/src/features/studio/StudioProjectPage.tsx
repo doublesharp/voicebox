@@ -2,6 +2,7 @@ import { Link, useBlocker, useNavigate, useParams } from '@tanstack/react-router
 import {
   ChevronDown,
   ChevronLeft,
+  Captions,
   Command,
   Headphones,
   LayoutPanelLeft,
@@ -31,6 +32,8 @@ import {
   DialogTrigger,
 } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
+import { Hint } from '@/components/ui/Hint';
+import { HelpButton } from '@/components/ui/HelpButton';
 import { stopNative } from '@/lib/audio/playbackOwnership';
 import { usePlatform } from '@/platform/PlatformContext';
 import { usePlayerStore } from '@/stores/playerStore';
@@ -39,6 +42,7 @@ import { AudioMeters } from './AudioMeters';
 import { StudioClient, type StudioProfile } from './client';
 import { StudioContext } from './context';
 import { Deliver } from './Deliver';
+import { CaptionsPanel } from './CaptionsPanel';
 import { Director } from './Director';
 import { clipFrames, formatTime, isJobActive, timelineEnd, toSamples } from './domain';
 import { studioShortcut } from './keyboard';
@@ -117,6 +121,7 @@ function ProjectWorkspace({
   const [revisionId, setRevisionId] = useState('');
   const [checkpointName, setCheckpointName] = useState('');
   const [checkpointOpen, setCheckpointOpen] = useState(false);
+  const [captionsOpen, setCaptionsOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [actionBusy, setActionBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -293,6 +298,7 @@ function ProjectWorkspace({
         setPaletteOpen(true);
       }
       if (action === 'transport') toggleTransport();
+      if (action === 'save') void session.flush();
       if (action === 'undo' || action === 'redo') void session.command(action);
       const clip = session
         .getSnapshot()
@@ -500,7 +506,8 @@ function ProjectWorkspace({
               disabled={!canMutate}
               onBlur={(event) => {
                 const name = event.target.value.trim();
-                if (name && name !== project.name) void session.command('update_project', { name });
+                if (!name) event.target.value = project.name;
+                else if (name !== project.name) void session.command('update_project', { name });
               }}
               onKeyDown={(event) => {
                 if (event.key === 'Enter') event.currentTarget.blur();
@@ -581,16 +588,33 @@ function ProjectWorkspace({
         <div className="studio-workspace-bar">
           <nav className="studio-workspace-tabs" aria-label="Project workspace">
             {(['edit', 'mix', 'review'] as const).map((mode, index) => (
-              <Link
+              <Hint
                 key={mode}
-                to="/studio/projects/$projectId/$workspace"
-                params={{ projectId, workspace: mode }}
-                className={workspace === mode ? 'is-active' : ''}
-                aria-current={workspace === mode ? 'page' : undefined}
+                content={
+                  { edit: 'Script & takes', mix: 'Arrange & mix', review: 'Review & approve' }[mode]
+                }
               >
-                <span className="studio-workspace-number">0{index + 1}</span>
-                {mode[0].toUpperCase() + mode.slice(1)}
-              </Link>
+                <Link
+                  to="/studio/projects/$projectId/$workspace"
+                  params={{ projectId, workspace: mode }}
+                  className={workspace === mode ? 'is-active' : ''}
+                  aria-current={workspace === mode ? 'page' : undefined}
+                >
+                  <span className="studio-workspace-number">0{index + 1}</span>
+                  <span>
+                    {mode[0].toUpperCase() + mode.slice(1)}
+                    <small className="app-workspace-description">
+                      {
+                        {
+                          edit: 'Script & takes',
+                          mix: 'Arrange & mix',
+                          review: 'Review & approve',
+                        }[mode]
+                      }
+                    </small>
+                  </span>
+                </Link>
+              </Hint>
             ))}
           </nav>
           <select
@@ -606,7 +630,31 @@ function ProjectWorkspace({
               </option>
             ))}
           </select>
+          <HelpButton label="About checkpoints">
+            A checkpoint is a saved, unchangeable version you can review, restore or deliver.
+          </HelpButton>
           <div className="studio-action-row">
+            <Dialog open={captionsOpen} onOpenChange={setCaptionsOpen}>
+              <DialogTrigger asChild>
+                <button
+                  type="button"
+                  className="studio-quiet"
+                  aria-label="Open captions and video timing"
+                >
+                  <Captions size={16} /> Captions &amp; video
+                </button>
+              </DialogTrigger>
+              <DialogContent className="studio studio-modal studio-caption-modal">
+                <DialogHeader>
+                  <DialogTitle>Captions &amp; video timing</DialogTitle>
+                  <DialogDescription>
+                    Preview a reference video, set scene targets, and review captions against the
+                    final arrangement.
+                  </DialogDescription>
+                </DialogHeader>
+                <CaptionsPanel />
+              </DialogContent>
+            </Dialog>
             <button
               type="button"
               className="studio-icon-button studio-outline-toggle"

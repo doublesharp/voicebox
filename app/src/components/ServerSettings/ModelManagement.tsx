@@ -432,15 +432,17 @@ export function ModelManagement() {
     { label: t('models.sections.languageModels'), models: llmModels },
   ];
 
-  // Get detail modal state for selected model
-  const selectedState = selectedModel ? getModelState(selectedModel) : null;
-  const selectedError = selectedModel ? erroredDownloads.get(selectedModel.model_name) : undefined;
-
   // Keep selectedModel data fresh from query results
   const freshSelectedModel =
     selectedModel && modelStatus
       ? modelStatus.models.find((m) => m.model_name === selectedModel.model_name) || selectedModel
       : selectedModel;
+
+  // Derive the detail actions from the same fresh data shown in the modal.
+  const selectedState = freshSelectedModel ? getModelState(freshSelectedModel) : null;
+  const selectedError = freshSelectedModel
+    ? erroredDownloads.get(freshSelectedModel.model_name)
+    : undefined;
 
   // Derive license from HF data
   const license =
@@ -451,8 +453,8 @@ export function ModelManagement() {
     <div className="flex flex-col h-full">
       {/* Header */}
       <div className="shrink-0 pb-4">
-        <h1 className="text-lg font-semibold">{t('models.title')}</h1>
-        <p className="text-sm text-muted-foreground">{t('models.subtitle')}</p>
+        <h1 className="text-xl font-semibold tracking-tight">{t('models.title')}</h1>
+        <p className="mt-1 text-xs text-muted-foreground">{t('models.subtitle')}</p>
       </div>
 
       {/* Model storage location */}
@@ -590,6 +592,15 @@ export function ModelManagement() {
 
                       {/* Right side info */}
                       <div className="shrink-0 flex items-center gap-2">
+                        {!hasError && !model.loaded && (
+                          <span className="text-xs text-muted-foreground">
+                            {isDownloading
+                              ? t('models.status.downloading', { defaultValue: 'Downloading' })
+                              : model.downloaded
+                                ? t('models.status.ready', { defaultValue: 'Ready' })
+                                : t('models.status.missing', { defaultValue: 'Not downloaded' })}
+                          </span>
+                        )}
                         {hasError && (
                           <Badge variant="destructive" className="text-[10px] h-5">
                             {t('common.error')}

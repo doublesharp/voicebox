@@ -118,6 +118,20 @@ const document = {
 } as StudioDocument;
 
 describe('studio exclusive playback boundary', () => {
+  test('phrase auditions start at the selected source boundary and stop at its end', async () => {
+    const player = setup();
+    await player.audition('/phrase', 'Selected phrase', 1, { start: 0.5, end: 0.9 });
+    const source = FakeAudio.instances[0];
+    expect(source.currentTime).toBe(0.5);
+    source.currentTime = 0.9;
+    source.ontimeupdate?.();
+    expect(source.paused).toBe(true);
+    expect(source.disposed).toBe(true);
+    expect(player.getSnapshot().mode).toBe('idle');
+    await player.audition('/invalid', 'Invalid', 1, { start: 1, end: 0.5 });
+    expect(FakeAudio.instances).toHaveLength(1);
+    expect(player.getSnapshot().error).toContain('valid source phrase range');
+  });
   test('a new audition stops and releases its previous source; dispose leaves no hidden playback', async () => {
     const player = setup();
     await player.audition('/take-a', 'A');

@@ -7,6 +7,7 @@ import { formatTime } from './domain';
 import { listeningGains, replacementNeedsReset } from './take-comparison';
 import type { StudioPassage, StudioTake } from './types';
 import { Field, StudioButton } from './ui';
+import { PhraseRepairPanel } from './PhraseRepairPanel';
 import './take-comparison.css';
 
 function TakeAnnotation({ take, label }: { take: StudioTake; label: string }) {
@@ -146,6 +147,7 @@ export function TakeWorkflow({
         <h3>Takes</h3>
         <span>{takes.length}</span>
       </div>
+      <PhraseRepairPanel passage={passage} currentText={currentText} />
       {takes.length > 0 && (
         <label className="studio-check">
           <input

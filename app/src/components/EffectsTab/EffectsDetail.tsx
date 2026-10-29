@@ -1,6 +1,6 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Loader2, Play, Save, Trash2, Wand2 } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { EffectsChainEditor } from '@/components/Effects/EffectsChainEditor';
@@ -14,9 +14,9 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
+import { FormSection } from '@/components/ui/form-section';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { Separator } from '@/components/ui/separator';
 import { Textarea } from '@/components/ui/textarea';
 import { useToast } from '@/components/ui/use-toast';
 import { apiClient } from '@/lib/api/client';
@@ -26,18 +26,46 @@ import { useEffectsStore } from '@/stores/effectsStore';
 import { usePlayerStore } from '@/stores/playerStore';
 
 export function EffectsDetail() {
+  const fieldId = useId();
   const { t } = useTranslation();
   const selectedPresetId = useEffectsStore((s) => s.selectedPresetId);
   const isCreatingNew = useEffectsStore((s) => s.isCreatingNew);
   const workingChain = useEffectsStore((s) => s.workingChain);
   const setWorkingChain = useEffectsStore((s) => s.setWorkingChain);
   const setSelectedPresetId = useEffectsStore((s) => s.setSelectedPresetId);
-  const setIsCreatingNew = useEffectsStore((s) => s.setIsCreatingNew);
 
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const selectionEpoch = useRef(0);
+  const mounted = useRef(false);
+  const editRevision = useRef(0);
+  const initializedSelection = useRef<string | null>(null);
+  const loadedSelection = useRef<string | null>(null);
+
+  useEffect(() => {
+    mounted.current = true;
+    const unsubscribe = useEffectsStore.subscribe((state, previous) => {
+      if (
+        state.selectedPresetId !== previous.selectedPresetId ||
+        state.isCreatingNew !== previous.isCreatingNew
+      ) {
+        selectionEpoch.current++;
+        setSaving(false);
+        setDeleting(false);
+        setPreviewLoading(false);
+        setSaveAsDialogOpen(false);
+      }
+    });
+    return () => {
+      mounted.current = false;
+      selectionEpoch.current++;
+      unsubscribe();
+    };
+  }, []);
+
+  const isCurrent = (epoch: number) => mounted.current && selectionEpoch.current === epoch;
 
   // "Save as Custom" dialog state
   const [saveAsDialogOpen, setSaveAsDialogOpen] = useState(false);
@@ -47,6 +75,8 @@ export function EffectsDetail() {
   // Preview state
   const [previewGenId, setPreviewGenId] = useState<string | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
+  const previewGenerationRef = useRef(previewGenId);
+  previewGenerationRef.current = previewGenId;
   const blobUrlRef = useRef<string | null>(null);
   const setAudioWithAutoPlay = usePlayerStore((s) => s.setAudioWithAutoPlay);
 
@@ -74,16 +104,30 @@ export function EffectsDetail() {
     staleTime: 30_000,
   });
 
-  // Sync name/description when selecting a preset
+  // Initialize each selection once; background refetches must not replace a draft.
   useEffect(() => {
-    if (preset) {
-      setName(preset.name);
-      setDescription(preset.description ?? '');
-    } else if (isCreatingNew) {
+    const selection = isCreatingNew
+      ? 'new'
+      : selectedPresetId
+        ? `preset:${selectedPresetId}`
+        : null;
+    if (selection !== initializedSelection.current) {
+      initializedSelection.current = selection;
+      loadedSelection.current = null;
       setName('');
       setDescription('');
+      editRevision.current++;
     }
-  }, [preset, isCreatingNew]);
+    if (
+      selection?.startsWith('preset:') &&
+      preset?.id === selectedPresetId &&
+      loadedSelection.current !== selection
+    ) {
+      loadedSelection.current = selection;
+      setName(preset.name);
+      setDescription(preset.description ?? '');
+    }
+  }, [preset, selectedPresetId, isCreatingNew]);
 
   // Cleanup blob URL on unmount
   useEffect(() => {
@@ -113,9 +157,19 @@ export function EffectsDetail() {
   async function handlePreview() {
     if (!previewGenId || workingChain.length === 0) return;
 
+    const epoch = selectionEpoch.current;
+    const generationId = previewGenId;
+    const previewChain = workingChain;
     setPreviewLoading(true);
     try {
       const blob = await apiClient.previewEffects(previewGenId, workingChain);
+
+      if (
+        !isCurrent(epoch) ||
+        useEffectsStore.getState().workingChain !== previewChain ||
+        previewGenerationRef.current !== generationId
+      )
+        return;
 
       // Revoke old blob URL
       if (blobUrlRef.current) {
@@ -128,13 +182,14 @@ export function EffectsDetail() {
       // Play through the main audio player
       setAudioWithAutoPlay(url, `preview-${Date.now()}`, null, 'Effects Preview');
     } catch (error) {
+      if (!isCurrent(epoch)) return;
       toast({
         title: t('effects.toast.previewFailed'),
         description: error instanceof Error ? error.message : t('common.unknownError'),
         variant: 'destructive',
       });
     } finally {
-      setPreviewLoading(false);
+      if (isCurrent(epoch)) setPreviewLoading(false);
     }
   }
 
@@ -147,6 +202,7 @@ export function EffectsDetail() {
       toast({ title: t('effects.toast.nameRequired'), variant: 'destructive' });
       return;
     }
+    const epoch = selectionEpoch.current;
     setSaving(true);
     try {
       const created = await apiClient.createEffectPreset({
@@ -155,25 +211,33 @@ export function EffectsDetail() {
         effects_chain: workingChain,
       });
       queryClient.invalidateQueries({ queryKey: ['effect-presets'] });
-      setIsCreatingNew(false);
-      setSelectedPresetId(created.id);
+      if (isCurrent(epoch)) {
+        // Adopt the acknowledged identity without replacing newer local edits.
+        // A second Save must update this preset rather than create a duplicate.
+        initializedSelection.current = `preset:${created.id}`;
+        loadedSelection.current = initializedSelection.current;
+        queryClient.setQueryData(['effect-preset', created.id], created);
+        setSelectedPresetId(created.id);
+      }
       toast({
         title: t('effects.toast.saved'),
         description: t('effects.toast.createdDescription', { name: created.name }),
       });
     } catch (error) {
+      if (!mounted.current) return;
       toast({
         title: t('effects.toast.saveFailed'),
         description: error instanceof Error ? error.message : t('common.unknownError'),
         variant: 'destructive',
       });
     } finally {
-      setSaving(false);
+      if (isCurrent(epoch)) setSaving(false);
     }
   }
 
   async function handleSaveExisting() {
     if (!selectedPresetId || !name.trim()) return;
+    const epoch = selectionEpoch.current;
     setSaving(true);
     try {
       await apiClient.updateEffectPreset(selectedPresetId, {
@@ -185,13 +249,14 @@ export function EffectsDetail() {
       queryClient.invalidateQueries({ queryKey: ['effect-preset', selectedPresetId] });
       toast({ title: t('effects.toast.updated') });
     } catch (error) {
+      if (!mounted.current) return;
       toast({
         title: t('effects.toast.saveFailed'),
         description: error instanceof Error ? error.message : t('common.unknownError'),
         variant: 'destructive',
       });
     } finally {
-      setSaving(false);
+      if (isCurrent(epoch)) setSaving(false);
     }
   }
 
@@ -207,6 +272,9 @@ export function EffectsDetail() {
       toast({ title: t('effects.toast.nameRequired'), variant: 'destructive' });
       return;
     }
+    const epoch = selectionEpoch.current;
+    const revision = editRevision.current;
+    const savedChain = workingChain;
     setSaving(true);
     try {
       const created = await apiClient.createEffectPreset({
@@ -215,40 +283,51 @@ export function EffectsDetail() {
         effects_chain: workingChain,
       });
       queryClient.invalidateQueries({ queryKey: ['effect-presets'] });
-      setSaveAsDialogOpen(false);
-      setSelectedPresetId(created.id);
+      if (
+        isCurrent(epoch) &&
+        editRevision.current === revision &&
+        useEffectsStore.getState().workingChain === savedChain
+      ) {
+        setSaveAsDialogOpen(false);
+        setSelectedPresetId(created.id);
+      }
       toast({
         title: t('effects.toast.saved'),
         description: t('effects.toast.createdDescription', { name: created.name }),
       });
     } catch (error) {
+      if (!mounted.current) return;
       toast({
         title: t('effects.toast.saveFailed'),
         description: error instanceof Error ? error.message : t('common.unknownError'),
         variant: 'destructive',
       });
     } finally {
-      setSaving(false);
+      if (isCurrent(epoch)) setSaving(false);
     }
   }
 
   async function handleDelete() {
     if (!selectedPresetId) return;
+    const epoch = selectionEpoch.current;
     setDeleting(true);
     try {
       await apiClient.deleteEffectPreset(selectedPresetId);
       queryClient.invalidateQueries({ queryKey: ['effect-presets'] });
-      setSelectedPresetId(null);
-      setWorkingChain([]);
+      if (isCurrent(epoch)) {
+        setSelectedPresetId(null);
+        setWorkingChain([]);
+      }
       toast({ title: t('effects.toast.deleted') });
     } catch (error) {
+      if (!mounted.current) return;
       toast({
         title: t('effects.toast.deleteFailed'),
         description: error instanceof Error ? error.message : t('common.unknownError'),
         variant: 'destructive',
       });
     } finally {
-      setDeleting(false);
+      if (isCurrent(epoch)) setDeleting(false);
     }
   }
 
@@ -265,15 +344,15 @@ export function EffectsDetail() {
 
   return (
     <div className="flex flex-col h-full min-h-0">
-      <div className="flex items-center justify-between mb-4">
-        <h2 className="text-lg font-semibold">
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border/60 pb-4 mb-5">
+        <h2 className="text-base font-semibold tracking-tight">
           {isCreatingNew
             ? t('effects.detail.newTitle')
             : isBuiltIn
               ? presetName
               : t('effects.detail.editTitle')}
         </h2>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           {!isBuiltIn && !isCreatingNew && (
             <>
               <Button
@@ -323,41 +402,68 @@ export function EffectsDetail() {
         </div>
       </div>
 
-      <div className="flex-1 min-h-0 overflow-y-auto space-y-5 pr-1">
+      <div className="flex-1 min-h-0 overflow-y-auto space-y-5 pr-1 pb-8">
         {(isCreatingNew || !isBuiltIn) && (
-          <div className="space-y-3">
+          <FormSection
+            title={t('effects.detail.detailsTitle', { defaultValue: 'Preset details' })}
+            className="rounded-xl border border-border/70 bg-card/50 p-5"
+          >
             <div className="space-y-1.5">
-              <Label className="text-xs">{t('effects.fields.name')}</Label>
+              <Label htmlFor={`${fieldId}-name`}>{t('effects.fields.name')}</Label>
               <Input
+                id={`${fieldId}-name`}
                 value={name}
-                onChange={(e) => setName(e.target.value)}
+                onChange={(e) => {
+                  editRevision.current++;
+                  setName(e.target.value);
+                }}
                 placeholder={t('effects.fields.namePlaceholder')}
                 className="h-9"
               />
             </div>
             <div className="space-y-1.5">
-              <Label className="text-xs">{t('effects.fields.description')}</Label>
+              <Label htmlFor={`${fieldId}-description`}>{t('effects.fields.description')}</Label>
               <Textarea
+                id={`${fieldId}-description`}
                 value={description}
-                onChange={(e) => setDescription(e.target.value)}
+                onChange={(e) => {
+                  editRevision.current++;
+                  setDescription(e.target.value);
+                }}
                 placeholder={t('effects.fields.descriptionPlaceholder')}
                 className="min-h-[60px] resize-none"
               />
             </div>
-          </div>
+          </FormSection>
         )}
 
         {isBuiltIn && presetDescription && (
           <p className="text-sm text-muted-foreground">{presetDescription}</p>
         )}
 
-        <EffectsChainEditor value={workingChain} onChange={setWorkingChain} showPresets={false} />
+        <FormSection
+          title={t('effects.detail.chainTitle', { defaultValue: 'Effect chain' })}
+          description={t('effects.detail.chainHint', {
+            defaultValue: 'Effects run in order, from top to bottom.',
+          })}
+          className="rounded-xl border border-border/70 bg-card/50 p-5"
+        >
+          <EffectsChainEditor
+            value={workingChain}
+            onChange={(chain) => {
+              editRevision.current++;
+              setWorkingChain(chain);
+            }}
+            showPresets={false}
+          />
+        </FormSection>
 
-        <Separator />
-
-        <div className="space-y-3">
-          <Label className="text-xs">{t('effects.preview.label')}</Label>
-          <div className="flex items-center gap-2">
+        <FormSection
+          title={t('effects.preview.label')}
+          description={t('effects.preview.hint')}
+          className="rounded-xl border border-border/70 bg-muted/20 p-5"
+        >
+          <div className="flex flex-wrap items-center gap-2">
             <GenerationPicker
               selectedId={previewGenId}
               onSelect={handleSelectGeneration}
@@ -383,11 +489,16 @@ export function EffectsDetail() {
               )}
             </Button>
           </div>
-          <p className="text-[11px] text-muted-foreground">{t('effects.preview.hint')}</p>
-        </div>
+        </FormSection>
       </div>
 
-      <Dialog open={saveAsDialogOpen} onOpenChange={setSaveAsDialogOpen}>
+      <Dialog
+        open={saveAsDialogOpen}
+        onOpenChange={(open) => {
+          if (!open) editRevision.current++;
+          setSaveAsDialogOpen(open);
+        }}
+      >
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle>{t('effects.saveAs.title')}</DialogTitle>
@@ -395,15 +506,19 @@ export function EffectsDetail() {
           </DialogHeader>
           <div className="space-y-3 py-2">
             <div className="space-y-1.5">
-              <Label className="text-xs">{t('effects.fields.name')}</Label>
+              <Label htmlFor={`${fieldId}-save-name`}>{t('effects.fields.name')}</Label>
               <Input
+                id={`${fieldId}-save-name`}
                 value={saveAsName}
-                onChange={(e) => setSaveAsName(e.target.value)}
+                onChange={(e) => {
+                  editRevision.current++;
+                  setSaveAsName(e.target.value);
+                }}
                 placeholder={t('effects.fields.namePlaceholder')}
                 className="h-9"
                 autoFocus
                 onKeyDown={(e) => {
-                  if (e.key === 'Enter' && saveAsName.trim()) {
+                  if (e.key === 'Enter' && saveAsName.trim() && !saving) {
                     handleSaveAsConfirm();
                   }
                 }}
@@ -413,7 +528,10 @@ export function EffectsDetail() {
               <Label className="text-xs">{t('effects.fields.description')}</Label>
               <Textarea
                 value={saveAsDescription}
-                onChange={(e) => setSaveAsDescription(e.target.value)}
+                onChange={(e) => {
+                  editRevision.current++;
+                  setSaveAsDescription(e.target.value);
+                }}
                 placeholder={t('effects.fields.descriptionPlaceholder')}
                 className="min-h-[60px] resize-none"
               />

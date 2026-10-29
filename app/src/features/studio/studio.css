@@ -102,11 +102,11 @@
   align-items: center;
   justify-content: center;
   gap: 8px;
-  min-height: 35px;
+  min-height: 36px;
   padding: 8px 15px;
-  background: hsl(var(--primary));
-  color: hsl(var(--primary-foreground));
-  border-radius: 9px;
+  background: hsl(var(--accent));
+  color: hsl(var(--accent-foreground));
+  border-radius: 8px;
   border: 1px solid transparent;
   font-size: 12px;
   font-weight: 600;
@@ -118,12 +118,12 @@
   align-items: center;
   justify-content: center;
   gap: 6px;
-  min-height: 34px;
-  border: 1px solid hsl(var(--border));
+  min-height: 32px;
+  border: 1px solid hsl(var(--input));
   border-radius: 8px;
   padding: 6px 10px;
   color: hsl(var(--foreground));
-  background: hsl(var(--card));
+  background: hsl(var(--background));
   font-size: 11px;
   white-space: nowrap;
   cursor: pointer;
@@ -1364,4 +1364,22 @@
   .studio-jobs-disclosure {
     max-height: 180px;
   }
+}
+.studio-phrase-range {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+.studio-phrase-source,
+.studio-phrase-repairs > .studio-note {
+  margin-block: 10px;
+}
+.studio-phrase-repairs select,
+.studio-phrase-range input {
+  min-width: 0;
+  max-width: 100%;
+}
+.studio-caption-modal {
+  width: min(960px, calc(100vw - 3rem));
+  max-width: 960px;
 }

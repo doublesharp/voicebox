@@ -81,8 +81,23 @@ export class StudioPlayback {
       return false;
     }
   }
-  async audition(url: string, label: string, temporaryGain = 1) {
+  async audition(
+    url: string,
+    label: string,
+    temporaryGain = 1,
+    range?: { start: number; end: number },
+  ) {
     this.stop();
+    if (
+      range &&
+      (!Number.isFinite(range.start) ||
+        !Number.isFinite(range.end) ||
+        range.start < 0 ||
+        range.end <= range.start)
+    ) {
+      this.emit({ error: 'Choose a valid source phrase range.' });
+      return;
+    }
     const token = this.epoch;
     if (!(await this.acquire(token))) return;
     const audio = new Audio();
@@ -97,6 +112,10 @@ export class StudioPlayback {
     };
     this.emit({ mode: 'loading', label, position: 0, duration: 0, error: null });
     audio.ontimeupdate = () => {
+      if (range && audio.currentTime >= range.end) {
+        if (token === this.epoch) this.stop();
+        return;
+      }
       if (token === this.epoch)
         this.emit({
           position: audio.currentTime,
@@ -138,6 +157,7 @@ export class StudioPlayback {
         this.meters.unavailable();
       }
       if (token !== this.epoch) return;
+      if (range) audio.currentTime = range.start;
       await audio.play();
       if (token === this.epoch) this.emit({ mode: 'audition' });
       else {

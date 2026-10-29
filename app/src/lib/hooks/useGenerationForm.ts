@@ -1,5 +1,5 @@
 import { zodResolver } from '@hookform/resolvers/zod';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useForm } from 'react-hook-form';
 import * as z from 'zod';
 import { useToast } from '@/components/ui/use-toast';
@@ -10,30 +10,50 @@ import { LANGUAGE_CODES, type LanguageCode } from '@/lib/constants/languages';
 import { useGeneration } from '@/lib/hooks/useGeneration';
 import { useModelDownloadToast } from '@/lib/hooks/useModelDownloadToast';
 import { useGenerationSettings } from '@/lib/hooks/useSettings';
+import { useGenerationDraftStore } from '@/stores/generationDraftStore';
 import { useGenerationStore } from '@/stores/generationStore';
 import { useUIStore } from '@/stores/uiStore';
 
-const generationSchema = z.object({
-  text: z.string().min(1, '').max(50000),
-  language: z.enum(LANGUAGE_CODES as [LanguageCode, ...LanguageCode[]]),
-  seed: z.number().int().optional(),
-  modelSize: z.enum(['1.7B', '0.6B', '1B', '3B']).optional(),
-  instruct: z.string().max(500).optional(),
-  engine: z
-    .enum([
-      'qwen',
-      'qwen_custom_voice',
-      'qwen_voice_design',
-      'luxtts',
-      'chatterbox',
-      'chatterbox_turbo',
-      'tada',
-      'kokoro',
-      'omnivoice',
-    ])
-    .optional(),
-  personality: z.boolean().optional(),
-});
+const generationSchema = z.preprocess(
+  (value) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+    const data = value as Record<string, unknown>;
+    if (data.engine === 'chatterbox') return data;
+    // Ignore hidden engine-specific fields before validation as well as before
+    // dispatch, including invalid values retained from an earlier engine.
+    return {
+      ...data,
+      chatterboxTemperature: undefined,
+      chatterboxCfgWeight: undefined,
+      chatterboxExaggeration: undefined,
+    };
+  },
+  z.object({
+    text: z.string().min(1, '').max(50000),
+    language: z.enum(LANGUAGE_CODES as [LanguageCode, ...LanguageCode[]]),
+    seed: z.number().int().optional(),
+    modelSize: z.enum(['1.7B', '0.6B', '1B', '3B']).optional(),
+    instruct: z.string().max(500).optional(),
+    engine: z
+      .enum([
+        'qwen',
+        'qwen_custom_voice',
+        'qwen_voice_design',
+        'luxtts',
+        'chatterbox',
+        'chatterbox_turbo',
+        'tada',
+        'kokoro',
+        'omnivoice',
+      ])
+      .optional(),
+    personality: z.boolean().optional(),
+    speed: z.number().finite().min(0.5).max(2).optional(),
+    chatterboxTemperature: z.number().finite().min(0.1).max(1.5).optional(),
+    chatterboxCfgWeight: z.number().finite().min(0).max(1).optional(),
+    chatterboxExaggeration: z.number().finite().min(0).max(1).optional(),
+  }),
+);
 
 export type GenerationFormValues = z.infer<typeof generationSchema>;
 
@@ -52,6 +72,7 @@ export function useGenerationForm(options: UseGenerationFormOptions = {}) {
   const crossfadeMs = genSettings?.crossfade_ms ?? 50;
   const normalizeAudio = genSettings?.normalize_audio ?? true;
   const selectedEngine = useUIStore((state) => state.selectedEngine);
+  const isSubmitting = useGenerationDraftStore((state) => state.submitting);
   const [downloadingModelName, setDownloadingModelName] = useState<string | null>(null);
   const [downloadingDisplayName, setDownloadingDisplayName] = useState<string | null>(null);
 
@@ -71,9 +92,26 @@ export function useGenerationForm(options: UseGenerationFormOptions = {}) {
       instruct: '',
       engine: (selectedEngine as GenerationFormValues['engine']) || 'qwen',
       personality: false,
+      speed: 1,
       ...options.defaultValues,
+      ...useGenerationDraftStore.getState().values,
     },
   });
+
+  useEffect(() => {
+    const draft = useGenerationDraftStore.getState();
+    if (!draft.values) draft.setValues(form.getValues());
+    const watch = form.watch(() => useGenerationDraftStore.getState().setValues(form.getValues()));
+    const unsubscribe = useGenerationDraftStore.subscribe((state) => {
+      if (state.values && state.values.text !== form.getValues('text')) {
+        form.setValue('text', state.values.text);
+      }
+    });
+    return () => {
+      watch.unsubscribe();
+      unsubscribe();
+    };
+  }, [form]);
 
   async function handleSubmit(
     data: GenerationFormValues,
@@ -88,7 +126,13 @@ export function useGenerationForm(options: UseGenerationFormOptions = {}) {
       return;
     }
 
+    const draft = useGenerationDraftStore.getState();
+    if (draft.submitting) return;
+    draft.setSubmitting(true);
+    const textRevision = draft.textRevision;
     try {
+      // Capture all request inputs at submission, before the model status request.
+      const effectsChain = options.getEffectsChain?.();
       const engine = data.engine || 'qwen';
       const modelName =
         engine === 'luxtts'
@@ -151,7 +195,6 @@ export function useGenerationForm(options: UseGenerationFormOptions = {}) {
       const hasModelSizes =
         engine === 'qwen' || engine === 'qwen_custom_voice' || engine === 'tada';
       const supportsInstruct = engineSupportsInstruct(engine);
-      const effectsChain = options.getEffectsChain?.();
       // This now returns immediately with status="generating"
       const result = await generation.mutateAsync({
         profile_id: selectedProfileId,
@@ -165,22 +208,17 @@ export function useGenerationForm(options: UseGenerationFormOptions = {}) {
         max_chunk_chars: maxChunkChars,
         crossfade_ms: crossfadeMs,
         normalize: normalizeAudio,
-        effects_chain: effectsChain?.length ? effectsChain : undefined,
+        effects_chain: effectsChain,
+        speed: data.speed ?? 1,
+        chatterbox_temperature: engine === 'chatterbox' ? data.chatterboxTemperature : undefined,
+        chatterbox_cfg_weight: engine === 'chatterbox' ? data.chatterboxCfgWeight : undefined,
+        chatterbox_exaggeration: engine === 'chatterbox' ? data.chatterboxExaggeration : undefined,
       });
 
       // Track this generation for SSE status updates
       addPendingGeneration(result.id);
 
-      // Reset form immediately — user can start typing again
-      form.reset({
-        text: '',
-        language: data.language,
-        seed: undefined,
-        modelSize: data.modelSize,
-        instruct: '',
-        engine: data.engine,
-        personality: data.personality,
-      });
+      useGenerationDraftStore.getState().clearSubmittedText(textRevision, data.text);
       options.onSuccess?.(result.id);
     } catch (error) {
       toast({
@@ -189,6 +227,7 @@ export function useGenerationForm(options: UseGenerationFormOptions = {}) {
         variant: 'destructive',
       });
     } finally {
+      useGenerationDraftStore.getState().setSubmitting(false);
       setDownloadingModelName(null);
       setDownloadingDisplayName(null);
     }
@@ -197,6 +236,6 @@ export function useGenerationForm(options: UseGenerationFormOptions = {}) {
   return {
     form,
     handleSubmit,
-    isPending: generation.isPending,
+    isPending: generation.isPending || isSubmitting,
   };
 }

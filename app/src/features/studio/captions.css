@@ -1,0 +1,42 @@
+.studio-captions {
+  display: grid;
+  gap: 0.7rem;
+  min-width: 0;
+}
+.studio-captions h3,
+.studio-captions h4,
+.studio-captions p {
+  margin: 0;
+}
+.studio-captions video {
+  width: 100%;
+  max-height: 17rem;
+  background: #080b10;
+  border-radius: 0.5rem;
+}
+.studio-caption-scene,
+.studio-caption-cue {
+  display: grid;
+  gap: 0.65rem;
+  padding: 0.75rem;
+  border: 1px solid var(--studio-border, #ffffff20);
+  border-radius: 0.5rem;
+}
+.studio-caption-cues {
+  display: grid;
+  gap: 0.65rem;
+  max-height: 28rem;
+  overflow-y: auto;
+}
+.studio-caption-cues textarea {
+  resize: vertical;
+  min-height: 4rem;
+}
+.studio-captions .studio-action-row {
+  flex-wrap: wrap;
+}
+@media (max-width: 520px) {
+  .studio-captions .studio-field-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

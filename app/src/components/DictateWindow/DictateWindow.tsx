@@ -139,6 +139,7 @@ export function DictateWindow() {
     // actually starts playing, and that's also when the elapsed counter
     // arms.
     audio.onplaying = () => {
+      if (audioRef.current !== audio) return;
       emit('dictate:show').catch(() => {});
       setSpeaking((prev) =>
         prev && prev.generationId === generationId
@@ -194,6 +195,7 @@ export function DictateWindow() {
           }
         }, 60_000);
         source.onmessage = (msg) => {
+          if (statusSourceRef.current !== source) return;
           try {
             const data = JSON.parse(msg.data) as { status?: string };
             if (data.status === 'completed') {

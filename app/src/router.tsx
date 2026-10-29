@@ -6,6 +6,8 @@ import {
   redirect,
   useRouterState,
 } from '@tanstack/react-router';
+import { useEffect, useRef } from 'react';
+import './app-shell.css';
 import { AppFrame } from '@/components/AppFrame/AppFrame';
 import { CapturesTab } from '@/components/CapturesTab/CapturesTab';
 import { EffectsTab } from '@/components/EffectsTab/EffectsTab';
@@ -21,12 +23,14 @@ import { LogsPage } from '@/components/ServerTab/LogsPage';
 import { MCPPage } from '@/components/ServerTab/MCPPage';
 import { SettingsLayout } from '@/components/ServerTab/ServerTab';
 import { Sidebar } from '@/components/Sidebar';
+import { KeyboardShortcuts } from '@/components/KeyboardShortcuts';
 import { StoriesTab } from '@/components/StoriesTab/StoriesTab';
 import { Toaster } from '@/components/ui/toaster';
 import { VoicesTab } from '@/components/VoicesTab/VoicesTab';
 import { ProjectsPage } from '@/features/studio/ProjectsPage';
 import { StudioFrame } from '@/features/studio/StudioFrame';
 import { StudioProjectPage } from '@/features/studio/StudioProjectPage';
+import { isProjectWorkspacePath, observeGlobalPlayerHeight } from '@/lib/constants/ui';
 import { useGenerationProgress } from '@/lib/hooks/useGenerationProgress';
 import { useModelDownloadToast } from '@/lib/hooks/useModelDownloadToast';
 import { MODEL_DISPLAY_NAMES, useRestoreActiveTasks } from '@/lib/hooks/useRestoreActiveTasks';
@@ -36,6 +40,15 @@ const isMacOS = () => navigator.platform.toLowerCase().includes('mac');
 
 // Root layout component
 function RootLayout() {
+  const shellRef = useRef<HTMLDivElement>(null);
+  const isProjectWorkspace = useRouterState({
+    select: (state) => isProjectWorkspacePath(state.location.pathname),
+  });
+  useEffect(() => {
+    const shell = shellRef.current;
+    if (shell) return observeGlobalPlayerHeight(shell);
+  }, []);
+
   // Monitor active downloads/generations and show toasts for them
   const activeDownloads = useRestoreActiveTasks();
   const isStudio = useRouterState({
@@ -48,37 +61,43 @@ function RootLayout() {
   const Frame = isStudio ? StudioFrame : AppFrame;
 
   return (
-    <Frame>
-      <div className="flex flex-1 min-h-0 overflow-hidden">
-        <Sidebar isMacOS={isMacOS()} />
+    <div ref={shellRef} className="app-shell" data-project-workspace={isProjectWorkspace}>
+      <Frame>
+        <KeyboardShortcuts />
+        <div className="flex flex-1 min-h-0 overflow-hidden">
+          <Sidebar isMacOS={isMacOS()} />
 
-        <main className="flex-1 ml-20 overflow-hidden flex flex-col">
-          <div
-            className={
-              isStudio
-                ? 'mx-auto w-full px-2 sm:px-4 max-w-[1800px] h-full overflow-hidden flex flex-col'
-                : 'container mx-auto px-8 max-w-[1800px] h-full overflow-hidden flex flex-col'
-            }
+          <main
+            className="flex-1 overflow-hidden flex flex-col"
+            style={{ marginLeft: 'var(--app-rail-width)' }}
           >
-            <Outlet />
-          </div>
-        </main>
-      </div>
+            <div
+              className={
+                isStudio
+                  ? 'mx-auto w-full px-2 sm:px-4 max-w-[1800px] h-full overflow-hidden flex flex-col'
+                  : 'container mx-auto px-8 max-w-[1800px] h-full overflow-hidden flex flex-col'
+              }
+            >
+              <Outlet />
+            </div>
+          </main>
+        </div>
 
-      {/* Show download toasts for any active downloads (from anywhere) */}
-      {activeDownloads.map((download) => {
-        const displayName = MODEL_DISPLAY_NAMES[download.model_name] || download.model_name;
-        return (
-          <DownloadToastRestorer
-            key={download.model_name}
-            modelName={download.model_name}
-            displayName={displayName}
-          />
-        );
-      })}
+        {/* Show download toasts for any active downloads (from anywhere) */}
+        {activeDownloads.map((download) => {
+          const displayName = MODEL_DISPLAY_NAMES[download.model_name] || download.model_name;
+          return (
+            <DownloadToastRestorer
+              key={download.model_name}
+              modelName={download.model_name}
+              displayName={displayName}
+            />
+          );
+        })}
 
-      <Toaster />
-    </Frame>
+        <Toaster />
+      </Frame>
+    </div>
   );
 }
 

@@ -1,27 +1,16 @@
 import { RouterProvider } from '@tanstack/react-router';
-import { useReducedMotion } from 'motion/react';
 import { useEffect, useRef, useState } from 'react';
-import voiceboxLogo from '@/assets/voicebox-logo.png';
-import { DoubleSharpMark, DoubleSharpSignature, EditionBadge } from '@/components/Branding';
 import { DictateWindow } from '@/components/DictateWindow/DictateWindow';
-import ShinyText from '@/components/ShinyText';
-import { TitleBarDragRegion } from '@/components/TitleBarDragRegion';
+import { StartupScreen } from '@/components/StartupScreen';
 import { useAutoUpdater } from '@/hooks/useAutoUpdater';
 import { useThemeSync } from '@/hooks/useThemeSync';
 import { apiClient } from '@/lib/api/client';
 import type { HealthResponse } from '@/lib/api/types';
-import { APP_BRANDING } from '@/lib/constants/branding';
-import { TOP_SAFE_AREA_PADDING } from '@/lib/constants/ui';
 import { useChordSync } from '@/lib/hooks/useChordSync';
-import { cn } from '@/lib/utils/cn';
 import { usePlatform } from '@/platform/PlatformContext';
 import { router } from '@/router';
 import { useLogStore } from '@/stores/logStore';
-import {
-  getDefaultServerUrl,
-  isLoopbackVoiceboxServerUrl,
-  useServerStore,
-} from '@/stores/serverStore';
+import { getDefaultServerUrl, useServerStore } from '@/stores/serverStore';
 
 function isDictateView(): boolean {
   if (typeof window === 'undefined') return false;
@@ -55,12 +44,6 @@ function isPortInUseError(error: unknown): boolean {
   );
 }
 
-const LOADING_MESSAGES = [
-  'Opening your voice studio...',
-  'Connecting to your voice server...',
-  'Waiting for your voice server to be ready...',
-];
-
 function App() {
   useThemeSync();
 
@@ -76,10 +59,8 @@ function App() {
 
 function MainApp() {
   const platform = usePlatform();
-  const prefersReducedMotion = useReducedMotion();
   const [serverReady, setServerReady] = useState(false);
   const [startupError, setStartupError] = useState<string | null>(null);
-  const [loadingMessageIndex, setLoadingMessageIndex] = useState(0);
   const serverStartingRef = useRef(false);
 
   // Automatically check for app updates on startup and show toast notifications
@@ -122,10 +103,7 @@ function MainApp() {
   useEffect(() => {
     if (!platform.metadata.isTauri) {
       const serverUrl = getDefaultServerUrl();
-      const currentServerUrl = useServerStore.getState().serverUrl;
-      if (currentServerUrl !== serverUrl && isLoopbackVoiceboxServerUrl(currentServerUrl)) {
-        useServerStore.getState().setServerUrl(serverUrl);
-      }
+      useServerStore.getState().setDiscoveredServerUrl(serverUrl);
       setServerReady(true); // Web assumes server is running
       return;
     }
@@ -160,8 +138,8 @@ function MainApp() {
       .startServer(isRemote, customModelsDir)
       .then((serverUrl) => {
         console.log('Server is ready at:', serverUrl);
-        // Update the server URL in the store with the dynamically assigned port
-        useServerStore.getState().setServerUrl(serverUrl);
+        // Use the bundled server address unless the user saved a custom URL.
+        useServerStore.getState().setDiscoveredServerUrl(serverUrl);
         setServerReady(true);
         // Mark that we started the server (so we know to stop it on close)
         window.__voiceboxServerStartedByApp = true;
@@ -222,80 +200,17 @@ function MainApp() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [platform.metadata.isTauri, platform.lifecycle]);
 
-  // Cycle through loading messages every 3 seconds
-  useEffect(() => {
-    if (!platform.metadata.isTauri || serverReady) {
-      return;
-    }
-
-    const interval = setInterval(() => {
-      setLoadingMessageIndex((prev) => (prev + 1) % LOADING_MESSAGES.length);
-    }, 3000);
-
-    return () => clearInterval(interval);
-  }, [serverReady, platform.metadata.isTauri]);
-
   // Show loading screen while server is starting in Tauri
   if (platform.metadata.isTauri && !serverReady) {
     return (
-      <div
-        className={cn(
-          'h-screen min-h-0 bg-background flex flex-col items-center overflow-y-auto',
-          TOP_SAFE_AREA_PADDING,
-        )}
-      >
-        <TitleBarDragRegion />
-        <div className="my-auto w-full max-w-xl shrink-0 text-center space-y-7 px-6 py-10">
-          <div className="flex justify-center relative mx-auto w-fit">
-            <div className="absolute inset-0 flex items-center justify-center">
-              <div
-                className="w-48 h-48 rounded-full opacity-15 blur-3xl"
-                style={{ background: 'var(--brand-gradient)' }}
-              />
-            </div>
-            <img
-              src={voiceboxLogo}
-              alt=""
-              className="w-32 h-32 object-contain animate-fade-in-scale motion-reduce:animate-none relative z-10"
-            />
-            <DoubleSharpMark className="absolute bottom-0 -right-2 z-20 h-10 w-10 shadow-lg" />
-          </div>
-          <div className="space-y-3">
-            <EditionBadge />
-            <h1 className="text-3xl font-light tracking-[0.12em]">{APP_BRANDING.name}</h1>
-            <DoubleSharpSignature className="mt-2 text-left" />
-          </div>
-          {startupError ? (
-            <div className="animate-fade-in-delayed motion-reduce:animate-none max-w-md mx-auto space-y-3">
-              <p className="text-lg font-medium text-destructive">Server startup failed</p>
-              <p className="text-sm text-muted-foreground break-words">{startupError}</p>
-              <button
-                type="button"
-                className="mt-2 px-4 py-2 text-sm rounded-md bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"
-                onClick={() => {
-                  setStartupError(null);
-                  serverStartingRef.current = false;
-                  // Trigger a re-mount of the effect by toggling state
-                  window.location.reload();
-                }}
-              >
-                Retry
-              </button>
-            </div>
-          ) : (
-            <div className="animate-fade-in-delayed motion-reduce:animate-none">
-              <ShinyText
-                text={LOADING_MESSAGES[loadingMessageIndex]}
-                disabled={prefersReducedMotion === true}
-                className="text-sm font-medium text-muted-foreground"
-                speed={2}
-                color="hsl(var(--muted-foreground))"
-                shineColor="hsl(var(--foreground))"
-              />
-            </div>
-          )}
-        </div>
-      </div>
+      <StartupScreen
+        error={startupError}
+        onRetry={() => {
+          setStartupError(null);
+          serverStartingRef.current = false;
+          window.location.reload();
+        }}
+      />
     );
   }
 

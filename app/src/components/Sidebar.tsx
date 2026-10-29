@@ -1,4 +1,4 @@
-import { Link, useMatchRoute } from '@tanstack/react-router';
+import { Link, useRouterState } from '@tanstack/react-router';
 import {
   AudioLines,
   Box,
@@ -6,61 +6,74 @@ import {
   FolderOpen,
   type LucideIcon,
   Mic,
+  Keyboard,
   Settings,
   Volume2,
   Wand2,
 } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import voiceboxLogo from '@/assets/voicebox-logo.png';
-import { DoubleSharpMark } from '@/components/Branding';
+import voiceboxLogo from '@/assets/voicebox-ds-icon.png';
+import { Hint } from '@/components/ui/Hint';
 import { APP_BRANDING } from '@/lib/constants/branding';
 import { cn } from '@/lib/utils/cn';
 import { usePlatform } from '@/platform/PlatformContext';
 import type { UpdateStatus } from '@/platform/types';
-import { usePlayerStore } from '@/stores/playerStore';
 import { version } from '../../package.json';
 
 interface SidebarProps {
   isMacOS?: boolean;
 }
-
-const tabs: Array<{
-  id: string;
-  path: string;
-  icon: LucideIcon;
-  labelKey?: string;
-  label?: string;
-}> = [
-  { id: 'projects', path: '/studio/projects', icon: FolderOpen, label: 'Projects' },
-  { id: 'main', path: '/', icon: Volume2, labelKey: 'nav.generate' },
-  { id: 'stories', path: '/stories', icon: AudioLines, labelKey: 'nav.stories' },
-  { id: 'captures', path: '/captures', icon: Captions, labelKey: 'nav.captures' },
-  { id: 'voices', path: '/voices', icon: Mic, labelKey: 'nav.voices' },
-  { id: 'effects', path: '/effects', icon: Wand2, labelKey: 'nav.effects' },
-  { id: 'models', path: '/models', icon: Box, labelKey: 'nav.models' },
-  { id: 'settings', path: '/settings', icon: Settings, labelKey: 'nav.settings' },
+type NavItem = { path: string; icon: LucideIcon; labelKey?: string; label?: string };
+const createItems: NavItem[] = [
+  { path: '/studio/projects', icon: FolderOpen, label: 'Projects' },
+  { path: '/', icon: Volume2, labelKey: 'nav.generate' },
+  { path: '/voices', icon: Mic, labelKey: 'nav.voices' },
+  { path: '/captures', icon: Captions, labelKey: 'nav.captures' },
 ];
+const toolItems: NavItem[] = [
+  { path: '/effects', icon: Wand2, labelKey: 'nav.effects' },
+  { path: '/models', icon: Box, labelKey: 'nav.models' },
+];
+const stories: NavItem = { path: '/stories', icon: AudioLines, labelKey: 'nav.stories' };
+const settings: NavItem = { path: '/settings', icon: Settings, labelKey: 'nav.settings' };
 
 export function Sidebar({ isMacOS }: SidebarProps) {
   const { t } = useTranslation();
-  const matchRoute = useMatchRoute();
-  const isPlayerOpen = !!usePlayerStore((s) => s.audioUrl);
+  const path = useRouterState({ select: (state) => state.location.pathname });
   const platform = usePlatform();
-
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>(platform.updater.getStatus());
   useEffect(() => platform.updater.subscribe(setUpdateStatus), [platform.updater]);
 
+  const item = (tab: NavItem) => {
+    const Icon = tab.icon;
+    const label = tab.label ?? t(tab.labelKey!);
+    const current =
+      tab.path === '/' ? path === '/' : path === tab.path || path.startsWith(`${tab.path}/`);
+    return (
+      <Hint key={tab.path} content={label}>
+        <Link
+          to={tab.path}
+          activeOptions={{ exact: tab.path === '/' }}
+          className="app-rail-link"
+          aria-label={label}
+          aria-current={current ? 'page' : undefined}
+        >
+          <Icon className="h-5 w-5 shrink-0" aria-hidden="true" />
+          <span className="app-rail-label">{label}</span>
+        </Link>
+      </Hint>
+    );
+  };
   return (
-    <div
+    <aside
       className={cn(
-        'fixed left-0 top-0 h-full w-20 bg-sidebar border-r border-border flex flex-col items-center py-4 gap-3 overflow-y-auto',
+        'app-rail fixed left-0 top-0 h-full bg-sidebar border-r border-border flex flex-col py-4 gap-3 overflow-y-auto',
         isMacOS && 'pt-14',
       )}
     >
-      {/* Logo */}
       <div
-        className="relative mb-2 shrink-0"
+        className="px-3 mb-2 shrink-0 flex justify-center"
         title={`${APP_BRANDING.name} · ${APP_BRANDING.edition}`}
       >
         <img
@@ -68,65 +81,51 @@ export function Sidebar({ isMacOS }: SidebarProps) {
           alt={`${APP_BRANDING.name} · ${APP_BRANDING.edition}`}
           className="sidebar-logo w-12 h-12 object-contain"
         />
-        <DoubleSharpMark className="absolute -bottom-1 -right-1 h-5 w-5 rounded-md text-[8px] shadow-sm" />
       </div>
-
-      {/* Navigation Buttons */}
-      <div className="flex flex-col gap-1.5">
-        {tabs.map((tab, index) => {
-          const Icon = tab.icon;
-          const isActive =
-            tab.path === '/'
-              ? matchRoute({ to: '/', fuzzy: false })
-              : matchRoute({ to: tab.path, fuzzy: true });
-
-          // Accent fades as buttons get further from the logo
-          const accentOpacity = Math.max(0.08, 0.5 - index * 0.07);
-
-          return (
-            <Link
-              key={tab.id}
-              to={tab.path}
-              className={cn(
-                'relative w-12 h-11 shrink-0 rounded-full flex items-center justify-center transition-all duration-200 overflow-hidden',
-                isActive
-                  ? 'bg-white/[0.07] text-foreground shadow-lg backdrop-blur-sm border border-white/[0.08]'
-                  : 'text-muted-foreground hover:bg-muted/50',
-              )}
-              title={tab.label ?? (tab.labelKey ? t(tab.labelKey) : tab.id)}
-              aria-label={tab.label ?? (tab.labelKey ? t(tab.labelKey) : tab.id)}
-            >
-              {isActive && (
-                <div
-                  className="absolute inset-0 rounded-full pointer-events-none"
-                  style={{
-                    maskImage: 'linear-gradient(to bottom, black, transparent 60%)',
-                    WebkitMaskImage: 'linear-gradient(to bottom, black, transparent 60%)',
-                    border: `1px solid hsl(var(--accent) / ${accentOpacity})`,
-                  }}
-                />
-              )}
-              <Icon className="h-5 w-5 relative z-10" />
-            </Link>
-          );
-        })}
-      </div>
-
-      {/* Version */}
-      <div
-        className="mt-auto flex flex-col items-center gap-1.5 transition-all duration-300"
-        style={{ paddingBottom: isPlayerOpen ? '7rem' : undefined }}
-      >
-        <span className="text-[10px] text-muted-foreground/50">v{version}</span>
-        {updateStatus.available && (
-          <Link
-            to="/settings"
-            className="text-[9px] font-semibold tracking-wide uppercase px-2 py-0.5 rounded-full bg-accent/15 text-accent hover:bg-accent/25 transition-colors"
+      <nav aria-label="Main navigation" className="flex flex-col gap-4 px-2">
+        <div className="flex flex-col gap-1">
+          <span className="app-rail-group-label">Create</span>
+          {createItems.map((tab) => (
+            <span key={tab.path}>
+              {item(tab)}
+              {tab.path === '/studio/projects' &&
+                (path === '/stories' || path.startsWith('/stories/')) && (
+                  <span className="app-rail-nested">{item(stories)}</span>
+                )}
+            </span>
+          ))}
+        </div>
+        <div className="flex flex-col gap-1">
+          <span className="app-rail-group-label">Tools</span>
+          {toolItems.map(item)}
+        </div>
+      </nav>
+      <div className="mt-auto px-2 flex flex-col gap-2">
+        <Hint content="Keyboard shortcuts · Command or Control + /">
+          <button
+            type="button"
+            className="app-rail-link"
+            aria-label="Keyboard shortcuts"
+            aria-keyshortcuts="Meta+/ Control+/"
+            onClick={() => window.dispatchEvent(new Event('voicebox:keyboard-shortcuts'))}
           >
-            {t('nav.updateBadge')}
-          </Link>
-        )}
+            <Keyboard className="h-5 w-5 shrink-0" aria-hidden="true" />
+            <span className="app-rail-label">Shortcuts</span>
+          </button>
+        </Hint>
+        {item(settings)}
+        <div className="flex flex-col items-center gap-1.5">
+          <span className="text-[10px] text-muted-foreground/50">v{version}</span>
+          {updateStatus.available && (
+            <Link
+              to="/settings"
+              className="text-[9px] font-semibold tracking-wide uppercase px-2 py-0.5 rounded-full bg-accent/15 text-accent hover:bg-accent/25"
+            >
+              {t('nav.updateBadge')}
+            </Link>
+          )}
+        </div>
       </div>
-    </div>
+    </aside>
   );
 }
