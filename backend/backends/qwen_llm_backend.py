@@ -108,15 +108,24 @@ class PyTorchQwenLLMBackend:
             # and silently switches every concurrent download/load on other
             # threads to offline mode (issue #841) — the same regression
             # removed app-wide in #524/#530.
-            self.tokenizer = AutoTokenizer.from_pretrained(repo)
-            dtype = torch.float16 if self.device in ("cuda", "mps") else torch.float32
-            self.model = AutoModelForCausalLM.from_pretrained(
-                repo,
-                dtype=dtype,
-            )
-            self.model.to(self.device)
-            self.model.eval()
+            tokenizer = None
+            model = None
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(repo)
+                dtype = torch.float16 if self.device in ("cuda", "mps") else torch.float32
+                model = AutoModelForCausalLM.from_pretrained(repo, dtype=dtype)
+                model.to(self.device)
+                model.eval()
+            except BaseException:
+                # Avoid retaining a partially initialized model through this
+                # traceback or exposing it as ready to other requests.
+                tokenizer = None
+                model = None
+                empty_device_cache(self.device)
+                raise
 
+        self.tokenizer = tokenizer
+        self.model = model
         self._current_model_size = model_size
         self.model_size = model_size
         logger.info("Qwen3 %s loaded successfully", model_size)
@@ -222,6 +231,9 @@ class MLXQwenLLMBackend:
         from .mlx_backend import _run_on_mlx_thread
 
         async with self._op_lock:
+            # Another request may have loaded this size while we waited.
+            if self.model is not None and self._current_model_size == model_size:
+                return
             await _run_on_mlx_thread(self._reload_sync, model_size)
 
     def _reload_sync(self, model_size: str) -> None:
