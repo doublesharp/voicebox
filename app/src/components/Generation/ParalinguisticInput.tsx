@@ -114,10 +114,14 @@ function htmlToText(container: HTMLElement): string {
 
 /** Get the text content from the current caret position back to the last
  *  whitespace or start of container, to detect the "/" trigger. */
-function getWordBeforeCaret(_container: HTMLElement): { word: string; range: Range | null } {
+function getWordBeforeCaret(container: HTMLElement): { word: string; range: Range | null } {
   const sel = window.getSelection();
   if (!sel || sel.rangeCount === 0) return { word: '', range: null };
-  const range = sel.getRangeAt(0).cloneRange();
+  const selectedRange = sel.getRangeAt(0);
+  if (!container.contains(selectedRange.startContainer) || !container.contains(selectedRange.endContainer)) {
+    return { word: '', range: null };
+  }
+  const range = selectedRange.cloneRange();
   range.collapse(true);
 
   // Walk backwards from caret through the text node
@@ -232,11 +236,20 @@ export const ParalinguisticInput = forwardRef<ParalinguisticInputRef, Paralingui
         const el = editorRef.current;
         if (!el) return;
 
-        // Delete the /filter text
         const wordRange = triggerRangeRef.current;
-        if (wordRange) {
-          wordRange.deleteContents();
+        const sel = window.getSelection();
+        const range = sel && sel.rangeCount > 0 ? sel.getRangeAt(0) : null;
+        if (!wordRange || !range ||
+            !el.contains(wordRange.startContainer) || !el.contains(wordRange.endContainer) ||
+            !el.contains(range.startContainer) || !el.contains(range.endContainer)) {
+          triggerRangeRef.current = null;
+          setShowMenu(false);
+          setMenuFilter('');
+          return;
         }
+
+        // Delete the /filter text
+        wordRange.deleteContents();
 
         // Insert badge HTML
         const temp = document.createElement('span');
@@ -247,9 +260,7 @@ export const ParalinguisticInput = forwardRef<ParalinguisticInputRef, Paralingui
           lastNode = frag.appendChild(temp.firstChild);
         }
 
-        const sel = window.getSelection();
-        if (sel && sel.rangeCount > 0) {
-          const range = sel.getRangeAt(0);
+        if (sel) {
           range.deleteContents();
           range.insertNode(frag);
 
@@ -351,26 +362,29 @@ export const ParalinguisticInput = forwardRef<ParalinguisticInputRef, Paralingui
 
         const html = textToHTML(text);
 
-        // Insert at caret
+        // A missing or foreign selection must not lose the paste or edit another field.
         const sel = window.getSelection();
-        if (sel && sel.rangeCount > 0) {
-          const range = sel.getRangeAt(0);
-          range.deleteContents();
-          const temp = document.createElement('div');
-          temp.innerHTML = html;
-          const frag = document.createDocumentFragment();
-          let lastNode: Node | null = null;
-          while (temp.firstChild) {
-            lastNode = frag.appendChild(temp.firstChild);
-          }
-          range.insertNode(frag);
-          if (lastNode) {
-            const newRange = document.createRange();
-            newRange.setStartAfter(lastNode);
-            newRange.collapse(true);
-            sel.removeAllRanges();
-            sel.addRange(newRange);
-          }
+        let range = sel && sel.rangeCount > 0 ? sel.getRangeAt(0) : null;
+        if (!range || !el.contains(range.startContainer) || !el.contains(range.endContainer)) {
+          range = document.createRange();
+          range.selectNodeContents(el);
+          range.collapse(false);
+        }
+        range.deleteContents();
+        const temp = document.createElement('div');
+        temp.innerHTML = html;
+        const frag = document.createDocumentFragment();
+        let lastNode: Node | null = null;
+        while (temp.firstChild) {
+          lastNode = frag.appendChild(temp.firstChild);
+        }
+        range.insertNode(frag);
+        if (lastNode && sel) {
+          const newRange = document.createRange();
+          newRange.setStartAfter(lastNode);
+          newRange.collapse(true);
+          sel.removeAllRanges();
+          sel.addRange(newRange);
         }
 
         emitChange();
