@@ -58,7 +58,7 @@ def _remove_deleted_audio(paths: set[Path], db: Session) -> None:
         try:
             path.unlink(missing_ok=True)
         except OSError:
-            logger.warning("Could not delete generation audio %s", path, exc_info=True)
+            logger.warning("Could not delete unreferenced audio %s", path, exc_info=True)
 
 
 def _queue_generation_delete(generation: DBGeneration, db: Session, paths: set[Path]) -> None:

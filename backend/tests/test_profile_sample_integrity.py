@@ -8,7 +8,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from backend import config
-from backend.database import Base, ProfileSample, VoiceProfile
+from backend.database import Base, Generation, ProfileSample, VoiceProfile
 from backend.services import profiles
 
 
@@ -101,4 +101,14 @@ async def test_delete_succeeds_when_post_commit_file_cleanup_fails(db, audio, mo
     assert await profiles.delete_profile_sample(sample.id, db) is True
     assert db.get(ProfileSample, sample.id) is None
     assert saved_audio.exists()
-    assert "Could not remove deleted profile sample audio" in caplog.text
+    assert "Could not delete unreferenced audio" in caplog.text
+
+
+async def test_deleting_sample_preserves_audio_used_by_generation(db, audio):
+    sample = await profiles.add_profile_sample("voice", str(audio), "words", db)
+    saved_audio = config.resolve_storage_path(sample.audio_path)
+    db.add(Generation(id="generation", profile_id="voice", text="hello", audio_path=str(saved_audio)))
+    db.commit()
+    assert await profiles.delete_profile_sample(sample.id, db) is True
+    assert db.get(Generation, "generation") is not None
+    assert saved_audio.is_file()

@@ -562,12 +562,7 @@ async def delete_profile_sample(
         raise
 
     if audio_path is not None:
-        try:
-            audio_path.unlink(missing_ok=True)
-        except OSError:
-            # The deletion is already committed; report success rather than
-            # inviting a retry of a mutation that has completed.
-            logger.warning("Could not remove deleted profile sample audio %s", audio_path, exc_info=True)
+        history._remove_deleted_audio({audio_path}, db)
 
     # Invalidate combined audio cache for this profile
     # Since the sample set changed, any cached combined audio is now stale
