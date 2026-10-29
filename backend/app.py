@@ -130,8 +130,8 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def voicebox_lifespan(app: FastAPI):
-        await _run_startup(app)
         try:
+            await _run_startup(app)
             # Native CLI configuration happens after module import, so studio
             # storage is opened only after the actual data directory is ready.
             app.state.studio_runtime.initialize()
