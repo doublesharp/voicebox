@@ -5,7 +5,6 @@ import json
 import math
 import os
 import re
-import shutil
 import subprocess
 import threading
 import uuid
@@ -13,6 +12,8 @@ from contextlib import contextmanager
 
 import numpy as np
 import soundfile as sf
+
+from .ffmpeg import find_ffmpeg
 
 _LIMIT = 64 * 1024 * 1024
 _BLOCK = 65536
@@ -44,7 +45,7 @@ def _identity(path):
 
 
 def _decoded_blocks(path):
-    ffmpeg = shutil.which("ffmpeg")
+    ffmpeg = find_ffmpeg()
     if not ffmpeg:
         raise ValueError("This source requires ffmpeg for waveform decoding")
     with subprocess.Popen(
