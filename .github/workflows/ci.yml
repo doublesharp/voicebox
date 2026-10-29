@@ -25,6 +25,12 @@ jobs:
       - name: Playback lifecycle regressions
         run: bun run test:playback
 
+      - name: Voice, story and model regressions
+        run: |
+          for test in app/tests/profile-form-coverage.test.tsx app/tests/story-track-editor-coverage.test.tsx app/tests/model-management-coverage.test.tsx app/tests/*-priority*.test.tsx; do
+            bun test "$test"
+          done
+
       - name: Typecheck app + web
         run: bun run typecheck
 

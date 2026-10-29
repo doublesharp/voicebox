@@ -432,15 +432,17 @@ export function ModelManagement() {
     { label: t('models.sections.languageModels'), models: llmModels },
   ];
 
-  // Get detail modal state for selected model
-  const selectedState = selectedModel ? getModelState(selectedModel) : null;
-  const selectedError = selectedModel ? erroredDownloads.get(selectedModel.model_name) : undefined;
-
   // Keep selectedModel data fresh from query results
   const freshSelectedModel =
     selectedModel && modelStatus
       ? modelStatus.models.find((m) => m.model_name === selectedModel.model_name) || selectedModel
       : selectedModel;
+
+  // Derive the detail actions from the same fresh data shown in the modal.
+  const selectedState = freshSelectedModel ? getModelState(freshSelectedModel) : null;
+  const selectedError = freshSelectedModel
+    ? erroredDownloads.get(freshSelectedModel.model_name)
+    : undefined;
 
   // Derive license from HF data
   const license =
