@@ -52,6 +52,28 @@ impl Default for PlaybackOptions {
     }
 }
 
+/// Keep audio binary across IPC; only the small routing metadata is JSON.
+pub fn read_playback_request(
+    body: &tauri::ipc::InvokeBody,
+    metadata: Option<&str>,
+) -> Result<(Vec<u8>, Vec<String>, Option<PlaybackOptions>), String> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Metadata {
+        device_ids: Vec<String>,
+        options: Option<PlaybackOptions>,
+    }
+    let metadata = metadata
+        .filter(|value| value.len() <= 16 * 1024)
+        .ok_or("Missing or oversized playback metadata")?;
+    let metadata: Metadata =
+        serde_json::from_str(metadata).map_err(|_| "Invalid playback metadata")?;
+    let tauri::ipc::InvokeBody::Raw(data) = body else {
+        return Err("Playback audio must use a binary request body".into());
+    };
+    Ok((data.clone(), metadata.device_ids, metadata.options))
+}
+
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct PlaybackControl {
     pub paused: Option<bool>,
@@ -563,6 +585,28 @@ fn run_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binary_playback_preserves_bytes_and_routing_metadata() {
+        let body = tauri::ipc::InvokeBody::Raw(vec![0, 127, 255]);
+        let (data, devices, options) = read_playback_request(
+            &body,
+            Some(r#"{"deviceIds":["device-a"],"options":{"startTime":1.5,"volume":0.25}}"#),
+        )
+        .unwrap();
+        assert_eq!(data, vec![0, 127, 255]);
+        assert_eq!(devices, vec!["device-a"]);
+        let options = options.unwrap();
+        assert_eq!(options.start_time, 1.5);
+        assert_eq!(options.volume, 0.25);
+        assert!(read_playback_request(&body, None).is_err());
+        assert!(read_playback_request(&body, Some("invalid")).is_err());
+        assert!(read_playback_request(
+            &tauri::ipc::InvokeBody::Json(serde_json::json!({})),
+            Some(r#"{"deviceIds":[]}"#)
+        )
+        .is_err());
+    }
     use std::io::Cursor;
 
     fn wav(samples: &[i16], channels: u16, rate: u32) -> Vec<u8> {

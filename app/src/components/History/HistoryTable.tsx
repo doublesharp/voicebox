@@ -14,12 +14,11 @@ import {
   Trash2,
   Wand2,
 } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { EffectsChainEditor } from '@/components/Effects/EffectsChainEditor';
 import { Button } from '@/components/ui/button';
-import { Hint } from '@/components/ui/Hint';
 import {
   Dialog,
   DialogContent,
@@ -34,6 +33,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
+import { Hint } from '@/components/ui/Hint';
 import {
   Select,
   SelectContent,
@@ -63,10 +63,14 @@ import { cn } from '@/lib/utils/cn';
 import { formatDate, formatDuration, formatEngineName } from '@/lib/utils/format';
 import { useGenerationStore } from '@/stores/generationStore';
 import { usePlayerStore } from '@/stores/playerStore';
+import { HistoryPlaybackState, useHistoryWindow } from './historyWindow';
 
 export function HistoryTable({ embedded = false }: { embedded?: boolean }) {
   const { t } = useTranslation();
   const [page, setPage] = useState(0);
+  const [pageCursor, setPageCursor] = useState<string>();
+  const [focusedRow, setFocusedRow] = useState<string | null>(null);
+  const [menuRow, setMenuRow] = useState<string | null>(null);
   const [allHistory, setAllHistory] = useState<HistoryResponse[]>([]);
   const [total, setTotal] = useState(0);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -101,7 +105,9 @@ export function HistoryTable({ embedded = false }: { embedded?: boolean }) {
     isFetching,
   } = useHistory({
     limit,
-    offset: page * limit,
+    offset: pageCursor ? 0 : page * limit,
+    cursor: pageCursor,
+    include_total: page === 0,
   });
 
   const deleteGeneration = useDeleteGeneration();
@@ -130,14 +136,12 @@ export function HistoryTable({ embedded = false }: { embedded?: boolean }) {
   const addPendingGeneration = useGenerationStore((state) => state.addPendingGeneration);
   const setAudioWithAutoPlay = usePlayerStore((state) => state.setAudioWithAutoPlay);
   const restartCurrentAudio = usePlayerStore((state) => state.restartCurrentAudio);
-  const currentAudioId = usePlayerStore((state) => state.audioId);
-  const isPlaying = usePlayerStore((state) => state.isPlaying);
   const isPlayerVisible = !!usePlayerStore((state) => state.audioUrl);
 
   // Update accumulated history when new data arrives
   useEffect(() => {
     if (historyData?.items) {
-      setTotal(historyData.total);
+      if (typeof historyData.total === 'number') setTotal(historyData.total);
       if (page === 0) {
         // Reset to first page
         setAllHistory(historyData.items);
@@ -164,6 +168,7 @@ export function HistoryTable({ embedded = false }: { embedded?: boolean }) {
   const prevPendingCountRef = useRef(pendingCount);
   useEffect(() => {
     if (deleteGeneration.isSuccess || importGeneration.isSuccess || clearFailed.isSuccess) {
+      setPageCursor(undefined);
       setPage(0);
     }
   }, [deleteGeneration.isSuccess, importGeneration.isSuccess, clearFailed.isSuccess]);
@@ -175,20 +180,25 @@ export function HistoryTable({ embedded = false }: { embedded?: boolean }) {
       pendingCount < prevPendingCountRef.current &&
       page !== 0
     ) {
+      setPageCursor(undefined);
       setPage(0);
     }
     prevPendingCountRef.current = pendingCount;
   }, [pendingCount, page]);
 
+  const hasMore =
+    historyData?.next_cursor === undefined ? allHistory.length < total : !!historyData.next_cursor;
+
   // Intersection Observer for infinite scroll
   useEffect(() => {
     const loadMoreEl = loadMoreRef.current;
-    if (!loadMoreEl) return;
+    if (!loadMoreEl || !allHistory.length) return;
 
     const observer = new IntersectionObserver(
       (entries) => {
         const target = entries[0];
-        if (target.isIntersecting && !isFetching && allHistory.length < total) {
+        if (target.isIntersecting && !isFetching && hasMore) {
+          setPageCursor(historyData?.next_cursor ?? undefined);
           setPage((prev) => prev + 1);
         }
       },
@@ -201,7 +211,7 @@ export function HistoryTable({ embedded = false }: { embedded?: boolean }) {
 
     observer.observe(loadMoreEl);
     return () => observer.disconnect();
-  }, [isFetching, allHistory.length, total, embedded]);
+  }, [isFetching, hasMore, embedded, historyData?.next_cursor, allHistory.length]);
 
   const handlePlay = (audioId: string, text: string, profileId: string) => {
     const generation = allHistory.find((item) => item.id === audioId);
@@ -522,6 +532,13 @@ export function HistoryTable({ embedded = false }: { embedded?: boolean }) {
     }
   };
 
+  const historyKeys = useMemo(() => allHistory.map((item) => item.id), [allHistory]);
+  const virtual = useHistoryWindow(historyKeys, scrollRef, embedded, [
+    expandedVersionsId,
+    focusedRow,
+    menuRow,
+  ]);
+
   if (isLoading && page === 0) {
     return (
       <div className="flex items-center justify-center h-full">
@@ -531,7 +548,6 @@ export function HistoryTable({ embedded = false }: { embedded?: boolean }) {
   }
 
   const history = allHistory;
-  const hasMore = allHistory.length < total;
   const failedCount = history.filter((g) => g.status === 'failed').length;
 
   const handleClearFailedConfirm = () => {
@@ -587,374 +603,422 @@ export function HistoryTable({ embedded = false }: { embedded?: boolean }) {
           <div
             ref={scrollRef}
             className={cn(
-              'space-y-2',
+              'relative',
               !embedded && 'flex-1 min-h-0 overflow-y-auto pb-4',
               !embedded && isPlayerVisible && BOTTOM_SAFE_AREA_PADDING,
             )}
           >
-            {history.map((gen) => {
-              const isSelected = currentAudioId === gen.id;
-              const isCurrentlyPlaying = currentAudioId === gen.id && isPlaying;
-              const isInProgress = gen.status === 'loading_model' || gen.status === 'generating';
-              const isGenerating = isInProgress;
-              const isFailed = gen.status === 'failed';
-              const isPlayable = !isGenerating && !isFailed;
-              const hasVersions = gen.versions && gen.versions.length > 1;
-              const isVersionsExpanded = expandedVersionsId === gen.id;
-              const isCancelling =
-                cancelGeneration.isPending && cancelGeneration.variables === gen.id;
-              return (
-                <div
-                  key={gen.id}
-                  className={cn(
-                    'border rounded-md bg-card transition-colors text-left w-full',
-                    isSelected && 'border-accent/60 bg-muted/70',
-                  )}
-                >
-                  {/* Main row */}
-                  <div className="flex items-stretch">
-                    {/* biome-ignore lint/a11y/useSemanticElements: The playable area includes a selectable, read-only transcript. Its action buttons are separate siblings. */}
-                    <div
-                      role="button"
-                      aria-disabled={!isPlayable}
-                      aria-pressed={isSelected}
-                      tabIndex={isPlayable ? 0 : undefined}
-                      className={cn(
-                        'flex flex-1 min-w-0 flex-col gap-2 p-3 outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-inset',
-                        isPlayable && 'hover:bg-muted/70 cursor-pointer rounded-md',
-                        isVersionsExpanded && 'rounded-b-none',
-                      )}
-                      aria-label={
-                        isGenerating
-                          ? `Generating speech for ${gen.profile_name}...`
-                          : isFailed
-                            ? `Generation failed for ${gen.profile_name}`
-                            : isCurrentlyPlaying
-                              ? `Sample from ${gen.profile_name}, ${formatDuration(gen.duration ?? 0)}, ${formatDate(gen.created_at)}. Playing. Press Enter to restart.`
-                              : `Sample from ${gen.profile_name}, ${formatDuration(gen.duration ?? 0)}, ${formatDate(gen.created_at)}. Press Enter to play.`
-                      }
-                      onClick={(e) => {
-                        if (!isPlayable || e.button !== 0) return;
-                        const target = e.target as HTMLElement;
-                        if (target.closest('button, [role="menuitem"]')) return;
-                        const transcript = target.closest('textarea') as HTMLTextAreaElement | null;
-                        if (transcript) {
-                          if (transcript.selectionStart !== transcript.selectionEnd) return;
-                        } else {
-                          const selection = window.getSelection();
-                          if (
-                            selection?.toString() &&
-                            e.currentTarget.contains(selection.anchorNode)
-                          )
-                            return;
-                        }
-                        handlePlay(gen.id, gen.text, gen.profile_id);
-                      }}
-                      onKeyDown={(e) => {
-                        if (!isPlayable) return;
-                        const target = e.target as HTMLElement;
-                        if (target.closest('textarea') || target.closest('button')) return;
-                        if (e.key === 'Enter' || e.key === ' ') {
-                          e.preventDefault();
-                          handlePlay(gen.id, gen.text, gen.profile_id);
-                        }
-                      }}
-                    >
-                      <Textarea
-                        value={gen.text}
-                        className="min-h-[3rem] w-full resize-y border-0 bg-transparent p-0 text-sm select-text focus-visible:ring-0"
-                        readOnly
-                        aria-label={`Transcript for sample from ${gen.profile_name}, ${formatDuration(gen.duration ?? 0)}`}
-                      />
-                      <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-muted-foreground">
-                        <span>{gen.profile_name}</span>
-                        <span aria-hidden="true">·</span>
-                        <span>{formatEngineName(gen.engine, gen.model_size)}</span>
-                        <span aria-hidden="true">·</span>
-                        <span>
-                          {isFailed
-                            ? 'Failed'
-                            : isInProgress
-                              ? gen.status === 'loading_model'
-                                ? 'Loading model...'
-                                : 'Generating...'
-                              : formatDuration(gen.duration ?? 0)}
-                        </span>
-                        <span aria-hidden="true">·</span>
-                        <span>{formatDate(gen.created_at)}</span>
-                        {isCurrentlyPlaying && (
-                          <span className="font-medium text-accent">Playing</span>
-                        )}
-                      </div>
-                    </div>
-
-                    {/* Far right - Actions */}
-                    <div className="shrink-0 flex flex-col items-center gap-1 px-2 py-3">
-                      {isPlayable && (
-                        <Hint content={isCurrentlyPlaying ? 'Restart playback' : 'Play take'}>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className={cn('h-8 w-8', isCurrentlyPlaying && 'text-accent')}
-                            aria-label={isCurrentlyPlaying ? 'Restart playback' : 'Play take'}
-                            onClick={() => handlePlay(gen.id, gen.text, gen.profile_id)}
-                          >
-                            <Play className="h-4 w-4" />
-                          </Button>
-                        </Hint>
-                      )}
-                      <Hint content={gen.is_favorited ? 'Remove favorite' : 'Favorite'}>
-                        <Button
-                          variant="ghost"
-                          size="icon"
+            <div ref={virtual.content} style={{ position: 'relative', height: virtual.total }}>
+              {virtual.rows.map(({ index, top }) => {
+                const gen = history[index];
+                const isInProgress = gen.status === 'loading_model' || gen.status === 'generating';
+                const isGenerating = isInProgress;
+                const isFailed = gen.status === 'failed';
+                const isPlayable = !isGenerating && !isFailed;
+                const hasVersions = gen.versions && gen.versions.length > 1;
+                const isVersionsExpanded = expandedVersionsId === gen.id;
+                const isCancelling =
+                  cancelGeneration.isPending && cancelGeneration.variables === gen.id;
+                return (
+                  <div
+                    key={gen.id}
+                    ref={(node) => virtual.measure(gen.id, node)}
+                    data-history-row={gen.id}
+                    style={{ position: 'absolute', top, width: '100%', paddingBottom: 8 }}
+                    onFocusCapture={() => setFocusedRow(gen.id)}
+                    onBlurCapture={(event) => {
+                      if (!event.currentTarget.contains(event.relatedTarget as Node | null))
+                        setFocusedRow(null);
+                    }}
+                  >
+                    <HistoryPlaybackState id={gen.id}>
+                      {({ isSelected, isCurrentlyPlaying }) => (
+                        <div
                           className={cn(
-                            'h-8 w-8 text-muted-foreground hover:bg-muted',
-                            gen.is_favorited && 'text-accent hover:text-accent',
+                            'border rounded-md bg-card transition-colors text-left w-full',
+                            isSelected && 'border-accent/60 bg-muted/70',
                           )}
-                          aria-label={gen.is_favorited ? 'Unfavorite' : 'Favorite'}
-                          onClick={() => handleToggleFavorite(gen.id)}
                         >
-                          <Star
-                            className="h-4 w-4"
-                            fill={gen.is_favorited ? 'currentColor' : 'none'}
-                          />
-                        </Button>
-                      </Hint>
-                      {hasVersions && (
-                        <Hint content="Show versions">
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className={cn(
-                              'h-8 w-8 text-muted-foreground hover:bg-muted',
-                              isVersionsExpanded && 'text-accent hover:text-accent',
-                            )}
-                            aria-label="Toggle versions"
-                            onClick={() =>
-                              setExpandedVersionsId(isVersionsExpanded ? null : gen.id)
-                            }
-                          >
-                            <AudioLines className="h-4 w-4" />
-                          </Button>
-                        </Hint>
-                      )}
+                          {/* Main row */}
+                          <div className="flex items-stretch">
+                            {/* biome-ignore lint/a11y/useSemanticElements: The playable area includes a selectable, read-only transcript. Its action buttons are separate siblings. */}
+                            <div
+                              role="button"
+                              aria-disabled={!isPlayable}
+                              aria-pressed={isSelected}
+                              tabIndex={isPlayable ? 0 : undefined}
+                              className={cn(
+                                'flex flex-1 min-w-0 flex-col gap-2 p-3 outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-inset',
+                                isPlayable && 'hover:bg-muted/70 cursor-pointer rounded-md',
+                                isVersionsExpanded && 'rounded-b-none',
+                              )}
+                              aria-label={
+                                isGenerating
+                                  ? `Generating speech for ${gen.profile_name}...`
+                                  : isFailed
+                                    ? `Generation failed for ${gen.profile_name}`
+                                    : isCurrentlyPlaying
+                                      ? `Sample from ${gen.profile_name}, ${formatDuration(gen.duration ?? 0)}, ${formatDate(gen.created_at)}. Playing. Press Enter to restart.`
+                                      : `Sample from ${gen.profile_name}, ${formatDuration(gen.duration ?? 0)}, ${formatDate(gen.created_at)}. Press Enter to play.`
+                              }
+                              onClick={(e) => {
+                                if (!isPlayable || e.button !== 0) return;
+                                const target = e.target as HTMLElement;
+                                if (target.closest('button, [role="menuitem"]')) return;
+                                const transcript = target.closest(
+                                  'textarea',
+                                ) as HTMLTextAreaElement | null;
+                                if (transcript) {
+                                  if (transcript.selectionStart !== transcript.selectionEnd) return;
+                                } else {
+                                  const selection = window.getSelection();
+                                  if (
+                                    selection?.toString() &&
+                                    e.currentTarget.contains(selection.anchorNode)
+                                  )
+                                    return;
+                                }
+                                handlePlay(gen.id, gen.text, gen.profile_id);
+                              }}
+                              onKeyDown={(e) => {
+                                if (!isPlayable) return;
+                                const target = e.target as HTMLElement;
+                                if (target.closest('textarea') || target.closest('button')) return;
+                                if (e.key === 'Enter' || e.key === ' ') {
+                                  e.preventDefault();
+                                  handlePlay(gen.id, gen.text, gen.profile_id);
+                                }
+                              }}
+                            >
+                              <Textarea
+                                value={gen.text}
+                                className="min-h-[3rem] w-full resize-y border-0 bg-transparent p-0 text-sm select-text focus-visible:ring-0"
+                                readOnly
+                                aria-label={`Transcript for sample from ${gen.profile_name}, ${formatDuration(gen.duration ?? 0)}`}
+                              />
+                              <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-muted-foreground">
+                                <span>{gen.profile_name}</span>
+                                <span aria-hidden="true">·</span>
+                                <span>{formatEngineName(gen.engine, gen.model_size)}</span>
+                                <span aria-hidden="true">·</span>
+                                <span>
+                                  {isFailed
+                                    ? 'Failed'
+                                    : isInProgress
+                                      ? gen.status === 'loading_model'
+                                        ? 'Loading model...'
+                                        : 'Generating...'
+                                      : formatDuration(gen.duration ?? 0)}
+                                </span>
+                                <span aria-hidden="true">·</span>
+                                <span>{formatDate(gen.created_at)}</span>
+                                {isCurrentlyPlaying && (
+                                  <span className="font-medium text-accent">Playing</span>
+                                )}
+                              </div>
+                            </div>
 
-                      {isFailed ? (
-                        <>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-8 w-8 text-muted-foreground hover:bg-muted"
-                            aria-label="Retry generation"
-                            onClick={() => handleRetry(gen.id)}
-                          >
-                            <RotateCcw className="h-4 w-4" />
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-8 w-8 text-muted-foreground hover:bg-muted"
-                            aria-label="Delete generation"
-                            disabled={deleteGeneration.isPending}
-                            onClick={() => handleDeleteClick(gen.id, gen.profile_name)}
-                          >
-                            <Trash2 className="h-4 w-4" />
-                          </Button>
-                        </>
-                      ) : isGenerating ? (
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="h-8 w-8 text-muted-foreground hover:bg-muted"
-                          aria-label="Cancel generation"
-                          disabled={isCancelling}
-                          onClick={() => cancelGeneration.mutate(gen.id)}
-                        >
-                          {isCancelling ? (
-                            <Loader2 className="h-4 w-4 animate-spin" />
-                          ) : (
-                            <Square className="h-4 w-4" />
-                          )}
-                        </Button>
-                      ) : (
-                        <DropdownMenu>
-                          <DropdownMenuTrigger asChild>
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              className="h-8 w-8 text-muted-foreground hover:bg-muted"
-                              aria-label={t('history.actions.menu')}
-                              disabled={isGenerating}
-                            >
-                              <MoreHorizontal className="h-4 w-4" />
-                            </Button>
-                          </DropdownMenuTrigger>
-                          <DropdownMenuContent align="end">
-                            <DropdownMenuItem
-                              onClick={() => handlePlay(gen.id, gen.text, gen.profile_id)}
-                            >
-                              <Play className="mr-2 h-4 w-4" />
-                              {t('history.actions.play')}
-                            </DropdownMenuItem>
-                            <DropdownMenuItem
-                              onClick={() => handleDownloadAudio(gen.id, gen.text)}
-                              disabled={exportGenerationAudio.isPending}
-                            >
-                              <Download className="mr-2 h-4 w-4" />
-                              {t('history.actions.exportAudio')}
-                            </DropdownMenuItem>
-                            <DropdownMenuItem
-                              onClick={() => handleDownloadAudio(gen.id, gen.text, 'mp3')}
-                              disabled={exportGenerationAudio.isPending}
-                            >
-                              <Download className="mr-2 h-4 w-4" />
-                              {t('history.actions.exportAudioMp3')}
-                            </DropdownMenuItem>
-                            <DropdownMenuItem
-                              onClick={() => handleExportPackage(gen.id, gen.text)}
-                              disabled={exportGeneration.isPending}
-                            >
-                              <FileArchive className="mr-2 h-4 w-4" />
-                              {t('history.actions.exportPackage')}
-                            </DropdownMenuItem>
-                            <DropdownMenuItem onClick={() => handleApplyEffects(gen.id)}>
-                              <Wand2 className="mr-2 h-4 w-4" />
-                              {t('history.actions.applyEffects')}
-                            </DropdownMenuItem>
-                            <DropdownMenuItem onClick={() => handleRegenerate(gen.id)}>
-                              <RotateCcw className="mr-2 h-4 w-4" />
-                              {t('history.actions.regenerate')}
-                            </DropdownMenuItem>
-                            <DropdownMenuItem
-                              onClick={() => handleDeleteClick(gen.id, gen.profile_name)}
-                              disabled={deleteGeneration.isPending}
-                            >
-                              <Trash2 className="mr-2 h-4 w-4" />
-                              {t('common.delete')}
-                            </DropdownMenuItem>
-                          </DropdownMenuContent>
-                        </DropdownMenu>
-                      )}
-                    </div>
-                  </div>
-
-                  {/* Expandable versions panel */}
-                  <AnimatePresence>
-                    {isVersionsExpanded && gen.versions && (
-                      <motion.div
-                        initial={{ height: 0, opacity: 0 }}
-                        animate={{ height: 'auto', opacity: 1 }}
-                        exit={{ height: 0, opacity: 0 }}
-                        transition={{ duration: 0.2, ease: 'easeOut' }}
-                        className="overflow-hidden"
-                      >
-                        <div className="border-t border-border/50">
-                          <div className="divide-y divide-border/40">
-                            {gen.versions.map((v) => {
-                              // Show source provenance when effects were applied to a non-clean version
-                              const sourceVersion = v.source_version_id
-                                ? gen.versions?.find((sv) => sv.id === v.source_version_id)
-                                : null;
-                              const showSource = (sourceVersion?.effects_chain?.length ?? 0) > 0;
-                              const original = gen.versions?.find(
-                                (version) => !version.effects_chain && !version.source_version_id,
-                              );
-                              const isOriginal = v.id === original?.id;
-                              const hasDerivedVersions = gen.versions?.some(
-                                (version) => version.source_version_id === v.id,
-                              );
-                              const canEdit =
-                                !isOriginal && (!!v.effects_chain || !!v.source_version_id);
-
-                              return (
-                                <div
-                                  key={v.id}
-                                  className="flex items-center pr-2 hover:bg-muted/50 transition-colors"
+                            {/* Far right - Actions */}
+                            <div className="shrink-0 flex flex-col items-center gap-1 px-2 py-3">
+                              {isPlayable && (
+                                <Hint
+                                  content={isCurrentlyPlaying ? 'Restart playback' : 'Play take'}
                                 >
-                                  <button
-                                    type="button"
-                                    className="flex items-center gap-2 flex-1 min-w-0 h-9 px-3 text-left"
-                                    disabled={applyingEffects || deletingVersion}
-                                    onClick={() => {
-                                      handlePlayVersion(gen.id, v.id, gen.text, gen.profile_id);
-                                      if (!v.is_default) {
-                                        handleSwitchVersion(gen.id, v.id);
-                                      }
-                                    }}
+                                  <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    className={cn('h-8 w-8', isCurrentlyPlaying && 'text-accent')}
+                                    aria-label={
+                                      isCurrentlyPlaying ? 'Restart playback' : 'Play take'
+                                    }
+                                    onClick={() => handlePlay(gen.id, gen.text, gen.profile_id)}
                                   >
-                                    <AudioLines className="h-3 w-3 shrink-0 text-muted-foreground" />
-                                    <span className="truncate text-xs font-medium">{v.label}</span>
-                                    {v.effects_chain && v.effects_chain.length > 0 && (
-                                      <span className="text-[10px] text-muted-foreground truncate">
-                                        {v.effects_chain.map((e) => e.type).join(' → ')}
-                                      </span>
-                                    )}
-                                    {showSource && (
-                                      <span className="text-[10px] text-muted-foreground/60 truncate">
-                                        from {sourceVersion?.label}
-                                      </span>
-                                    )}
-                                    <span className="flex-1" />
-                                    {v.is_default && (
-                                      <span className="text-[10px] bg-accent/15 text-accent px-1.5 py-0.5 rounded-full">
-                                        active
-                                      </span>
-                                    )}
-                                  </button>
-                                  {!isOriginal && (
-                                    <DropdownMenu>
-                                      <DropdownMenuTrigger asChild>
-                                        <Button
-                                          variant="ghost"
-                                          size="icon"
-                                          className="h-7 w-7 shrink-0 text-muted-foreground"
-                                          aria-label={t('history.versions.actions', {
-                                            name: v.label,
-                                          })}
-                                          disabled={applyingEffects || deletingVersion}
-                                        >
-                                          <MoreHorizontal className="h-3.5 w-3.5" />
-                                        </Button>
-                                      </DropdownMenuTrigger>
-                                      <DropdownMenuContent align="end">
-                                        {canEdit && (
-                                          <DropdownMenuItem
-                                            disabled={hasDerivedVersions}
-                                            onSelect={() => handleEditVersion(gen.id, v)}
-                                          >
-                                            <Pencil className="mr-2 h-4 w-4" />
-                                            {t('history.versions.edit')}
-                                          </DropdownMenuItem>
-                                        )}
-                                        <DropdownMenuItem
-                                          className="text-destructive focus:text-destructive"
-                                          disabled={
-                                            hasDerivedVersions || (gen.versions?.length ?? 0) <= 1
-                                          }
-                                          onSelect={() => setVersionToDelete(v)}
-                                        >
-                                          <Trash2 className="mr-2 h-4 w-4" />
-                                          {t('history.versions.delete')}
-                                        </DropdownMenuItem>
-                                        {hasDerivedVersions && (
-                                          <p className="max-w-56 px-2 py-1.5 text-xs text-muted-foreground">
-                                            {t('history.versions.usedAsSource')}
-                                          </p>
-                                        )}
-                                      </DropdownMenuContent>
-                                    </DropdownMenu>
+                                    <Play className="h-4 w-4" />
+                                  </Button>
+                                </Hint>
+                              )}
+                              <Hint content={gen.is_favorited ? 'Remove favorite' : 'Favorite'}>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className={cn(
+                                    'h-8 w-8 text-muted-foreground hover:bg-muted',
+                                    gen.is_favorited && 'text-accent hover:text-accent',
                                   )}
-                                </div>
-                              );
-                            })}
+                                  aria-label={gen.is_favorited ? 'Unfavorite' : 'Favorite'}
+                                  onClick={() => handleToggleFavorite(gen.id)}
+                                >
+                                  <Star
+                                    className="h-4 w-4"
+                                    fill={gen.is_favorited ? 'currentColor' : 'none'}
+                                  />
+                                </Button>
+                              </Hint>
+                              {hasVersions && (
+                                <Hint content="Show versions">
+                                  <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    className={cn(
+                                      'h-8 w-8 text-muted-foreground hover:bg-muted',
+                                      isVersionsExpanded && 'text-accent hover:text-accent',
+                                    )}
+                                    aria-label="Toggle versions"
+                                    onClick={() =>
+                                      setExpandedVersionsId(isVersionsExpanded ? null : gen.id)
+                                    }
+                                  >
+                                    <AudioLines className="h-4 w-4" />
+                                  </Button>
+                                </Hint>
+                              )}
+
+                              {isFailed ? (
+                                <>
+                                  <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    className="h-8 w-8 text-muted-foreground hover:bg-muted"
+                                    aria-label="Retry generation"
+                                    onClick={() => handleRetry(gen.id)}
+                                  >
+                                    <RotateCcw className="h-4 w-4" />
+                                  </Button>
+                                  <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    className="h-8 w-8 text-muted-foreground hover:bg-muted"
+                                    aria-label="Delete generation"
+                                    disabled={deleteGeneration.isPending}
+                                    onClick={() => handleDeleteClick(gen.id, gen.profile_name)}
+                                  >
+                                    <Trash2 className="h-4 w-4" />
+                                  </Button>
+                                </>
+                              ) : isGenerating ? (
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="h-8 w-8 text-muted-foreground hover:bg-muted"
+                                  aria-label="Cancel generation"
+                                  disabled={isCancelling}
+                                  onClick={() => cancelGeneration.mutate(gen.id)}
+                                >
+                                  {isCancelling ? (
+                                    <Loader2 className="h-4 w-4 animate-spin" />
+                                  ) : (
+                                    <Square className="h-4 w-4" />
+                                  )}
+                                </Button>
+                              ) : (
+                                <DropdownMenu
+                                  onOpenChange={(open) =>
+                                    setMenuRow((current) =>
+                                      open ? gen.id : current === gen.id ? null : current,
+                                    )
+                                  }
+                                >
+                                  <DropdownMenuTrigger asChild>
+                                    <Button
+                                      variant="ghost"
+                                      size="icon"
+                                      className="h-8 w-8 text-muted-foreground hover:bg-muted"
+                                      aria-label={t('history.actions.menu')}
+                                      disabled={isGenerating}
+                                    >
+                                      <MoreHorizontal className="h-4 w-4" />
+                                    </Button>
+                                  </DropdownMenuTrigger>
+                                  <DropdownMenuContent align="end">
+                                    <DropdownMenuItem
+                                      onClick={() => handlePlay(gen.id, gen.text, gen.profile_id)}
+                                    >
+                                      <Play className="mr-2 h-4 w-4" />
+                                      {t('history.actions.play')}
+                                    </DropdownMenuItem>
+                                    <DropdownMenuItem
+                                      onClick={() => handleDownloadAudio(gen.id, gen.text)}
+                                      disabled={exportGenerationAudio.isPending}
+                                    >
+                                      <Download className="mr-2 h-4 w-4" />
+                                      {t('history.actions.exportAudio')}
+                                    </DropdownMenuItem>
+                                    <DropdownMenuItem
+                                      onClick={() => handleDownloadAudio(gen.id, gen.text, 'mp3')}
+                                      disabled={exportGenerationAudio.isPending}
+                                    >
+                                      <Download className="mr-2 h-4 w-4" />
+                                      {t('history.actions.exportAudioMp3')}
+                                    </DropdownMenuItem>
+                                    <DropdownMenuItem
+                                      onClick={() => handleExportPackage(gen.id, gen.text)}
+                                      disabled={exportGeneration.isPending}
+                                    >
+                                      <FileArchive className="mr-2 h-4 w-4" />
+                                      {t('history.actions.exportPackage')}
+                                    </DropdownMenuItem>
+                                    <DropdownMenuItem onClick={() => handleApplyEffects(gen.id)}>
+                                      <Wand2 className="mr-2 h-4 w-4" />
+                                      {t('history.actions.applyEffects')}
+                                    </DropdownMenuItem>
+                                    <DropdownMenuItem onClick={() => handleRegenerate(gen.id)}>
+                                      <RotateCcw className="mr-2 h-4 w-4" />
+                                      {t('history.actions.regenerate')}
+                                    </DropdownMenuItem>
+                                    <DropdownMenuItem
+                                      onClick={() => handleDeleteClick(gen.id, gen.profile_name)}
+                                      disabled={deleteGeneration.isPending}
+                                    >
+                                      <Trash2 className="mr-2 h-4 w-4" />
+                                      {t('common.delete')}
+                                    </DropdownMenuItem>
+                                  </DropdownMenuContent>
+                                </DropdownMenu>
+                              )}
+                            </div>
                           </div>
+
+                          {/* Expandable versions panel */}
+                          <AnimatePresence>
+                            {isVersionsExpanded && gen.versions && (
+                              <motion.div
+                                initial={{ height: 0, opacity: 0 }}
+                                animate={{ height: 'auto', opacity: 1 }}
+                                exit={{ height: 0, opacity: 0 }}
+                                transition={{ duration: 0.2, ease: 'easeOut' }}
+                                className="overflow-hidden"
+                              >
+                                <div className="border-t border-border/50">
+                                  <div className="divide-y divide-border/40">
+                                    {gen.versions.map((v) => {
+                                      // Show source provenance when effects were applied to a non-clean version
+                                      const sourceVersion = v.source_version_id
+                                        ? gen.versions?.find((sv) => sv.id === v.source_version_id)
+                                        : null;
+                                      const showSource =
+                                        (sourceVersion?.effects_chain?.length ?? 0) > 0;
+                                      const original = gen.versions?.find(
+                                        (version) =>
+                                          !version.effects_chain && !version.source_version_id,
+                                      );
+                                      const isOriginal = v.id === original?.id;
+                                      const hasDerivedVersions = gen.versions?.some(
+                                        (version) => version.source_version_id === v.id,
+                                      );
+                                      const canEdit =
+                                        !isOriginal && (!!v.effects_chain || !!v.source_version_id);
+
+                                      return (
+                                        <div
+                                          key={v.id}
+                                          className="flex items-center pr-2 hover:bg-muted/50 transition-colors"
+                                        >
+                                          <button
+                                            type="button"
+                                            className="flex items-center gap-2 flex-1 min-w-0 h-9 px-3 text-left"
+                                            disabled={applyingEffects || deletingVersion}
+                                            onClick={() => {
+                                              handlePlayVersion(
+                                                gen.id,
+                                                v.id,
+                                                gen.text,
+                                                gen.profile_id,
+                                              );
+                                              if (!v.is_default) {
+                                                handleSwitchVersion(gen.id, v.id);
+                                              }
+                                            }}
+                                          >
+                                            <AudioLines className="h-3 w-3 shrink-0 text-muted-foreground" />
+                                            <span className="truncate text-xs font-medium">
+                                              {v.label}
+                                            </span>
+                                            {v.effects_chain && v.effects_chain.length > 0 && (
+                                              <span className="text-[10px] text-muted-foreground truncate">
+                                                {v.effects_chain.map((e) => e.type).join(' → ')}
+                                              </span>
+                                            )}
+                                            {showSource && (
+                                              <span className="text-[10px] text-muted-foreground/60 truncate">
+                                                from {sourceVersion?.label}
+                                              </span>
+                                            )}
+                                            <span className="flex-1" />
+                                            {v.is_default && (
+                                              <span className="text-[10px] bg-accent/15 text-accent px-1.5 py-0.5 rounded-full">
+                                                active
+                                              </span>
+                                            )}
+                                          </button>
+                                          {!isOriginal && (
+                                            <DropdownMenu
+                                              onOpenChange={(open) =>
+                                                setMenuRow((current) =>
+                                                  open
+                                                    ? gen.id
+                                                    : current === gen.id
+                                                      ? null
+                                                      : current,
+                                                )
+                                              }
+                                            >
+                                              <DropdownMenuTrigger asChild>
+                                                <Button
+                                                  variant="ghost"
+                                                  size="icon"
+                                                  className="h-7 w-7 shrink-0 text-muted-foreground"
+                                                  aria-label={t('history.versions.actions', {
+                                                    name: v.label,
+                                                  })}
+                                                  disabled={applyingEffects || deletingVersion}
+                                                >
+                                                  <MoreHorizontal className="h-3.5 w-3.5" />
+                                                </Button>
+                                              </DropdownMenuTrigger>
+                                              <DropdownMenuContent align="end">
+                                                {canEdit && (
+                                                  <DropdownMenuItem
+                                                    disabled={hasDerivedVersions}
+                                                    onSelect={() => handleEditVersion(gen.id, v)}
+                                                  >
+                                                    <Pencil className="mr-2 h-4 w-4" />
+                                                    {t('history.versions.edit')}
+                                                  </DropdownMenuItem>
+                                                )}
+                                                <DropdownMenuItem
+                                                  className="text-destructive focus:text-destructive"
+                                                  disabled={
+                                                    hasDerivedVersions ||
+                                                    (gen.versions?.length ?? 0) <= 1
+                                                  }
+                                                  onSelect={() => setVersionToDelete(v)}
+                                                >
+                                                  <Trash2 className="mr-2 h-4 w-4" />
+                                                  {t('history.versions.delete')}
+                                                </DropdownMenuItem>
+                                                {hasDerivedVersions && (
+                                                  <p className="max-w-56 px-2 py-1.5 text-xs text-muted-foreground">
+                                                    {t('history.versions.usedAsSource')}
+                                                  </p>
+                                                )}
+                                              </DropdownMenuContent>
+                                            </DropdownMenu>
+                                          )}
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                </div>
+                              </motion.div>
+                            )}
+                          </AnimatePresence>
                         </div>
-                      </motion.div>
-                    )}
-                  </AnimatePresence>
-                </div>
-              );
-            })}
+                      )}
+                    </HistoryPlaybackState>
+                  </div>
+                );
+              })}
+            </div>
 
             {/* Load more trigger element */}
             {hasMore && (

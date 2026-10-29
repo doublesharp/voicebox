@@ -991,11 +991,18 @@ fn list_audio_output_devices(
 async fn play_audio_to_devices(
     app: tauri::AppHandle,
     state: State<'_, audio_output::AudioOutputState>,
-    audio_data: Vec<u8>,
-    device_ids: Vec<String>,
-    options: Option<audio_output::PlaybackOptions>,
+    request: tauri::ipc::Request<'_>,
 ) -> Result<audio_output::PlaybackSession, String> {
-    state.play_audio_to_devices(app, audio_data, device_ids, options).await
+    let (audio_data, device_ids, options) = audio_output::read_playback_request(
+        request.body(),
+        request
+            .headers()
+            .get("x-voicebox-playback")
+            .and_then(|value| value.to_str().ok()),
+    )?;
+    state
+        .play_audio_to_devices(app, audio_data, device_ids, options)
+        .await
 }
 
 #[command]

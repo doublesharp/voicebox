@@ -10,8 +10,9 @@ import uuid
 import shutil
 import os
 from pathlib import Path
+import base64
 from sqlalchemy.orm import Session
-from sqlalchemy import or_
+from sqlalchemy import tuple_
 
 from ..models import GenerationRequest, GenerationResponse, HistoryQuery, HistoryResponse, HistoryListResponse, GenerationVersionResponse, EffectConfig
 from ..database import Capture as DBCapture, Generation as DBGeneration, GenerationVersion as DBGenerationVersion, ProfileSample as DBProfileSample, StoryItem as DBStoryItem, VoiceProfile as DBVoiceProfile
@@ -298,17 +299,39 @@ async def list_generations(
         search_pattern = f"%{query.search}%"
         q = q.filter(DBGeneration.text.like(search_pattern))
     
-    # Get total count before pagination
-    total_count = q.count()
+    # Count only when requested; older cursor pages reuse the initial total.
+    total_count = q.count() if query.include_total else None
+
+    if query.cursor:
+        if query.offset:
+            raise ValueError("cursor and offset cannot be combined")
+        try:
+            raw = base64.b64decode(query.cursor + "=" * (-len(query.cursor) % 4), altchars=b"-_", validate=True)
+            parts = json.loads(raw)
+            if not isinstance(parts, list) or len(parts) != 2:
+                raise ValueError()
+            stamp, identifier = parts
+            if not isinstance(stamp, str) or not isinstance(identifier, str) or not identifier or len(identifier) > 128:
+                raise ValueError()
+            boundary = datetime.fromisoformat(stamp)
+        except (ValueError, TypeError, UnicodeError) as error:
+            raise ValueError("Invalid history cursor") from error
+        q = q.filter(tuple_(DBGeneration.created_at, DBGeneration.id) < (boundary, identifier))
     
     # Apply ordering (newest first)
-    q = q.order_by(DBGeneration.created_at.desc())
+    q = q.order_by(DBGeneration.created_at.desc(), DBGeneration.id.desc())
     
     # Apply pagination
-    q = q.offset(query.offset).limit(query.limit)
+    q = q.offset(query.offset).limit(query.limit + 1)
     
     # Execute query
     results = q.all()
+    has_more = len(results) > query.limit
+    results = results[:query.limit]
+    next_cursor = None
+    if has_more:
+        last = results[-1][0]
+        next_cursor = base64.urlsafe_b64encode(json.dumps([last.created_at.isoformat(), last.id]).encode()).decode().rstrip("=")
     
     # Fetch versions for every generation on this page with a single
     # query instead of one SELECT per generation (N+1).
@@ -343,6 +366,7 @@ async def list_generations(
     return HistoryListResponse(
         items=items,
         total=total_count,
+        next_cursor=next_cursor,
     )
 
 

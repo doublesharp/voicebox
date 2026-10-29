@@ -23,8 +23,9 @@ export function clipFrames(clip: StudioClip, asset: StudioAsset, sampleRate = 48
   return sourceFrames(asset, sampleRate) - clip.trim_start_sample - clip.trim_end_sample;
 }
 export function timelineEnd(document: StudioDocument, assets: StudioAsset[]) {
+  const byId = new Map(assets.map((asset) => [asset.id, asset]));
   return document.clips.reduce((end, clip) => {
-    const asset = assets.find((a) => a.id === clip.asset_id);
+    const asset = byId.get(clip.asset_id);
     return asset
       ? Math.max(end, clip.start_sample + clipFrames(clip, asset, document.sample_rate))
       : end;

@@ -12,8 +12,8 @@ from sqlalchemy.orm import Session
 
 from backend import config
 from backend.database import Base, Generation, GenerationVersion, Story, StoryItem, VoiceProfile
-from backend.services.stories import export_story_audio
 from backend.routes.stories import export_story_audio as export_story_endpoint
+from backend.services.stories import export_story_audio
 
 
 @pytest.fixture
@@ -96,7 +96,9 @@ def test_version_audio_duration_is_not_cut_to_generation_metadata(story_db, tmp_
     assert audio[-1, 0] == pytest.approx(0.1, abs=4e-5)
 
 
-@pytest.mark.parametrize("failure", ["missing", "corrupt", "missing_version", "wrong_version", "missing_generation", "empty_trim"])
+@pytest.mark.parametrize(
+    "failure", ["missing", "corrupt", "missing_version", "wrong_version", "missing_generation", "empty_trim"]
+)
 def test_export_rejects_story_with_unusable_clip(story_db, tmp_path, failure):
     add_clip(story_db, tmp_path, "good", np.full(2400, 0.2), 24000)
     add_clip(story_db, tmp_path, "bad", np.full(2400, 0.2), 24000, start_time_ms=200)
@@ -126,3 +128,95 @@ def test_export_endpoint_reports_missing_audio_as_bad_request(story_db, tmp_path
         asyncio.run(export_story_endpoint("story", "wav", "none", story_db))
     assert error.value.status_code == 400
     assert "item-bad" in error.value.detail
+
+
+def test_export_http_uses_bounded_mix_and_file_backed_delivery(story_db, tmp_path, monkeypatch):
+    from fastapi.responses import FileResponse
+
+    add_clip(story_db, tmp_path, "long", np.full(200000, 0.2, dtype=np.float32), 24000)
+    zeros = np.zeros
+
+    def bounded_zeros(shape, *args, **kwargs):
+        frames = shape[0] if isinstance(shape, tuple) else shape
+        assert frames <= 65536, "export allocated an entire story instead of a bounded block"
+        return zeros(shape, *args, **kwargs)
+
+    monkeypatch.setattr(np, "zeros", bounded_zeros)
+    response = asyncio.run(export_story_endpoint("story", "wav", "none", story_db))
+    assert isinstance(response, FileResponse), "HTTP export buffered all encoded bytes"
+    path = response.path
+    try:
+        assert sf.info(path).frames == 200000
+        assert sf.info(path).samplerate == 24000
+    finally:
+        from pathlib import Path
+
+        Path(path).unlink(missing_ok=True)
+
+
+def test_block_mix_applies_one_global_peak_gain_and_preserves_trim_placement(story_db, tmp_path):
+    add_clip(story_db, tmp_path, "a", np.full(80000, 0.8, dtype=np.float32), 24000)
+    add_clip(story_db, tmp_path, "b", np.full(80000, 0.8, dtype=np.float32), 24000, start_time_ms=100)
+    item = story_db.get(StoryItem, "item-b")
+    item.trim_start_ms = 10
+    item.trim_end_ms = 20
+    story_db.commit()
+    audio, rate = exported(story_db)
+    assert rate == 24000
+    assert len(audio) == 2400 + 80000 - 240 - 480
+    assert audio[100, 0] == pytest.approx(0.4995, abs=4e-5)
+    assert audio[3000, 0] == pytest.approx(0.999, abs=4e-5)
+    assert audio[70000, 0] == pytest.approx(0.999, abs=4e-5)
+    assert audio[-100, 0] == pytest.approx(0.4995, abs=4e-5)
+
+
+@pytest.mark.asyncio
+async def test_file_response_removes_export_if_client_send_fails(tmp_path):
+    from backend.utils.file_response import TemporaryFileResponse
+
+    path = tmp_path / "export.wav"
+    path.write_bytes(b"wave")
+
+    async def receive():
+        await asyncio.Event().wait()
+        return {"type": "http.disconnect"}
+
+    async def send(_):
+        raise RuntimeError("client disconnected")
+
+    with pytest.raises(RuntimeError, match="client disconnected"):
+        await TemporaryFileResponse(path)({"type": "http", "method": "GET", "headers": []}, receive, send)
+    assert not path.exists()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_export_drains_writer_before_removing_owned_file(tmp_path, monkeypatch):
+    import threading
+
+    from backend.services import stories
+    from backend.services.story_export import render_story_file
+
+    source = tmp_path / "source.wav"
+    sf.write(source, np.full(100, 0.1), 24000)
+    output = tmp_path / "owned.wav"
+    started, release = threading.Event(), threading.Event()
+
+    def allocate(_):
+        output.touch()
+        started.set()
+        assert release.wait(3)
+        return output
+
+    monkeypatch.setattr(stories, "_make_tempfile", allocate)
+    clips = [dict(id="clip", path=str(source), trim_start_ms=0, trim_end_ms=0, start_time_ms=0, volume=1, text="Hello")]
+    pending = asyncio.create_task(render_story_file(clips, "wav", "none"))
+    try:
+        assert await asyncio.to_thread(started.wait, 1)
+        pending.cancel()
+        await asyncio.sleep(0)
+        assert not pending.done()
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    assert not output.exists()

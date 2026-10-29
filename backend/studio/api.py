@@ -1,5 +1,8 @@
 """HTTP interface for the independent studio store."""
 
+import asyncio
+import copy
+from concurrent.futures import Future
 import zipfile
 from typing import Literal
 from fastapi import APIRouter, File, Header, HTTPException, UploadFile
@@ -7,6 +10,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, StrictStr
+from ..utils.async_work import run_blocking
 from .jobs import StudioJobs
 from .storage import Conflict, NotFound, uid
 
@@ -91,6 +95,28 @@ def make_router(store, jobs=None):
         except (ValueError, TypeError, zipfile.BadZipFile) as exc:
             raise HTTPException(422, detail=str(exc)) from exc
 
+    def on_loop(loop, callback):
+        # Admission owns its worker until enqueue/schedule has completed on-loop.
+        def forwarded(*args):
+            result = Future()
+            def invoke():
+                try:
+                    result.set_result(callback(*args))
+                except BaseException as error:
+                    result.set_exception(error)
+            loop.call_soon_threadsafe(invoke)
+            return result.result()
+        return forwarded
+
+    async def job_work(method, *args, **kwargs):
+        from ..services.task_queue import create_background_task
+
+        worker = copy.copy(jobs)
+        loop = asyncio.get_running_loop()
+        worker.enqueue = on_loop(loop, jobs.enqueue)
+        worker.delivery_schedule = on_loop(loop, create_background_task)
+        return await run_blocking(call, getattr(worker, method), *args, **kwargs)
+
     @router.get("/projects")
     def projects():
         return {"items": store.list_projects()}
@@ -112,16 +138,16 @@ def make_router(store, jobs=None):
         return call(store.get_revision, project_id, revision_id)
 
     @router.post("/projects/{project_id}/commands")
-    def command(project_id: str, body: Command):
-        return call(store.command, project_id, **body.model_dump())
+    def command(project_id: str, body: Command, x_studio_projection: str | None = Header(default=None)):
+        return call(store.command, project_id, **body.model_dump(), compact=x_studio_projection == "compact")
 
     @router.post("/projects/{project_id}/revisions")
-    def revision(project_id: str, body: Revision):
-        return call(store.checkpoint, project_id, **body.model_dump())
+    def revision(project_id: str, body: Revision, x_studio_projection: str | None = Header(default=None)):
+        return call(store.checkpoint, project_id, **body.model_dump(), compact=x_studio_projection == "compact")
 
     @router.post("/projects/{project_id}/approvals")
-    def approval(project_id: str, body: Approval):
-        return call(store.approve, project_id, **body.model_dump())
+    def approval(project_id: str, body: Approval, x_studio_projection: str | None = Header(default=None)):
+        return call(store.approve, project_id, **body.model_dump(), compact=x_studio_projection == "compact")
 
     @router.get("/engines")
     def get_engines(commercial_only: bool = False):
@@ -132,8 +158,8 @@ def make_router(store, jobs=None):
     @router.post("/projects/{project_id}/generation-jobs", status_code=202)
     async def generate(project_id: str, body: Generate):
         return {
-            "jobs": call(
-                jobs.submit, project_id, body.idempotency_key, body.passage_ids, body.count, body.adopt,
+            "jobs": await job_work(
+                "submit", project_id, body.idempotency_key, body.passage_ids, body.count, body.adopt,
                 commercial_only=body.commercial_only,
                 phrase_text=body.phrase_text,
             )
@@ -149,11 +175,13 @@ def make_router(store, jobs=None):
 
     @router.post("/jobs/{job_id}/retry")
     async def retry(job_id: str):
-        return call(jobs.retry, job_id)
+        return await job_work("retry", job_id)
 
     @router.post("/projects/{project_id}/render-jobs", status_code=202)
     async def render(project_id: str, body: Render):
-        return {"job": call(get_delivery().submit, project_id, **body.model_dump())}
+        delivery = get_delivery()
+        delivery.schedule = on_loop(asyncio.get_running_loop(), delivery.schedule)
+        return {"job": await run_blocking(call, delivery.submit, project_id, **body.model_dump())}
 
     @router.get("/deliverables/{ident}/audio")
     @router.get("/deliverables/{ident}/download")

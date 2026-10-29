@@ -9,6 +9,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 # GUI-launched apps on macOS get a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin),
@@ -63,6 +64,7 @@ def encode_audio(
     fmt: str,
     metadata_path: Path | None = None,
     timeout: int = 600,
+    cancelled=None,
 ) -> None:
     """Transcode ``wav_path`` to ``fmt`` ("mp3" or "m4b") at ``out_path``.
 
@@ -82,6 +84,27 @@ def encode_audio(
         cmd.extend(["-i", str(metadata_path), "-map_metadata", "1", "-map_chapters", "1"])
     cmd.extend(["-map", "0:a", *ENCODERS[fmt], str(out_path)])
 
+    if cancelled is not None:
+        with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+            deadline = time.monotonic() + timeout
+            try:
+                while True:
+                    if cancelled():
+                        raise RuntimeError("Audio export cancelled")
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("ffmpeg timed out during audio export")
+                    try:
+                        _, stderr = process.communicate(timeout=min(.2, max(.001, deadline - time.monotonic())))
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+                if process.returncode:
+                    raise RuntimeError(f"ffmpeg exited {process.returncode}: {stderr.decode(errors='replace').strip()}")
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+        return
     try:
         # Hard ceiling so a stuck ffmpeg can't pin server resources forever;
         # ten minutes covers a multi-hour audiobook on slow hardware.
