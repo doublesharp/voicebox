@@ -1,7 +1,8 @@
 # Local AI follow-ups: Apple Silicon work and CUDA handoff
 
-Planning deliverable; a row in this document is not an implementation claim.
-Use the current integration branch and confirm which batches have since landed.
+This is the maintained implementation and qualification view. A completed
+source slice does not establish listening, device, packaged or CUDA acceptance.
+Use the current integration branch and record the exact source revision.
 The [implementation report](../local-ai-implementation-2026-10-29.md) records the
 prior accepted local AI work; record the exact source revision for each new run.
 
@@ -10,27 +11,27 @@ The prior batches passed 274 tests with 975/986 changed executable lines traced
 They did not qualify CUDA, desktop streaming playback, listening quality or
 frozen builds. See [completed work](../local-ai-implementation-2026-10-29.md).
 
-## Work we can implement and verify on Apple Silicon
+## Apple Silicon implementation and remaining qualification
 
-| Batch | Deliverable | Acceptance here | Main responsibility |
+| Batch | Implemented | Verified boundary | Remaining work |
 | --- | --- | --- | --- |
-| M1: playback | Connect incremental API audio to desktop playback, with bounded buffering, one continuous output stream, stop/replacement/device-change handling and underrun recovery. | Real desktop playback starts before synthesis completes; measure submission to first audible output separately from first model frame. Verify disconnect/repeated cancellation and retain buffered mastering behavior. | App playback code, Tauri audio lifecycle, focused backend/API integration. |
-| M2: MLX efficiency | Trial explicit Qwen 8-bit variants, then 4-bit; record exact weight/codec revisions, prewarm the selected model and enforce a model-residency budget. Optionally compare a GGML/Metal runtime in isolation. | Matched BF16/quantized corpus, seeds and references; report latency, peak/steady unified memory, repeated unload behavior and listening artifacts. Preserve BF16 default until quality is accepted. | MLX adapters, model variant metadata, runtime identity and Mac benchmarks. |
-| M3: CPU cloning | Audit and compare Pocket TTS, Chatterbox Nano and MOSS-TTS-Nano against existing LuxTTS/Turbo; consider Phonon only for presets. Integrate one qualifying candidate at a time. | Complete dependencies/codecs, offline real CPU synthesis, reference identity, pronunciation, sample-rate/channel conversion and frozen inference. Unsupported features must not be advertised. | Separate engine adapter/test/docs tracks; serialized registry and packaging integration. |
-| M4: production quality | Add generated-speech verification, word alignment, caption timing and assisted phrase repair; improve reference-segment selection and engine-specific pronunciation controls. | Known omissions/repetitions/substitutions and timing fixtures; real local ASR/alignment runs; preserve the script and original take; user auditions repairs. ASR disagreement is advisory and alignment is not proof every word was spoken. | Studio services/UI, local ASR adapters and editing tests. |
-| M5: recognition and management | Evaluate CPU/MLX ASR/streaming transcription where supported, optional refinement that preserves meaning, and persisted revision/license/runtime metadata. | Names, numbers, multilingual speech and hotkey-stop latency; offline and packaged checks on the target Mac. Mark unsupported backends explicitly. | Transcription/refinement paths, provenance and model manager. |
+| M1: playback | Desktop “Preview speech” connects incremental API PCM to the native playback owner with bounded buffering, replacement/stop ownership and validated fallback for guarded utterances. | Real CustomVoice request reached the native output callback before HTTP EOF; deterministic lifecycle/queue regressions pass. | Final packaged Tauri UI journey, physical device changes and first-audible measurement; Windows/Linux device qualification. |
+| M2: MLX efficiency | Explicit pinned Qwen Base 1.7B 8-bit/4-bit variants, BF16 default, session residency limits and cached prewarming. | Real finite BF16/8-bit/4-bit synthesis and memory recovery after unload; pinned asset and ownership checks. | Blind listening, controlled same-corpus performance/memory distributions and wider lifecycle/hardware qualification. Quantized variants remain experimental. |
+| M3: CPU cloning | MOSS-TTS-Nano low-level ONNX CPU adapter with pinned codec, reference-content cache, registry/UI selection and packaging hooks. | Offline English synthesis, encoded-reference reuse and speaker-state isolation; comparison with existing Turbo was observational. | Final rebuilt frozen ordinary-generation/recovery checks, listening and multilingual quality. Pocket TTS access/NumPy compatibility and Chatterbox Nano dependency conflicts remain explicit deferrals. |
+| M4: production quality | Persisted advisory take/script comparisons, recognized-word caption drafts, explicit phrase-repair preparation/audition and ranked original-reference interval auditions. | Real cached Whisper word timings, immutable source/revision checks, archive identity and component workflows. | Rendered/browser journeys and listening. Recognized timing is not supplied-script forced alignment; ASR agreement does not certify speech. |
+| M5: recognition and management | Existing local recognizer exposes detailed words; optional refinement skips disabled/unneeded work and guards clear name/number/negation/content loss; model identity and session residency are surfaced. | Real cached Whisper recognition plus deterministic refusal, cancellation, metadata and cleanup checks. | Multilingual/error-corpus and packaged recognition/refinement qualification; streaming dictation/hotkey latency remains separate. No new ASR runtime is claimed. |
 
-M1 and an isolated M3 dependency/model trial can run in parallel. M2 shares MLX
-runtime and model metadata with M3, so schedule their real GPU runs separately
-and serialize registry/capability changes. M4 depends on a chosen local ASR and
-aligner: start with bounded existing-runtime trials before changing defaults.
-M5 metadata can proceed alongside UI work. Within each batch, use RED/GREEN
-behavioral tests, scoped runtime coverage, documentation and bounded independent
-review before merging accepted commits into `doublesharp`.
+The [implementation report](../local-ai-implementation-2026-10-29.md) and
+[CPU audit](../content/docs/developer/cpu-tts-audit.mdx) distinguish source,
+fixture, real-model and artifact evidence. Final artifact receipts supersede
+intermediate builds. Serialize real GPU work and shared registry/model changes;
+use behavioral RED/GREEN, actual changed-source coverage and independent review
+for remaining implementation batches.
 
 Place worktrees, temporary files, model downloads, native builds, audio, coverage
 and raw evidence under task-owned storage approved for the current host. Follow
-any required mount policy; do not assume a particular volume name. Run the resource preflight when budget assumptions change. Use separate
+any required mount policy; do not assume a particular volume name. Run the
+resource preflight when budget assumptions change. Use separate
 environments for model experiments; no shared environment dependency upgrades.
 Read `.agents/skills/add-tts-engine/SKILL.md` and its full guide before adding an
 engine, including the Phase 0 dependency audit and frozen-inference gates.
@@ -64,7 +65,8 @@ Turbo benchmarking needs its own admitted asset policy, not a validation bypass.
   and the packaged CUDA runtime. None of those acceptance claims can come from
   CPU fixture tests.
 - MLX quantization and Metal-native experiments do not require CUDA. CPU cloning,
-  verification, alignment, editing and provenance can be developed on supported CPU/Apple Silicon hosts.
+  verification, alignment, editing and provenance can be developed on supported
+  CPU/Apple Silicon hosts.
 - New models are candidates, not automatic defaults. Model-specific dependency,
   license, quality and packaging audits still decide adoption.
 - Accelerated implementations need not produce bit-identical arrays to a stock

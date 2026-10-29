@@ -5,7 +5,8 @@ as Qwen Base: MLX on functional Apple Silicon installations, existing PyTorch
 adapters elsewhere. Registry downloads, cache readiness, model inventory, and
 Studio runtime identity select the matching adapter and repository. MLX uses
 `mlx-community/Qwen3-TTS-12Hz-{size}-CustomVoice-bf16` (1.7B/0.6B) and
-`mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16`. No quantized default is added.
+`mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16`. No quantized style default is added. Qwen Base separately offers explicit
+experimental 1.7B 8-bit/4-bit variants; these do not change style-model selection.
 
 The implementation follows the installed **mlx-audio 0.4.1** source:
 `tts.utils.load` eagerly loads weights by default, and the Qwen model exposes

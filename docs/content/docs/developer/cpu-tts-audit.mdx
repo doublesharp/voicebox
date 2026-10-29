@@ -18,7 +18,7 @@ ranking or a controlled speed advantage over LuxTTS or Chatterbox Turbo.
 | MOSS-TTS-Nano ONNX | [OpenMOSS source](https://github.com/OpenMOSS/MOSS-TTS-Nano/tree/8b7bcc9341b3b4ef3a3a58ba1338a7d85ff133eb), Apache 2.0; [TTS ONNX model](https://huggingface.co/OpenMOSS-Team/MOSS-TTS-Nano-100M-ONNX), Apache 2.0; [codec ONNX model](https://huggingface.co/OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano-ONNX), Apache 2.0 | The package's default installer pins Torch/Torchaudio 2.7.0 and Transformers 4.57.1. Its low-level `ort_cpu_runtime` imports only standard library, NumPy and ONNX Runtime. It works with the app's NumPy 1.26.4 and ONNX Runtime 1.31.1; SentencePiece 0.2.1 supplies text tokenization. | Select the low-level ONNX path, install source without dependencies, and keep the existing shared Torch/Transformers stack. |
 
 The upstream Pocket, Nano and MOSS speed statements are vendor measurements,
-not measurements of Voicebox on this machine. LuxTTS's existing adapter uses
+not measurements of Voicebox from this evaluation. LuxTTS's existing adapter uses
 its ZipVoice/LinaCodec stack, an internal Whisper reference transcription and
 48 kHz output. Turbo already provides CPU English cloning and paralinguistic
 tags. MOSS adds an independently qualified small ONNX CPU path and additional

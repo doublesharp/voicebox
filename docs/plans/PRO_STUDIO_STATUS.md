@@ -43,9 +43,28 @@ Root also repaired native-fetch receiver errors across Studio, review, storage a
 
 This pass used available empty and script-populated states. The 720×450 check approximates reduced workspace area; actual 200% browser zoom was not established by the preview shortcuts. Populated audio, full accessibility, real models and packaged desktop behavior remain separate gates.
 
+## Local speech quality continuation
+
+Phrase repairs now expose explicit cached-Whisper take/script checks. Saved
+reports flag possible omissions, substitutions, repetitions and extra words;
+users can audition the interval and prepare editable phrase-repair controls.
+This never rewrites the script, generates a replacement or adopts a take on its
+own. Audio/request/script provenance and revision checks reject stale results;
+portable archives retain report identity.
+
+Captions can use saved recognized word times to create an unreviewed draft.
+These are recognized-word timings, not supplied-text forced alignment or proof
+that every script word was spoken. The existing wording/timing review gate
+still applies. A real cached Whisper run produced word times from synthetic
+speech; component/API/archive checks cover application behavior. Rendered
+quality journeys, listening and packaged recognition remain separate gates.
+Reference Quality also ranks short level-based intervals for audition while
+preserving the original recording.
+
 ## Qualification still open
 
-- Real preset/cloned/directed models, GPU cancellation/contention and platform-specific model execution.
+- Wider preset/cloned/directed model and GPU-contention qualification beyond the
+  bounded real local-AI runs documented in the implementation report.
 - Populated-audio browser layouts, full keyboard/accessibility and recovery/navigation journeys, and actual 200% browser zoom beyond the bounded visual pass above.
 - Packaged lifecycle, native output routing/save dialogs, HTTP failure journeys and Windows replacement/ACL behavior.
 - Listening, independent metering, final encoded true-peak/loudness compliance and long-project UI/effects performance.

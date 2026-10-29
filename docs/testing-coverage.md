@@ -18,10 +18,11 @@ python3 scripts/test-frontend.py \
 
 The output directory must be new, absolute, and have no `..` or symlink
 components. The guard requires POSIX directory-relative no-follow IO; unsupported
-hosts fail explicitly. Follow any host-specific mount requirement before running. The instrumentation
-directory must contain `istanbul-lib-instrument@6.0.3` and
+hosts fail explicitly. Follow any host-specific mount requirement before running.
+The instrumentation directory must contain `istanbul-lib-instrument@6.0.3` and
 `istanbul-lib-coverage@3.2.2` in its own `node_modules`. These tools are installed
-separately in the chosen tooling directory; they do not modify the application's dependencies.
+separately in the chosen tooling directory; they do not modify the application's
+dependencies.
 Use `--test <basename>` repeatedly for a focused run. Omit `--coverage` for a
 normal regression run.
 
@@ -40,24 +41,23 @@ raw percentage directly with Istanbul or claim it is whole-app coverage.
 
 ## Measured scope, 29 October 2026
 
-The merged DoubleSharp source passes **414 tests in 62 files**, with no failed
-tests or missing coverage files. Source remained stable during the run. This
-includes the upstream reliability and audio preview regressions already on the
-DoubleSharp branch.
+The final consolidated candidate passes **728 tests in 115 isolated files** and
+the application TypeScript check, with no failed checks or missing coverage files.
+All 116 checks completed and production source remained stable during the run.
+This includes local AI preview, model management, speech review and existing
+Studio/upstream regressions.
 
 | Scope | Lines | Statements | Functions | Branches |
 | --- | ---: | ---: | ---: | ---: |
-| Whole frontend, all 230 source files | 45.85% | 44.95% | 42.02% | 39.77% |
-| The 101 modules imported by tests | 79.14% | 76.92% | 72.06% | 67.47% |
+| Whole frontend, all 248 source files | 74.52% | 72.76% | 66.27% | 65.65% |
+| The 156 modules imported by tests | 80.31% | 78.35% | 73.31% | 70.36% |
 
-Measured with the same Istanbul setup, the original 333-test suite covered
-38.69% of whole-frontend lines and 70.12% of lines in its 96 imported modules.
-Before the upstream merge, the installed UI snapshot passed 373 tests in 56
-files and covered 44.35% of whole-frontend lines (549 additional covered lines).
-The merged source adds two production files and the upstream tests. The earlier
-raw Bun 72% figure used an imported-module scope and a different denominator.
+Using the same Istanbul setup, the earlier 333-test suite covered 38.69% of
+whole-frontend lines; the later 414-test/62-file integration covered 45.85%.
+These are historical snapshots with different source denominators. The earlier
+raw Bun 72% figure used imported modules and a different instrumentation method.
 
-Some focused areas exceed 95% line coverage: API client 99.56%, profile hooks
+Some focused areas exceed 95% line coverage: API client 97.48%, profile hooks
 97.14%, story hooks 100%, effects chain 97.64%, and audio utilities 100%.
 The whole-frontend 95% target has not been reached. Untested screens and forms,
 capture workflows, and platform integration remain significant gaps. Backend

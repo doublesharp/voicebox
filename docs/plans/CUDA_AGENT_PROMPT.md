@@ -200,8 +200,8 @@ that acceptance gate is cleared.
 
 Keep CUDA-specific adapters/helpers/tests and a CUDA report in focused commits.
 Avoid unrelated cleanup. Keep shared registry, scheduler, benchmark, requirements
-and build-file changes minimal and in separate commits: the Mac owner is working
-on MLX/CPU/UI tracks. Coordinate shared-file ownership through the existing task
+and build-file changes minimal and in separate commits, isolated from the
+MLX/CPU/UI implementation ownership. Coordinate shared-file ownership through the existing task
 mechanism; do not launch overlapping writers. If parallel agents are authorized,
 limit them to independent source review,
 deterministic tests and docs; serialize expensive GPU execution. Use an

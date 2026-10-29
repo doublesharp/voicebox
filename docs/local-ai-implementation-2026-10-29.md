@@ -1,8 +1,67 @@
 # Local AI improvements — 2026-10-29
 
-This report describes the local AI implementation integrated into `doublesharp`.
+This report records the earlier existing-engine integration and the subsequent
+local AI continuation. Source revisions and final distribution checks remain
+separate from the bounded observations below.
 Source behavior, model execution, listening quality, CUDA, native playback, and
 frozen-build qualification are separate evidence domains.
+
+## Current continuation
+
+- **Desktop speech preview:** “Preview speech” plays the current script at normal
+  speed without effects or loudness normalization and does not save a generation.
+  “Generate” retains finished audio, mastering and export. Incremental PCM uses
+  the existing native playback owner with a bounded queue. Engines requiring
+  whole-utterance guard/trim checks still wait for their validated utterance.
+- **Explicit MLX variants:** Qwen Base 1.7B adds pinned `1.7B-8bit` and
+  `1.7B-4bit` selections on Apple Silicon. BF16 remains the default. Real cached
+  synthesis produced finite audio for all three variants and unload returned
+  active MLX memory near its starting level. The quantized variants remain
+  experimental: listening fidelity, a controlled matched corpus and reliable
+  performance distributions have not been established. Style engines retain
+  their existing BF16 variants.
+- **CPU cloning:** MOSS-TTS-Nano uses its pinned low-level ONNX CPU runtime,
+  companion codec and actual encoded-reference cache. It preserves the shared
+  Torch/Transformers stack and returns finite mono 48 kHz audio. Offline English
+  synthesis and reference-switch isolation passed. Pocket TTS and Chatterbox
+  Nano remain deferred for the specific access/dependency reasons in the
+  [CPU audit](content/docs/developer/cpu-tts-audit.mdx).
+- **Studio speech review:** Phrase repairs can recognize a retained take using
+  cached local Whisper, save advisory omissions/substitutions/repetitions and
+  audition the suspected interval. “Prepare replacement phrase” fills editable
+  controls; generation, composition and adoption remain separate user actions.
+  The original script, take and audio remain available. Reports carry content,
+  request, script, language and recognizer provenance; stale results are rejected
+  and portable archive import retains their identity.
+- **Recognized captions and reference selection:** “Use recognized word timings”
+  creates an unreviewed caption draft from saved current speech reviews. These
+  timings describe recognized words, not forced alignment of the supplied script
+  or proof that every word was spoken. Reference Quality ranks short waveform
+  intervals and auditions the unchanged original; level heuristics do not detect
+  speaker identity or sentence boundaries. Optional refinement skips disabled or
+  unnecessary work and conservatively rejects obvious content loss.
+- **Model management:** Server model controls expose cached-only prewarming and
+  session residency limits. The budget estimates model-weight bytes; it is not
+  a runtime RAM cap and resets on restart. Model status and Studio provenance
+  carry pinned revisions, licenses and actual runtime identity where available;
+  unknown metadata remains unknown.
+
+A real CustomVoice 0.6B request reached the native CPAL output callback before
+HTTP generation finished. This establishes the production HTTP/native queue
+path, not first audible output, physical hotplug or the packaged Tauri journey.
+Cached Whisper Base produced ten word intervals from explicitly synthetic speech;
+its number formatting and punctuation artifacts reinforce the advisory label.
+The audited mlx-audio 0.4.1 word-timing head-name mismatch is handled by a scoped
+compatibility alias without editing the installed library.
+
+An intermediate frozen backend passed clean-cache MOSS download/load and Qwen
+4-bit synthesis. MOSS ordinary generation exposed a model-selection defect that
+was repaired in source; final rebuilt-artifact synthesis/recovery and packaged UI
+qualification must be checked against the final artifact before distribution.
+Windows/Linux devices, signing/notarization, blind listening and CUDA remain
+separate gates. See the [remaining work](plans/LOCAL_AI_FOLLOWUPS.md).
+
+## Earlier integration
 
 Delivered to `doublesharp` in merge commit
 `fe2f8394961c7f85293cbede6d79c487d6e9cc86`, after independent round 2
@@ -27,8 +86,8 @@ preexisting target checkout edits and links were verified unchanged.
   samples fail explicitly. Guarded engines retain buffered validation, so Qwen
   Base's existing preview runaway protection is preserved.
 - Buffered generation, final normalization/effects, saved takes, and exported WAV
-  headers retain their existing contracts. This change adds backend/API streaming;
-  it does not claim new streaming playback in the desktop UI.
+  headers retain their existing contracts. The earlier integration added
+  backend/API streaming; the continuation above connects desktop preview.
 - Qwen Base reuses bounded CPU reference codec codes on the same loaded model,
   across different target texts in both buffered and native generation. Keys use
   actual normalized audio; unload, bypass and failures invalidate or skip reuse.
@@ -72,11 +131,12 @@ No raw evidence or downloaded model weights belong in Git.
 
 ## Remaining research qualification
 
-Pocket TTS, Chatterbox Nano and MOSS-TTS-Nano remain lightweight cloning candidates;
-Ming 0.5B and VoxCPM2 remain quality/control candidates. They are not registered or
-advertised by this change. Each needs its own dependency audit, compatible runtime,
-checkpoint-specific license check, real synthesis, and frozen-build acceptance.
-Qwen CUDA graphs/fused kernels/quantization are also separate trials. Turbo
+Pocket TTS and Chatterbox Nano remain deferred lightweight cloning candidates;
+Ming 0.5B and VoxCPM2 remain quality/control candidates. MOSS-TTS-Nano is now
+implemented as described above. Deferred engines still need compatible runtime,
+license, real synthesis and frozen-build acceptance. Qwen CUDA graph/fused-kernel
+acceleration and CUDA quantization remain separate trials; the explicit MLX
+quantized variants do not qualify NVIDIA behavior. Turbo
 conditioning reuse applies before device restoration and can benefit CUDA, but
 no NVIDIA measurements or CUDA qualification were available during this run. The
 MLX routing, codec reuse and streaming changes are Apple Silicon improvements.

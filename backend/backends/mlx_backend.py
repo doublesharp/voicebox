@@ -596,4 +596,3 @@ class MLXSTTBackend:
 
         async with self._op_lock:
             return await run_owned(_run_on_mlx_thread(recognize))
-
