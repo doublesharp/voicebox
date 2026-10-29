@@ -107,22 +107,34 @@ def _migrate_story_items(engine, inspector, tables: set[str]) -> None:
                     trim_start_ms INTEGER NOT NULL DEFAULT 0,
                     trim_end_ms INTEGER NOT NULL DEFAULT 0,
                     version_id VARCHAR,
+                    volume FLOAT NOT NULL DEFAULT 1.0,
                     created_at DATETIME,
                     FOREIGN KEY (story_id) REFERENCES stories(id),
                     FOREIGN KEY (generation_id) REFERENCES generations(id)
                 )
             """))
-            conn.execute(text("""
-                INSERT INTO story_items_new (id, story_id, generation_id, start_time_ms, track, trim_start_ms, trim_end_ms, version_id, created_at)
+            # Older position-based schemas may predate any of the editing
+            # columns. Preserve values that exist and default only absent ones.
+            def existing_or_default(name: str, default: str) -> str:
+                return f"COALESCE({name}, {default})" if name in columns else default
+
+            track = existing_or_default("track", "0")
+            trim_start = existing_or_default("trim_start_ms", "0")
+            trim_end = existing_or_default("trim_end_ms", "0")
+            volume = existing_or_default("volume", "1.0")
+            version = "version_id" if "version_id" in columns else "NULL"
+            conn.execute(text(f"""
+                INSERT INTO story_items_new (id, story_id, generation_id, start_time_ms, track, trim_start_ms, trim_end_ms, version_id, volume, created_at)
                 SELECT id, story_id, generation_id, start_time_ms,
-                    COALESCE(track, 0), COALESCE(trim_start_ms, 0), COALESCE(trim_end_ms, 0), version_id, created_at
+                    {track}, {trim_start}, {trim_end}, {version}, {volume}, created_at
                 FROM story_items
             """))
             conn.execute(text("DROP TABLE story_items"))
             conn.execute(text("ALTER TABLE story_items_new RENAME TO story_items"))
             conn.commit()
 
-        # Re-read after table recreation
+        # The Inspector caches the old schema across the table rebuild.
+        inspector.clear_cache()
         columns = _get_columns(inspector, "story_items")
 
     if "track" not in columns:
