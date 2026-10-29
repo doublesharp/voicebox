@@ -39,25 +39,32 @@ class ProgressManager:
         
         if model_name not in self._listeners:
             return
-            
-        for queue in self._listeners[model_name]:
+
+        def deliver(queue, data):
+            # A terminal event must reach a slow subscriber even when its
+            # bounded queue is full of older progress updates.
+            if queue.full() and data.get("status") in ("complete", "error"):
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
             try:
-                # Check if we're in the main event loop thread
+                queue.put_nowait(data)
+            except asyncio.QueueFull:
+                logger.warning("Queue full for %s, dropping update", model_name)
+
+        for queue in list(self._listeners[model_name]):
+            try:
                 try:
                     running_loop = asyncio.get_running_loop()
-                    # We're in an async context, can use put_nowait directly
-                    queue.put_nowait(progress_data.copy())
                 except RuntimeError:
-                    # Not in async context (running in background thread)
-                    # Use call_soon_threadsafe to safely put on queue
-                    if self._main_loop and self._main_loop.is_running():
-                        self._main_loop.call_soon_threadsafe(
-                            lambda q=queue, d=progress_data.copy(): q.put_nowait(d) if not q.full() else None
-                        )
-                    else:
-                        logger.debug(f"No main loop available for {model_name}, skipping notification")
-            except asyncio.QueueFull:
-                logger.warning(f"Queue full for {model_name}, dropping update")
+                    running_loop = None
+                if running_loop is not None and running_loop is self._main_loop:
+                    deliver(queue, progress_data.copy())
+                elif self._main_loop and self._main_loop.is_running():
+                    self._main_loop.call_soon_threadsafe(deliver, queue, progress_data.copy())
+                else:
+                    logger.debug(f"No main loop available for {model_name}, skipping notification")
             except Exception as e:
                 logger.warning(f"Error notifying listener for {model_name}: {e}")
 
@@ -158,6 +165,17 @@ class ProgressManager:
                 if status in ("downloading", "extracting"):
                     active.append(progress.copy())
         return active
+
+    def clear_terminal(self, failed_models: set[str] | None = None) -> None:
+        """Dismiss terminal progress and stale progress for failed tasks."""
+        failed_models = failed_models or set()
+        with self._lock:
+            remove = [name for name, data in self._progress.items()
+                      if name in failed_models or data.get("status") in ("complete", "error")]
+            for name in remove:
+                self._progress.pop(name, None)
+                self._last_notify_time.pop(name, None)
+                self._last_notify_progress.pop(name, None)
     
     def create_progress_callback(self, model_name: str, filename: Optional[str] = None):
         """

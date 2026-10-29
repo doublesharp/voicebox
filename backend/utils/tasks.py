@@ -94,6 +94,13 @@ class TaskManager:
         self._active_downloads.clear()
         self._active_generations.clear()
 
+    def clear_failed_downloads(self) -> set[str]:
+        """Dismiss download errors without hiding work that is still running."""
+        failed = {name for name, task in self._active_downloads.items() if task.status == "error"}
+        for name in failed:
+            self._active_downloads.pop(name, None)
+        return failed
+
     def is_download_active(self, model_name: str) -> bool:
         """Check if a download is active."""
         return model_name in self._active_downloads

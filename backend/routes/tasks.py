@@ -15,18 +15,14 @@ router = APIRouter()
 
 @router.post("/tasks/clear")
 async def clear_all_tasks():
-    """Clear all download tasks and progress state."""
+    """Dismiss finished download state without hiding live work."""
     task_manager = get_task_manager()
     progress_manager = get_progress_manager()
 
-    task_manager.clear_all()
+    failed_models = task_manager.clear_failed_downloads()
+    progress_manager.clear_terminal(failed_models)
 
-    with progress_manager._lock:
-        progress_manager._progress.clear()
-        progress_manager._last_notify_time.clear()
-        progress_manager._last_notify_progress.clear()
-
-    return {"message": "All task state cleared"}
+    return {"message": "Finished task state cleared"}
 
 
 @router.post("/cache/clear")
