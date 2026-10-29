@@ -1,15 +1,7 @@
-import i18n from 'i18next';
+import i18n, { type BackendModule } from 'i18next';
 import LanguageDetector from 'i18next-browser-languagedetector';
 import { initReactI18next } from 'react-i18next';
 import en from './locales/en/translation.json';
-import es from './locales/es/translation.json';
-import fr from './locales/fr/translation.json';
-import it from './locales/it/translation.json';
-import ja from './locales/ja/translation.json';
-import ko from './locales/ko/translation.json';
-import ptBR from './locales/pt-BR/translation.json';
-import zhCN from './locales/zh-CN/translation.json';
-import zhTW from './locales/zh-TW/translation.json';
 
 export const SUPPORTED_LANGUAGES = [
   { code: 'en', label: 'English' },
@@ -25,21 +17,46 @@ export const SUPPORTED_LANGUAGES = [
 
 export type LanguageCode = (typeof SUPPORTED_LANGUAGES)[number]['code'];
 
-i18n
+const dictionaries = {
+  es: () => import('./locales/es/translation.json'),
+  fr: () => import('./locales/fr/translation.json'),
+  it: () => import('./locales/it/translation.json'),
+  ja: () => import('./locales/ja/translation.json'),
+  ko: () => import('./locales/ko/translation.json'),
+  'pt-BR': () => import('./locales/pt-BR/translation.json'),
+  'zh-CN': () => import('./locales/zh-CN/translation.json'),
+  'zh-TW': () => import('./locales/zh-TW/translation.json'),
+};
+
+/** i18next waits for this backend before publishing a language change. */
+const bundledLocales: BackendModule = {
+  type: 'backend',
+  init() {},
+  read(language, _namespace, callback) {
+    const load = dictionaries[language as keyof typeof dictionaries];
+    if (!load) {
+      callback(null, language === 'en' ? en : {});
+      return;
+    }
+    void load().then(
+      (module) => callback(null, module.default),
+      // Do not request retries for a missing deployment chunk. English remains
+      // available even when a selected locale cannot be loaded while offline.
+      (error: unknown) =>
+        callback(error instanceof Error ? error : new Error(String(error)), false),
+    );
+  },
+};
+
+export const i18nReady = i18n
+  .use(bundledLocales)
   .use(LanguageDetector)
   .use(initReactI18next)
   .init({
     resources: {
       en: { translation: en },
-      es: { translation: es },
-      'pt-BR': { translation: ptBR },
-      ja: { translation: ja },
-      ko: { translation: ko },
-      'zh-CN': { translation: zhCN },
-      'zh-TW': { translation: zhTW },
-      fr: { translation: fr },
-      it: { translation: it },
     },
+    partialBundledLanguages: true,
     fallbackLng: 'en',
     supportedLngs: SUPPORTED_LANGUAGES.map((l) => l.code),
     load: 'currentOnly',

@@ -3,6 +3,7 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 // import { ReactQueryDevtools } from '@tanstack/react-query-devtools';
 import App from '@/App';
+import { LocaleReady } from '@/i18n/LocaleReady';
 // Import CSS from app directory using alias so Tailwind can scan the source files
 import '@/index.css';
 import { queryClient } from '@/lib/queryClient';
@@ -13,7 +14,9 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>
       <PlatformProvider platform={tauriPlatform}>
-        <App />
+        <LocaleReady>
+          <App />
+        </LocaleReady>
         {/* <ReactQueryDevtools initialIsOpen={false} /> */}
       </PlatformProvider>
     </QueryClientProvider>

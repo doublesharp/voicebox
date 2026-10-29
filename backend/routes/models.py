@@ -4,14 +4,13 @@ import asyncio
 import shutil
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
-from sqlalchemy.orm import Session
 
-from ..services.inference_scheduler import run_serialized_inference, serialized_inference
 from .. import models
-from ..utils.platform_detect import get_backend_type
+from ..services.inference_scheduler import run_serialized_inference, serialized_inference
 from ..services.task_queue import create_background_task
+from ..utils.model_inventory import model_inventory
 from ..utils.progress import get_progress_manager
 from ..utils.tasks import get_task_manager
 
@@ -104,6 +103,8 @@ async def load_model(
             await _run_model_work(config, get_model_load_func(config))
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e)) from e
+        finally:
+            model_inventory.invalidate()
         return {"message": f"Model {config.model_name} loaded successfully"}
 
     size = requested_size or DEFAULT_QWEN_MODEL_SIZE
@@ -113,6 +114,8 @@ async def load_model(
         return {"message": f"Model {size} loaded successfully"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+    finally:
+        model_inventory.invalidate()
 
 
 @router.post("/models/unload")
@@ -271,7 +274,10 @@ async def migrate_models(request: models.ModelMigrateRequest):
         except Exception as e:
             progress_manager.update_progress("migration", 0, 0, status="error")
             progress_manager.mark_error("migration", str(e))
+        finally:
+            model_inventory.invalidate()
 
+    model_inventory.invalidate()
     create_background_task(migrate_background())
 
     return {"source": str(source), "destination": str(destination)}
@@ -297,177 +303,87 @@ async def get_migration_progress():
     )
 
 
-@router.get("/models/status", response_model=models.ModelStatusListResponse)
-async def get_model_status():
-    """Get status of all available models."""
+def _scan_model_inventory(configurations):
+    """Disk-only state, run on a worker and shared by polling clients."""
     from huggingface_hub import constants as hf_constants
 
-    backend_type = get_backend_type()
-    task_manager = get_task_manager()
+    from ..backends.base import has_in_progress_download, is_model_cached
 
-    # Pending only — an errored task stays in the active list for the
-    # error/retry UI, but reporting it as "downloading" here would mask
-    # the model's real cache state until the app restarts (issue #925).
-    active_download_names = {task.model_name for task in task_manager.get_pending_downloads()}
-
+    repositories = {}
     try:
         from huggingface_hub import scan_cache_dir
 
-        use_scan_cache = True
-    except ImportError:
-        use_scan_cache = False
+        repositories = {repo.repo_id: repo for repo in scan_cache_dir().repos}
+    except Exception:
+        pass
 
-    from ..backends import get_all_model_configs, check_model_loaded
-    from ..backends.base import has_in_progress_download, is_model_cached
-
-    registry_configs = get_all_model_configs()
-    model_configs = [
-        {
-            "model_name": cfg.model_name,
-            "display_name": cfg.display_name,
-            "hf_repo_id": cfg.hf_repo_id,
-            "aux_hf_repo_ids": cfg.aux_hf_repo_ids,
-            "model_size": cfg.model_size,
-            "check_loaded": lambda c=cfg: check_model_loaded(c),
-        }
-        for cfg in registry_configs
-    ]
-
-    model_to_repo = {cfg["model_name"]: cfg["hf_repo_id"] for cfg in model_configs}
-    active_download_repos = {model_to_repo.get(name) for name in active_download_names if name in model_to_repo}
-
-    cache_info = None
-    if use_scan_cache:
+    result = {}
+    extensions = (".safetensors", ".bin", ".pt", ".pth", ".npz")
+    for configuration in configurations:
+        downloaded, size_mb = False, None
         try:
-            cache_info = scan_cache_dir()
+            repo_id = configuration.hf_repo_id
+            repo_cache = Path(hf_constants.HF_HUB_CACHE) / ("models--" + repo_id.replace("/", "--"))
+            repo = repositories.get(repo_id)
+            if repo is not None:
+                downloaded = any(
+                    file.file_name.lower().endswith(extensions) and file.file_path.is_file()
+                    for revision in repo.revisions for file in revision.files
+                ) and not has_in_progress_download(repo_cache / "blobs")
+                if downloaded:
+                    size_mb = sum(revision.size_on_disk for revision in repo.revisions) / (1024 * 1024)
+            if not downloaded and is_model_cached(repo_id, weight_extensions=extensions):
+                downloaded = True
+                size_mb = sum(
+                    file.stat().st_size for file in repo_cache.rglob("*")
+                    if file.is_file() and not file.name.endswith(".incomplete")
+                ) / (1024 * 1024)
+            if downloaded and not all(is_model_cached(repo) for repo in configuration.aux_hf_repo_ids):
+                downloaded = False
         except Exception:
             pass
+        result[configuration.model_name] = (downloaded, size_mb)
+    return result
 
+
+@router.get("/models/status", response_model=models.ModelStatusListResponse)
+async def get_model_status():
+    """Read cached disk inventory, overlaying live model and download state."""
+    from huggingface_hub import constants as hf_constants
+
+    from ..backends import check_model_loaded, get_all_model_configs
+
+    configurations = get_all_model_configs()
+    task_manager = get_task_manager()
+    # Including pending downloads observes loads initiated by generation/STT,
+    # not only downloads explicitly requested through this router.
+    pending = tuple(sorted(
+        (task.model_name, str(getattr(task, "started_at", "")), getattr(task, "status", ""))
+        for task in task_manager.get_pending_downloads()
+    ))
+    key = (str(hf_constants.HF_HUB_CACHE), tuple(
+        (cfg.model_name, cfg.hf_repo_id, tuple(cfg.aux_hf_repo_ids)) for cfg in configurations
+    ), pending)
+    inventory = await model_inventory.get(key, lambda: _scan_model_inventory(configurations))
+    model_to_repo = {cfg.model_name: cfg.hf_repo_id for cfg in configurations}
+    active_repositories = {model_to_repo.get(task.model_name) for task in task_manager.get_pending_downloads()}
     statuses = []
-
-    for config in model_configs:
+    for cfg in configurations:
+        downloaded, size_mb = inventory[cfg.model_name]
         try:
-            downloaded = False
-            size_mb = None
-            loaded = False
-
-            if cache_info:
-                repo_id = config["hf_repo_id"]
-                for repo in cache_info.repos:
-                    if repo.repo_id == repo_id:
-                        has_model_weights = False
-                        for rev in repo.revisions:
-                            for f in rev.files:
-                                fname = f.file_name.lower()
-                                if (
-                                    fname.endswith((".safetensors", ".bin", ".pt", ".pth", ".npz"))
-                                    and f.file_path.is_file()
-                                ):
-                                    has_model_weights = True
-                                    break
-                            if has_model_weights:
-                                break
-
-                        has_incomplete = False
-                        try:
-                            cache_dir = hf_constants.HF_HUB_CACHE
-                            blobs_dir = Path(cache_dir) / ("models--" + repo_id.replace("/", "--")) / "blobs"
-                            has_incomplete = has_in_progress_download(blobs_dir)
-                        except Exception:
-                            pass
-
-                        if has_model_weights and not has_incomplete:
-                            downloaded = True
-                            try:
-                                total_size = sum(revision.size_on_disk for revision in repo.revisions)
-                                size_mb = total_size / (1024 * 1024)
-                            except Exception:
-                                pass
-                        break
-
-            if not downloaded:
-                try:
-                    cache_dir = hf_constants.HF_HUB_CACHE
-                    repo_cache = Path(cache_dir) / ("models--" + config["hf_repo_id"].replace("/", "--"))
-
-                    if repo_cache.exists():
-                        blobs_dir = repo_cache / "blobs"
-                        has_incomplete = has_in_progress_download(blobs_dir)
-
-                        if not has_incomplete:
-                            snapshots_dir = repo_cache / "snapshots"
-                            has_model_files = False
-                            if snapshots_dir.exists():
-                                has_model_files = (
-                                    any(path.is_file() for path in snapshots_dir.rglob("*.bin"))
-                                    or any(path.is_file() for path in snapshots_dir.rglob("*.safetensors"))
-                                    or any(path.is_file() for path in snapshots_dir.rglob("*.pt"))
-                                    or any(path.is_file() for path in snapshots_dir.rglob("*.pth"))
-                                    or any(path.is_file() for path in snapshots_dir.rglob("*.npz"))
-                                )
-
-                            if has_model_files:
-                                downloaded = True
-                                try:
-                                    total_size = sum(
-                                        f.stat().st_size
-                                        for f in repo_cache.rglob("*")
-                                        if f.is_file() and not f.name.endswith(".incomplete")
-                                    )
-                                    size_mb = total_size / (1024 * 1024)
-                                except Exception:
-                                    pass
-                except Exception:
-                    pass
-
-            # A model whose backend also pulls auxiliary repos at load time
-            # (e.g. Chatterbox MLX's S3 tokenizer) is only downloaded once
-            # those are present too, matching the backend's own cache check.
-            if downloaded and not all(is_model_cached(repo) for repo in config["aux_hf_repo_ids"]):
-                downloaded = False
-
-            try:
-                loaded = config["check_loaded"]()
-            except Exception:
-                loaded = False
-
-            is_downloading = config["hf_repo_id"] in active_download_repos
-
-            if is_downloading:
-                downloaded = False
-                size_mb = None
-
-            statuses.append(
-                models.ModelStatus(
-                    model_name=config["model_name"],
-                    display_name=config["display_name"],
-                    hf_repo_id=config["hf_repo_id"],
-                    downloaded=downloaded,
-                    downloading=is_downloading,
-                    size_mb=size_mb,
-                    loaded=loaded,
-                )
-            )
+            loaded = check_model_loaded(cfg)
         except Exception:
-            try:
-                loaded = config["check_loaded"]()
-            except Exception:
-                loaded = False
-
-            is_downloading = config["hf_repo_id"] in active_download_repos
-
-            statuses.append(
-                models.ModelStatus(
-                    model_name=config["model_name"],
-                    display_name=config["display_name"],
-                    hf_repo_id=config["hf_repo_id"],
-                    downloaded=False,
-                    downloading=is_downloading,
-                    size_mb=None,
-                    loaded=loaded,
-                )
-            )
-
+            loaded = False
+        downloading = cfg.hf_repo_id in active_repositories
+        statuses.append(models.ModelStatus(
+            model_name=cfg.model_name,
+            display_name=cfg.display_name,
+            hf_repo_id=cfg.hf_repo_id,
+            downloaded=downloaded and not downloading,
+            downloading=downloading,
+            size_mb=None if downloading else size_mb,
+            loaded=loaded,
+        ))
     return models.ModelStatusListResponse(models=statuses)
 
 
@@ -500,7 +416,10 @@ async def trigger_model_download(request: models.ModelDownloadRequest):
         except Exception as e:
             task_manager.error_download(request.model_name, str(e))
             progress_manager.mark_error(request.model_name, str(e))
+        finally:
+            model_inventory.invalidate()
 
+    model_inventory.invalidate()
     task_manager.start_download(request.model_name)
 
     progress_manager.update_progress(
@@ -547,6 +466,7 @@ async def cancel_model_download(request: models.ModelDownloadRequest):
 async def delete_model(model_name: str):
     """Delete a downloaded model from the HuggingFace cache."""
     from huggingface_hub import constants as hf_constants
+
     from ..backends import get_model_config, unload_model_by_config
 
     config = get_model_config(model_name)
@@ -554,6 +474,7 @@ async def delete_model(model_name: str):
         raise HTTPException(status_code=400, detail=f"Unknown model: {model_name}")
 
     hf_repo_id = config.hf_repo_id
+    model_inventory.invalidate()
 
     try:
         unload_model_by_config(config)
@@ -579,3 +500,5 @@ async def delete_model(model_name: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete model: {str(e)}")
+    finally:
+        model_inventory.invalidate()

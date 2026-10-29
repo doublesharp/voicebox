@@ -7,6 +7,8 @@ let retryJob: () => Promise<unknown> = async () => {};
 let includeJob = false;
 const commands: unknown[] = [];
 const sessions: any[] = [];
+const playbackInstances: Array<{ tick(position: number): void; getPlayhead(): number }> = [];
+let scriptRenders = 0;
 const project = (id: string) => ({
   id,
   name: `Project ${id}`,
@@ -100,8 +102,28 @@ mock.module('../src/features/studio/review-session', () => ({
 const idle = { mode: 'idle', position: 0 };
 mock.module('../src/features/studio/playback', () => ({
   StudioPlayback: class {
-    subscribe = () => () => {};
-    getSnapshot = () => idle;
+    state = idle;
+    listeners = new Set<() => void>();
+    cursor = 0;
+    constructor() {
+      playbackInstances.push(this);
+    }
+    subscribe = (listener: () => void) => {
+      this.listeners.add(listener);
+      return () => this.listeners.delete(listener);
+    };
+    getSnapshot = () => this.state;
+    getPlayhead = () => this.cursor;
+    seek = (position: number) => {
+      this.cursor = position;
+      this.state = { mode: 'idle', position };
+      for (const listener of this.listeners) listener();
+    };
+    tick(position: number) {
+      this.cursor = position;
+      this.state = { mode: 'timeline', position };
+      for (const listener of this.listeners) listener();
+    }
     stop() {}
     dispose() {}
   },
@@ -120,7 +142,12 @@ mock.module('../src/features/studio/AudioMeters', () => ({ AudioMeters: () => nu
 mock.module('../src/features/studio/Deliver', () => ({ Deliver: () => null }));
 mock.module('../src/features/studio/Director', () => ({ Director: () => null }));
 mock.module('../src/features/studio/Review', () => ({ Review: () => null }));
-mock.module('../src/features/studio/ScriptEditor', () => ({ ScriptEditor: () => null }));
+mock.module('../src/features/studio/ScriptEditor', () => ({
+  ScriptEditor: () => {
+    scriptRenders++;
+    return null;
+  },
+}));
 mock.module('../src/features/studio/Timeline', () => ({
   Timeline: () => null,
   Mixer: () => null,
@@ -204,4 +231,20 @@ test('a job completion after switching projects cannot refresh the old project',
   expect(old.disposed).toBe(true);
   expect(refreshes).toBe(0);
   expect(nameInput().props.defaultValue).toBe('Project two');
+});
+
+test('playback clock updates transport without rerendering script and keeps manual seeks', async () => {
+  await mount();
+  const player = playbackInstances.at(-1);
+  const before = scriptRenders;
+  act(() => player.tick(1.25));
+  const input = renderer.root
+    .findAllByType('input')
+    .find((node) => node.props['aria-label'] === 'Playhead seconds')!;
+  expect(input.props.value).toBe(1.25);
+  expect(scriptRenders).toBe(before);
+  act(() => input.props.onChange({ target: { valueAsNumber: 3.5 } }));
+  expect(player.getPlayhead()).toBe(3.5);
+  expect(input.props.value).toBe(3.5);
+  expect(scriptRenders).toBe(before);
 });

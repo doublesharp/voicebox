@@ -21,11 +21,18 @@ export class StudioPlayback {
   private request: AbortController | null = null;
   private epoch = 0;
   private timer: ReturnType<typeof setInterval> | undefined;
+  private playhead = 0;
   private readonly unregister: () => void;
   constructor(private readonly claim: () => void | Promise<void> = () => {}) {
     this.unregister = registerStudioPlaybackStop(this.stop);
   }
   getSnapshot = () => this.state;
+  getPlayhead = () => this.playhead;
+  seek = (seconds: number) => {
+    if (!Number.isFinite(seconds) || seconds < 0) return;
+    this.playhead = seconds;
+    this.stop();
+  };
   subscribe = (listener: () => void) => {
     this.listeners.add(listener);
     return () => {
@@ -184,6 +191,7 @@ export class StudioPlayback {
     if (!(await this.acquire(token))) return;
     const controller = new AbortController();
     this.request = controller;
+    this.playhead = fromSeconds;
     this.emit({
       mode: 'loading',
       label,
@@ -226,23 +234,31 @@ export class StudioPlayback {
           hi: number;
           buffer: AudioBuffer;
         }> = [];
-        for (const part of parts) {
-          const lo = Math.max(begin, part.clip.start_sample);
-          const hi = Math.min(end, part.clip.start_sample + part.duration);
-          const sourceStart = part.clip.trim_start_sample + lo - part.clip.start_sample;
-          const url = new URL(
-            assetUrl(part.clip.asset_id),
-            globalThis.location?.href ?? 'http://localhost',
-          );
-          url.pathname = url.pathname.replace(/\/audio$/, '/preview');
-          url.searchParams.set('start_sample', String(sourceStart));
-          url.searchParams.set('frames', String(hi - lo));
-          const response = await fetch(url.toString(), { signal: controller.signal });
-          if (!response.ok) throw new Error(`Source audio unavailable (${response.status}).`);
-          const buffer = await context.decodeAudioData(await response.arrayBuffer());
-          if (token !== this.epoch) return;
-          loaded.push({ part, lo, hi, buffer });
-        }
+        let next = 0;
+        const loadPart = async () => {
+          while (next < parts.length) {
+            if (controller.signal.aborted || token !== this.epoch) return;
+            const part = parts[next++];
+            const lo = Math.max(begin, part.clip.start_sample);
+            const hi = Math.min(end, part.clip.start_sample + part.duration);
+            const sourceStart = part.clip.trim_start_sample + lo - part.clip.start_sample;
+            const url = new URL(
+              assetUrl(part.clip.asset_id),
+              globalThis.location?.href ?? 'http://localhost',
+            );
+            url.pathname = url.pathname.replace(/\/audio$/, '/preview');
+            url.searchParams.set('start_sample', String(sourceStart));
+            url.searchParams.set('frames', String(hi - lo));
+            const response = await fetch(url.toString(), { signal: controller.signal });
+            if (!response.ok) throw new Error(`Source audio unavailable (${response.status}).`);
+            const buffer = await context.decodeAudioData(await response.arrayBuffer());
+            if (token !== this.epoch) return;
+            loaded.push({ part, lo, hi, buffer });
+          }
+        };
+        // Bound both network and decode work without serializing overlapping tracks.
+        await Promise.all(Array.from({ length: Math.min(3, parts.length) }, loadPart));
+        if (token !== this.epoch) return;
         if (!origin) origin = context.currentTime + 0.04;
         if (begin !== first && context.currentTime > origin + (begin - first) / rate)
           throw new Error('Preview underrun. Stop and try again.');
@@ -287,9 +303,11 @@ export class StudioPlayback {
       let loading = false;
       this.timer = setInterval(() => {
         if (token !== this.epoch) return;
-        this.emit({
-          position: Math.min(last / rate, fromSeconds + Math.max(0, context.currentTime - origin)),
-        });
+        this.playhead = Math.min(
+          last / rate,
+          fromSeconds + Math.max(0, context.currentTime - origin),
+        );
+        this.emit({ position: this.playhead });
         if (context.currentTime >= origin + (last - first) / rate) {
           this.stop();
           return;

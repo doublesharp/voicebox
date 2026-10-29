@@ -2,8 +2,8 @@
 
 import zipfile
 from typing import Literal
-from fastapi import APIRouter, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, File, Header, HTTPException, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, StrictStr
@@ -100,8 +100,16 @@ def make_router(store, jobs=None):
         return call(store.create_project, **body.model_dump())
 
     @router.get("/projects/{project_id}")
-    def project(project_id: str):
+    def project(project_id: str, compact: bool = False, if_none_match: str | None = Header(default=None)):
+        if compact:
+            result, token = call(store.poll_project, project_id, if_none_match)
+            headers = {"ETag": token, "Cache-Control": "no-cache"}
+            return Response(status_code=304, headers=headers) if result is None else JSONResponse(result, headers=headers)
         return call(store.get_project, project_id)
+
+    @router.get("/projects/{project_id}/revisions/{revision_id}")
+    def revision_detail(project_id: str, revision_id: str):
+        return call(store.get_revision, project_id, revision_id)
 
     @router.post("/projects/{project_id}/commands")
     def command(project_id: str, body: Command):

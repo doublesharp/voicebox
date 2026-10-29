@@ -1,15 +1,12 @@
 import { Link, useBlocker, useNavigate, useParams } from '@tanstack/react-router';
 import {
+  Captions,
   ChevronDown,
   ChevronLeft,
-  Captions,
   Command,
-  Headphones,
   LayoutPanelLeft,
   List,
   PanelRight,
-  Pause,
-  Play,
   Redo2,
   Save,
   Undo2,
@@ -31,26 +28,26 @@ import {
   DialogTitle,
   DialogTrigger,
 } from '@/components/ui/dialog';
-import { Input } from '@/components/ui/input';
-import { Hint } from '@/components/ui/Hint';
 import { HelpButton } from '@/components/ui/HelpButton';
+import { Hint } from '@/components/ui/Hint';
+import { Input } from '@/components/ui/input';
 import { stopNative } from '@/lib/audio/playbackOwnership';
 import { usePlatform } from '@/platform/PlatformContext';
 import { usePlayerStore } from '@/stores/playerStore';
 import { useServerStore } from '@/stores/serverStore';
-import { AudioMeters } from './AudioMeters';
+import { CaptionsPanel } from './CaptionsPanel';
 import { StudioClient, type StudioProfile } from './client';
 import { StudioContext } from './context';
 import { Deliver } from './Deliver';
-import { CaptionsPanel } from './CaptionsPanel';
 import { Director } from './Director';
-import { clipFrames, formatTime, isJobActive, timelineEnd, toSamples } from './domain';
+import { clipFrames, isJobActive, toSamples } from './domain';
 import { studioShortcut } from './keyboard';
 import { StudioPlayback } from './playback';
 import { Review } from './Review';
 import { ReviewClient } from './review-client';
 import { ReviewSessions } from './review-session';
 import { ScriptEditor } from './ScriptEditor';
+import { StudioTransport } from './StudioTransport';
 import { errorMessage, ProjectSession, type RecoveryStorage } from './session';
 import { ClipInspector, Mixer, Timeline } from './Timeline';
 import type { StudioEngine } from './types';
@@ -110,14 +107,13 @@ function ProjectWorkspace({
       }),
     [platform.audio],
   );
-  const audio = useSyncExternalStore(playback.subscribe, playback.getSnapshot);
   const [profiles, setProfiles] = useState<StudioProfile[]>([]);
   const [engines, setEngines] = useState<StudioEngine[]>([]);
   const [capabilitiesError, setCapabilitiesError] = useState<string | null>(null);
   const [selectedPassageId, setSelectedPassageId] = useState<string | null>(null);
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
   const [checkedPassages, setCheckedPassages] = useState<string[]>([]);
-  const [playhead, setPlayhead] = useState(0);
+  const setPlayhead = useCallback((seconds: number) => playback.seek(seconds), [playback]);
   const [revisionId, setRevisionId] = useState('');
   const [checkpointName, setCheckpointName] = useState('');
   const [checkpointOpen, setCheckpointOpen] = useState(false);
@@ -225,9 +221,6 @@ function ProjectWorkspace({
       setRevisionId(project.revisions[project.revisions.length - 1]?.id ?? '');
   }, [project, revisionId]);
   useEffect(() => {
-    if (audio.mode === 'timeline') setPlayhead(audio.position);
-  }, [audio.mode, audio.position]);
-  useEffect(() => {
     const beforeUnload = (event: BeforeUnloadEvent) => {
       if (
         reviewSessions.unsafeToLeave() ||
@@ -281,10 +274,10 @@ function ProjectWorkspace({
         latest.document,
         latest.assets,
         (id) => client.assetAudio(id),
-        playhead,
+        playback.getPlayhead(),
         `Timeline preview · draft ${latest.revision}`,
       );
-  }, [playback, session, client, playhead]);
+  }, [playback, session, client]);
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
@@ -310,14 +303,14 @@ function ProjectWorkspace({
         const asset = session
           .getSnapshot()
           .project?.assets.find((asset) => asset.id === clip.asset_id);
-        const at = toSamples(playhead);
+        const at = toSamples(playback.getPlayhead());
         if (asset && at > clip.start_sample && at < clip.start_sample + clipFrames(clip, asset))
           void session.command('split_clip', { clip_id: clip.id, at_sample: at });
       }
     };
     window.addEventListener('keydown', onKeyDown, true);
     return () => window.removeEventListener('keydown', onKeyDown, true);
-  }, [session, selectedClipId, playhead, toggleTransport]);
+  }, [session, selectedClipId, playback, toggleTransport]);
   const changeWidth = (panel: 'outline' | 'inspector', value: number) => {
     const next = {
       ...layout,
@@ -472,7 +465,7 @@ function ProjectWorkspace({
         setCheckedPassages,
         selectPassage,
         selectClip,
-        playhead,
+        playhead: playback.getPlayhead?.() ?? 0,
         setPlayhead,
         revisionId,
         setRevisionId,
@@ -863,58 +856,7 @@ function ProjectWorkspace({
             </div>
           </details>
         )}
-        <footer className="studio-transport">
-          <StudioButton
-            primary
-            onClick={toggleTransport}
-            disabled={!project.document.clips.length && audio.mode === 'idle'}
-          >
-            {audio.mode === 'loading' ? (
-              'Cancel load'
-            ) : audio.mode !== 'idle' ? (
-              <>
-                <Pause size={15} /> Stop
-              </>
-            ) : (
-              <>
-                <Play size={15} /> Play
-              </>
-            )}
-          </StudioButton>
-          <div className="studio-transport-time">
-            <span className="studio-mono">{formatTime(playhead)}</span>
-            <small>/ {formatTime(timelineEnd(project.document, project.assets) / 48000)}</small>
-          </div>
-          <Field label="Playhead (s)">
-            <Input
-              aria-label="Playhead seconds"
-              type="number"
-              value={Number(playhead.toFixed(3))}
-              min={0}
-              step={0.01}
-              onChange={(event) => {
-                const value = event.target.valueAsNumber;
-                if (Number.isFinite(value) && value >= 0) {
-                  playback.stop();
-                  setPlayhead(value);
-                }
-              }}
-            />
-          </Field>
-          <span className="studio-transport-label">
-            <Headphones size={14} />
-            {audio.mode === 'idle'
-              ? 'Source preview · default output'
-              : `${audio.label} · ${audio.mode === 'loading' ? 'Loading…' : formatTime(audio.position)}`}
-          </span>
-          <AudioMeters meter={playback.meters} />
-          <span className="studio-transport-note">Final mix: Deliver → audition file</span>
-        </footer>
-        {audio.error && (
-          <p className="studio-playback-error" role="alert">
-            {audio.error}
-          </p>
-        )}
+        <StudioTransport toggleTransport={toggleTransport} />
         <Dialog open={paletteOpen} onOpenChange={setPaletteOpen}>
           <DialogContent
             className="studio studio-modal"

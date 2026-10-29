@@ -355,3 +355,80 @@ test('a legacy native request stops active Studio audition before fetching', asy
   expect(stoppedBeforeFetch).toBe(true);
   native.dispose();
 });
+
+test('overlapping preview requests run concurrently with a finite worker bound', async () => {
+  const player = setup();
+  let active = 0;
+  let maxActive = 0;
+  const releases: Array<() => void> = [];
+  globalThis.fetch = (async () => {
+    active++;
+    maxActive = Math.max(maxActive, active);
+    await new Promise<void>((resolve) => releases.push(resolve));
+    active--;
+    return new Response(new Uint8Array([0]));
+  }) as typeof fetch;
+  const doc = {
+    ...document,
+    clips: Array.from({ length: 8 }, (_, index) => ({ ...document.clips[0], id: `clip-${index}` })),
+  } as StudioDocument;
+  const pending = player.timeline(doc, assets, () => 'http://local/assets/asset/audio', 0);
+  for (let i = 0; i < 10; i++) await Promise.resolve();
+  const initial = active;
+  // Drain requests even if the initial concurrency assertion will fail.
+  for (let i = 0; i < 12; i++) {
+    for (const release of releases.splice(0)) release();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  await pending;
+  expect(initial).toBeGreaterThan(1);
+  expect(maxActive).toBeLessThanOrEqual(3);
+  expect(FakeContext.instances[0].sources).toHaveLength(8);
+});
+
+test('timeline cursor survives stop and audition without moving the editor cursor', async () => {
+  const player = setup();
+  await player.timeline(document, assets, () => 'http://local/assets/asset/audio', 0.25);
+  expect(player.getPlayhead()).toBe(0.25);
+  player.stop();
+  await player.audition('/take', 'Take');
+  expect(player.getPlayhead()).toBe(0.25);
+  player.seek(1.25);
+  expect(player.getPlayhead()).toBe(1.25);
+  expect(player.getSnapshot().mode).toBe('idle');
+});
+
+test('one failed overlapping fetch aborts peers and late decodes never schedule or fetch more clips', async () => {
+  const player = setup();
+  const decoded: Array<(buffer: { duration: number }) => void> = [];
+  let rejectFetch!: (error: Error) => void;
+  let requests = 0;
+  let signal: AbortSignal | undefined;
+  FakeContext.decode = () => new Promise((resolve) => decoded.push(resolve));
+  globalThis.fetch = (async (_url, options) => {
+    requests++;
+    signal = options?.signal ?? undefined;
+    if (requests === 2)
+      return new Promise((_resolve, reject) => {
+        rejectFetch = reject;
+      });
+    return new Response(new Uint8Array([0]));
+  }) as typeof fetch;
+  const doc = {
+    ...document,
+    clips: Array.from({ length: 8 }, (_, index) => ({ ...document.clips[0], id: `clip-${index}` })),
+  } as StudioDocument;
+  const pending = player.timeline(doc, assets, () => 'http://local/assets/asset/audio', 0);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(decoded).toHaveLength(2);
+  rejectFetch(new Error('Preview unavailable'));
+  await pending;
+  expect(player.getSnapshot().mode).toBe('idle');
+  expect(player.getSnapshot().error).toBe('Preview unavailable');
+  expect(signal?.aborted).toBe(true);
+  expect(FakeContext.instances[0].closed).toBe(true);
+  for (const resolve of decoded) resolve({ duration: 1 });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(FakeContext.instances[0].sources).toHaveLength(0);
+  expect(requests).toBe(3);
+});

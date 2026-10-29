@@ -6,6 +6,7 @@ import os
 import re
 import threading
 import uuid
+from contextlib import contextmanager
 
 from fastapi import APIRouter, HTTPException, Query
 
@@ -14,6 +15,53 @@ from .storage import NotFound
 _CACHE_LIMIT = 64 * 1024 * 1024
 _BLOCK = 65536
 _lock = threading.Lock()
+_source_locks = {}
+_envelope_slots = threading.BoundedSemaphore(2)
+
+
+@contextmanager
+def _source_lock(key):
+    # Reference counts include waiters, so a key cannot acquire two locks.
+    with _lock:
+        lock, users = _source_locks.get(key, (threading.Lock(), 0))
+        _source_locks[key] = (lock, users + 1)
+    try:
+        with lock:
+            yield
+    finally:
+        with _lock:
+            _, users = _source_locks[key]
+            if users == 1:
+                del _source_locks[key]
+            else:
+                _source_locks[key] = (lock, users - 1)
+
+
+def _cached(target, bins):
+    # Called with the short cache lock to avoid races with eviction.
+    if target.is_file():
+        try:
+            data = json.loads(target.read_text())
+            if len(data["peaks"]) == bins:
+                os.utime(target, None)
+                return data
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    return None
+
+
+def _evict(cache):
+    entries = sorted(
+        (p for p in cache.iterdir() if re.fullmatch(r"[0-9a-f]{64}-\d+\.json", p.name) and p.is_file()),
+        key=lambda p: p.stat().st_mtime,
+    )
+    total = sum(p.stat().st_size for p in entries)
+    for entry in entries:
+        if total <= _CACHE_LIMIT:
+            break
+        size = entry.stat().st_size
+        entry.unlink(missing_ok=True)
+        total -= size
 
 
 def _envelope(path, bins):
@@ -61,36 +109,26 @@ def make_waveform_router(store):
                 raise NotFound("Asset not found")
             cache = store.root / "waveform-cache"
             key = f"{row['hash']}-{bins}.json"
-            with _lock:
-                cache.mkdir(exist_ok=True)
-                target = cache / key
-                if target.is_file():
-                    try:
-                        data = json.loads(target.read_text())
-                        if len(data["peaks"]) == bins:
-                            os.utime(target, None)
-                            return data
-                    except (OSError, ValueError, KeyError, TypeError):
-                        pass
-                data = _envelope(path, bins)
+            with _source_lock((str(cache), key)):
+                with _lock:
+                    cache.mkdir(exist_ok=True)
+                    target = cache / key
+                    data = _cached(target, bins)
+                if data is not None:
+                    return data
+                # Cold source scans share a bounded worker budget. They never
+                # hold the cache lock, so warm and unrelated sources proceed.
+                with _envelope_slots:
+                    data = _envelope(path, bins)
                 encoded = json.dumps(data, separators=(",", ":"), allow_nan=False).encode()
                 temp = cache / ("." + uuid.uuid4().hex + ".tmp")
                 try:
                     temp.write_bytes(encoded)
-                    os.replace(temp, target)
+                    with _lock:
+                        os.replace(temp, target)
+                        _evict(cache)
                 finally:
                     temp.unlink(missing_ok=True)
-                entries = sorted(
-                    (p for p in cache.iterdir() if re.fullmatch(r"[0-9a-f]{64}-\d+\.json", p.name) and p.is_file()),
-                    key=lambda p: p.stat().st_mtime,
-                )
-                total = sum(p.stat().st_size for p in entries)
-                for entry in entries:
-                    if total <= _CACHE_LIMIT:
-                        break
-                    size = entry.stat().st_size
-                    entry.unlink(missing_ok=True)
-                    total -= size
                 return data
         except NotFound as exc:
             raise HTTPException(404, detail=str(exc)) from exc

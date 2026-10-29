@@ -80,6 +80,7 @@ export class ProjectSession {
   private disposed = false;
   private epoch = 0;
   private loadEpoch = 0;
+  private refreshing = false;
   private idleTimer: ReturnType<typeof setTimeout> | undefined;
   private maxTimer: ReturnType<typeof setTimeout> | undefined;
   readonly key: string;
@@ -453,11 +454,14 @@ export class ProjectSession {
     }
   }
   async refresh() {
-    if (this.disposed || this.active || this.state.status === 'loading') return;
+    if (this.disposed || this.active || this.refreshing || this.state.status === 'loading') return;
     const epoch = this.epoch;
+    this.refreshing = true;
     try {
-      const project = await this.client.project(this.id);
-      if (this.disposed || epoch !== this.epoch || this.active) return;
+      const project = this.client.refreshProject
+        ? await this.client.refreshProject(this.id, this.state.project?.change_token)
+        : await this.client.project(this.id);
+      if (!project || this.disposed || epoch !== this.epoch || this.active) return;
       const currentRevision = this.state.project?.revision ?? 0;
       if (
         project.revision > currentRevision &&
@@ -475,6 +479,7 @@ export class ProjectSession {
               deliverables: project.deliverables,
               revisions: project.revisions,
               approvals: project.approvals,
+              change_token: project.change_token,
             },
           });
         if (!this.queue.length && !this.recovered.length) {
@@ -487,6 +492,8 @@ export class ProjectSession {
       } else if (project.revision >= currentRevision) this.emit({ project });
     } catch {
       // A read outage is not a failed durable save. The next poll can reconnect.
+    } finally {
+      this.refreshing = false;
     }
   }
   dispose() {

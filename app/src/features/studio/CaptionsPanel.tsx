@@ -9,7 +9,7 @@ import {
   CaptionsClient,
   type ReferenceVideo,
 } from './captions-client';
-import { useStudio } from './context';
+import { useStudio, useStudioPlayhead } from './context';
 import { errorMessage, operationId } from './session';
 import { Field, StudioButton } from './ui';
 import './captions.css';
@@ -24,6 +24,7 @@ const seconds = (samples: number, rate: number) => Number((samples / rate).toFix
 
 export function CaptionsPanel() {
   const studio = useStudio();
+  const playhead = useStudioPlayhead();
   const playback = useSyncExternalStore(studio.playback.subscribe, studio.playback.getSnapshot);
   const platform = usePlatform();
   const { project, session, client } = studio;
@@ -62,7 +63,7 @@ export function CaptionsPanel() {
   const passage = document.passages.find((item) => item.id === studio.selectedPassageId);
   const target = passage ? document.scene_targets?.[passage.id] : undefined;
   const selectedTiming = status?.scene_timing.find((item) => item.passage_id === passage?.id);
-  const videoPosition = studio.playhead + videoMetadata.time_origin_sample / rate;
+  const videoPosition = playhead + videoMetadata.time_origin_sample / rate;
   const followPlayback =
     playback.mode === 'timeline' &&
     videoPosition >= 0 &&
@@ -107,14 +108,14 @@ export function CaptionsPanel() {
   }, []);
   useEffect(() => {
     if (!video.current || !videoUrl) return;
-    const desired = Math.max(0, studio.playhead + videoMetadata.time_origin_sample / rate);
+    const desired = Math.max(0, playhead + videoMetadata.time_origin_sample / rate);
     if (
       desired >= 0 &&
       Number.isFinite(desired) &&
       Math.abs(video.current.currentTime - desired) > 0.15
     )
       video.current.currentTime = desired;
-  }, [studio.playhead, videoUrl, videoMetadata.time_origin_sample, rate]);
+  }, [playhead, videoUrl, videoMetadata.time_origin_sample, rate]);
   useEffect(() => {
     const element = video.current;
     if (!element || !videoUrl) return;
@@ -202,7 +203,7 @@ export function CaptionsPanel() {
               latest.document,
               latest.assets,
               (id) => client.assetAudio(id),
-              studio.playhead,
+              playhead,
               `Caption review · draft ${latest.revision}`,
             );
           }}
@@ -452,8 +453,8 @@ export function CaptionsPanel() {
               {
                 id: operationId(),
                 clip_id: null,
-                start_sample: Math.round(studio.playhead * rate),
-                end_sample: Math.round((studio.playhead + 2) * rate),
+                start_sample: Math.round(playhead * rate),
+                end_sample: Math.round((playhead + 2) * rate),
                 text: '',
               },
             ]);

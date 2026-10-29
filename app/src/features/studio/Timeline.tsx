@@ -1,8 +1,8 @@
 import { Copy, Plus, Scissors, Trash2 } from 'lucide-react';
-import { useRef, useState } from 'react';
+import { useCallback, useRef, useState, useSyncExternalStore } from 'react';
 import { EffectsChainEditor } from '@/components/Effects/EffectsChainEditor';
 import { Input } from '@/components/ui/input';
-import { useStudio } from './context';
+import { readStudioPlayhead, useStudio, useStudioPlayhead } from './context';
 import { clipFrames, formatTime, timelineEnd, toSamples } from './domain';
 import type { StudioClip } from './types';
 import { Field, NumberField, StudioButton } from './ui';
@@ -29,15 +29,18 @@ export function Timeline({ compact = false }: { compact?: boolean }) {
     void session.command('insert_passages', {
       passage_ids: selectedIds,
       gap_ms: gap,
-      ...(atPlayhead ? { start_sample: toSamples(studio.playhead, doc.sample_rate) } : {}),
+      ...(atPlayhead
+        ? { start_sample: toSamples(readStudioPlayhead(studio), doc.sample_rate) }
+        : {}),
     });
   const importAudio = (file: File) => {
     if (!canMutate || studio.actionBusy) return;
+    const startSample = toSamples(readStudioPlayhead(studio), doc.sample_rate);
     void studio.runAction(async () => {
       const asset = await studio.client.uploadAsset(project.id, file);
       await session.command('insert_asset', {
         asset_id: asset.id,
-        start_sample: toSamples(studio.playhead, doc.sample_rate),
+        start_sample: startSample,
         kind: mediaKind,
         name: file.name,
       });
@@ -158,12 +161,7 @@ export function Timeline({ compact = false }: { compact?: boolean }) {
               </div>
             </div>
             <div className="studio-track-lane">
-              <div
-                className={`studio-playhead ${studio.playback.getSnapshot().mode === 'timeline' ? 'is-playing' : ''}`}
-                style={{
-                  transform: `translateX(${Math.min(100, (studio.playhead / end) * 100)}%)`,
-                }}
-              />
+              <TimelinePlayhead end={end} />
               {doc.clips
                 .filter((clip) => clip.track_id === track.id)
                 .map((clip) => {
@@ -236,6 +234,41 @@ export function Timeline({ compact = false }: { compact?: boolean }) {
   );
 }
 
+function TimelinePlayhead({ end }: { end: number }) {
+  const studio = useStudio();
+  const playhead = useStudioPlayhead();
+  const mode = useCallback(() => studio.playback.getSnapshot().mode, [studio.playback]);
+  const playing = useSyncExternalStore(studio.playback.subscribe, mode) === 'timeline';
+  return (
+    <div
+      className={`studio-playhead ${playing ? 'is-playing' : ''}`}
+      style={{ transform: `translateX(${Math.min(100, (playhead / end) * 100)}%)` }}
+    />
+  );
+}
+
+function SplitClipButton({ clip, duration }: { clip: StudioClip; duration: number }) {
+  const studio = useStudio();
+  const { project, session, canMutate } = studio;
+  const playhead = useStudioPlayhead();
+  const canSplit =
+    playhead > clip.start_sample / project.document.sample_rate &&
+    playhead < clip.start_sample / project.document.sample_rate + duration;
+  return (
+    <StudioButton
+      disabled={!canMutate || !canSplit}
+      onClick={() =>
+        void session.command('split_clip', {
+          clip_id: clip.id,
+          at_sample: toSamples(readStudioPlayhead(studio)),
+        })
+      }
+    >
+      <Scissors size={14} /> Split at playhead
+    </StudioButton>
+  );
+}
+
 export function ClipInspector() {
   const studio = useStudio();
   const { project, session, canMutate } = studio;
@@ -269,9 +302,6 @@ export function ClipInspector() {
       }
     />
   );
-  const canSplit =
-    studio.playhead > clip.start_sample / project.document.sample_rate &&
-    studio.playhead < clip.start_sample / project.document.sample_rate + duration;
   return (
     <div className="studio-clip-inspector">
       <div className="studio-section-title">
@@ -306,17 +336,7 @@ export function ClipInspector() {
         {numeric('Fade out (s)', 'fade_out_samples', clip.fade_out_samples)}
       </div>
       <div className="studio-action-row">
-        <StudioButton
-          disabled={!canMutate || !canSplit}
-          onClick={() =>
-            void session.command('split_clip', {
-              clip_id: clip.id,
-              at_sample: toSamples(studio.playhead),
-            })
-          }
-        >
-          <Scissors size={14} /> Split at playhead
-        </StudioButton>
+        <SplitClipButton clip={clip} duration={duration} />
         <StudioButton
           disabled={!canMutate}
           onClick={() => void session.command('duplicate_clip', { clip_id: clip.id })}

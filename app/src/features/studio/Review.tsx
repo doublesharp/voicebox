@@ -4,12 +4,14 @@ import { Textarea } from '@/components/ui/textarea';
 import { useStudio } from './context';
 import type { ReviewSession } from './review-session';
 import { Field, StudioButton } from './ui';
+import { useRevisionDocument } from './useRevisionDocument';
 
 export function Review() {
   const studio = useStudio();
   const { project, session, revisionId, setRevisionId } = studio;
   const [restoreConfirm, setRestoreConfirm] = useState(false);
   const revision = project.revisions.find((r) => r.id === revisionId);
+  const checkpoint = useRevisionDocument(studio.client, project.id, revision);
   const approvals = project.approvals.filter((a) => a.revision_id === revision?.id);
   const deliverables = project.deliverables.filter((d) => d.revision_id === revision?.id);
   return (
@@ -56,7 +58,9 @@ export function Review() {
             </span>
           </div>
           <ol className="studio-review-script">
-            {revision.document.passages.map((passage, index) => (
+            {checkpoint.error && <li role="alert">{checkpoint.error}</li>}
+            {!checkpoint.document && !checkpoint.error && <li>Loading checkpoint…</li>}
+            {checkpoint.document?.passages.map((passage, index) => (
               <li key={passage.id}>
                 <span className="studio-mono">{String(index + 1).padStart(2, '0')}</span>
                 <p>{passage.text}</p>

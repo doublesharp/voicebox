@@ -6,6 +6,7 @@ import type {
   StudioJob,
   StudioProject,
   StudioProjectSummary,
+  StudioRevision,
   StudioTransport,
 } from './types';
 
@@ -42,9 +43,15 @@ export class StudioClient implements StudioTransport {
   url(path: string) {
     return `${this.baseUrl}/studio/v1${path}`;
   }
-  private async request<T>(path: string, options: RequestInit = {}, legacy = false): Promise<T> {
+  private async request<T>(
+    path: string,
+    options: RequestInit = {},
+    legacy = false,
+    conditional = false,
+  ): Promise<T> {
     const fetcher = this.fetcher;
     const response = await fetcher(legacy ? `${this.baseUrl}${path}` : this.url(path), options);
+    if (conditional && response.status === 304) return null as T;
     if (!response.ok) {
       const body = await response.json().catch(() => ({}));
       const detail = body.detail;
@@ -82,7 +89,24 @@ export class StudioClient implements StudioTransport {
     return this.post<StudioProject>('/projects', input);
   }
   project(id: string, signal?: AbortSignal) {
-    return this.request<StudioProject>(`/projects/${encodeURIComponent(id)}`, { signal });
+    return this.request<StudioProject>(`/projects/${encodeURIComponent(id)}?compact=true`, {
+      signal,
+      cache: 'no-store',
+    });
+  }
+  refreshProject(id: string, token?: string, signal?: AbortSignal) {
+    return this.request<StudioProject | null>(
+      `/projects/${encodeURIComponent(id)}?compact=true`,
+      { signal, cache: 'no-store', headers: token ? { 'If-None-Match': token } : undefined },
+      false,
+      true,
+    );
+  }
+  revision(projectId: string, revisionId: string, signal?: AbortSignal) {
+    return this.request<StudioRevision>(
+      `/projects/${encodeURIComponent(projectId)}/revisions/${encodeURIComponent(revisionId)}`,
+      { signal },
+    );
   }
   command(id: string, input: StudioCommand) {
     return this.post<StudioProject>(`/projects/${encodeURIComponent(id)}/commands`, input);

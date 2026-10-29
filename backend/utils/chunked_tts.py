@@ -16,8 +16,8 @@ from typing import List, Tuple
 
 import numpy as np
 
-from .inference import serialized_inference
 from ..services.inference_scheduler import check_inference_cancelled
+from .inference import serialized_inference
 
 logger = logging.getLogger("voicebox.chunked-tts")
 
@@ -189,20 +189,30 @@ def concatenate_audio_chunks(
     if len(chunks) == 1:
         return chunks[0]
 
-    crossfade_samples = int(sample_rate * crossfade_ms / 1000)
-    result = np.array(chunks[0], dtype=np.float32, copy=True)
+    crossfade_samples = max(0, int(sample_rate * crossfade_ms / 1000))
+    length = len(chunks[0])
+    for chunk in chunks[1:]:
+        length += len(chunk) - min(crossfade_samples, length, len(chunk))
+    result = np.empty(length, dtype=np.float32)
+    cursor = len(chunks[0])
+    result[:cursor] = chunks[0]
+    fades = {}
 
     for chunk in chunks[1:]:
         if len(chunk) == 0:
             continue
-        overlap = min(crossfade_samples, len(result), len(chunk))
+        overlap = min(crossfade_samples, cursor, len(chunk))
         if overlap > 0:
-            fade_out = np.linspace(1.0, 0.0, overlap, dtype=np.float32)
-            fade_in = np.linspace(0.0, 1.0, overlap, dtype=np.float32)
-            result[-overlap:] = result[-overlap:] * fade_out + chunk[:overlap] * fade_in
-            result = np.concatenate([result, chunk[overlap:]])
-        else:
-            result = np.concatenate([result, chunk])
+            if overlap not in fades:
+                fades[overlap] = (
+                    np.linspace(1.0, 0.0, overlap, dtype=np.float32),
+                    np.linspace(0.0, 1.0, overlap, dtype=np.float32),
+                )
+            fade_out, fade_in = fades[overlap]
+            result[cursor - overlap:cursor] = result[cursor - overlap:cursor] * fade_out + chunk[:overlap] * fade_in
+        remaining = len(chunk) - overlap
+        result[cursor:cursor + remaining] = chunk[overlap:]
+        cursor += remaining
 
     return result
 
