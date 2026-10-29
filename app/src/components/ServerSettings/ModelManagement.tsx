@@ -18,7 +18,7 @@ import {
   Unplug,
   X,
 } from 'lucide-react';
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Trans, useTranslation } from 'react-i18next';
 import {
   AlertDialog,
@@ -141,6 +141,11 @@ export function ModelManagement() {
   const { toast } = useToast();
   const queryClient = useQueryClient();
   const platform = usePlatform();
+  const serverUrl = useServerStore((state) => state.serverUrl);
+  const serverIdentity = useRef({ url: serverUrl, revision: 0 });
+  if (serverIdentity.current.url !== serverUrl) {
+    serverIdentity.current = { url: serverUrl, revision: serverIdentity.current.revision + 1 };
+  }
   const customModelsDir = useServerStore((state) => state.customModelsDir);
   const setCustomModelsDir = useServerStore((state) => state.setCustomModelsDir);
   const [migrating, setMigrating] = useState(false);
@@ -157,6 +162,10 @@ export function ModelManagement() {
   const [consoleOpen, setConsoleOpen] = useState(false);
   const [dismissedErrors, setDismissedErrors] = useState<Set<string>>(new Set());
   const [localErrors, setLocalErrors] = useState<Map<string, string>>(new Map());
+  const modelRevisions = useRef(new Map<string, number>());
+  const nextDownloadRequest = useRef(0);
+  const latestSuccessfulDownload = useRef(0);
+
 
   // Modal state
   const [selectedModel, setSelectedModel] = useState<ModelStatus | null>(null);
@@ -242,6 +251,7 @@ export function ModelManagement() {
   const handleDownloadError = useCallback(
     (error: string) => {
       if (downloadingModel) {
+        modelRevisions.current.set(downloadingModel, (modelRevisions.current.get(downloadingModel) ?? 0) + 1);
         setLocalErrors((prev) => new Map(prev).set(downloadingModel, error));
         setConsoleOpen(true);
       }
@@ -268,7 +278,23 @@ export function ModelManagement() {
     sizeMb?: number;
   } | null>(null);
 
+  useEffect(() => {
+    setDownloadingModel(null);
+    setDownloadingDisplayName(null);
+    setDismissedErrors(new Set());
+    setLocalErrors(new Map());
+    setSelectedModel(null);
+    setDetailOpen(false);
+    setModelToDelete(null);
+    setDeleteDialogOpen(false);
+    modelRevisions.current.clear();
+    nextDownloadRequest.current = 0;
+    latestSuccessfulDownload.current = 0;
+  }, [serverUrl]);
+
   const handleDownload = async (modelName: string) => {
+    const request = ++nextDownloadRequest.current;
+    const serverRevision = serverIdentity.current.revision;
     setDismissedErrors((prev) => {
       const next = new Set(prev);
       next.delete(modelName);
@@ -280,15 +306,25 @@ export function ModelManagement() {
 
     try {
       await apiClient.triggerModelDownload(modelName);
+      if (serverIdentity.current.revision !== serverRevision) return;
+      modelRevisions.current.set(modelName, (modelRevisions.current.get(modelName) ?? 0) + 1);
 
-      setDownloadingModel(modelName);
-      setDownloadingDisplayName(displayName);
+      setLocalErrors((prev) => {
+        const next = new Map(prev);
+        next.delete(modelName);
+        return next;
+      });
+      if (request > latestSuccessfulDownload.current) {
+        latestSuccessfulDownload.current = request;
+        setDownloadingModel(modelName);
+        setDownloadingDisplayName(displayName);
+      }
 
       queryClient.invalidateQueries({ queryKey: ['modelStatus'] });
       queryClient.invalidateQueries({ queryKey: ['activeTasks'] });
     } catch (error) {
-      setDownloadingModel(null);
-      setDownloadingDisplayName(null);
+      if (serverIdentity.current.revision !== serverRevision) return;
+      // A failed start must not detach a different download already tracked.
       toast({
         title: t('models.toast.downloadFailed'),
         description: error instanceof Error ? error.message : t('common.unknownError'),
@@ -306,6 +342,9 @@ export function ModelManagement() {
   });
 
   const handleCancel = (modelName: string) => {
+    const serverRevision = serverIdentity.current.revision;
+    const revision = (modelRevisions.current.get(modelName) ?? 0) + 1;
+    modelRevisions.current.set(modelName, revision);
     const prevDismissed = dismissedErrors;
     const prevLocalErrors = localErrors;
     const prevDownloadingModel = downloadingModel;
@@ -324,10 +363,26 @@ export function ModelManagement() {
 
     cancelMutation.mutate(modelName, {
       onError: () => {
-        setDismissedErrors(prevDismissed);
-        setLocalErrors(prevLocalErrors);
-        setDownloadingModel(prevDownloadingModel);
-        setDownloadingDisplayName(prevDownloadingDisplayName);
+        if (serverIdentity.current.revision !== serverRevision) return;
+        if (modelRevisions.current.get(modelName) === revision) {
+          setDismissedErrors((current) => {
+            const next = new Set(current);
+            if (prevDismissed.has(modelName)) next.add(modelName);
+            else next.delete(modelName);
+            return next;
+          });
+          setLocalErrors((current) => {
+            const next = new Map(current);
+            const previous = prevLocalErrors.get(modelName);
+            if (previous !== undefined) next.set(modelName, previous);
+            else next.delete(modelName);
+            return next;
+          });
+          if (prevDownloadingModel === modelName) {
+            setDownloadingModel((current) => current ?? prevDownloadingModel);
+            setDownloadingDisplayName((current) => current ?? prevDownloadingDisplayName);
+          }
+        }
         toast({
           title: t('models.toast.cancelFailed'),
           description: t('models.toast.cancelFailedDescription'),
@@ -339,11 +394,21 @@ export function ModelManagement() {
 
   const clearAllMutation = useMutation({
     mutationFn: () => apiClient.clearAllTasks(),
-    onSuccess: async () => {
-      setDismissedErrors(new Set());
-      setLocalErrors(new Map());
-      setDownloadingModel(null);
-      setDownloadingDisplayName(null);
+    onMutate: () => ({
+      serverRevision: serverIdentity.current.revision,
+      modelRevisions: new Map(modelRevisions.current),
+      latestSuccessfulDownload: latestSuccessfulDownload.current,
+    }),
+    onSuccess: async (_data, _variables, context) => {
+      if (!context || serverIdentity.current.revision !== context.serverRevision) return;
+      const changedSinceClear = (name: string) =>
+        modelRevisions.current.get(name) !== context.modelRevisions.get(name);
+      setDismissedErrors((current) => new Set([...current].filter(changedSinceClear)));
+      setLocalErrors((current) => new Map([...current].filter(([name]) => changedSinceClear(name))));
+      if (latestSuccessfulDownload.current === context.latestSuccessfulDownload) {
+        setDownloadingModel(null);
+        setDownloadingDisplayName(null);
+      }
       await queryClient.invalidateQueries({ queryKey: ['modelStatus'], refetchType: 'all' });
       await queryClient.invalidateQueries({ queryKey: ['activeTasks'], refetchType: 'all' });
     },

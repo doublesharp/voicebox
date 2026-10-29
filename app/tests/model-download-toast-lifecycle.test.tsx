@@ -4,6 +4,8 @@ import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 const originalEventSource = Object.getOwnPropertyDescriptor(globalThis, 'EventSource');
 const sources: FakeEventSource[] = [];
 class FakeEventSource {
+  static CLOSED = 2;
+  readyState = 0;
   onmessage: ((event: { data: string }) => void) | null = null;
   onerror: ((event: unknown) => void) | null = null;
   onopen: (() => void) | null = null;
@@ -17,7 +19,8 @@ class FakeEventSource {
 }
 Object.defineProperty(globalThis, 'EventSource', { configurable: true, value: FakeEventSource });
 const update = mock((_value: unknown) => {});
-const toast = mock((_value: unknown) => ({ id: 'toast', update }));
+const dismiss = mock(() => {});
+const toast = mock((_value: unknown) => ({ id: 'toast', update, dismiss }));
 const complete = mock(() => {});
 const failed = mock((_error: string) => {});
 mock.module('../src/components/ui/use-toast', () => ({ useToast: () => ({ toast }) }));
@@ -48,6 +51,7 @@ beforeEach(() => {
   sources.length = 0;
   update.mockClear();
   toast.mockClear();
+  dismiss.mockClear();
   complete.mockClear();
   failed.mockClear();
 });
@@ -109,4 +113,45 @@ test('events from a replaced subscription cannot finish the new download', () =>
   act(() => current.send(event('complete')));
   act(() => current.send(event('complete')));
   expect(complete).toHaveBeenCalledTimes(1);
+});
+
+
+test('a temporary disconnect allows the browser to reconnect and complete tracking', () => {
+  act(() => { view = create(<Probe />); });
+  const source = sources[0];
+  act(() => source.onerror?.(new Error('temporary disconnect')));
+  expect(source.close).not.toHaveBeenCalled();
+  expect(failed).not.toHaveBeenCalled();
+  act(() => source.send(event('complete')));
+  expect(complete).toHaveBeenCalledTimes(1);
+});
+
+test('a permanently closed connection reports a tracking error without reporting download failure', () => {
+  act(() => { view = create(<Probe />); });
+  const source = sources[0];
+  source.readyState = FakeEventSource.CLOSED;
+  act(() => source.onerror?.(new Error('connection rejected')));
+  expect(source.close).toHaveBeenCalledTimes(1);
+  expect(update).toHaveBeenCalledWith(expect.objectContaining({ description: 'Failed to track download progress', duration: 5000 }));
+  expect(failed).not.toHaveBeenCalled();
+  act(() => view?.unmount());
+  view = undefined;
+  expect(dismiss).not.toHaveBeenCalled();
+});
+
+test('replacing or unmounting an active subscription dismisses its unfinished toast', () => {
+  act(() => { view = create(<Probe model="model-a" />); });
+  act(() => view?.update(<Probe model="model-b" />));
+  expect(dismiss).toHaveBeenCalledTimes(1);
+  act(() => view?.unmount());
+  view = undefined;
+  expect(dismiss).toHaveBeenCalledTimes(2);
+});
+
+test('completed notifications remain visible after the subscription ends', () => {
+  act(() => { view = create(<Probe />); });
+  act(() => sources[0].send(event('complete')));
+  act(() => view?.unmount());
+  view = undefined;
+  expect(dismiss).not.toHaveBeenCalled();
 });

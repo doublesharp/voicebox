@@ -75,6 +75,7 @@ export function useModelDownloadToast({
     console.log('[useModelDownloadToast] Creating EventSource to:', eventSourceUrl);
     const eventSource = new EventSource(eventSourceUrl);
     let active = true;
+    let finished = false;
 
     eventSource.onopen = () => {
       console.log('[useModelDownloadToast] EventSource connection opened for:', modelName);
@@ -144,6 +145,7 @@ export function useModelDownloadToast({
           const isError = progress.status === 'error';
 
           if (isComplete || isError) {
+            finished = true;
             console.log('[useModelDownloadToast] Download finished:', {
               isComplete,
               isError,
@@ -184,6 +186,9 @@ export function useModelDownloadToast({
 
     eventSource.onerror = (error) => {
       if (!active) return;
+      // EventSource reconnects automatically while it remains in CONNECTING state.
+      if (eventSource.readyState !== EventSource.CLOSED) return;
+      finished = true;
       active = false;
       console.error('[useModelDownloadToast] SSE error for:', modelName, error);
       console.log('[useModelDownloadToast] EventSource readyState:', eventSource.readyState);
@@ -213,7 +218,12 @@ export function useModelDownloadToast({
       if (eventSourceRef.current === eventSource) {
         eventSourceRef.current = null;
       }
-      // Note: We don't dismiss the toast here as it might still be showing completion state
+      // Keep terminal notifications visible, but remove abandoned progress notifications.
+      if (!finished) toastResult.dismiss();
+      if (toastIdRef.current === toastResult.id) {
+        toastIdRef.current = null;
+        toastUpdateRef.current = null;
+      }
     };
   }, [
     enabled,
