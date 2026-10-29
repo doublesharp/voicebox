@@ -422,3 +422,82 @@ async def test_uint32_codes_round_trip_on_worker():
         assert np.array_equal(np.array(restored), np.array(values))
 
     await run_scenario(scenario)
+
+
+@pytest.mark.asyncio
+async def test_native_stream_reuses_codes_across_texts_and_honors_bypass(monkeypatch, supported, tmp_path):
+    model = Model()
+    backend = mlx_backend.MLXTTSBackend()
+    monkeypatch.setattr("mlx_audio.tts.load", lambda path: model)
+    monkeypatch.setattr(backend, "_is_model_cached", lambda size: True)
+    reference = tmp_path / "synthetic.wav"
+    reference.touch()
+    prompt, _ = await backend.create_voice_prompt(str(reference), "current transcript", use_cache=False)
+    for text in ("first bypass", "second bypass"):
+        assert [frame async for frame in backend.generate_stream(text, prompt)]
+    assert model.speech_tokenizer.calls == 2
+    prompt.pop("_mlx_reference_cache")
+    for text in ("first cached", "a different target"):
+        assert [frame async for frame in backend.generate_stream(text, prompt)]
+    assert model.speech_tokenizer.calls == 3
+    assert [item[0] for item in model.seen] == ["first bypass", "second bypass", "first cached", "a different target"]
+    assert "encode" not in vars(model.speech_tokenizer)
+    backend.unload_model()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["close", "cancel", "unload", "failure"])
+async def test_native_stream_unfinished_generation_never_publishes_codes(monkeypatch, supported, tmp_path, action):
+    entered, release = threading.Event(), threading.Event()
+    model = Model()
+    original = model.generate
+
+    def paused(*args, **kwargs):
+        yield from original(*args, **kwargs)
+        entered.set()
+        assert release.wait(10), "test did not release native generation"
+        if action == "failure":
+            raise RuntimeError("reference generation failed")
+        yield SimpleNamespace(audio=mx.array([0.0, 1.0]), sample_rate=24000)
+
+    model.generate = paused
+    backend = mlx_backend.MLXTTSBackend()
+    monkeypatch.setattr("mlx_audio.tts.load", lambda path: model)
+    monkeypatch.setattr(backend, "_is_model_cached", lambda size: True)
+    reference = tmp_path / "synthetic.wav"
+    reference.touch()
+    stream = backend.generate_stream("unfinished", {"ref_audio": str(reference), "ref_text": "current"})
+    close_task = None
+    try:
+        assert await asyncio.wait_for(anext(stream), 2)
+        assert await asyncio.to_thread(entered.wait, 2)
+        assert "encode" in vars(model.speech_tokenizer)
+        if action == "unload":
+            backend.unload_model()
+        if action == "failure":
+            release.set()
+            with pytest.raises(mlx_backend.VoiceCloningError, match="reference generation failed"):
+                await anext(stream)
+        else:
+            close_task = asyncio.create_task(stream.aclose())
+            await asyncio.sleep(0.02)
+            assert not close_task.done()
+            if action == "cancel":
+                close_task.cancel()
+                await asyncio.sleep(0.01)
+                close_task.cancel()
+                await asyncio.sleep(0.01)
+                assert not close_task.done()
+            release.set()
+            # aclose drains through cancellation; its contract here is full
+            # worker cleanup before completion, including repeated cancellation.
+            await asyncio.wait_for(close_task, 2)
+        assert not backend._reference_cache._entries
+        assert "encode" not in vars(model.speech_tokenizer)
+        assert not backend._op_lock.locked()
+    finally:
+        release.set()
+        if close_task is not None:
+            await asyncio.gather(close_task, return_exceptions=True)
+        await stream.aclose()
+        backend.unload_model()

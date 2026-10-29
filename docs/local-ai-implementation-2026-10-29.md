@@ -24,6 +24,16 @@ frozen-build qualification are separate evidence domains.
 - Buffered generation, final normalization/effects, saved takes, and exported WAV
   headers retain their existing contracts. This change adds backend/API streaming;
   it does not claim new streaming playback in the desktop UI.
+- Qwen Base reuses bounded CPU reference codec codes on the same loaded model,
+  across different target texts in both buffered and native generation. Keys use
+  actual normalized audio; unload, bypass and failures invalidate or skip reuse.
+  Speaker embeddings and text prefill remain fresh. See [cache audit](qwen-mlx-reference-cache.md).
+- Chatterbox Turbo reuses validated CPU voice conditioning across requests and
+  chunks, restoring isolated device storage for every generation and clearing
+  request speaker state afterward. See [Turbo verification](chatterbox-turbo-conditioning.md).
+- The [offline benchmark runner](content/docs/developer/local-ai-benchmarks.mdx)
+  records pinned asset/source provenance, cold/warm timing, RTF, percentiles and
+  failed partial reports without downloading or contacting providers.
 - Model inventory scans use the active Hugging Face cache root explicitly,
   including after the configured root changes. Previously the scanner could
   retain its import-time default and inspect a different cache.
@@ -61,7 +71,32 @@ Pocket TTS, Chatterbox Nano and MOSS-TTS-Nano remain lightweight cloning candida
 Ming 0.5B and VoxCPM2 remain quality/control candidates. They are not registered or
 advertised by this change. Each needs its own dependency audit, compatible runtime,
 checkpoint-specific license check, real synthesis, and frozen-build acceptance.
-Qwen CUDA graphs/fused kernels/quantization are also separate trials. Existing
-MLX checks do not qualify NVIDIA behavior. The new CPU-independent conditioning
-work and benchmark runner are integrated and documented only after their owning
-tracks pass verification and review.
+Qwen CUDA graphs/fused kernels/quantization are also separate trials. Turbo
+conditioning reuse applies before device restoration and can benefit CUDA, but
+no NVIDIA measurements or CUDA qualification were available on this Mac. The
+MLX routing, codec reuse and streaming changes are Apple Silicon improvements.
+
+## Integration evidence
+
+Real Turbo CPU encoding and synthesis passed with memory/disk reuse and exact
+seeded parity against bypass. Initial preparation was 3.21 seconds versus
+1.52 ms from memory and 3.84 ms from disk in one bounded run. This demonstrates
+skipped reference work, not a hardware-wide speedup claim.
+
+Both direct and native MLX Base checks observed encoder calls **1, 1, 0, 0**
+for bypass/miss/hit/different-text hit and exact same-text fixed-seed parity.
+The direct warm miss/hit finished in about 4.21 seconds each, so no reliable
+end-to-end speedup is claimed for codec reuse. CPU cache payload was 5,120 bytes.
+
+Independent review reproduced a preview disconnect releasing scheduler ownership
+before native closure. The endpoint now explicitly closes the iterator within
+ownership; RED regressions proved early admission of unload/another engine,
+and GREEN checks cover repeated cancellation and drain ordering. Native cache
+regressions also cover partial close, failure, unload and repeated cancellation.
+
+The merge candidate starts from `doublesharp` and contains only this task's
+scoped changes. Unrelated newer development commits and the target checkout's
+local packaging edits were excluded from this implementation. Coordinate's
+latest source/log checkpoint was rejected by automatic approval review because
+external export was not explicitly authorized; local source and Scratch proof
+remain the current integration record.

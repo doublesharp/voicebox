@@ -36,7 +36,25 @@ The implementation targets installed `chatterbox-tts` 0.1.7:
 backend and current chunk pipeline with real installed `Conditionals`/`T3Cond`
 classes, real CPU tensors and disk serialization, and a deterministic model
 double. It covers reuse, voice switching, corruption, invalidation, bypass,
-unload, worker ownership, cancellation and failures. These checks do not qualify
-real Turbo encoder output, synthesis quality/latency, GPU restoration or frozen
-packaging. Those gates require existing Turbo weights and the target platform;
-no model download is needed for this test suite.
+unload, worker ownership, cancellation and failures. These deterministic checks establish adapter/cache behavior. The separate real
+CPU check below establishes actual encoder/synthesis compatibility; GPU
+restoration, listening quality and frozen packaging remain separate gates. No
+model download is needed for the deterministic test suite.
+
+## Real CPU verification
+
+A bounded offline check used `ResembleAI/chatterbox-turbo` revision
+`749d1c1a46eb10492095d68fbcf55691ccf137cd`, Chatterbox 0.1.7 and PyTorch 2.15.0
+on Apple M2 Max CPU with six Torch threads. The 6.35-second reference was macOS
+Samantha synthetic speech, not a personal recording. Actual conditioning
+creation took 3.21 seconds on the initial miss; the next memory hit took
+1.52 ms and a hit after clearing the memory cache took 3.84 ms. Both hits skipped
+the encoder. Cached and bypassed generation of “Hello from Voicebox.” with seed
+42 produced exactly equal finite mono 24 kHz arrays (36,960 samples).
+
+Generation took 13.07 seconds cached and 15.97 seconds bypassed in this one
+sequence. This pair does not establish a general latency percentage or GPU
+performance: process/kernel warmup and run order were not controlled. CUDA/XPU,
+other references, listening fidelity and frozen packaging remain unqualified.
+Raw provenance, timings and audio are on Scratch under
+`reports/local-ai-20261029/turbo-runtime/`; the backend was unloaded afterward.

@@ -281,12 +281,16 @@ async def test_invalid_native_timeout_is_rejected_before_worker_submission():
 @pytest.mark.parametrize("kind", ["base", "custom", "design"])
 async def test_native_adapter_finishes_on_worker_and_clears_unloaded_model(kind, monkeypatch, tmp_path):
     import sys
-    from types import SimpleNamespace
+    from types import ModuleType, SimpleNamespace
 
     from backend.backends import mlx_backend, qwen_mlx_styles_backend as styles
 
     seeds, clears, requests = [], [], []
-    monkeypatch.setitem(sys.modules, "mlx.core", SimpleNamespace(random=SimpleNamespace(seed=seeds.append)))
+    fake_mlx = ModuleType("mlx")
+    fake_mlx.core = SimpleNamespace(random=SimpleNamespace(seed=seeds.append))
+    # Patch both lookup paths even when a real-MLX test already imported the package.
+    monkeypatch.setitem(sys.modules, "mlx", fake_mlx)
+    monkeypatch.setitem(sys.modules, "mlx.core", fake_mlx.core)
     monkeypatch.setattr(mlx_backend, "empty_mlx_cache", lambda: clears.append(True))
     monkeypatch.setattr(styles, "empty_mlx_cache", lambda: clears.append(True))
     cls = {

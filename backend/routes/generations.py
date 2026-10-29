@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import uuid
+from contextlib import aclosing
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
@@ -431,17 +432,18 @@ async def _incremental_speech(data: models.GenerationRequest, db: Session):
             with Session(bind=bind) as stream_db:
                 prompt = await profiles.create_voice_prompt_for_profile(data.profile_id, stream_db, engine=engine)
             first = True
-            async for audio, rate in iter_speech_audio(
+            async with aclosing(iter_speech_audio(
                 backend, data.text, prompt, language=data.language, seed=data.seed,
                 instruct=data.instruct, max_chunk_chars=min(data.max_chunk_chars, 240),
                 crossfade_ms=data.crossfade_ms,
                 trim_fn=trim_tts_output if engine_needs_trim(engine) else None,
                 runaway_detector=has_tts_runaway if engine_retries_runaway(engine) else None,
-            ):
-                if first:
-                    await send(streaming_wav_header(rate))
-                    first = False
-                await send(pcm16_bytes(audio))
+            )) as audio_stream:
+                async for audio, rate in audio_stream:
+                    if first:
+                        await send(streaming_wav_header(rate))
+                        first = False
+                    await send(pcm16_bytes(audio))
         finally:
             release_generation_memory(backend)
 

@@ -1,6 +1,7 @@
 # Qwen MLX Base reference codec cache
 
-Track D adds bounded, in-memory CPU codec reuse to `MLXTTSBackend.generate`.
+Bounded, in-memory CPU codec reuse applies to `MLXTTSBackend.generate` and
+`MLXTTSBackend.generate_stream`.
 Different target chunks/takes may share reference codec codes on the same
 loaded model. The caller's current reference transcript and target text still
 reach the model on every call. `create_voice_prompt(..., use_cache=False)` also
@@ -65,30 +66,21 @@ miss and re-encode; encoding failures propagate through the existing cloning
 error path with no replacement speaker. MLX load, seed, materialization, encode
 and restore remain on the single MLX worker.
 
-## Parent native-stream integration required
+## Native-stream integration
 
-This checkout predates parent's `ac708cf` native `generate_stream`; that method
-was deliberately not added or edited in Track D. Cherry-pick the focused commit,
-then wrap the **entire** `model.generate` loop inside worker-side `frames()`:
+The worker-side `frames()` iterator wraps the entire `model.generate` loop in
+`_reference_cache.encoding(...)`. Both buffered and native calls honor the
+`_mlx_reference_cache=False` bypass marker returned by
+`create_voice_prompt(..., use_cache=False)`. The shim does not apply to style
+adapters. Operation ownership remains held through generator closure and the
+physical worker's final drain. Early close, failure and unload do not publish
+staged codes. Tests cover early close with repeated cancellation, failure,
+unload, cross-text reuse and cache bypass.
 
-```python
-with self._reference_cache.encoding(
-    model,
-    enabled=bool(reference) and voice_prompt.get("_mlx_reference_cache", True),
-):
-    for result in model.generate(text, **kwargs):
-        # Existing frame validation/materialization/yield stays here.
-        ...
-```
-
-Keep load, seeding, iteration, context exit and generator close on the MLX
-worker, with the operation lock held through the native worker's final drain.
-Keep parent's existing reference validation and cloning-error handling. The
-`use_cache=False` prompt marker must reach this context. `GeneratorExit`/failure
-must escape the context so staged codes are not published on early stream
-closure. Do not apply the shim to the style adapter. Until this integration,
-native streaming continues to re-encode references; non-streaming generation
-uses the cache. Native-stream integration tests remain parent-owned.
+The HTTP preview endpoint explicitly closes its audio iterator inside scheduler
+ownership. A disconnected or stalled send cannot release admission while the
+native worker is still running. Endpoint regressions queue an unload or another
+engine behind a blocked native worker and exercise repeated cancellation.
 
 ## Verification and limits
 
@@ -145,3 +137,12 @@ all runs set `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1`, Scratch `TMPDIR` and
 `PYTHONPYCACHEPREFIX`. No shared environment or model cache was modified.
 `verify.py`, `test-coverage.log`, and `changed-coverage.json` preserve the exact
 coverage runner, final result and executable-line accounting for parent review.
+
+Parent integration also exercised the actual native Base adapter offline, using
+seed 42, the same checkpoint/reference and `max_tokens=16` on the loaded model.
+Encoder calls were **1, 1, 0, 0** for bypass, miss, same-text hit and different-text
+hit. Bypass/miss/hit returned exactly equal seeded audio; changing target text
+changed the output. Each run emitted four native frames and retained only
+**5,120 bytes** of CPU codes. This bounded run is evidence of integration and
+parity, not a statistically established speedup. Its separate artifact is
+`/Volumes/Scratch/voicebox/reports/local-ai-20261029/native-cache-runtime.json`.

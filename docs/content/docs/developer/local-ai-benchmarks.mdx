@@ -143,3 +143,16 @@ speech quality, frozen builds and cross-platform performance require separate
 qualification with existing local weights. No model-quality claim follows from
 these tests. Instrumented runner coverage likewise does not qualify the adapters
 or their model libraries.
+
+## Recorded integration smoke
+
+The integrated runner completed CustomVoice **0.6B MLX BF16**, revision
+`6415d95f88be018ff9e46813119dc3bc12261328`, offline on Apple M2 Max / 96 GiB.
+For “Hello from Voicebox. This speech was generated locally.”, Ryan, seed 42
+and “Speak clearly and calmly.”, the first generation took 7.38 seconds and the
+three warm generations had p50 **6.13 seconds**, p95 **6.35 seconds**. All returned
+4.96 seconds of finite mono 24 kHz audio. This tiny smoke sample qualifies the
+runner/checkpoint integration, not comparative model quality, reliable tail
+latency, CUDA performance or first audible device latency. Exact source hashes,
+configuration, timings and WAVs remain on Scratch at
+`reports/local-ai-20261029/benchmark-custom-001/`.

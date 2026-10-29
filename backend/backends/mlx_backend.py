@@ -379,12 +379,15 @@ class MLXTTSBackend:
                     kwargs.update(ref_audio=reference, ref_text=voice_prompt.get("ref_text", ""))
                 rate = None
                 try:
-                    for result in model.generate(text, **kwargs):
-                        frame = audio_frame(result.audio, result.sample_rate)
-                        if rate is not None and frame[1] != rate:
-                            raise ValueError("Qwen returned inconsistent audio sample rates")
-                        rate = frame[1]
-                        yield frame
+                    with self._reference_cache.encoding(
+                        model, enabled=bool(reference) and voice_prompt.get("_mlx_reference_cache", True)
+                    ):
+                        for result in model.generate(text, **kwargs):
+                            frame = audio_frame(result.audio, result.sample_rate)
+                            if rate is not None and frame[1] != rate:
+                                raise ValueError("Qwen returned inconsistent audio sample rates")
+                            rate = frame[1]
+                            yield frame
                 except Exception as error:
                     if reference and not isinstance(error, VoiceCloningError):
                         raise VoiceCloningError(f"Voice cloning failed; no replacement voice was generated: {error}") from error
