@@ -90,19 +90,37 @@ def update_preset(preset_id: str, data: EffectPresetUpdate, db: Session) -> Opti
     if preset.is_builtin:
         raise ValueError("Cannot modify built-in presets")
 
-    if data.name is not None:
-        preset.name = data.name
-    if data.description is not None:
-        preset.description = data.description
+    chain_json = None
     if data.effects_chain is not None:
-
         chain_dicts = [e.model_dump() for e in data.effects_chain]
         error = validate_effects_chain(chain_dicts)
         if error:
             raise ValueError(error)
-        preset.effects_chain = json.dumps(chain_dicts)
+        chain_json = json.dumps(chain_dicts)
 
-    db.commit()
+    if data.name is not None:
+        existing = db.query(DBEffectPreset).filter(
+            DBEffectPreset.name == data.name, DBEffectPreset.id != preset_id
+        ).first()
+        if existing:
+            raise ValueError(f"A preset named '{data.name}' already exists")
+
+    if data.name is not None:
+        preset.name = data.name
+    if data.description is not None:
+        preset.description = data.description
+    if chain_json is not None:
+        preset.effects_chain = chain_json
+
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        if data.name is not None and db.query(DBEffectPreset).filter(
+            DBEffectPreset.name == data.name, DBEffectPreset.id != preset_id
+        ).first():
+            raise ValueError(f"A preset named '{data.name}' already exists") from exc
+        raise
     db.refresh(preset)
     return _preset_response(preset)
 
