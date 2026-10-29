@@ -133,13 +133,12 @@ except Exception as e:
     logger.error(f"Failed to import required modules: {e}", exc_info=True)
     sys.exit(1)
 
-_watchdog_disabled = False
+from backend import watchdog_state
 
 
 def disable_watchdog():
     """Disable the parent watchdog so the server keeps running after parent exits."""
-    global _watchdog_disabled
-    _watchdog_disabled = True
+    watchdog_state.disabled = True
     # Ignore SIGHUP so the server survives when the parent Tauri process exits.
     # On Unix, child processes receive SIGHUP when the parent's session leader
     # exits, which would kill the server even though we want it to persist.
@@ -207,7 +206,10 @@ def _start_parent_watchdog(parent_pid, data_dir=None):
             else:
                 os.kill(pid, 0)
                 return True
-        except (OSError, PermissionError):
+        except PermissionError:
+            # The process exists, but the current user cannot signal it.
+            return True
+        except OSError:
             return False
 
     def _watch():
@@ -232,7 +234,7 @@ def _start_parent_watchdog(parent_pid, data_dir=None):
                 except OSError as e:
                     watchdog_logger.warning(f"Failed to remove stale sentinel: {e}")
         while True:
-            if _watchdog_disabled:
+            if watchdog_state.disabled:
                 watchdog_logger.info("Watchdog disabled (keep server running), stopping monitor")
                 return
             if not _is_pid_alive(parent_pid):
@@ -242,7 +244,7 @@ def _start_parent_watchdog(parent_pid, data_dir=None):
                 # mid-iteration (already past the _watchdog_disabled check above).
                 watchdog_logger.info(f"Parent process {parent_pid} gone, waiting for possible disable request...")
                 time.sleep(1)
-                if _watchdog_disabled:
+                if watchdog_state.disabled:
                     watchdog_logger.info("Watchdog was disabled during grace period, keeping server alive")
                     return
                 # Check for sentinel file written by Tauri before exit.
@@ -311,13 +313,23 @@ if __name__ == "__main__":
 
         logger.info(f"Backend variant: {os.environ.get('VOICEBOX_BACKEND_VARIANT', 'cpu').upper()}")
 
-        # Register parent watchdog to start after server is fully ready
+        # The application uses a custom lifespan, so on_event startup hooks
+        # are not run. Wrap the lifespan and start the watchdog after the app
+        # and its MCP transport have successfully initialized.
         if args.parent_pid is not None:
+            from contextlib import asynccontextmanager
+
+            original_lifespan = app.router.lifespan_context
             _parent_pid = args.parent_pid
             _data_dir = args.data_dir
-            @app.on_event("startup")
-            async def _on_startup():
-                _start_parent_watchdog(_parent_pid, _data_dir)
+
+            @asynccontextmanager
+            async def _with_parent_watchdog(application):
+                async with original_lifespan(application) as state:
+                    _start_parent_watchdog(_parent_pid, _data_dir)
+                    yield state
+
+            app.router.lifespan_context = _with_parent_watchdog
 
         logger.info(f"Parsed arguments: host={args.host}, port={args.port}, data_dir={args.data_dir}")
 
