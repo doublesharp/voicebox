@@ -316,4 +316,29 @@ mod tests {
         assert_eq!(events, [("speak-end".into(), "done".into())]);
         task.await.unwrap();
     }
+
+    #[tokio::test]
+    async fn oversized_incomplete_event_aborts_the_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/events/speak", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).await;
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").await;
+            let _ = stream.write_all(&vec![b'x'; 1024 * 1024 + 1]).await;
+        });
+        let mut events = Vec::new();
+        let error = stream_once_with(
+            &reqwest::Client::new(),
+            &url,
+            Duration::from_secs(2),
+            |event, data| events.push((event.to_string(), data.to_string())),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("maximum frame size"));
+        assert!(events.is_empty());
+        task.await.unwrap();
+    }
 }

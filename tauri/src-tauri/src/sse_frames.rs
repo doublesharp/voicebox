@@ -1,5 +1,8 @@
 //! Incremental SSE frame handling for the native speech subscriber.
 
+// Speech events carry small metadata records, never audio payloads.
+const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
 #[derive(Default)]
 pub(crate) struct FrameBuffer {
     buf: Vec<u8>,
@@ -8,10 +11,7 @@ pub(crate) struct FrameBuffer {
 }
 
 impl FrameBuffer {
-    pub(crate) fn push(
-        &mut self,
-        chunk: &[u8],
-    ) -> Result<Vec<(String, String)>, std::str::Utf8Error> {
+    pub(crate) fn push(&mut self, chunk: &[u8]) -> Result<Vec<(String, String)>, std::io::Error> {
         let mut result = Vec::new();
         for &byte in chunk {
             if self.skip_lf {
@@ -22,21 +22,35 @@ impl FrameBuffer {
             }
             if byte == b'\r' || byte == b'\n' {
                 if self.line_start == self.buf.len() {
-                    if let Some(event) = parse_frame(std::str::from_utf8(&self.buf)?) {
+                    let frame = std::str::from_utf8(&self.buf).map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                    })?;
+                    if let Some(event) = parse_frame(frame) {
                         result.push(event);
                     }
                     self.buf.clear();
                     self.line_start = 0;
                 } else {
-                    self.buf.push(b'\n');
+                    self.push_byte(b'\n')?;
                     self.line_start = self.buf.len();
                 }
                 self.skip_lf = byte == b'\r';
             } else {
-                self.buf.push(byte);
+                self.push_byte(byte)?;
             }
         }
         Ok(result)
+    }
+
+    fn push_byte(&mut self, byte: u8) -> Result<(), std::io::Error> {
+        if self.buf.len() >= MAX_FRAME_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Speech event exceeds the maximum frame size",
+            ));
+        }
+        self.buf.push(byte);
+        Ok(())
     }
 }
 
@@ -183,5 +197,32 @@ mod tests {
             buffer.push(b"event: speak-end\rdata: done\r\r").unwrap(),
             [("speak-end".into(), "done".into())]
         );
+    }
+
+    #[test]
+    fn oversized_unterminated_frame_is_rejected_across_chunks() {
+        let mut buffer = FrameBuffer::default();
+        let chunk = vec![b'x'; 64 * 1024];
+        for _ in 0..16 {
+            assert!(buffer.push(&chunk).is_ok());
+        }
+        assert!(buffer.push(b"x").is_err());
+    }
+
+    #[test]
+    fn oversized_single_chunk_is_rejected() {
+        let mut buffer = FrameBuffer::default();
+        assert!(buffer.push(&vec![b'x'; 1024 * 1024 + 1]).is_err());
+    }
+
+    #[test]
+    fn many_small_events_can_exceed_the_limit_in_total() {
+        let mut buffer = FrameBuffer::default();
+        let frame = b"event: speak-end\ndata: done\n\n";
+        let input = frame.repeat(40_000);
+        assert!(input.len() > 1024 * 1024);
+        let events = buffer.push(&input).unwrap();
+        assert_eq!(events.len(), 40_000);
+        assert_eq!(events.last().unwrap(), &("speak-end".into(), "done".into()));
     }
 }
