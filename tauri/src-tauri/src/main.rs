@@ -1119,6 +1119,9 @@ fn build_chord_bindings(
 
     let push_chord = build_chord("push-to-talk", push_to_talk)?;
     let toggle_chord = build_chord("toggle-to-talk", toggle_to_talk)?;
+    if push_chord == toggle_chord {
+        return Err("Push-to-talk and toggle-to-talk chords must be different".to_string());
+    }
 
     let mut bindings = Bindings::new();
     bindings.insert(ChordAction::PushToTalk, push_chord);
@@ -1812,6 +1815,44 @@ mod backend_probe_tests {
         let f = Fixture::new("exit 0");
         assert_eq!(f.probe().await, None);
         assert_eq!(probe_binary_version(&f.0.join("missing"), &f.0).await, None);
+    }
+}
+
+#[cfg(all(test, desktop))]
+mod chord_validation_tests {
+    use super::build_chord_bindings;
+    use crate::hotkey_monitor::ChordAction;
+    use keytap::Key;
+    use std::collections::HashSet;
+
+    fn keys(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn defaults_allow_superset_and_preserve_key_identity() {
+        let bindings = build_chord_bindings(
+            &keys(&["MetaRight", "AltGr"]),
+            &keys(&["MetaRight", "AltRight", "Space"]),
+        ).unwrap();
+        assert_eq!(bindings[&ChordAction::PushToTalk], HashSet::from([Key::MetaRight, Key::AltRight]));
+        assert_eq!(bindings[&ChordAction::ToggleToTalk], HashSet::from([Key::MetaRight, Key::AltRight, Key::Space]));
+    }
+
+    #[test]
+    fn empty_and_unsupported_chords_are_rejected() {
+        assert!(build_chord_bindings(&[], &keys(&["Space"])).is_err());
+        assert!(build_chord_bindings(&keys(&["Space"]), &[]).is_err());
+        assert!(build_chord_bindings(&keys(&["Unknown"]), &keys(&["Space"])).is_err());
+    }
+
+    #[test]
+    fn identical_chords_are_rejected_even_with_aliases_and_reordered_keys() {
+        let error = build_chord_bindings(
+            &keys(&["MetaRight", "AltGr"]),
+            &keys(&["AltRight", "MetaRight"]),
+        ).unwrap_err();
+        assert!(error.contains("different"), "{error}");
     }
 }
 
