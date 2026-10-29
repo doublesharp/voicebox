@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from .. import config, models
 from ..utils.http import safe_content_disposition
+from ..utils.upload import copy_bounded_upload
 from ..database import VoiceProfile as DBVoiceProfile, get_db
 from ..services import channels, export_import, personality, profiles
 from ..services.profiles import _profile_to_response
@@ -24,16 +25,6 @@ router = APIRouter()
 PROFILE_IMPORT_MAX_BYTES = 100 * 1024 * 1024
 PROFILE_AVATAR_MAX_BYTES = 5 * 1024 * 1024
 PROFILE_UPLOAD_CHUNK_BYTES = 1024 * 1024
-
-
-async def _copy_bounded_upload(file: UploadFile, destination, limit: int, *, status: int, detail: str):
-    """Copy without reading unbounded input or writing bytes past the limit."""
-    total = 0
-    while chunk := await file.read(min(PROFILE_UPLOAD_CHUNK_BYTES, limit - total + 1)):
-        total += len(chunk)
-        if total > limit:
-            raise HTTPException(status_code=status, detail=detail)
-        destination.write(chunk)
 
 
 @router.post("/profiles", response_model=models.VoiceProfileResponse)
@@ -63,8 +54,8 @@ async def import_profile(
 ):
     """Import a voice profile from a ZIP archive."""
     content = io.BytesIO()
-    await _copy_bounded_upload(
-        file, content, PROFILE_IMPORT_MAX_BYTES, status=400,
+    await copy_bounded_upload(
+        file, content, PROFILE_IMPORT_MAX_BYTES, chunk_size=PROFILE_UPLOAD_CHUNK_BYTES, status=400,
         detail=f"File too large. Maximum size is {PROFILE_IMPORT_MAX_BYTES / (1024 * 1024)}MB",
     )
 
@@ -242,8 +233,8 @@ async def upload_profile_avatar(
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename or "").suffix) as tmp:
             tmp_path = tmp.name
-            await _copy_bounded_upload(
-                file, tmp, PROFILE_AVATAR_MAX_BYTES, status=413,
+            await copy_bounded_upload(
+                file, tmp, PROFILE_AVATAR_MAX_BYTES, chunk_size=PROFILE_UPLOAD_CHUNK_BYTES, status=413,
                 detail=f"File too large (max {PROFILE_AVATAR_MAX_BYTES // (1024 * 1024)} MB)",
             )
         try:

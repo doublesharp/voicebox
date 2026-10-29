@@ -14,9 +14,13 @@ from .. import config, models
 from ..services import export_import, history
 from ..utils.ffmpeg import encode_audio
 from ..utils.http import safe_content_disposition
+from ..utils.upload import copy_bounded_upload
 from ..database import Generation as DBGeneration, VoiceProfile as DBVoiceProfile, get_db
 
 router = APIRouter()
+
+HISTORY_IMPORT_MAX_BYTES = 50 * 1024 * 1024
+HISTORY_UPLOAD_CHUNK_BYTES = 1024 * 1024
 
 
 @router.get("/history", response_model=models.HistoryListResponse)
@@ -56,17 +60,14 @@ async def import_generation(
     db: Session = Depends(get_db),
 ):
     """Import a generation from a ZIP archive."""
-    MAX_FILE_SIZE = 50 * 1024 * 1024
-
-    content = await file.read()
-
-    if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=400, detail=f"File too large. Maximum size is {MAX_FILE_SIZE / (1024 * 1024)}MB"
-        )
+    content = io.BytesIO()
+    await copy_bounded_upload(
+        file, content, HISTORY_IMPORT_MAX_BYTES, chunk_size=HISTORY_UPLOAD_CHUNK_BYTES, status=400,
+        detail=f"File too large. Maximum size is {HISTORY_IMPORT_MAX_BYTES / (1024 * 1024)}MB",
+    )
 
     try:
-        result = await export_import.import_generation_from_zip(content, db)
+        result = await export_import.import_generation_from_zip(content.getvalue(), db)
         return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
