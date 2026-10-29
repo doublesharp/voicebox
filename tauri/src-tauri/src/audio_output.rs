@@ -253,6 +253,28 @@ impl Drop for AudioOutputState {
 fn device_id(name: &str) -> String {
     format!("device_{}", name.replace(' ', "_").to_lowercase())
 }
+
+fn selected_device_indices(names: &[String], ids: &[String]) -> Result<Vec<usize>, String> {
+    let requested: HashSet<&str> = ids.iter().map(String::as_str).collect();
+    let mut found = HashSet::new();
+    let mut selected = Vec::new();
+    for (index, name) in names.iter().enumerate() {
+        let id = device_id(name);
+        if requested.contains(id.as_str()) {
+            if !found.insert(id) {
+                return Err("Multiple audio outputs share the same identifier. Rename or disconnect one and try again.".into());
+            }
+            selected.push(index);
+        }
+    }
+    if found.len() != requested.len() {
+        return Err(
+            "A selected audio output is unavailable. Choose an available output and try again."
+                .into(),
+        );
+    }
+    Ok(selected)
+}
 fn emit(
     app: &tauri::AppHandle,
     id: &str,
@@ -391,27 +413,27 @@ fn run_session(
     let (samples, rate, channels) = decode_audio(data)?;
     let duration = samples.len() as f64 / channels as f64 / rate as f64;
     let samples: Arc<[f32]> = samples.into();
-    let mut requested: HashSet<String> = ids.into_iter().collect();
     let host = cpal::default_host();
-    let devices: Vec<Device> = host
+    let devices: Vec<(Device, String)> = host
         .output_devices()
         .map_err(|error| format!("Unable to list outputs: {error}"))?
-        .filter_map(|device| {
-            let name = device.name().ok()?;
-            requested.remove(&device_id(&name)).then_some(device)
-        })
+        .filter_map(|device| device.name().ok().map(|name| (device, name)))
         .collect();
-    if !requested.is_empty() {
-        return Err(
-            "A selected audio output is unavailable. Choose an available output and try again."
-                .into(),
-        );
-    }
+    let names = devices
+        .iter()
+        .map(|(_, name)| name.clone())
+        .collect::<Vec<_>>();
+    let selected = selected_device_indices(&names, &ids)?
+        .into_iter()
+        .collect::<HashSet<_>>();
     let mut prepared: HashMap<(u32, u16), Arc<[f32]>> = HashMap::new();
     let mut streams = Vec::new();
     let mut positions = Vec::new();
     let (errors, error_receiver) = mpsc::channel();
-    for device in devices {
+    for (index, (device, _)) in devices.into_iter().enumerate() {
+        if !selected.contains(&index) {
+            continue;
+        }
         if controls.stopped.load(Ordering::Acquire) {
             return Err("Playback cancelled".into());
         }
@@ -717,5 +739,23 @@ mod tests {
         state.stop_playback(None).unwrap();
         assert!(controls.stopped.load(Ordering::Acquire));
         assert!(receiver.try_recv().is_ok());
+    }
+
+    #[test]
+    fn selected_outputs_reject_ambiguous_device_identifiers() {
+        let names: Vec<String> = vec!["USB Audio".into(), "USB_Audio".into(), "Speakers".into()];
+        assert_eq!(device_id(&names[0]), device_id(&names[1]));
+        assert!(selected_device_indices(&names, &[device_id(&names[0])]).is_err());
+        assert_eq!(
+            selected_device_indices(&names, &[device_id(&names[2])]).unwrap(),
+            vec![2]
+        );
+        assert!(selected_device_indices(&names, &["device_missing".into()]).is_err());
+        let unique: Vec<String> = vec!["Speakers".into(), "Headphones".into()];
+        assert_eq!(
+            selected_device_indices(&unique, &[device_id(&unique[1]), device_id(&unique[0])])
+                .unwrap(),
+            vec![0, 1]
+        );
     }
 }
