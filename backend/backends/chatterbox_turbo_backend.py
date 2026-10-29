@@ -8,10 +8,9 @@ Forces CPU on macOS due to known MPS tensor issues.
 
 import asyncio
 import logging
-import threading
 from importlib.metadata import version
 from pathlib import Path
-from typing import ClassVar, Optional
+from typing import Optional
 
 import numpy as np
 
@@ -25,6 +24,7 @@ from .base import (
     manual_seed,
     model_load_progress,
     patch_chatterbox_f32,
+    chatterbox_cpu_load,
 )
 
 logger = logging.getLogger(__name__)
@@ -126,9 +126,6 @@ _TURBO_WEIGHT_FILES = [
 class ChatterboxTurboTTSBackend:
     """Chatterbox Turbo TTS backend — fast, English-only, with paralinguistic tags."""
 
-    # Class-level lock for torch.load monkey-patching
-    _load_lock: ClassVar[threading.Lock] = threading.Lock()
-
     def __init__(self):
         self.model = None
         self.model_size = "default"
@@ -169,7 +166,6 @@ class ChatterboxTurboTTSBackend:
             self._device = device
             logger.info(f"Loading Chatterbox Turbo TTS on {device}...")
 
-            import torch
             from chatterbox.tts_turbo import ChatterboxTurboTTS
             from huggingface_hub import snapshot_download
 
@@ -180,18 +176,8 @@ class ChatterboxTurboTTSBackend:
             )
 
             if device == "cpu":
-                _orig_torch_load = torch.load
-
-                def _patched_load(*args, **kwargs):
-                    kwargs.setdefault("map_location", "cpu")
-                    return _orig_torch_load(*args, **kwargs)
-
-                with ChatterboxTurboTTSBackend._load_lock:
-                    torch.load = _patched_load
-                    try:
-                        model = ChatterboxTurboTTS.from_local(local_path, device)
-                    finally:
-                        torch.load = _orig_torch_load
+                with chatterbox_cpu_load():
+                    model = ChatterboxTurboTTS.from_local(local_path, device)
             else:
                 model = ChatterboxTurboTTS.from_local(local_path, device)
 

@@ -27,3 +27,14 @@ def resolve_model_size(backend: LLMBackend, requested: str | None) -> str:
 def unload_llm_model() -> None:
     """Unload LLM model to free memory."""
     get_llm_backend().unload_model()
+
+
+async def unload_llm_model_async() -> None:
+    """Drain local model work before releasing its state at shutdown."""
+    backend = get_llm_backend()
+    lock = getattr(backend, "_op_lock", None)
+    if lock is not None:
+        async with lock:
+            backend.unload_model()
+    else:
+        backend.unload_model()

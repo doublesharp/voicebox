@@ -44,6 +44,7 @@ from .base import (
     model_load_progress,
 )
 from ..utils.cache import cache_voice_prompt, get_cache_key, get_cached_voice_prompt
+from ..utils.async_work import run_blocking
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +141,7 @@ class OmniVoiceBackend:
         async with self._model_load_lock:
             if self.model is not None:
                 return
-            await asyncio.to_thread(self._load_model_sync)
+            await run_blocking(self._load_model_sync)
 
     def _load_model_sync(self) -> None:
         model_name = "omnivoice"
@@ -242,7 +243,7 @@ class OmniVoiceBackend:
             # failure every time the profile is used.
             if (
                 isinstance(cached, dict)
-                and "ref_audio_tokens" in cached
+                and {"ref_audio_tokens", "ref_text", "ref_rms"} <= cached.keys()
                 and cached.get("format_version") == _VOICE_CLONE_PROMPT_FORMAT_VERSION
             ):
                 return cached, True
@@ -263,7 +264,7 @@ class OmniVoiceBackend:
                 "ref_rms": float(prompt.ref_rms),
             }
 
-        encoded = await asyncio.to_thread(_encode_sync)
+        encoded = await run_blocking(_encode_sync)
 
         if cache_key:
             cache_voice_prompt(cache_key, encoded)
@@ -335,7 +336,7 @@ class OmniVoiceBackend:
 
             return audios[0], self.sample_rate
 
-        return await asyncio.to_thread(_generate_sync)
+        return await run_blocking(_generate_sync)
 
     def _rebuild_clone_prompt(self, voice_prompt: dict):
         """Turn a cached prompt dict back into OmniVoice's dataclass.

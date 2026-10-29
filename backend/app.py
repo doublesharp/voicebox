@@ -130,8 +130,8 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def voicebox_lifespan(app: FastAPI):
-        await _run_startup(app)
         try:
+            await _run_startup(app)
             # Native CLI configuration happens after module import, so studio
             # storage is opened only after the actual data directory is ready.
             app.state.studio_runtime.initialize()
@@ -381,11 +381,11 @@ async def _unload_models() -> None:
     except Exception:
         logger.exception("Failed to unload TTS model")
     try:
-        transcribe.unload_whisper_model()
+        await transcribe.unload_whisper_model_async()
     except Exception:
         logger.exception("Failed to unload Whisper model")
     try:
-        llm.unload_llm_model()
+        await llm.unload_llm_model_async()
     except Exception:
         logger.exception("Failed to unload LLM model")
 

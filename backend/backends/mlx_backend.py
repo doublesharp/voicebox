@@ -2,7 +2,7 @@
 MLX backend implementation for TTS and STT using mlx-audio.
 """
 
-from typing import Optional, List, Tuple
+from typing import Optional, Tuple
 import asyncio
 import logging
 import numpy as np
@@ -32,7 +32,7 @@ from ..utils.hf_offline_patch import patch_huggingface_hub_offline, ensure_origi
 patch_huggingface_hub_offline()
 ensure_original_qwen_config_cached()
 
-from . import TTSBackend, STTBackend, LANGUAGE_CODE_TO_NAME, WHISPER_HF_REPOS  # noqa: E402
+from . import LANGUAGE_CODE_TO_NAME, WHISPER_HF_REPOS  # noqa: E402
 from .base import (  # noqa: E402
     is_model_cached,
     combine_voice_prompts as _combine_voice_prompts,
@@ -41,6 +41,7 @@ from .base import (  # noqa: E402
 )
 from ..utils.cache import get_cache_key, get_cached_voice_prompt, cache_voice_prompt  # noqa: E402
 from ..utils.mlx_reference_cache import MLXReferenceCache  # noqa: E402
+from ..utils.async_work import run_owned  # noqa: E402
 
 
 class VoiceCloningError(RuntimeError):
@@ -442,11 +443,10 @@ class MLXSTTBackend:
         if model_size is None:
             model_size = self.model_size
 
-        if self.model is not None and self.model_size == model_size:
-            return
-
-        # Run blocking load in thread pool
-        await _run_on_mlx_thread(self._load_model_sync, model_size)
+        async with self._op_lock:
+            if self.model is not None and self.model_size == model_size:
+                return
+            await run_owned(_run_on_mlx_thread(self._load_model_sync, model_size))
 
     # Alias for compatibility
     load_model = load_model_async
@@ -547,7 +547,7 @@ class MLXSTTBackend:
                     empty_mlx_cache()
 
         async with self._op_lock:
-            return await _run_on_mlx_thread(_reload_and_transcribe_sync)
+            return await run_owned(_run_on_mlx_thread(_reload_and_transcribe_sync))
 
 
     async def transcribe_detailed(self, audio_path, language=None, model_size=None):
@@ -596,3 +596,4 @@ class MLXSTTBackend:
 
         async with self._op_lock:
             return await run_owned(_run_on_mlx_thread(recognize))
+

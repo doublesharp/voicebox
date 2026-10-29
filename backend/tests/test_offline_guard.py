@@ -14,16 +14,12 @@ run this file serially.
 
 import multiprocessing
 import os
-import sys
 import threading
 import time
-from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from utils.hf_offline_patch import force_offline_if_cached
+from backend.utils.hf_offline_patch import force_offline_if_cached
 
 
 def _nest_opposite_modes_in_subprocess(queue, ready):
@@ -136,11 +132,13 @@ def test_concurrent_threads_share_offline_window():
     assert original == _hf_const().HF_HUB_OFFLINE
 
 
-def test_uncached_load_never_observes_offline_flag_from_concurrent_cached_load():
+@pytest.mark.parametrize("baseline", [False, True])
+def test_uncached_load_never_observes_offline_flag_from_concurrent_cached_load(monkeypatch, baseline):
     """An uncached (network-needing) load must never inherit the forced
     offline mode of a concurrent, unrelated cached load — even when both
     start at nearly the same time.
     """
+    monkeypatch.setattr(_hf_const(), "HF_HUB_OFFLINE", baseline)
     original = _hf_const().HF_HUB_OFFLINE
     observations: list[bool] = []
     errors: list[Exception] = []
@@ -172,7 +170,7 @@ def test_uncached_load_never_observes_offline_flag_from_concurrent_cached_load()
     assert not t_cached.is_alive(), "cached thread did not finish"
     assert not t_uncached.is_alive(), "uncached thread did not finish"
     assert not errors, errors
-    assert observations == [False], "uncached load observed offline mode forced by a concurrent cached load"
+    assert observations == [baseline], "uncached load observed offline mode forced by a concurrent cached load"
     assert original == _hf_const().HF_HUB_OFFLINE
 
 
@@ -214,6 +212,76 @@ def test_nesting_opposite_mode_on_same_thread_raises_instead_of_deadlocking():
     kind, exc_type, exc_msg = queue.get(timeout=2)
     assert kind == "exc", (kind, exc_type, exc_msg)
     assert exc_type == "RuntimeError", (kind, exc_type, exc_msg)
+
+
+def test_cached_load_waits_until_active_uncached_load_finishes(monkeypatch):
+    """A cached load must not force offline mode while a network load is active."""
+    monkeypatch.setattr(_hf_const(), "HF_HUB_OFFLINE", False)
+    uncached_entered = threading.Event()
+    release_uncached = threading.Event()
+    cached_entered = threading.Event()
+    cached_attempting = threading.Event()
+    errors = []
+
+    def uncached():
+        try:
+            with force_offline_if_cached(False, "network"):
+                uncached_entered.set()
+                assert release_uncached.wait(timeout=5)
+                assert not _hf_const().HF_HUB_OFFLINE
+        except Exception as exc:
+            errors.append(exc)
+
+    def cached():
+        try:
+            assert uncached_entered.wait(timeout=5)
+            cached_attempting.set()
+            with force_offline_if_cached(True, "cached"):
+                assert _hf_const().HF_HUB_OFFLINE
+                cached_entered.set()
+        except Exception as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=uncached)
+    second = threading.Thread(target=cached)
+    first.start()
+    second.start()
+    try:
+        assert uncached_entered.wait(timeout=5)
+        assert cached_attempting.wait(timeout=5)
+        assert not cached_entered.wait(timeout=0.2)
+    finally:
+        release_uncached.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+    assert not first.is_alive() and not second.is_alive()
+    assert not errors
+    assert cached_entered.is_set()
+    assert not _hf_const().HF_HUB_OFFLINE
+
+
+def test_uncached_loads_can_overlap_without_forcing_offline(monkeypatch):
+    monkeypatch.setattr(_hf_const(), "HF_HUB_OFFLINE", False)
+    barrier = threading.Barrier(2)
+    observations = []
+    errors = []
+
+    def load():
+        try:
+            with force_offline_if_cached(False, "network"):
+                barrier.wait(timeout=5)
+                observations.append(_hf_const().HF_HUB_OFFLINE)
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=load) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=6)
+    assert all(not thread.is_alive() for thread in threads)
+    assert not errors
+    assert observations == [False, False]
 
 
 if __name__ == "__main__":

@@ -30,6 +30,7 @@ from .base import (
     model_load_progress,
 )
 from ..utils.cache import get_cache_key, get_cached_voice_prompt, cache_voice_prompt
+from ..utils.async_work import run_blocking
 
 logger = logging.getLogger(__name__)
 
@@ -103,9 +104,17 @@ class HumeTadaBackend:
             if self.model is not None:
                 self.unload_model()
             self.model_size = model_size
-            await asyncio.to_thread(self._load_model_sync, model_size)
+            await run_blocking(self._load_model_sync, model_size)
 
     def _load_model_sync(self, model_size: str = "1B"):
+        """Load both parts or release any partially initialized state."""
+        try:
+            self._load_model_sync_impl(model_size)
+        except BaseException:
+            self.unload_model()
+            raise
+
+    def _load_model_sync_impl(self, model_size: str = "1B"):
         """Synchronous model loading with progress tracking."""
         model_name = f"tada-{model_size.lower()}"
         is_cached = self._is_model_cached(model_size)
@@ -197,8 +206,15 @@ class HumeTadaBackend:
             logger.info(f"Loading TADA {model_size} model...")
             config = TadaConfig.from_pretrained(repo)
             config.tokenizer_name = tokenizer_path
-            self.model = TadaForCausalLM.from_pretrained(repo, config=config, torch_dtype=model_dtype).to(device)
-            self.model.eval()
+            model = None
+            try:
+                model = TadaForCausalLM.from_pretrained(repo, config=config, torch_dtype=model_dtype).to(device)
+                model.eval()
+            except BaseException:
+                model = None
+                raise
+            # Only publish the model after initialization has succeeded.
+            self.model = model
 
         logger.info(f"HumeAI TADA {model_size} loaded successfully on {device}")
 
@@ -280,7 +296,7 @@ class HumeTadaBackend:
                     prompt_dict[field_name] = val
             return prompt_dict
 
-        encoded = await asyncio.to_thread(_encode_sync)
+        encoded = await run_blocking(_encode_sync)
 
         if cache_key:
             cache_voice_prompt(cache_key, encoded)
@@ -365,4 +381,4 @@ class HumeTadaBackend:
 
             return audio, 24000
 
-        return await asyncio.to_thread(_generate_sync)
+        return await run_blocking(_generate_sync)

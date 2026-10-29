@@ -25,6 +25,7 @@ from .base import (
 )
 from ..utils.cache import get_cache_key, get_cached_voice_prompt, cache_voice_prompt
 from ..utils.audio import load_audio
+from ..utils.async_work import run_blocking
 
 
 def _serialize_qwen_voice_prompt(items: list) -> dict:
@@ -301,6 +302,7 @@ class PyTorchSTTBackend:
         self.processor = None
         self.model_size = model_size
         self.device = self._get_device()
+        self._op_lock = asyncio.Lock()
 
     def _get_device(self) -> str:
         """Get the best available device."""
@@ -321,13 +323,15 @@ class PyTorchSTTBackend:
         Args:
             model_size: Model size (tiny, base, small, medium, large)
         """
+        async with self._op_lock:
+            await self._load_model_owned(model_size)
+
+    async def _load_model_owned(self, model_size: Optional[str]):
         if model_size is None:
             model_size = self.model_size
-
         if self.model is not None and self.model_size == model_size:
             return
-
-        await asyncio.to_thread(self._load_model_sync, model_size)
+        await run_blocking(self._load_model_sync, model_size)
 
     # Alias for compatibility
     load_model = load_model_async
@@ -343,10 +347,20 @@ class PyTorchSTTBackend:
             model_name = WHISPER_HF_REPOS.get(model_size, f"openai/whisper-{model_size}")
             logger.info("Loading Whisper model %s on %s...", model_size, self.device)
 
-            self.processor = WhisperProcessor.from_pretrained(model_name)
-            self.model = WhisperForConditionalGeneration.from_pretrained(model_name)
+            processor = None
+            model = None
+            try:
+                processor = WhisperProcessor.from_pretrained(model_name)
+                model = WhisperForConditionalGeneration.from_pretrained(model_name)
+                model.to(self.device)
+            except BaseException:
+                processor = None
+                model = None
+                empty_device_cache(self.device)
+                raise
 
-        self.model.to(self.device)
+        self.processor = processor
+        self.model = model
         self.model_size = model_size
         logger.info("Whisper model %s loaded successfully", model_size)
 
@@ -368,6 +382,15 @@ class PyTorchSTTBackend:
         language: Optional[str] = None,
         model_size: Optional[str] = None,
     ) -> str:
+        async with self._op_lock:
+            return await self._transcribe_owned(audio_path, language, model_size)
+
+    async def _transcribe_owned(
+        self,
+        audio_path: str,
+        language: Optional[str],
+        model_size: Optional[str],
+    ) -> str:
         """
         Transcribe audio to text.
 
@@ -379,7 +402,7 @@ class PyTorchSTTBackend:
         Returns:
             Transcribed text
         """
-        await self.load_model_async(model_size)
+        await self._load_model_owned(model_size)
 
         def _transcribe_sync():
             """Run synchronous transcription in thread pool."""
@@ -446,4 +469,4 @@ class PyTorchSTTBackend:
             return transcription.strip()
 
         # Run blocking transcription in thread pool
-        return await asyncio.to_thread(_transcribe_sync)
+        return await run_blocking(_transcribe_sync)

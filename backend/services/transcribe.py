@@ -78,3 +78,14 @@ async def recognize_words(audio_path, duration, language=None, model_size=None):
         package_version = None
     return {**recognized, "recognizer": {"backend": type(backend).__name__, "model_size": size,
             "package_version": package_version, "revision": getattr(backend, "_recognition_revision", None)}}
+
+
+async def unload_whisper_model_async():
+    """Wait for active transcription before releasing the Whisper model."""
+    backend = get_stt_backend()
+    lock = getattr(backend, "_op_lock", None)
+    if lock is not None:
+        async with lock:
+            backend.unload_model()
+    else:
+        backend.unload_model()

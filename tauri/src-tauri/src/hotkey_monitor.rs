@@ -132,7 +132,10 @@ impl HotkeyMonitor {
             .spawn(move || dispatcher_loop(app, matcher, shutdown_for_thread))
             .expect("spawn hotkey dispatcher thread");
 
-        self.active = Some(Active { dispatcher, shutdown });
+        self.active = Some(Active {
+            dispatcher,
+            shutdown,
+        });
     }
 }
 
@@ -153,28 +156,19 @@ fn build_matcher(bindings: &Bindings) -> Result<ChordMatcher<ChordAction>, keyta
     let mut builder = ChordMatcher::builder();
     if let Some(keys) = bindings.get(&ChordAction::PushToTalk) {
         if !keys.is_empty() {
-            builder = builder.add(
-                ChordAction::PushToTalk,
-                Chord::of(keys.iter().copied()),
-            );
+            builder = builder.add(ChordAction::PushToTalk, Chord::of(keys.iter().copied()));
         }
     }
     if let Some(keys) = bindings.get(&ChordAction::ToggleToTalk) {
         if !keys.is_empty() {
-            builder = builder.add_toggle(
-                ChordAction::ToggleToTalk,
-                Chord::of(keys.iter().copied()),
-            );
+            builder =
+                builder.add_toggle(ChordAction::ToggleToTalk, Chord::of(keys.iter().copied()));
         }
     }
     builder.build()
 }
 
-fn dispatcher_loop(
-    app: AppHandle,
-    matcher: ChordMatcher<ChordAction>,
-    shutdown: Arc<AtomicBool>,
-) {
+fn dispatcher_loop(app: AppHandle, matcher: ChordMatcher<ChordAction>, shutdown: Arc<AtomicBool>) {
     while !shutdown.load(Ordering::Relaxed) {
         match matcher.recv_timeout(Duration::from_millis(100)) {
             Ok(event) => process_event(&app, &matcher, event),
@@ -193,36 +187,141 @@ fn process_event(
     matcher: &ChordMatcher<ChordAction>,
     event: ChordEvent<ChordAction>,
 ) {
-    match event {
-        ChordEvent::Start { id, .. } => {
-            apply_effect(app, Effect::StartRecording(id));
-        }
-        ChordEvent::End { id: end_id, time: end_time } => {
-            // Peek for an immediately-following Start. keytap emits
-            // End+Start atomically (same Instant) when the held set
-            // transitions between registered chords — our 5 ms window
-            // is well under perceptible latency but far longer than the
-            // channel hop between keytap's chord worker and our
-            // dispatcher.
-            match matcher.recv_timeout(Duration::from_millis(5)) {
-                Ok(ChordEvent::Start { id: start_id, time: start_time })
-                    if start_time == end_time =>
-                {
-                    apply_effect(app, Effect::RestartRecording(start_id));
-                }
-                Ok(other) => {
-                    apply_effect(app, Effect::StopRecording(end_id));
-                    // The peeked event wasn't a transition partner;
-                    // process it in its own right. Recursion depth is
-                    // bounded by the number of back-to-back chord
-                    // events, in practice 1–2.
-                    process_event(app, matcher, other);
-                }
-                Err(_) => {
-                    apply_effect(app, Effect::StopRecording(end_id));
-                }
+    process_events(
+        event,
+        || matcher.recv_timeout(Duration::from_millis(5)).ok(),
+        |effect| apply_effect(app, effect),
+    );
+}
+
+fn process_events(
+    mut event: ChordEvent<ChordAction>,
+    mut next: impl FnMut() -> Option<ChordEvent<ChordAction>>,
+    mut emit: impl FnMut(Effect),
+) {
+    loop {
+        match event {
+            ChordEvent::Start { id, .. } => {
+                emit(Effect::StartRecording(id));
+                return;
             }
+            ChordEvent::End {
+                id: end_id,
+                time: end_time,
+            } => match next() {
+                Some(ChordEvent::Start {
+                    id: start_id,
+                    time: start_time,
+                }) if end_id == ChordAction::PushToTalk
+                    && start_id == ChordAction::ToggleToTalk
+                    && start_time == end_time =>
+                {
+                    emit(Effect::RestartRecording(start_id));
+                    return;
+                }
+                Some(other) => {
+                    emit(Effect::StopRecording(end_id));
+                    event = other;
+                }
+                None => {
+                    emit(Effect::StopRecording(end_id));
+                    return;
+                }
+            },
         }
+    }
+}
+
+#[cfg(test)]
+mod event_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::time::Instant;
+
+    fn effects(first: ChordEvent<ChordAction>, rest: Vec<ChordEvent<ChordAction>>) -> Vec<Effect> {
+        let mut rest = VecDeque::from(rest);
+        let mut output = Vec::new();
+        process_events(first, || rest.pop_front(), |effect| output.push(effect));
+        output
+    }
+
+    #[test]
+    fn push_to_toggle_upgrade_restarts_recording() {
+        let time = Instant::now();
+        assert_eq!(
+            effects(
+                ChordEvent::End {
+                    id: ChordAction::PushToTalk,
+                    time
+                },
+                vec![ChordEvent::Start {
+                    id: ChordAction::ToggleToTalk,
+                    time
+                }]
+            ),
+            vec![Effect::RestartRecording(ChordAction::ToggleToTalk)]
+        );
+    }
+    #[test]
+    fn unrelated_start_is_not_lost_during_lookahead() {
+        let time = Instant::now();
+        assert_eq!(
+            effects(
+                ChordEvent::End {
+                    id: ChordAction::PushToTalk,
+                    time
+                },
+                vec![ChordEvent::Start {
+                    id: ChordAction::ToggleToTalk,
+                    time: time + Duration::from_millis(1)
+                }]
+            ),
+            vec![
+                Effect::StopRecording(ChordAction::PushToTalk),
+                Effect::StartRecording(ChordAction::ToggleToTalk)
+            ]
+        );
+    }
+    #[test]
+    fn reverse_or_same_action_transitions_do_not_discard_recording() {
+        let time = Instant::now();
+        for (end_id, start_id) in [
+            (ChordAction::ToggleToTalk, ChordAction::PushToTalk),
+            (ChordAction::PushToTalk, ChordAction::PushToTalk),
+            (ChordAction::ToggleToTalk, ChordAction::ToggleToTalk),
+        ] {
+            assert_eq!(
+                effects(
+                    ChordEvent::End { id: end_id, time },
+                    vec![ChordEvent::Start { id: start_id, time }]
+                ),
+                vec![
+                    Effect::StopRecording(end_id),
+                    Effect::StartRecording(start_id)
+                ]
+            );
+        }
+    }
+    #[test]
+    fn long_runs_of_end_events_are_processed_without_recursion() {
+        let time = Instant::now();
+        let count = 10_000;
+        let output = effects(
+            ChordEvent::End {
+                id: ChordAction::PushToTalk,
+                time,
+            },
+            (1..count)
+                .map(|_| ChordEvent::End {
+                    id: ChordAction::PushToTalk,
+                    time,
+                })
+                .collect(),
+        );
+        assert_eq!(output.len(), count);
+        assert!(output
+            .iter()
+            .all(|effect| *effect == Effect::StopRecording(ChordAction::PushToTalk)));
     }
 }
 
@@ -258,8 +357,8 @@ fn apply_effect(app: &AppHandle, effect: Effect) {
                     let monitor_pos = monitor.position();
                     let monitor_size = monitor.size();
                     if let Ok(win_size) = window.outer_size() {
-                        let x = monitor_pos.x
-                            + (monitor_size.width as i32 - win_size.width as i32) / 2;
+                        let x =
+                            monitor_pos.x + (monitor_size.width as i32 - win_size.width as i32) / 2;
                         let y = monitor_pos.y + (monitor_size.height as f64 * 0.04) as i32;
                         let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
                     }
