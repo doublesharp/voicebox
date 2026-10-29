@@ -205,3 +205,115 @@ async def test_overlapping_migrations_are_rejected_before_second_task(migration)
     await asyncio.gather(*tasks)
     assert manager.get_progress('migration')['status'] == 'complete'
     assert (destination / 'models--first' / 'weight.bin').read_bytes() == b'original'
+
+
+@pytest.mark.asyncio
+async def test_cancel_waits_for_copy_worker_and_rolls_back(migration, monkeypatch):
+    import threading
+
+    source, destination, manager, tasks = migration
+    model(source, 'first', b'original')
+    monkeypatch.setattr(routes, '_same_filesystem', lambda *_: False)
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+    real_copy = routes._copy_with_progress
+    def delayed_copy(*args):
+        started.set()
+        try:
+            if not release.wait(3):
+                raise RuntimeError('test failed to release copy')
+            return real_copy(*args)
+        finally:
+            finished.set()
+    monkeypatch.setattr(routes, '_copy_with_progress', delayed_copy)
+    await routes.migrate_models(models.ModelMigrateRequest(destination=str(destination)))
+    assert await asyncio.to_thread(started.wait, 2)
+    tasks[0].cancel()
+    await asyncio.sleep(0.05)
+    tasks[0].cancel()
+    await asyncio.sleep(0.05)
+    still_waiting = not tasks[0].done()
+    release.set()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    assert await asyncio.to_thread(finished.wait, 2)
+    assert still_waiting, 'repeated cancellation must not abandon a live copy thread'
+    assert manager.get_progress('migration')['status'] == 'error'
+    assert (source / 'models--first' / 'weight.bin').read_bytes() == b'original'
+    assert list(destination.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_cross_filesystem_copy_rebases_absolute_internal_symlink(migration, monkeypatch):
+    source, destination, manager, tasks = migration
+    root = model(source, 'first', b'weight')
+    (root / 'snapshot').mkdir()
+    (root / 'snapshot' / 'model.bin').symlink_to(root / 'weight.bin')
+    monkeypatch.setattr(routes, '_same_filesystem', lambda *_: False)
+    await routes.migrate_models(models.ModelMigrateRequest(destination=str(destination)))
+    await asyncio.gather(*tasks)
+    link = destination / 'models--first' / 'snapshot' / 'model.bin'
+    assert manager.get_progress('migration')['status'] == 'complete'
+    assert link.is_symlink()
+    assert link.read_bytes() == b'weight'
+    assert not root.exists()
+
+
+@pytest.mark.asyncio
+async def test_cancel_before_background_task_starts_clears_active_status(migration):
+    source, destination, manager, tasks = migration
+    model(source, 'first', b'original')
+    await routes.migrate_models(models.ModelMigrateRequest(destination=str(destination)))
+    tasks[0].cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    await asyncio.sleep(0)
+    assert manager.get_progress('migration')['status'] == 'error'
+    assert (source / 'models--first' / 'weight.bin').read_bytes() == b'original'
+    assert list(destination.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_source_cleanup_retains_completed_destination(migration, monkeypatch):
+    import threading
+
+    source, destination, manager, tasks = migration
+    model(source, 'first', b'original')
+    monkeypatch.setattr(routes, '_same_filesystem', lambda *_: False)
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+    real_remove = routes.shutil.rmtree
+    def delayed_remove(path, *args, **kwargs):
+        if str(path).startswith(str(source)):
+            started.set()
+            try:
+                if not release.wait(3):
+                    raise RuntimeError('test failed to release cleanup')
+                return real_remove(path, *args, **kwargs)
+            finally:
+                finished.set()
+        return real_remove(path, *args, **kwargs)
+    monkeypatch.setattr(routes.shutil, 'rmtree', delayed_remove)
+    await routes.migrate_models(models.ModelMigrateRequest(destination=str(destination)))
+    assert await asyncio.to_thread(started.wait, 2)
+    tasks[0].cancel()
+    await asyncio.sleep(0.05)
+    release.set()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    assert await asyncio.to_thread(finished.wait, 2)
+    progress = manager.get_progress('migration')
+    assert progress['status'] == 'error'
+    assert 'source cleanup was incomplete' in progress['error']
+    assert (destination / 'models--first' / 'weight.bin').read_bytes() == b'original'
+
+
+@pytest.mark.asyncio
+async def test_cross_filesystem_copy_preserves_external_absolute_symlink(migration, monkeypatch, tmp_path):
+    source, destination, manager, tasks = migration
+    root = model(source, 'first', b'weight')
+    external = tmp_path / 'outside.bin'
+    external.write_bytes(b'external')
+    (root / 'external').symlink_to(external)
+    monkeypatch.setattr(routes, '_same_filesystem', lambda *_: False)
+    await routes.migrate_models(models.ModelMigrateRequest(destination=str(destination)))
+    await asyncio.gather(*tasks)
+    link = destination / 'models--first' / 'external'
+    assert link.is_symlink()
+    assert link.readlink() == external
+    assert link.read_bytes() == b'external'

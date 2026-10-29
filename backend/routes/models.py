@@ -27,15 +27,25 @@ def _get_dir_size(path: Path) -> int:
     return total
 
 
-def _copy_with_progress(src: Path, dst: Path, progress_manager, copied_so_far: int, total_bytes: int) -> int:
+def _copy_with_progress(src: Path, dst: Path, progress_manager, copied_so_far: int, total_bytes: int, source_root=None, destination_root=None) -> int:
     """Copy a directory tree with byte-level progress tracking."""
+    if source_root is None:
+        source_root, destination_root = src.parent.absolute(), dst.parent.absolute()
     dst.mkdir(parents=True, exist_ok=True)
     for item in src.iterdir():
         dest_item = dst / item.name
         if item.is_symlink():
-            dest_item.symlink_to(os.readlink(item))
+            target = Path(os.readlink(item))
+            if target.is_absolute():
+                try:
+                    relative = target.relative_to(source_root)
+                except ValueError:
+                    pass
+                else:
+                    target = Path(os.path.relpath(destination_root / relative, dest_item.parent))
+            dest_item.symlink_to(target)
         elif item.is_dir():
-            copied_so_far = _copy_with_progress(item, dest_item, progress_manager, copied_so_far, total_bytes)
+            copied_so_far = _copy_with_progress(item, dest_item, progress_manager, copied_so_far, total_bytes, source_root, destination_root)
         else:
             size = item.stat().st_size
             shutil.copy2(str(item), str(dest_item))
@@ -48,6 +58,27 @@ def _copy_with_progress(src: Path, dst: Path, progress_manager, copied_so_far: i
                 status="downloading",
             )
     return copied_so_far
+
+
+async def _finish_thread_before_cancelling(function, *args):
+    """Do not roll back a destination while its worker is still writing."""
+    worker = asyncio.create_task(asyncio.to_thread(function, *args))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        # Further cancellation requests must not cancel the asyncio wrapper:
+        # the underlying thread would keep writing after rollback begins.
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        # Retrieve any worker exception so it does not become unhandled.
+        if not worker.cancelled():
+            worker.exception()
+        raise
 
 
 def _same_filesystem(source: Path, destination: Path) -> bool:
@@ -243,7 +274,11 @@ async def migrate_models(request: models.ModelMigrateRequest):
 
     same_fs = _same_filesystem(source, destination)
 
+    started = False
+
     async def migrate_background():
+        nonlocal started
+        started = True
         moved = []
         copied = []
         deletion_started = False
@@ -272,18 +307,18 @@ async def migrate_models(request: models.ModelMigrateRequest):
                     # Claim the new directory exclusively before copying.
                     dest_item.mkdir()
                     copied.append(dest_item)
-                    copied_bytes = await asyncio.to_thread(
+                    copied_bytes = await _finish_thread_before_cancelling(
                         _copy_with_progress, item, dest_item, progress_manager, copied_bytes, total_bytes
                     )
                 # Keep every original until every copy has finished, so a
                 # copy error can be rolled back without losing source files.
                 deletion_started = True
                 for item in model_dirs:
-                    await asyncio.to_thread(shutil.rmtree, str(item))
+                    await _finish_thread_before_cancelling(shutil.rmtree, str(item))
 
             progress_manager.update_progress("migration", 1, 1, status="complete")
             progress_manager.mark_complete("migration")
-        except Exception as e:
+        except (Exception, asyncio.CancelledError) as e:
             rollback_errors = []
             if same_fs:
                 for original, target in reversed(moved):
@@ -301,19 +336,25 @@ async def migrate_models(request: models.ModelMigrateRequest):
                         pass
                     except Exception as rollback_error:
                         rollback_errors.append(str(rollback_error))
-            message = str(e)
+            message = str(e) or "Model migration cancelled"
             if deletion_started and not same_fs:
                 message += "; copied models remain in the destination; source cleanup was incomplete"
             if rollback_errors:
                 message += "; rollback incomplete: " + "; ".join(rollback_errors)
             progress_manager.mark_error("migration", message)
+            if isinstance(e, asyncio.CancelledError):
+                raise
         finally:
             model_inventory.invalidate()
 
     model_inventory.invalidate()
     work = migrate_background()
     try:
-        create_background_task(work)
+        task = create_background_task(work)
+        def clear_cancelled_before_start(done):
+            if done.cancelled() and not started:
+                progress_manager.mark_error("migration", "Model migration cancelled before starting")
+        task.add_done_callback(clear_cancelled_before_start)
     except Exception as e:
         work.close()
         progress_manager.mark_error("migration", str(e))
