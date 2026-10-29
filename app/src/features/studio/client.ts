@@ -43,10 +43,8 @@ export class StudioClient implements StudioTransport {
     return `${this.baseUrl}/studio/v1${path}`;
   }
   private async request<T>(path: string, options: RequestInit = {}, legacy = false): Promise<T> {
-    const response = await this.fetcher(
-      legacy ? `${this.baseUrl}${path}` : this.url(path),
-      options,
-    );
+    const fetcher = this.fetcher;
+    const response = await fetcher(legacy ? `${this.baseUrl}${path}` : this.url(path), options);
     if (!response.ok) {
       const body = await response.json().catch(() => ({}));
       const detail = body.detail;
@@ -173,7 +171,8 @@ export class StudioClient implements StudioTransport {
     return this.upload<StudioAsset>(`/projects/${encodeURIComponent(id)}/assets`, file);
   }
   async download(url: string) {
-    const response = await this.fetcher(url);
+    const fetcher = this.fetcher;
+    const response = await fetcher(url);
     if (!response.ok)
       throw new StudioApiError(`Download failed (${response.status})`, response.status);
     return response.blob();

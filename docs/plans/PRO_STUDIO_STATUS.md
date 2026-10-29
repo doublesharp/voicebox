@@ -35,10 +35,18 @@ Independent source reviews accepted the integrated inference/playback ownership 
 
 An earlier renderer baseline produced a 30-minute/200-clip WAV fixture in about 72 seconds with about 195 MiB process peak RSS. That receipt predates the new effects pipeline and is not a current application performance qualification.
 
+## Local visual testing
+
+Terra Max navigated the current source UI against an isolated local backend at 1440×900 and 800×600, plus a 720×450 viewport approximation. Available sidebar screens, a UI-created two-passage Studio project, Edit/Mix/Review, a checkpoint, Deliver's missing-audio preflight and an Effects keyboard selection were checked. The pass repaired wrapped Story composer controls, long-title overlap and access to Generate's empty-history state on short screens.
+
+Root also repaired native-fetch receiver errors across Studio, review, storage and Story copying, and a deletion race that could reopen a deleted Story from cached choices. The browser test workaround was removed; the unmodified browser API loads Studio, and a UI-created Story deletes without stale detail or a reload. Focused regressions cover delayed list results, failed deletion and selection changes while deletion is pending. The affected frontend checks, app/web types and production web build pass; bounded evidence remains on Scratch and in local Coordinate.
+
+This pass used available empty and script-populated states. The 720×450 check approximates reduced workspace area; actual 200% browser zoom was not established by the preview shortcuts. Populated audio, full accessibility, real models and packaged desktop behavior remain separate gates.
+
 ## Qualification still open
 
 - Real preset/cloned/directed models, GPU cancellation/contention and platform-specific model execution.
-- Actual browser layout, keyboard/accessibility and recovery/navigation journeys at 800×600 and 200% zoom.
+- Populated-audio browser layouts, full keyboard/accessibility and recovery/navigation journeys, and actual 200% browser zoom beyond the bounded visual pass above.
 - Packaged lifecycle, native output routing/save dialogs, HTTP failure journeys and Windows replacement/ACL behavior.
 - Listening, independent metering, final encoded true-peak/loudness compliance and long-project UI/effects performance.
 - Actual disk-full, power-loss and OS write/flush failure behavior; current failure fixtures are bounded/injected.

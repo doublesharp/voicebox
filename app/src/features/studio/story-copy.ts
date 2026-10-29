@@ -83,7 +83,8 @@ export class StoryCopy {
       };
       // No mutation is sent until its original identity is durably readable.
       this.persist(record);
-      const response = await this.fetcher(
+      const fetcher = this.fetcher;
+      const response = await fetcher(
         `${this.endpoint}/studio/v1/imports/story/${encodeURIComponent(this.storyId)}`,
         {
           method: 'POST',

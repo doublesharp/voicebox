@@ -540,7 +540,7 @@ export function HistoryTable() {
   return (
     <div className="flex flex-col h-full min-h-0 relative">
       {history.length === 0 ? (
-        <div className="text-center py-12 px-5 border-2 border-dashed mb-5 border-muted rounded-md text-muted-foreground flex-1 flex items-center justify-center">
+        <div className="text-center py-12 pt-4 lg:pt-12 px-5 border-2 border-dashed mb-5 border-muted rounded-md text-muted-foreground flex-1 flex items-start lg:items-center justify-center">
           {t('history.empty')}
         </div>
       ) : (

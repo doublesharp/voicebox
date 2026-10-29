@@ -83,7 +83,8 @@ export class ReviewClient implements ReviewTransport {
     body?: unknown,
     approval = false,
   ): Promise<ReviewResponse> {
-    const response = await this.fetcher(
+    const fetcher = this.fetcher;
+    const response = await fetcher(
       `${this.baseUrl}/studio/v1/projects/${encodeURIComponent(project)}/reviews/${encodeURIComponent(revision)}${approval ? '/approvals' : ''}`,
       body === undefined
         ? {}
