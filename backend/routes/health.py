@@ -3,6 +3,7 @@
 import asyncio
 import os
 import signal
+import tempfile
 from pathlib import Path
 
 import torch
@@ -212,20 +213,19 @@ async def filesystem_health():
         writable = False
         error = None
         if exists:
-            probe = dir_path / ".voicebox_probe"
             try:
-                probe.write_text("ok")
-                probe.unlink()
+                # Each request owns a unique file, so it cannot overwrite a
+                # user's file or interfere with another health check.
+                with tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8", prefix=".voicebox_probe-", dir=dir_path
+                ) as probe:
+                    probe.write("ok")
+                    probe.flush()
                 writable = True
             except PermissionError:
                 error = "Permission denied"
             except OSError as e:
                 error = str(e)
-            finally:
-                try:
-                    probe.unlink(missing_ok=True)
-                except Exception:
-                    pass
         else:
             error = "Directory does not exist"
 
