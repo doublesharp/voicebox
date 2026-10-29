@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
 import { Slider } from '@/components/ui/slider';
 import { Toggle } from '@/components/ui/toggle';
+import { useToast } from '@/components/ui/use-toast';
 import { useGenerationSettings } from '@/lib/hooks/useSettings';
 import { usePlatform } from '@/platform/PlatformContext';
 import { useServerStore } from '@/stores/serverStore';
@@ -13,7 +14,15 @@ export function GenerationPage() {
   const { t } = useTranslation();
   const platform = usePlatform();
   const serverUrl = useServerStore((state) => state.serverUrl);
-  const { settings, update } = useGenerationSettings();
+  const { toast } = useToast();
+  const onSettingsError = useCallback(() => {
+    toast({
+      title: t('settings.generation.saveError.title'),
+      description: t('settings.generation.saveError.description'),
+      variant: 'destructive',
+    });
+  }, [t, toast]);
+  const { settings, update } = useGenerationSettings({ onError: onSettingsError });
   const persistedMaxChunkChars = settings?.max_chunk_chars ?? 800;
   const persistedCrossfadeMs = settings?.crossfade_ms ?? 50;
   const normalizeAudio = settings?.normalize_audio ?? true;
@@ -29,15 +38,26 @@ export function GenerationPage() {
   const [generationsPath, setGenerationsPath] = useState<string | null>(null);
 
   useEffect(() => {
-    fetch(`${serverUrl}/health/filesystem`)
-      .then((res) => res.json())
+    let active = true;
+    const controller = new AbortController();
+    setGenerationsPath(null);
+    if (!serverUrl) return () => { active = false; controller.abort(); };
+    fetch(`${serverUrl}/health/filesystem`, { signal: controller.signal })
+      .then((res) => {
+        if (!res.ok) throw new Error('Unable to load generations folder');
+        return res.json();
+      })
       .then((data) => {
         const genDir = data.directories?.find((d: { path: string }) =>
-          d.path.includes('generations'),
+          d.path.replace(/[\\/]+$/, '').split(/[\\/]/).pop()?.toLowerCase() === 'generations',
         );
-        if (genDir?.path) setGenerationsPath(genDir.path);
+        if (active && genDir?.path) setGenerationsPath(genDir.path);
       })
       .catch(() => {});
+    return () => {
+      active = false;
+      controller.abort();
+    };
   }, [serverUrl]);
 
   const openGenerationsFolder = useCallback(async () => {
