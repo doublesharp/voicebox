@@ -48,8 +48,11 @@ def build_server(cuda=False, rocm=False):
     #   1. Server core (~200-400MB) — versioned with the app
     #   2. GPU libs (~2GB) — versioned independently (only redownloaded on
     #      GPU toolkit / torch major version changes)
-    # CPU builds remain --onefile for simplicity.
-    pack_mode = "--onedir" if (cuda or rocm) else "--onefile"
+    # macOS also ships the default backend as a directory inside the app.
+    # Unpacking its ML libraries and data on every launch can exceed the
+    # native startup deadline under disk contention. Other CPU builds keep
+    # their existing single-file distribution.
+    pack_mode = "--onedir" if (cuda or rocm or platform.system() == "Darwin") else "--onefile"
     args = [
         "server.py",  # Use server.py as entry point instead of main.py
         pack_mode,
