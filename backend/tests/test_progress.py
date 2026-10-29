@@ -248,8 +248,7 @@ async def test_full_integration():
         print("✓ Test 4 PASSED\n")
         return True
     else:
-        print("✗ Test 4 FAILED - No events received\n")
-        return False
+        raise AssertionError("No progress events received")
 
 
 async def main():
