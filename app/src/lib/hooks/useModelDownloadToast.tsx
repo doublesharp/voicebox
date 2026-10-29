@@ -28,6 +28,7 @@ export function useModelDownloadToast({
 }: UseModelDownloadToastOptions) {
   const { toast } = useToast();
   const serverUrl = useServerStore((state) => state.serverUrl);
+  const serverRevision = useServerStore((state) => state.serverRevision);
   const toastIdRef = useRef<string | null>(null);
   // biome-ignore lint: Using any for toast update ref to handle complex toast types
   const toastUpdateRef = useRef<any>(null);
@@ -76,13 +77,17 @@ export function useModelDownloadToast({
     const eventSource = new EventSource(eventSourceUrl);
     let active = true;
     let finished = false;
+    const isCurrent = () => {
+      const current = useServerStore.getState();
+      return active && current.serverUrl === serverUrl && current.serverRevision === serverRevision;
+    };
 
     eventSource.onopen = () => {
       console.log('[useModelDownloadToast] EventSource connection opened for:', modelName);
     };
 
     eventSource.onmessage = (event) => {
-      if (!active) return;
+      if (!isCurrent()) return;
       console.log('[useModelDownloadToast] Received SSE message:', event.data);
       try {
         const progress = JSON.parse(event.data) as ModelProgress;
@@ -185,7 +190,7 @@ export function useModelDownloadToast({
     };
 
     eventSource.onerror = (error) => {
-      if (!active) return;
+      if (!isCurrent()) return;
       // EventSource reconnects automatically while it remains in CONNECTING state.
       if (eventSource.readyState !== EventSource.CLOSED) return;
       finished = true;
@@ -228,6 +233,7 @@ export function useModelDownloadToast({
   }, [
     enabled,
     serverUrl,
+    serverRevision,
     modelName,
     displayName,
     toast,

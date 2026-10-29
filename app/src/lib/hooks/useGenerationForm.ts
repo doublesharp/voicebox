@@ -12,6 +12,7 @@ import { useModelDownloadToast } from '@/lib/hooks/useModelDownloadToast';
 import { useGenerationSettings } from '@/lib/hooks/useSettings';
 import { useGenerationDraftStore } from '@/stores/generationDraftStore';
 import { useGenerationStore } from '@/stores/generationStore';
+import { useServerStore } from '@/stores/serverStore';
 import { useUIStore } from '@/stores/uiStore';
 
 const generationSchema = z.preprocess(
@@ -129,8 +130,23 @@ export function useGenerationForm(options: UseGenerationFormOptions = {}) {
 
     const draft = useGenerationDraftStore.getState();
     if (draft.submitting) return;
+    const { serverUrl, serverRevision } = useServerStore.getState();
+    const serverChanged = () => {
+      const current = useServerStore.getState();
+      return current.serverUrl !== serverUrl || current.serverRevision !== serverRevision;
+    };
+    const reportServerChange = (mayHaveStarted: boolean) => {
+      toast({
+        title: 'Server changed',
+        description: mayHaveStarted
+          ? 'Generation may continue on the previous server. Your draft was kept.'
+          : 'Generation was not started. Your draft was kept.',
+        variant: 'destructive',
+      });
+    };
     draft.setSubmitting(true);
     const textRevision = draft.textRevision;
+    let generationDispatched = false;
     try {
       // Capture all request inputs at submission, before the model status request.
       const effectsChain = options.getEffectsChain?.();
@@ -153,6 +169,10 @@ export function useGenerationForm(options: UseGenerationFormOptions = {}) {
       // Check if model needs downloading
       try {
         const modelStatus = await apiClient.getModelStatus();
+        if (serverChanged()) {
+          reportServerChange(false);
+          return;
+        }
         const model = modelStatus.models.find((m) => m.model_name === modelName);
 
         if (model && !model.downloaded) {
@@ -163,10 +183,16 @@ export function useGenerationForm(options: UseGenerationFormOptions = {}) {
         console.error('Failed to check model status:', error);
       }
 
+      if (serverChanged()) {
+        reportServerChange(false);
+        return;
+      }
+
       const hasModelSizes =
         engine === 'qwen' || engine === 'qwen_custom_voice' || engine === 'tada';
       const supportsInstruct = engineSupportsInstruct(engine);
       // This now returns immediately with status="generating"
+      generationDispatched = true;
       const result = await generation.mutateAsync({
         profile_id: selectedProfileId,
         text: data.text,
@@ -186,12 +212,21 @@ export function useGenerationForm(options: UseGenerationFormOptions = {}) {
         chatterbox_exaggeration: engine === 'chatterbox' ? data.chatterboxExaggeration : undefined,
       });
 
+      if (serverChanged()) {
+        reportServerChange(true);
+        return;
+      }
+
       // Track this generation for SSE status updates
       addPendingGeneration(result.id);
 
       useGenerationDraftStore.getState().clearSubmittedText(textRevision, data.text);
       options.onSuccess?.(result.id);
     } catch (error) {
+      if (serverChanged()) {
+        reportServerChange(generationDispatched);
+        return;
+      }
       toast({
         title: 'Generation failed',
         description: error instanceof Error ? error.message : 'Failed to generate audio',

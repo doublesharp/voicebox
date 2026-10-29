@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeEach, expect, mock, test } from 'bun:test';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
+import { create as createStore } from 'zustand';
 
 const originalEventSource = Object.getOwnPropertyDescriptor(globalThis, 'EventSource');
 const sources: FakeEventSource[] = [];
@@ -24,9 +25,8 @@ const toast = mock((_value: unknown) => ({ id: 'toast', update, dismiss }));
 const complete = mock(() => {});
 const failed = mock((_error: string) => {});
 mock.module('../src/components/ui/use-toast', () => ({ useToast: () => ({ toast }) }));
-mock.module('../src/stores/serverStore', () => ({
-  useServerStore: (selector: any) => selector({ serverUrl: 'http://localhost:17493' }),
-}));
+const useServerStore = createStore(() => ({ serverUrl: 'http://localhost:17493', serverRevision: 0 }));
+mock.module('../src/stores/serverStore', () => ({ useServerStore }));
 mock.module('../src/components/ui/progress', () => ({ Progress: () => null }));
 const { useModelDownloadToast } = await import('../src/lib/hooks/useModelDownloadToast');
 let view: ReactTestRenderer | undefined;
@@ -48,6 +48,7 @@ function Probe({
   return null;
 }
 beforeEach(() => {
+  useServerStore.setState({ serverUrl: 'http://localhost:17493', serverRevision: 0 });
   sources.length = 0;
   update.mockClear();
   toast.mockClear();
@@ -154,4 +155,38 @@ test('completed notifications remain visible after the subscription ends', () =>
   act(() => view?.unmount());
   view = undefined;
   expect(dismiss).not.toHaveBeenCalled();
+});
+
+
+test('queued old-server events cannot complete or fail the new server download', () => {
+  act(() => { view = create(<Probe />); });
+  const old = sources[0];
+  act(() => {
+    useServerStore.setState({ serverUrl: 'http://server-b', serverRevision: 1 });
+    old.send(event('complete'));
+    old.readyState = FakeEventSource.CLOSED;
+    old.onerror?.(new Error('old server disconnected'));
+  });
+  expect(complete).not.toHaveBeenCalled();
+  expect(failed).not.toHaveBeenCalled();
+  expect(update).not.toHaveBeenCalled();
+  expect(old.close).toHaveBeenCalled();
+  expect(sources[1].url).toContain('http://server-b/');
+  act(() => sources[1].send(event('complete')));
+  expect(complete).toHaveBeenCalledTimes(1);
+});
+
+test('switching away and back replaces a same-url stream and ignores its queued events', () => {
+  act(() => { view = create(<Probe />); });
+  const old = sources[0];
+  act(() => {
+    useServerStore.setState({ serverUrl: 'http://server-b', serverRevision: 1 });
+    useServerStore.setState({ serverUrl: 'http://localhost:17493', serverRevision: 2 });
+    old.send({ ...event('error'), error: 'old failure' });
+  });
+  expect(failed).not.toHaveBeenCalled();
+  expect(old.close).toHaveBeenCalled();
+  expect(sources).toHaveLength(2);
+  act(() => sources[1].send(event('complete')));
+  expect(complete).toHaveBeenCalledTimes(1);
 });

@@ -7,6 +7,7 @@ import { useGenerationSettings } from '@/lib/hooks/useSettings';
 import { condenseError } from '@/lib/utils/errorText';
 import { useGenerationStore } from '@/stores/generationStore';
 import { usePlayerStore } from '@/stores/playerStore';
+import { useServerStore } from '@/stores/serverStore';
 
 interface GenerationStatusEvent {
   id: string;
@@ -29,6 +30,8 @@ export function useGenerationProgress() {
   const queryClient = useQueryClient();
   const { toast } = useToast();
   const pendingIds = useGenerationStore((s) => s.pendingGenerationIds);
+  const serverUrl = useServerStore((s) => s.serverUrl);
+  const serverRevision = useServerStore((s) => s.serverRevision);
   const removePendingGeneration = useGenerationStore((s) => s.removePendingGeneration);
   const removePendingStoryAdd = useGenerationStore((s) => s.removePendingStoryAdd);
   const isPlaying = usePlayerStore((s) => s.isPlaying);
@@ -45,7 +48,7 @@ export function useGenerationProgress() {
   // Track active EventSource instances
   const eventSourcesRef = useRef<Map<string, EventSource>>(new Map());
 
-  // Unmount-only cleanup — close all SSE connections when the hook is torn down
+  // Close old-server subscriptions before opening streams for the new server.
   useEffect(() => {
     const sources = eventSourcesRef.current;
     return () => {
@@ -54,7 +57,7 @@ export function useGenerationProgress() {
       }
       sources.clear();
     };
-  }, []);
+  }, [serverUrl, serverRevision]);
 
   useEffect(() => {
     const currentSources = eventSourcesRef.current;
@@ -76,7 +79,11 @@ export function useGenerationProgress() {
 
       source.onmessage = (event) => {
         // Ignore queued callbacks from a connection that has been replaced or closed.
-        if (currentSources.get(id) !== source) return;
+        if (
+          currentSources.get(id) !== source ||
+          useServerStore.getState().serverUrl !== serverUrl ||
+          useServerStore.getState().serverRevision !== serverRevision
+        ) return;
         try {
           const data: GenerationStatusEvent = JSON.parse(event.data);
 
@@ -178,7 +185,11 @@ export function useGenerationProgress() {
       };
 
       source.onerror = () => {
-        if (currentSources.get(id) !== source) return;
+        if (
+          currentSources.get(id) !== source ||
+          useServerStore.getState().serverUrl !== serverUrl ||
+          useServerStore.getState().serverRevision !== serverRevision
+        ) return;
         // EventSource reconnects automatically after a transient interruption.
         // Keep pending story additions until it completes or closes permanently.
         if (source.readyState !== EventSource.CLOSED) return;
@@ -194,6 +205,8 @@ export function useGenerationProgress() {
     }
   }, [
     pendingIds,
+    serverUrl,
+    serverRevision,
     removePendingGeneration,
     removePendingStoryAdd,
     queryClient,

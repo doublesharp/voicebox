@@ -142,10 +142,15 @@ export function ModelManagement() {
   const queryClient = useQueryClient();
   const platform = usePlatform();
   const serverUrl = useServerStore((state) => state.serverUrl);
-  const serverIdentity = useRef({ url: serverUrl, revision: 0 });
-  if (serverIdentity.current.url !== serverUrl) {
-    serverIdentity.current = { url: serverUrl, revision: serverIdentity.current.revision + 1 };
-  }
+  const serverRevision = useServerStore((state) => state.serverRevision);
+  const currentServer = () => {
+    const { serverUrl: url, serverRevision: revision } = useServerStore.getState();
+    return { url, revision };
+  };
+  const isCurrentServer = (server: { url: string; revision: number }) => {
+    const current = currentServer();
+    return current.url === server.url && current.revision === server.revision;
+  };
   const customModelsDir = useServerStore((state) => state.customModelsDir);
   const setCustomModelsDir = useServerStore((state) => state.setCustomModelsDir);
   const [migrating, setMigrating] = useState(false);
@@ -290,11 +295,11 @@ export function ModelManagement() {
     modelRevisions.current.clear();
     nextDownloadRequest.current = 0;
     latestSuccessfulDownload.current = 0;
-  }, [serverUrl]);
+  }, [serverUrl, serverRevision]);
 
   const handleDownload = async (modelName: string) => {
     const request = ++nextDownloadRequest.current;
-    const serverRevision = serverIdentity.current.revision;
+    const server = currentServer();
     setDismissedErrors((prev) => {
       const next = new Set(prev);
       next.delete(modelName);
@@ -306,7 +311,7 @@ export function ModelManagement() {
 
     try {
       await apiClient.triggerModelDownload(modelName);
-      if (serverIdentity.current.revision !== serverRevision) return;
+      if (!isCurrentServer(server)) return;
       modelRevisions.current.set(modelName, (modelRevisions.current.get(modelName) ?? 0) + 1);
 
       setLocalErrors((prev) => {
@@ -323,7 +328,7 @@ export function ModelManagement() {
       queryClient.invalidateQueries({ queryKey: ['modelStatus'] });
       queryClient.invalidateQueries({ queryKey: ['activeTasks'] });
     } catch (error) {
-      if (serverIdentity.current.revision !== serverRevision) return;
+      if (!isCurrentServer(server)) return;
       // A failed start must not detach a different download already tracked.
       toast({
         title: t('models.toast.downloadFailed'),
@@ -342,7 +347,7 @@ export function ModelManagement() {
   });
 
   const handleCancel = (modelName: string) => {
-    const serverRevision = serverIdentity.current.revision;
+    const server = currentServer();
     const revision = (modelRevisions.current.get(modelName) ?? 0) + 1;
     modelRevisions.current.set(modelName, revision);
     const prevDismissed = dismissedErrors;
@@ -363,7 +368,7 @@ export function ModelManagement() {
 
     cancelMutation.mutate(modelName, {
       onError: () => {
-        if (serverIdentity.current.revision !== serverRevision) return;
+        if (!isCurrentServer(server)) return;
         if (modelRevisions.current.get(modelName) === revision) {
           setDismissedErrors((current) => {
             const next = new Set(current);
@@ -395,12 +400,12 @@ export function ModelManagement() {
   const clearAllMutation = useMutation({
     mutationFn: () => apiClient.clearAllTasks(),
     onMutate: () => ({
-      serverRevision: serverIdentity.current.revision,
+      server: currentServer(),
       modelRevisions: new Map(modelRevisions.current),
       latestSuccessfulDownload: latestSuccessfulDownload.current,
     }),
     onSuccess: async (_data, _variables, context) => {
-      if (!context || serverIdentity.current.revision !== context.serverRevision) return;
+      if (!context || !isCurrentServer(context.server)) return;
       const changedSinceClear = (name: string) =>
         modelRevisions.current.get(name) !== context.modelRevisions.get(name);
       setDismissedErrors((current) => new Set([...current].filter(changedSinceClear)));

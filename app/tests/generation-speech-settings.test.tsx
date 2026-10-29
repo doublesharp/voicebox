@@ -4,6 +4,13 @@ import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 
 const requests: Record<string, unknown>[] = [];
 let modelStatus: Promise<{ models: never[] }> | undefined;
+let generationResult: Promise<{ id: string }> | undefined;
+let serverUrl = 'http://server-a';
+let serverRevision = 0;
+const pendingIds: string[] = [];
+const toasts: any[] = [];
+const serverStore = Object.assign((selector: any) => selector({ serverUrl, serverRevision }), { getState: () => ({ serverUrl, serverRevision }) });
+mock.module('../src/stores/serverStore', () => ({ useServerStore: serverStore }));
 mock.module('../src/lib/api/client', () => ({
   apiClient: { getModelStatus: async () => modelStatus ?? { models: [] } },
 }));
@@ -12,7 +19,7 @@ mock.module('../src/lib/hooks/useGeneration', () => ({
     isPending: false,
     mutateAsync: async (request: Record<string, unknown>) => {
       requests.push(JSON.parse(JSON.stringify(request)));
-      return { id: `generation-${requests.length}` };
+      return generationResult ?? { id: `generation-${requests.length}` };
     },
   }),
 }));
@@ -20,7 +27,7 @@ mock.module('../src/lib/hooks/useSettings', () => ({
   useGenerationSettings: () => ({ settings: {} }),
 }));
 mock.module('../src/lib/hooks/useModelDownloadToast', () => ({ useModelDownloadToast() {} }));
-mock.module('../src/components/ui/use-toast', () => ({ useToast: () => ({ toast() {} }) }));
+mock.module('../src/components/ui/use-toast', () => ({ useToast: () => ({ toast(value: unknown) { toasts.push(value); } }) }));
 mock.module('../src/stores/uiStore', () => ({
   useUIStore: (selector: (state: { selectedEngine: string }) => unknown) =>
     selector({ selectedEngine: 'chatterbox' }),
@@ -28,7 +35,7 @@ mock.module('../src/stores/uiStore', () => ({
 mock.module('../src/stores/generationStore', () => ({
   useGenerationStore: (
     selector: (state: { addPendingGeneration: (id: string) => void }) => unknown,
-  ) => selector({ addPendingGeneration() {} }),
+  ) => selector({ addPendingGeneration(id: string) { pendingIds.push(id); } }),
 }));
 mock.module('../src/components/ui/popover', () => ({
   Popover: ({ children }: { children: ReactNode }) => <>{children}</>,
@@ -61,6 +68,11 @@ afterEach(() => {
   act(() => renderer?.unmount());
   requests.length = 0;
   modelStatus = undefined;
+  generationResult = undefined;
+  serverUrl = 'http://server-a';
+  serverRevision = 0;
+  pendingIds.length = 0;
+  toasts.length = 0;
   useGenerationDraftStore.setState({
     values: null,
     textRevision: 0,
@@ -308,4 +320,53 @@ test('Relaxed and variation controls change the take without silently overriding
   expect(form.form.getValues('speed')).toBe(1);
   expect(form.form.getValues('chatterboxTemperature')).toBeUndefined();
   expect(form.form.getValues('chatterboxCfgWeight')).toBeUndefined();
+});
+
+
+test('server change during model status check cannot submit to the new server', async () => {
+  let release!: (value: { models: never[] }) => void;
+  modelStatus = new Promise((resolve) => { release = resolve; });
+  mount();
+  act(() => form.form.setValue('text', 'Keep this draft'));
+  let submission!: Promise<void>;
+  act(() => { submission = form.handleSubmit(form.form.getValues(), 'voice-a'); });
+  serverUrl = 'http://server-b';
+  serverRevision++;
+  await act(async () => { release({ models: [] }); await submission; });
+  expect(requests).toHaveLength(0);
+  expect(pendingIds).toEqual([]);
+  expect(form.form.getValues('text')).toBe('Keep this draft');
+  expect(toasts.at(-1)?.title).toBe('Server changed');
+});
+
+test('late generation acceptance from a previous server preserves the draft and is not tracked on the new server', async () => {
+  let release!: (value: { id: string }) => void;
+  generationResult = new Promise((resolve) => { release = resolve; });
+  mount();
+  act(() => form.form.setValue('text', 'Keep this draft'));
+  let submission!: Promise<void>;
+  await act(async () => { submission = form.handleSubmit(form.form.getValues(), 'voice-a'); await Promise.resolve(); });
+  expect(requests).toHaveLength(1);
+  serverUrl = 'http://server-b';
+  serverRevision++;
+  await act(async () => { release({ id: 'old-generation' }); await submission; });
+  expect(pendingIds).toEqual([]);
+  expect(form.form.getValues('text')).toBe('Keep this draft');
+  expect(toasts.at(-1)?.title).toBe('Server changed');
+});
+
+
+test('switching away and back during model lookup does not resume the old submission', async () => {
+  let release!: (value: { models: never[] }) => void;
+  modelStatus = new Promise((resolve) => { release = resolve; });
+  mount();
+  act(() => form.form.setValue('text', 'Keep this draft'));
+  let submission!: Promise<void>;
+  act(() => { submission = form.handleSubmit(form.form.getValues(), 'voice-a'); });
+  serverUrl = 'http://server-b'; serverRevision++;
+  serverUrl = 'http://server-a'; serverRevision++;
+  await act(async () => { release({ models: [] }); await submission; });
+  expect(requests).toHaveLength(0);
+  expect(form.form.getValues('text')).toBe('Keep this draft');
+  expect(toasts.at(-1)?.description).toContain('not started');
 });

@@ -1,9 +1,11 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { queryClient } from '@/lib/queryClient';
+import { useGenerationStore } from '@/stores/generationStore';
 
 interface ServerStore {
   serverUrl: string;
+  serverRevision: number;
   serverUrlSource: 'auto' | 'custom';
   setServerUrl: (url: string) => void;
   setDiscoveredServerUrl: (url: string) => void;
@@ -26,6 +28,13 @@ interface ServerStore {
  * server is not shown. Called when the server URL changes.
  */
 function invalidateAllServerData() {
+  // Task IDs and deferred story associations belong to the previous server.
+  useGenerationStore.setState({
+    pendingGenerationIds: new Set(),
+    pendingStoryAdds: new Map(),
+    activeGenerationId: null,
+    isGenerating: false,
+  });
   queryClient.invalidateQueries();
 }
 
@@ -48,10 +57,15 @@ export const useServerStore = create<ServerStore>()(
   persist(
     (set, get) => ({
       serverUrl: getDefaultServerUrl(),
+      serverRevision: 0,
       serverUrlSource: 'auto',
       setServerUrl: (url) => {
         const prev = get().serverUrl;
-        set({ serverUrl: url, serverUrlSource: 'custom' });
+        set((state) => ({
+          serverUrl: url,
+          serverUrlSource: 'custom',
+          serverRevision: state.serverRevision + (url !== prev ? 1 : 0),
+        }));
         if (url !== prev) {
           invalidateAllServerData();
         }
@@ -61,7 +75,10 @@ export const useServerStore = create<ServerStore>()(
         // Read the latest selection: a user may save while startup is pending.
         if (get().serverUrlSource === 'custom') return;
         const prev = get().serverUrl;
-        set({ serverUrl: url });
+        set((state) => ({
+          serverUrl: url,
+          serverRevision: state.serverRevision + (url !== prev ? 1 : 0),
+        }));
         if (url !== prev) {
           invalidateAllServerData();
         }

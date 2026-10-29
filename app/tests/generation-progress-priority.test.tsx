@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeEach, expect, mock, test } from 'bun:test';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { useGenerationStore } from '../src/stores/generationStore';
 import { usePlayerStore } from '../src/stores/playerStore';
+import { useServerStore } from '../src/stores/serverStore';
 
 const refetch = mock(async () => {});
 const invalidate = mock(async () => {});
@@ -54,6 +55,7 @@ function Probe() {
 let view: ReactTestRenderer | undefined;
 beforeEach(() => {
   FakeEventSource.instances = [];
+  useServerStore.setState({ serverUrl: 'http://server-a' });
   refetch.mockClear();
   invalidate.mockClear();
   toast.mockClear();
@@ -194,4 +196,32 @@ test('a stale connection error cannot cancel a newer pending generation', async 
   await act(async () => source.onerror?.());
   expect(useGenerationStore.getState().pendingGenerationIds.has('new')).toBe(true);
   expect(refetch).not.toHaveBeenCalled();
+});
+
+
+test('switching servers replaces same-id generation streams and ignores the old server', async () => {
+  const old = await start('same-id');
+  act(() => useServerStore.setState({ serverUrl: 'http://server-b' }));
+  const current = FakeEventSource.instances.at(-1)!;
+  expect(old.closed).toBe(true);
+  expect(current).not.toBe(old);
+  await act(async () => old.emit({ id: 'same-id', status: 'completed' }));
+  expect(useGenerationStore.getState().pendingGenerationIds.has('same-id')).toBe(true);
+  expect(usePlayerStore.getState().audioId).toBeNull();
+  await act(async () => current.emit({ id: 'same-id', status: 'completed' }));
+  expect(usePlayerStore.getState().audioId).toBe('same-id');
+});
+
+
+test('queued old-server callbacks are ignored even before effects clean up', async () => {
+  const old = await start('same-id', 'story');
+  act(() => {
+    useServerStore.setState({ serverUrl: 'http://server-b' });
+    old.emit({ id: 'same-id', status: 'completed' });
+    old.onerror?.();
+  });
+  expect(usePlayerStore.getState().audioId).toBeNull();
+  expect(addStory).not.toHaveBeenCalled();
+  expect(useGenerationStore.getState().pendingGenerationIds.has('same-id')).toBe(true);
+  expect(useGenerationStore.getState().pendingStoryAdds.get('same-id')).toBe('story');
 });
