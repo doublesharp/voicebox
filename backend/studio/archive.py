@@ -195,6 +195,8 @@ def _validate_project(project, assets):
         _string(take.get("created_at"), "take date")
         if not isinstance(take.get("request", {}), dict):
             raise ValueError("invalid take request")
+        if "passage" in take.get("request", {}) and not isinstance(take["request"]["passage"], dict):
+            raise ValueError("invalid frozen passage snapshot")
     documents = [project["document"]]
     revisions = _records(project.get("revisions", []), "revision")
     from .review_schema import validate_reviews
@@ -392,8 +394,15 @@ def read_archive(archive_path, destination, *, max_total_bytes=1073741824, max_f
                 raise ValueError("invalid asset entries")
             missing = {asset["id"] for asset in assets if asset["archive_path"] not in names}
             if missing:
+                import copy
+
+                from .voice_identity import rekey_portable_tracks
+
+                original = copy.deepcopy(manifest["project"])
+                original_assets = assets
                 mark_missing_references(manifest["project"], missing)
                 assets = [asset for asset in assets if asset["id"] not in missing]
+                rekey_portable_tracks(original, manifest["project"], original_assets, assets)
                 ids = _metadata(assets)
                 _validate_project(manifest["project"], ids)
                 paths = [asset["archive_path"] for asset in assets]

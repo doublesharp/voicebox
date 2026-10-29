@@ -64,11 +64,13 @@ def make_router(store, jobs=None):
     from .waveforms import make_waveform_router
     from .audition import make_audition_router
     from .reviews import make_review_router
+    from .cleanup import make_cleanup_router
 
     router.include_router(make_preview_router(store))
     router.include_router(make_waveform_router(store))
     router.include_router(make_audition_router(store))
     router.include_router(make_review_router(store))
+    router.include_router(make_cleanup_router(store))
     jobs = jobs or StudioJobs(store)
 
     def get_delivery():

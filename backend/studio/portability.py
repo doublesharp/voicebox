@@ -110,6 +110,16 @@ def import_archive(store, archive_path):
                 for key in ("clip_id", "take_id"):
                     recording[key] = ref(recording[key])
         imported["reviews"] = remap_reviews(project, mapping)
+        from .voice_identity import rekey_portable_tracks
+
+        rekey_portable_tracks(
+            project,
+            imported,
+            assets,
+            [{**asset, "id": mapping[asset["id"]]} for asset in assets],
+            mapping,
+            bind_unkeyed=True,
+        )
         project_id = imported["id"]
         stamp = now()
         with store.connect() as db:

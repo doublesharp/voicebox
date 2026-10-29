@@ -257,7 +257,9 @@ def test_v3_upgrade_preserves_old_operation_replay_and_verified_snapshot(tmp_pat
     upgraded = StudioStore(store.root)
     assert upgraded.command(project["id"], "old-operation", 0, "update_project", {"name": "Renamed"}) == committed
     with upgraded.connect() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 4
+        from backend.studio.migrations import CURRENT_VERSION
+
+        assert db.execute("PRAGMA user_version").fetchone()[0] == CURRENT_VERSION
     backup = next((store.root / "backups").glob("studio-v3-*.sqlite"))
     with sqlite3.connect(backup) as db:
         assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"

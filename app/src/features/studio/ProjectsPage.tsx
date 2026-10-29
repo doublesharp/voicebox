@@ -14,6 +14,7 @@ import { Textarea } from '@/components/ui/textarea';
 import { useServerStore } from '@/stores/serverStore';
 import { type LegacyStory, StudioClient } from './client';
 import { splitScript } from './domain';
+import { StorageCleanupDialog } from './StorageCleanupDialog';
 import { errorMessage } from './session';
 import type { StudioProject, StudioProjectSummary } from './types';
 import { EmptyState, Field, StudioButton } from './ui';
@@ -228,6 +229,7 @@ export function ProjectsPage() {
         <StudioButton onClick={() => archiveInput.current?.click()} disabled={busy}>
           <FileArchive size={15} /> Import archive
         </StudioButton>
+        <StorageCleanupDialog key={client.baseUrl} baseUrl={client.baseUrl} projects={projects} />
         <Dialog open={storyOpen} onOpenChange={setStoryOpen}>
           <DialogTrigger asChild>
             <button type="button" className="studio-quiet">
