@@ -99,3 +99,20 @@ def test_ffmpeg_only_source_uses_bounded_peak_decode(waveform_client):
     assert 3 < data["frames"] / data["sample_rate"] < 5
     assert len(data["peaks"]) == 32
     assert all(np.isfinite(pair).all() for pair in data["peaks"])
+
+
+def test_waveform_decoder_uses_desktop_ffmpeg_location_with_minimal_path(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from backend.utils import waveforms
+    from backend.utils.ffmpeg import find_ffmpeg
+
+    executable = find_ffmpeg()
+    if executable is None:
+        pytest.skip("ffmpeg is not installed")
+    source = tmp_path / "desktop.wav"
+    sf.write(source, np.zeros(80, dtype=np.float32), 8000)
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.setenv("VOICEBOX_FFMPEG_DIR", str(Path(executable).parent))
+    blocks = list(waveforms._decoded_blocks(source))
+    assert sum(len(block) for block in blocks) == 240
