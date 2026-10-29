@@ -17,7 +17,6 @@ import json
 import logging
 import os
 import sys
-import tarfile
 from pathlib import Path
 from typing import Optional
 
@@ -25,6 +24,7 @@ from .. import __version__
 from ..config import get_data_dir
 from ..utils.platform_detect import SUPPORTED_GPU_ASSET_PLATFORMS, server_asset_platform
 from ..utils.progress import get_progress_manager
+from ..utils.release_archive import extract_release_archive
 
 logger = logging.getLogger(__name__)
 
@@ -243,7 +243,7 @@ async def _download_and_extract_archive(
                 )
             logger.info(f"{label}: integrity verified")
 
-        # Extract (use data filter for path traversal protection on Python 3.12+)
+        # Stage and validate before changing the installed backend.
         progress.update_progress(
             PROGRESS_KEY,
             current=progress_offset + downloaded,
@@ -251,11 +251,7 @@ async def _download_and_extract_archive(
             filename=f"Extracting {label}...",
             status="downloading",
         )
-        with tarfile.open(temp_path, "r:gz") as tar:
-            if sys.version_info >= (3, 12):
-                tar.extractall(path=dest_dir, filter="data")
-            else:
-                tar.extractall(path=dest_dir)
+        extract_release_archive(temp_path, dest_dir)
 
         logger.info(f"{label}: extracted to {dest_dir}")
     finally:
