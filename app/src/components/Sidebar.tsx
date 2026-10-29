@@ -6,6 +6,7 @@ import {
   FolderOpen,
   type LucideIcon,
   Mic,
+  Keyboard,
   Settings,
   Volume2,
   Wand2,
@@ -100,6 +101,18 @@ export function Sidebar({ isMacOS }: SidebarProps) {
         </div>
       </nav>
       <div className="mt-auto px-2 flex flex-col gap-2">
+        <Hint content="Keyboard shortcuts · Command or Control + /">
+          <button
+            type="button"
+            className="app-rail-link"
+            aria-label="Keyboard shortcuts"
+            aria-keyshortcuts="Meta+/ Control+/"
+            onClick={() => window.dispatchEvent(new Event('voicebox:keyboard-shortcuts'))}
+          >
+            <Keyboard className="h-5 w-5 shrink-0" aria-hidden="true" />
+            <span className="app-rail-label">Shortcuts</span>
+          </button>
+        </Hint>
         {item(settings)}
         <div className="flex flex-col items-center gap-1.5">
           <span className="text-[10px] text-muted-foreground/50">v{version}</span>

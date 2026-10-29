@@ -11,6 +11,7 @@ import { engineForPassage } from './domain';
 import { operationId } from './session';
 import { useDurableSubmission } from './submissions';
 import { TakeWorkflow } from './TakeWorkflow';
+import { PronunciationPanel } from './PronunciationPanel';
 import { Field, NumberField, StudioButton } from './ui';
 
 export function Director() {
@@ -434,6 +435,11 @@ export function Director() {
             : 'Keeps your current selected takes.'}
         </p>
       </div>
+      <PronunciationPanel
+        key={`pronunciation:${passage.id}`}
+        passage={passage}
+        currentText={currentText}
+      />
       <TakeWorkflow key={passage.id} passage={passage} currentText={currentText} />
     </div>
   );

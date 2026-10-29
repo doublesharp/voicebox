@@ -4,10 +4,14 @@ export interface ShortcutEvent {
   ctrlKey?: boolean;
   shiftKey?: boolean;
   altKey?: boolean;
+  repeat?: boolean;
+  isComposing?: boolean;
+  defaultPrevented?: boolean;
   target?: unknown;
 }
 export type StudioShortcut =
   | 'palette'
+  | 'save'
   | 'transport'
   | 'undo'
   | 'redo'
@@ -15,6 +19,7 @@ export type StudioShortcut =
   | 'duplicate'
   | 'delete';
 export function studioShortcut(event: ShortcutEvent, timeline: boolean): StudioShortcut | null {
+  if (event.repeat || event.isComposing || event.defaultPrevented) return null;
   const target = event.target as {
     tagName?: string;
     isContentEditable?: boolean;
@@ -29,6 +34,13 @@ export function studioShortcut(event: ShortcutEvent, timeline: boolean): StudioS
       ));
   const modifier = event.metaKey || event.ctrlKey;
   const key = event.key.toLowerCase();
+  if (
+    target?.closest?.(
+      '[role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"], [data-shortcut-capture]',
+    )
+  )
+    return null;
+  if (modifier && key === 's' && !event.altKey && !event.shiftKey) return 'save';
   if (
     modifier &&
     key === 'k' &&

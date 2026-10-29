@@ -52,6 +52,7 @@ class Generate(BaseModel):
     count: int = Field(ge=1, le=3)
     adopt: bool
     commercial_only: bool = False
+    phrase_text: str | None = Field(default=None, min_length=1, max_length=1000)
 
 
 class StoryImport(BaseModel):
@@ -65,12 +66,14 @@ def make_router(store, jobs=None):
     from .audition import make_audition_router
     from .reviews import make_review_router
     from .cleanup import make_cleanup_router
+    from .captions import make_caption_router
 
     router.include_router(make_preview_router(store))
     router.include_router(make_waveform_router(store))
     router.include_router(make_audition_router(store))
     router.include_router(make_review_router(store))
     router.include_router(make_cleanup_router(store))
+    router.include_router(make_caption_router(store))
     jobs = jobs or StudioJobs(store)
 
     def get_delivery():
@@ -124,6 +127,7 @@ def make_router(store, jobs=None):
             "jobs": call(
                 jobs.submit, project_id, body.idempotency_key, body.passage_ids, body.count, body.adopt,
                 commercial_only=body.commercial_only,
+                phrase_text=body.phrase_text,
             )
         }
 

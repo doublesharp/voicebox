@@ -2,6 +2,7 @@ import { Link, useBlocker, useNavigate, useParams } from '@tanstack/react-router
 import {
   ChevronDown,
   ChevronLeft,
+  Captions,
   Command,
   Headphones,
   LayoutPanelLeft,
@@ -41,6 +42,7 @@ import { AudioMeters } from './AudioMeters';
 import { StudioClient, type StudioProfile } from './client';
 import { StudioContext } from './context';
 import { Deliver } from './Deliver';
+import { CaptionsPanel } from './CaptionsPanel';
 import { Director } from './Director';
 import { clipFrames, formatTime, isJobActive, timelineEnd, toSamples } from './domain';
 import { studioShortcut } from './keyboard';
@@ -119,6 +121,7 @@ function ProjectWorkspace({
   const [revisionId, setRevisionId] = useState('');
   const [checkpointName, setCheckpointName] = useState('');
   const [checkpointOpen, setCheckpointOpen] = useState(false);
+  const [captionsOpen, setCaptionsOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [actionBusy, setActionBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -295,6 +298,7 @@ function ProjectWorkspace({
         setPaletteOpen(true);
       }
       if (action === 'transport') toggleTransport();
+      if (action === 'save') void session.flush();
       if (action === 'undo' || action === 'redo') void session.command(action);
       const clip = session
         .getSnapshot()
@@ -629,6 +633,27 @@ function ProjectWorkspace({
             A checkpoint is a saved, unchangeable version you can review, restore or deliver.
           </HelpButton>
           <div className="studio-action-row">
+            <Dialog open={captionsOpen} onOpenChange={setCaptionsOpen}>
+              <DialogTrigger asChild>
+                <button
+                  type="button"
+                  className="studio-quiet"
+                  aria-label="Open captions and video timing"
+                >
+                  <Captions size={16} /> Captions &amp; video
+                </button>
+              </DialogTrigger>
+              <DialogContent className="studio studio-modal studio-caption-modal">
+                <DialogHeader>
+                  <DialogTitle>Captions &amp; video timing</DialogTitle>
+                  <DialogDescription>
+                    Preview a reference video, set scene targets, and review captions against the
+                    final arrangement.
+                  </DialogDescription>
+                </DialogHeader>
+                <CaptionsPanel />
+              </DialogContent>
+            </Dialog>
             <button
               type="button"
               className="studio-icon-button studio-outline-toggle"

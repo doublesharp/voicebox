@@ -6,6 +6,7 @@ import json
 from ..utils.inference import serialized_inference
 from .capabilities import freeze_passage, resolve_voice
 from .job_state import enrich_job, phase, start_attempt
+from .pronunciation import spoken_text, validate_rules
 from .storage import Conflict, NotFound, encode, now, uid
 
 
@@ -20,7 +21,7 @@ class StudioJobs:
             enqueue = enqueue_generation
         self.enqueue = enqueue
 
-    def submit(self, project_id, key, passage_ids, count, adopt, commercial_only=False):
+    def submit(self, project_id, key, passage_ids, count, adopt, commercial_only=False, phrase_text=None):
         if (
             not isinstance(key, str)
             or not key.strip()
@@ -33,10 +34,21 @@ class StudioJobs:
             or type(commercial_only) is not bool
         ):
             raise ValueError("Invalid generation request")
+        if phrase_text is not None and (
+            not isinstance(phrase_text, str)
+            or not phrase_text.strip()
+            or len(phrase_text) > 1000
+            or len(passage_ids) != 1
+            or count != 1
+            or adopt
+        ):
+            raise ValueError("A phrase repair requires 1–1000 characters, one passage, one take and adopt=false")
         request = dict(passage_ids=passage_ids, count=count, adopt=adopt)
         # Keep the pre-policy default request identity replay-compatible.
         if commercial_only:
             request["commercial_only"] = True
+        if phrase_text is not None:
+            request["phrase_text"] = phrase_text
         scheduled = []
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -46,6 +58,7 @@ class StudioJobs:
                     raise Conflict("idempotency key already used with different input")
                 return json.loads(old["response"])
             project = self.store._project(db, project_id)
+            rules = validate_rules(project["document"].get("pronunciation_rules", []))
             passages = {p["id"]: p for p in project["document"]["passages"]}
             for ident in passage_ids:
                 p = passages.get(ident)
@@ -53,16 +66,29 @@ class StudioJobs:
                     raise NotFound("Passage not found in project")
                 if p["locked"]:
                     raise ValueError("Passage is locked")
-                caps, effective = freeze_passage(p, self.capability_resolver)
+                original_text = p["text"]
+                p = copy.deepcopy(p)
+                if phrase_text is not None:
+                    p["text"] = phrase_text
+                spoken = spoken_text(p["text"], rules, p.get("profile_id"))
+                caps, effective = freeze_passage({**p, "text": spoken}, self.capability_resolver)
                 if commercial_only and caps.get("commercial_use") != "allowed":
                     raise ValueError(f"Passage {ident}: model is not eligible for commercial-only generation")
-                p = copy.deepcopy(p)
                 if p.get("voice_snapshot") is not None:
                     p["voice_snapshot"]["capabilities"] = caps
                 for _ in range(count):
                     job_id = uid()
                     timestamp = now()
-                    frozen = dict(passage=p, adopt=adopt, capabilities=caps, effective_direction=effective)
+                    frozen = dict(
+                        passage=p,
+                        adopt=adopt,
+                        capabilities=caps,
+                        effective_direction=effective,
+                        spoken_text=spoken,
+                        pronunciation_rules=rules,
+                    )
+                    if phrase_text is not None:
+                        frozen["phrase_repair"] = {"source_text": original_text, "source_passage_id": ident}
                     if commercial_only:
                         frozen["commercial_only"] = True
                     db.execute(
@@ -337,7 +363,7 @@ async def synthesize(request, store, set_phase=None):
         set_phase("generating")
     return await generate_chunked(
         model,
-        p["text"],
+        request.get("spoken_text", p["text"]),
         prompt,
         language=p["language"],
         seed=d["seed"],

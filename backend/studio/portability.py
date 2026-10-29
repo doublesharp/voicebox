@@ -86,6 +86,14 @@ def import_archive(store, archive_path):
             for clip in value["clips"]:
                 for key in ("id", "asset_id", "take_id", "passage_id", "track_id"):
                     clip[key] = ref(clip.get(key))
+            if "scene_targets" in value:
+                value["scene_targets"] = {ref(key): target for key, target in value["scene_targets"].items()}
+            if value.get("captions"):
+                for cue in value["captions"]["cues"]:
+                    cue["clip_id"] = ref(cue["clip_id"])
+                # Import rekeys source identities. Retain edits and require a
+                # fresh listen/review against the imported arrangement.
+                value["captions"]["reviewed"] = False
 
         imported = copy.deepcopy(project)
         imported["id"] = ref(imported["id"])
@@ -97,6 +105,20 @@ def import_archive(store, archive_path):
                 take[key] = ref(take[key])
             if isinstance(take.get("request", {}).get("passage"), dict):
                 passage(take["request"]["passage"])
+            request = take.get("request", {})
+            composition = request.get("composition")
+            if isinstance(composition, dict) and isinstance(composition.get("segments"), list):
+                for segment in composition["segments"]:
+                    if not isinstance(segment, dict):
+                        raise ValueError("Invalid composition provenance")
+                    segment["asset_id"] = ref(segment.get("asset_id"))
+                    old_take = segment.get("take_id")
+                    if isinstance(old_take, str):
+                        mapping.setdefault(old_take, uid())
+                        segment["take_id"] = ref(old_take)
+            repair = request.get("phrase_repair")
+            if isinstance(repair, dict):
+                repair["source_passage_id"] = ref(repair.get("source_passage_id"))
         for revision in imported.get("revisions", []):
             revision["id"] = ref(revision["id"])
             document(revision["document"])

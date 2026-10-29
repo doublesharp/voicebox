@@ -240,6 +240,33 @@ test('space on an interactive control is not intercepted by the player shortcut'
   expect(usePlayerStore.getState().isPlaying).toBe(true);
 });
 
+test('player shortcuts ignore held keys, composition, modifiers and dialog focus', async () => {
+  usePlayerStore.getState().setAudio('/audio/a', 'a', null);
+  await mount();
+  await act(async () => waves[0].ready(3));
+  const preventDefault = mock(() => {});
+  for (const event of [
+    { repeat: true },
+    { isComposing: true },
+    { defaultPrevented: true },
+    { metaKey: true },
+    {
+      target: { closest: (selector: string) => (selector.includes('[role="dialog"]') ? {} : null) },
+    },
+  ])
+    await act(async () =>
+      keydown!({
+        code: 'Space',
+        target: { closest: () => null },
+        preventDefault,
+        stopPropagation() {},
+        ...event,
+      } as unknown as KeyboardEvent),
+    );
+  expect(preventDefault).not.toHaveBeenCalled();
+  expect(usePlayerStore.getState().isPlaying).toBe(false);
+});
+
 test('seeded selection, version, stale-event, close and unmount sequences preserve source identity', async () => {
   for (const seed of [0x1a2b3c4d, 0x91e10da5, 0xc0ffee]) {
     let random = seed >>> 0;

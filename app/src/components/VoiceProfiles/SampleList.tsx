@@ -41,6 +41,7 @@ import {
 import { formatAudioDuration } from '@/lib/utils/audio';
 import { cn } from '@/lib/utils/cn';
 import { SampleUpload } from './SampleUpload';
+import { SampleQuality } from './SampleQuality';
 
 interface MiniSamplePlayerProps {
   audioUrl: string;
@@ -409,6 +410,13 @@ export function SampleList({ profileId }: SampleListProps) {
                     </div>
                   </>
                 )}
+                <details className="border-t border-border/60 px-3 py-2 text-xs">
+                  <summary className="cursor-pointer py-1 text-muted-foreground">Reference quality guidance</summary>
+                  <SampleQuality
+                    audioUrl={apiClient.getSampleUrl(sample.id)}
+                    referenceText={isEditing ? editedText : sample.reference_text}
+                  />
+                </details>
               </div>
             );
           })}
