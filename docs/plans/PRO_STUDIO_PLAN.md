@@ -1,7 +1,7 @@
 # Voicebox DS: phased implementation plan
 
-**Status:** B0 branding implemented. S1 implementation authorized by the user and in integration/review; runtime qualification remains open. S2-S4 remain phased follow-up work.
-**Date:** 2026-10-28
+**Status:** B0 branding implemented. S1 is in integration/review. Selected S2 editing tools and app keyboard shortcuts are implemented; runtime qualification remains open. Other S2-S4 work remains phased follow-up work.
+**Date:** 2026-10-29
 **Specification:** [PRO_STUDIO_SPEC.md](PRO_STUDIO_SPEC.md)
 
 This plan decomposes the specification into deliverable slices. Local Coordinate is the authoritative task and evidence record: Voicebox DS project `project_14a676bd-5cff-4ffe-ad9c-9aa08abc554e`, S1 effort `effort_efc6c236-4604-4cb2-95ee-f1e66c8e6320`. This file is a working view. Source implementation, fixture checks, native/model qualification, and distribution acceptance are separate gates.
@@ -150,4 +150,16 @@ Do not install dependencies, bootstrap environments, download models, or trigger
 
 ## Follow-on planning
 
-After S1 is accepted, turn S2 into separate slices for reference-video timing, pronunciation/alignment/captions, and authenticated batch handoff. Plan S3 only after reviewer identity, sharing boundaries, and hosting are selected. Each S4 capability starts with a bounded qualification of its specific uncertainty. Telephone outreach remains outside these studio milestones.
+The selected editing tools below were requested and implemented while S1 runtime qualification remains open. Authenticated batch handoff remains separate follow-up work. Plan S3 only after reviewer identity, sharing boundaries, and hosting are selected. Each S4 capability starts with a bounded qualification of its specific uncertainty. Telephone outreach remains outside these studio milestones.
+
+## Editing tools implemented 2026-10-29
+
+- **Pronunciation:** Director dictionaries support project and voice aliases, substitution previews, and alternative-take audition. Jobs freeze spoken aliases while retaining the original script. Changed pronunciation invalidates affected takes and pending adoption intent. Aliases are literal; phoneme support is not assumed.
+- **Reference guidance:** Voice sample forms check clipping, quiet time, levels, duration, and possible steady noise. Noise hints are qualified heuristics. Transcript checking is explicit and uses a cached Whisper model; a missing model produces download guidance without starting a download.
+- **Captions and video:** The project toolbar opens reference-video playback, frame rate/time origin, scene duration targets, narration preview, and cue editing. Initial captions cover audible clip intervals and require wording/timing review against the final trimmed arrangement. SRT/WebVTT exports require reviewed cues matching the current source fingerprint. Video metadata persists; choose the external video again after reopening. Video bytes are outside portable archives.
+- **Phrase repair and comping:** Takes exposes replacement-phrase generation, source-range audition, word/phrase replacement, ordered source ranges, and adjustable join crossfades. Composition publishes a new alternative with source hashes and ranges, preserving selected takes and timeline audio until the user chooses it. Crossfades overlap the joins and shorten the result. Sources are limited to 32 ranges and 30 minutes per composition; no automatic word-boundary detection or time stretching is claimed.
+- **Keyboard:** The sidebar Shortcuts button or Command/Control+/ opens the reference. Command/Control+K opens app commands or the existing Studio commands; Command/Control+Alt+1 through 7 navigates workspaces, Command/Control+, opens Settings, and Command/Control+Shift+G opens Generate and focuses its script. Studio adds Command/Control+S. Text editing, dialogs, IME composition, and held-key guards protect existing playback/clip actions.
+
+**Verified:** 255 Studio/reference-quality backend tests; 242 frontend tests in 31 isolated files; app/web typechecks; web production build with output on Scratch; focused Biome/Ruff checks. Regression coverage includes composition archive import/re-export in both scopes, rollback cleanup, caption review identity after arrangement changes, narration playback inside the caption dialog, and shortcut ownership. Independent source review findings were fixed and exercised by regressions.
+
+**Open qualification:** Browser appearance, native media/device behavior, packaged runtime, actual Whisper/TTS output, and listening checks. Estimated captions and manual source boundaries require user review; passing fixture tests does not qualify speech alignment or repair sound quality.
