@@ -277,6 +277,17 @@ fn decode_audio(data: Vec<u8>) -> Result<(Vec<f32>, u32, usize), String> {
     use symphonia::core::audio::SampleBuffer;
     use symphonia::core::errors::Error;
     use symphonia::core::io::MediaSourceStream;
+    // Symphonia treats an unexpected EOF as the end of a stream. For RIFF
+    // WAVE files with a known container size that can silently play only a
+    // prefix of a damaged recording, so verify its declared length first.
+    if data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WAVE" {
+        let declared = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        // Some streaming encoders use the sentinel because the length was
+        // unknown at the time the header was written.
+        if declared != u32::MAX && u64::from(declared) + 8 > data.len() as u64 {
+            return Err("Audio file is truncated".into());
+        }
+    }
     let input = MediaSourceStream::new(Box::new(std::io::Cursor::new(data)), Default::default());
     let mut format = symphonia::default::get_probe()
         .format(
@@ -525,4 +536,186 @@ fn run_session(
     }
     drop(streams);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn wav(samples: &[i16], channels: u16, rate: u32) -> Vec<u8> {
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let spec = hound::WavSpec {
+                channels,
+                sample_rate: rate,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut writer = hound::WavWriter::new(&mut cursor, spec).unwrap();
+            for sample in samples {
+                writer.write_sample(*sample).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+        cursor.into_inner()
+    }
+
+    #[test]
+    fn decode_audio_preserves_stereo_frames_and_rejects_invalid_input() {
+        let input = wav(&[0, 16384, -16384, 32767], 2, 24000);
+        let (samples, rate, channels) = decode_audio(input).unwrap();
+        assert_eq!((rate, channels, samples.len()), (24000, 2, 4));
+        assert!((samples[1] - 0.5).abs() < 0.0001);
+        assert!((samples[2] + 0.5).abs() < 0.0001);
+        assert!(decode_audio(b"not audio".to_vec()).is_err());
+        assert!(decode_audio(wav(&[], 1, 24000)).is_err());
+    }
+
+    #[test]
+    fn truncated_wav_is_not_accepted_as_a_complete_clip() {
+        let mut audio = wav(&vec![16384; 24000], 1, 24000);
+        audio.truncate(audio.len() - 10000);
+        assert!(decode_audio(audio).is_err());
+    }
+
+    #[test]
+    fn wav_with_truncated_data_chunk_is_rejected_even_if_container_length_matches() {
+        let mut audio = wav(&vec![16384; 24000], 1, 24000);
+        audio.truncate(audio.len() - 10000);
+        let size = (audio.len() - 8) as u32;
+        audio[4..8].copy_from_slice(&size.to_le_bytes());
+        assert!(decode_audio(audio).is_err());
+    }
+
+    #[test]
+    fn decode_accepts_complete_wave_with_trailing_bytes_and_streaming_size() {
+        let mut with_trailing_bytes = wav(&[1, 2, 3], 1, 16000);
+        with_trailing_bytes.extend_from_slice(b"extra");
+        assert_eq!(decode_audio(with_trailing_bytes).unwrap().0.len(), 3);
+        let mut unknown_size = wav(&[1, 2, 3], 1, 16000);
+        unknown_size[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(decode_audio(unknown_size).unwrap().0.len(), 3);
+    }
+
+    #[test]
+    fn decode_rejects_nonfinite_float_samples() {
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: 24000,
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            };
+            let mut writer = hound::WavWriter::new(&mut cursor, spec).unwrap();
+            writer.write_sample(f32::NAN).unwrap();
+            writer.finalize().unwrap();
+        }
+        assert!(decode_audio(cursor.into_inner()).is_err());
+    }
+
+    #[test]
+    fn stale_controls_and_stops_do_not_touch_current_session() {
+        let state = AudioOutputState::new();
+        let controls = Arc::new(PlaybackControls::new(0.0, 1.0));
+        let (wake, receiver) = mpsc::channel();
+        *state.active.lock().unwrap() = Some(SessionHandle {
+            id: "current".into(),
+            controls: controls.clone(),
+            wake,
+        });
+        assert!(state
+            .control_playback(
+                "old",
+                PlaybackControl {
+                    paused: Some(false),
+                    position: None,
+                    volume: None
+                }
+            )
+            .is_err());
+        state.stop_playback(Some("old")).unwrap();
+        assert!(!controls.stopped.load(Ordering::Acquire));
+        assert!(receiver.try_recv().is_err());
+        state
+            .control_playback(
+                "current",
+                PlaybackControl {
+                    paused: Some(false),
+                    position: Some(0.5),
+                    volume: Some(0.25),
+                },
+            )
+            .unwrap();
+        assert_eq!(controls.requested_position(), 0.5);
+        assert!(!controls.paused.load(Ordering::Acquire));
+        assert!(receiver.try_recv().is_ok());
+        state.stop_playback(Some("current")).unwrap();
+        assert!(controls.stopped.load(Ordering::Acquire));
+        assert!(state
+            .control_playback(
+                "current",
+                PlaybackControl {
+                    paused: None,
+                    position: None,
+                    volume: None
+                }
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn invalid_controls_do_not_change_playback() {
+        let state = AudioOutputState::new();
+        let controls = Arc::new(PlaybackControls::new(0.25, 1.0));
+        let (wake, receiver) = mpsc::channel();
+        *state.active.lock().unwrap() = Some(SessionHandle {
+            id: "current".into(),
+            controls: controls.clone(),
+            wake,
+        });
+        for control in [
+            PlaybackControl {
+                paused: Some(false),
+                position: Some(f64::NAN),
+                volume: None,
+            },
+            PlaybackControl {
+                paused: Some(false),
+                position: Some(-1.0),
+                volume: None,
+            },
+            PlaybackControl {
+                paused: Some(false),
+                position: None,
+                volume: Some(f32::INFINITY),
+            },
+            PlaybackControl {
+                paused: Some(false),
+                position: None,
+                volume: Some(1.1),
+            },
+        ] {
+            assert!(state.control_playback("current", control).is_err());
+        }
+        assert_eq!(controls.requested_position(), 0.25);
+        assert!(controls.paused.load(Ordering::Acquire));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn stop_without_session_id_cancels_current_playback() {
+        let state = AudioOutputState::new();
+        let controls = Arc::new(PlaybackControls::new(0.0, 1.0));
+        let (wake, receiver) = mpsc::channel();
+        *state.active.lock().unwrap() = Some(SessionHandle {
+            id: "current".into(),
+            controls: controls.clone(),
+            wake,
+        });
+        state.stop_playback(None).unwrap();
+        assert!(controls.stopped.load(Ordering::Acquire));
+        assert!(receiver.try_recv().is_ok());
+    }
 }
