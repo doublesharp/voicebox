@@ -211,3 +211,188 @@ def test_generation_export_rejects_missing_legacy_audio(db, monkeypatch, tmp_pat
     db.commit()
     with pytest.raises(ValueError, match="Audio file not found"):
         export_import.export_generation_to_zip("g", db)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind', ['profile', 'generation'])
+async def test_compressed_expanded_archive_limit_is_checked_before_mutation(kind, db, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, '_data_dir', tmp_path)
+    monkeypatch.setattr(export_import, 'MAX_IMPORT_EXPANDED_BYTES', 256, raising=False)
+    db.add(VoiceProfile(id='existing', name='Voice'))
+    db.commit()
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as z:
+        if kind == 'profile':
+            z.writestr('manifest.json', json.dumps({'version': '1.0', 'profile': {'name': 'New'}}))
+            z.writestr('samples.json', json.dumps({'sample.wav': 'words'}))
+            z.writestr('samples/sample.wav', b'0' * 4096)
+        else:
+            z.writestr('manifest.json', json.dumps({'version': '1.0', 'generation': {'text': 'Hello', 'language': 'en', 'duration': 1}}))
+            z.writestr('audio/sample.wav', b'0' * 4096)
+    assert len(output.getvalue()) < 1024
+    with pytest.raises(ValueError, match='archive exceeds limits'):
+        if kind == 'profile':
+            await export_import.import_profile_from_zip(output.getvalue(), db)
+        else:
+            await export_import.import_generation_from_zip(output.getvalue(), db)
+    assert db.query(VoiceProfile).count() == 1
+    assert db.query(Generation).count() == 0
+    assert db.query(ProfileSample).count() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind', ['profile', 'generation'])
+async def test_duplicate_manifest_is_rejected_before_mutation(kind, db, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, '_data_dir', tmp_path)
+    db.add(VoiceProfile(id='existing', name='Voice'))
+    db.commit()
+    manifest = {'version': '1.0', 'profile': {'name': 'New'}} if kind == 'profile' else {
+        'version': '1.0', 'generation': {'text': 'Hi', 'language': 'en', 'duration': 1}}
+    output = io.BytesIO()
+    with pytest.warns(UserWarning, match='Duplicate name'):
+        with zipfile.ZipFile(output, 'w') as z:
+            z.writestr('manifest.json', json.dumps(manifest))
+            z.writestr('manifest.json', json.dumps(manifest))
+            if kind == 'profile': z.writestr('samples.json', '{}')
+            else: z.writestr('audio/test.wav', b'audio')
+    with pytest.raises(ValueError, match='duplicate archive entry'):
+        if kind == 'profile':
+            await export_import.import_profile_from_zip(output.getvalue(), db)
+        else:
+            await export_import.import_generation_from_zip(output.getvalue(), db)
+    assert db.query(VoiceProfile).count() == 1
+    assert db.query(Generation).count() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind', ['profile', 'generation'])
+async def test_import_streams_audio_instead_of_reading_full_member(kind, db, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, '_data_dir', tmp_path)
+    db.add(VoiceProfile(id='existing', name='Voice'))
+    db.commit()
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, 'w') as z:
+        if kind == 'profile':
+            z.writestr('manifest.json', json.dumps({'version': '1.0', 'profile': {'name': 'New'}}))
+            z.writestr('samples.json', json.dumps({'sample.wav': 'words'}))
+            z.writestr('samples/sample.wav', reference_wav())
+        else:
+            z.writestr('manifest.json', json.dumps({'version': '1.0', 'generation': {'text': 'Hi', 'language': 'en', 'duration': 1}}))
+            z.writestr('audio/sample.wav', b'audio data')
+    original_read = zipfile.ZipFile.read
+    def no_whole_audio(self, name, *args, **kwargs):
+        assert not str(name).startswith(('samples/', 'audio/')), 'audio must be streamed'
+        return original_read(self, name, *args, **kwargs)
+    monkeypatch.setattr(zipfile.ZipFile, 'read', no_whole_audio)
+    if kind == 'profile':
+        result = await export_import.import_profile_from_zip(output.getvalue(), db)
+        assert result.name == 'New'
+        assert db.query(ProfileSample).count() == 1
+    else:
+        result = await export_import.import_generation_from_zip(output.getvalue(), db)
+        generation = db.query(Generation).filter_by(id=result['id']).one()
+        assert config.resolve_storage_path(generation.audio_path).read_bytes() == b'audio data'
+
+
+@pytest.mark.asyncio
+async def test_failed_optional_avatar_extraction_removes_its_temporary_file(db, monkeypatch, tmp_path):
+    import tempfile
+    monkeypatch.setattr(config, '_data_dir', tmp_path)
+    temp = tmp_path / 'uploads'
+    temp.mkdir()
+    monkeypatch.setattr(tempfile, 'tempdir', str(temp))
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, 'w') as z:
+        z.writestr('manifest.json', json.dumps({'version': '1.0', 'profile': {'name': 'New'}}))
+        z.writestr('samples.json', '{}')
+        z.writestr('avatar.png', b'image')
+    original_open = zipfile.ZipFile.open
+    def broken_avatar(self, name, *args, **kwargs):
+        if name == 'avatar.png': raise OSError('broken avatar')
+        return original_open(self, name, *args, **kwargs)
+    monkeypatch.setattr(zipfile.ZipFile, 'open', broken_avatar)
+    result = await export_import.import_profile_from_zip(output.getvalue(), db)
+    assert result.name == 'New'
+    assert list(temp.iterdir()) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('metadata', ['manifest.json', 'samples.json'])
+async def test_oversized_profile_metadata_is_rejected_before_profile_creation(metadata, db, monkeypatch):
+    monkeypatch.setattr(export_import, 'MAX_IMPORT_METADATA_BYTES', 32)
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as z:
+        z.writestr('manifest.json', json.dumps({'version': '1.0', 'profile': {'name': 'Voice'}}))
+        z.writestr('samples.json', json.dumps({'x' * 80: 'words'}) if metadata == 'samples.json' else '{}')
+    if metadata == 'samples.json':
+        # Keep the valid manifest below this bound while exceeding it for samples.
+        monkeypatch.setattr(export_import, 'MAX_IMPORT_METADATA_BYTES', 80)
+    with pytest.raises(ValueError, match=f'archive metadata exceeds limits: {metadata}'):
+        await export_import.import_profile_from_zip(output.getvalue(), db)
+    assert db.query(VoiceProfile).count() == 0
+
+
+@pytest.mark.asyncio
+async def test_archive_entry_limit_accepts_boundary_and_rejects_extra_entry(db, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, '_data_dir', tmp_path)
+    monkeypatch.setattr(export_import, 'MAX_IMPORT_ENTRIES', 2)
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, 'w') as z:
+        z.writestr('manifest.json', json.dumps({'version': '1.0', 'profile': {'name': 'Voice'}}))
+        z.writestr('samples.json', '{}')
+    result = await export_import.import_profile_from_zip(output.getvalue(), db)
+    assert result.name == 'Voice'
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, 'w') as z:
+        z.writestr('manifest.json', json.dumps({'version': '1.0', 'profile': {'name': 'Extra'}}))
+        z.writestr('samples.json', '{}')
+        z.writestr('extra.txt', 'extra')
+    with pytest.raises(ValueError, match='archive exceeds limits'):
+        await export_import.import_profile_from_zip(output.getvalue(), db)
+    assert db.query(VoiceProfile).count() == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind', ['profile', 'generation'])
+async def test_interrupted_audio_extraction_rolls_back_and_removes_temporary_file(kind, db, monkeypatch, tmp_path):
+    import tempfile
+    monkeypatch.setattr(config, '_data_dir', tmp_path)
+    temp = tmp_path / 'uploads'
+    temp.mkdir()
+    monkeypatch.setattr(tempfile, 'tempdir', str(temp))
+    db.add(VoiceProfile(id='existing', name='Voice'))
+    db.commit()
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, 'w') as z:
+        if kind == 'profile':
+            z.writestr('manifest.json', json.dumps({'version': '1.0', 'profile': {'name': 'New'}}))
+            z.writestr('samples.json', json.dumps({'sample.wav': 'words'}))
+            z.writestr('samples/sample.wav', b'audio')
+            target = 'samples/sample.wav'
+        else:
+            z.writestr('manifest.json', json.dumps({'version': '1.0', 'generation': {'text': 'Hi', 'language': 'en', 'duration': 1}}))
+            z.writestr('audio/sample.wav', b'audio')
+            target = 'audio/sample.wav'
+    original_open = zipfile.ZipFile.open
+    class Interrupted:
+        calls = 0
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def read(self, size):
+            assert 0 < size <= export_import.IMPORT_COPY_CHUNK_BYTES
+            self.calls += 1
+            if self.calls == 1: return b'partial'
+            raise OSError('archive read interrupted')
+    def broken_audio(self, name, *args, **kwargs):
+        if name == target: return Interrupted()
+        return original_open(self, name, *args, **kwargs)
+    monkeypatch.setattr(zipfile.ZipFile, 'open', broken_audio)
+    with pytest.raises(ValueError, match='archive read interrupted'):
+        if kind == 'profile':
+            await export_import.import_profile_from_zip(output.getvalue(), db)
+        else:
+            await export_import.import_generation_from_zip(output.getvalue(), db)
+    assert db.query(VoiceProfile).count() == 1
+    assert db.query(Generation).count() == 0
+    assert db.query(ProfileSample).count() == 0
+    assert list(temp.iterdir()) == []

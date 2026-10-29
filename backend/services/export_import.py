@@ -20,6 +20,28 @@ from ..models import VoiceProfileCreate
 from .. import config
 
 
+# Match Studio's archive-wide limits; metadata is kept smaller because it is
+# parsed in memory. Audio is copied in chunks instead of materialized at once.
+MAX_IMPORT_EXPANDED_BYTES = 1024 * 1024 * 1024
+MAX_IMPORT_ENTRIES = 10_000
+MAX_IMPORT_METADATA_BYTES = 8 * 1024 * 1024
+IMPORT_COPY_CHUNK_BYTES = 1024 * 1024
+
+
+def _validate_import_archive(archive: zipfile.ZipFile) -> list[str]:
+    entries = archive.infolist()
+    if len(entries) > MAX_IMPORT_ENTRIES or sum(entry.file_size for entry in entries) > MAX_IMPORT_EXPANDED_BYTES:
+        raise ValueError("archive exceeds limits")
+    names = set()
+    for entry in entries:
+        if entry.filename in names:
+            raise ValueError(f"duplicate archive entry: {entry.filename}")
+        names.add(entry.filename)
+        if entry.filename in {"manifest.json", "samples.json"} and entry.file_size > MAX_IMPORT_METADATA_BYTES:
+            raise ValueError(f"archive metadata exceeds limits: {entry.filename}")
+    return [entry.filename for entry in entries]
+
+
 def _get_unique_profile_name(name: str, db: Session) -> str:
     """
     Get a unique profile name by appending a number if needed.
@@ -140,7 +162,7 @@ async def import_profile_from_zip(file_bytes: bytes, db: Session) -> VoiceProfil
     try:
         with zipfile.ZipFile(zip_buffer, 'r') as zip_file:
             # Validate ZIP structure
-            namelist = zip_file.namelist()
+            namelist = _validate_import_archive(zip_file)
             
             if "manifest.json" not in namelist:
                 raise ValueError("ZIP archive missing manifest.json")
@@ -194,7 +216,8 @@ async def import_profile_from_zip(file_bytes: bytes, db: Session) -> VoiceProfil
                     try:
                         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                             tmp_path = tmp.name
-                            tmp.write(zip_file.read(f"samples/{filename}"))
+                            with zip_file.open(f"samples/{filename}") as source:
+                                shutil.copyfileobj(source, tmp, length=IMPORT_COPY_CHUNK_BYTES)
                         await add_profile_sample(
                             profile.id, tmp_path, reference_text, db, commit=False,
                         )
@@ -214,14 +237,17 @@ async def import_profile_from_zip(file_bytes: bytes, db: Session) -> VoiceProfil
                 try:
                     import tempfile
                     avatar_file = avatar_files[0]
-                    with tempfile.NamedTemporaryFile(suffix=Path(avatar_file).suffix, delete=False) as tmp:
-                        tmp.write(zip_file.read(avatar_file))
-                        tmp_path = tmp.name
+                    tmp_path = None
                     try:
+                        with tempfile.NamedTemporaryFile(suffix=Path(avatar_file).suffix, delete=False) as tmp:
+                            tmp_path = tmp.name
+                            with zip_file.open(avatar_file) as source:
+                                shutil.copyfileobj(source, tmp, length=IMPORT_COPY_CHUNK_BYTES)
                         from .profiles import upload_avatar
                         await upload_avatar(profile.id, tmp_path, db)
                     finally:
-                        Path(tmp_path).unlink(missing_ok=True)
+                        if tmp_path is not None:
+                            Path(tmp_path).unlink(missing_ok=True)
                 except Exception:
                     pass
 
@@ -353,7 +379,7 @@ async def import_generation_from_zip(file_bytes: bytes, db: Session) -> dict:
     try:
         with zipfile.ZipFile(zip_buffer, 'r') as zip_file:
             # Validate ZIP structure
-            namelist = zip_file.namelist()
+            namelist = _validate_import_archive(zip_file)
             
             if "manifest.json" not in namelist:
                 raise ValueError("ZIP archive missing manifest.json")
@@ -416,7 +442,8 @@ async def import_generation_from_zip(file_bytes: bytes, db: Session) -> dict:
             try:
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                     tmp_path = tmp.name
-                    tmp.write(zip_file.read(audio_file_path))
+                    with zip_file.open(audio_file_path) as source:
+                        shutil.copyfileobj(source, tmp, length=IMPORT_COPY_CHUNK_BYTES)
                 # Create generations directory
                 generations_dir = config.get_generations_dir()
                 generations_dir.mkdir(parents=True, exist_ok=True)
