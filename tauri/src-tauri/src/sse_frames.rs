@@ -3,6 +3,8 @@
 #[derive(Default)]
 pub(crate) struct FrameBuffer {
     buf: Vec<u8>,
+    line_start: usize,
+    skip_lf: bool,
 }
 
 impl FrameBuffer {
@@ -10,20 +12,28 @@ impl FrameBuffer {
         &mut self,
         chunk: &[u8],
     ) -> Result<Vec<(String, String)>, std::str::Utf8Error> {
-        self.buf.extend_from_slice(chunk);
         let mut result = Vec::new();
-        loop {
-            let crlf = self.buf.windows(4).position(|window| window == b"\r\n\r\n");
-            let lf = self.buf.windows(2).position(|window| window == b"\n\n");
-            let (end, sep_len) = match (crlf, lf) {
-                (Some(c), Some(l)) if c <= l => (c, 4),
-                (Some(c), None) => (c, 4),
-                (_, Some(l)) => (l, 2),
-                (None, None) => break,
-            };
-            let frame: Vec<u8> = self.buf.drain(..end + sep_len).collect();
-            if let Some(event) = parse_frame(std::str::from_utf8(&frame)?) {
-                result.push(event);
+        for &byte in chunk {
+            if self.skip_lf {
+                self.skip_lf = false;
+                if byte == b'\n' {
+                    continue;
+                }
+            }
+            if byte == b'\r' || byte == b'\n' {
+                if self.line_start == self.buf.len() {
+                    if let Some(event) = parse_frame(std::str::from_utf8(&self.buf)?) {
+                        result.push(event);
+                    }
+                    self.buf.clear();
+                    self.line_start = 0;
+                } else {
+                    self.buf.push(b'\n');
+                    self.line_start = self.buf.len();
+                }
+                self.skip_lf = byte == b'\r';
+            } else {
+                self.buf.push(byte);
             }
         }
         Ok(result)
@@ -75,11 +85,11 @@ mod tests {
             .push(b"event: speak-start\r\ndata: hel")
             .unwrap()
             .is_empty());
-        assert!(buffer.push(b"lo\r\n\r").unwrap().is_empty());
         assert_eq!(
-            buffer.push(b"\n").unwrap(),
+            buffer.push(b"lo\r\n\r").unwrap(),
             [("speak-start".into(), "hello".into())]
         );
+        assert!(buffer.push(b"\n").unwrap().is_empty());
     }
 
     #[test]
@@ -135,6 +145,43 @@ mod tests {
         assert_eq!(
             buffer.push(b"event: speak-end\ndata:\n\n").unwrap(),
             [("speak-end".into(), "".into())]
+        );
+    }
+
+    #[test]
+    fn accepts_each_line_ending_and_mixed_endings_at_every_chunk_boundary() {
+        for field_end in ["\n", "\r", "\r\n"] {
+            for data_end in ["\n", "\r", "\r\n"] {
+                for blank_end in ["\n", "\r", "\r\n"] {
+                    // Adjacent CR + LF is one CRLF terminator, not two lines.
+                    if data_end == "\r" && blank_end.starts_with('\n') {
+                        continue;
+                    }
+                    let input = format!("event: speak-start{field_end}data: hello{data_end}{blank_end}event: speak-end\ndata: done\n\n");
+                    for split in 0..=input.len() {
+                        let mut buffer = FrameBuffer::default();
+                        let mut events = buffer.push(&input.as_bytes()[..split]).unwrap();
+                        events.extend(buffer.push(&input.as_bytes()[split..]).unwrap());
+                        assert_eq!(
+                            events,
+                            [
+                                ("speak-start".into(), "hello".into()),
+                                ("speak-end".into(), "done".into())
+                            ],
+                            "{input:?} split {split}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lone_carriage_return_frame_is_delivered_without_waiting_for_another_chunk() {
+        let mut buffer = FrameBuffer::default();
+        assert_eq!(
+            buffer.push(b"event: speak-end\rdata: done\r\r").unwrap(),
+            [("speak-end".into(), "done".into())]
         );
     }
 }
