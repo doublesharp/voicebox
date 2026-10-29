@@ -8,6 +8,7 @@ const clearAll = mock(async () => {});
 const toast = mock((_value: unknown) => {});
 let downloadCallbacks: any;
 let serverUrl = 'http://server-a';
+let serverRevision = 0;
 mock.module('../src/lib/api/client', () => ({
   apiClient: {
     getModelStatus: async () => ({ models: [] }),
@@ -26,10 +27,9 @@ mock.module('../src/lib/hooks/useModelDownloadToast', () => ({
 mock.module('../src/platform/PlatformContext', () => ({
   usePlatform: () => ({ metadata: { isTauri: false } }),
 }));
-mock.module('../src/stores/serverStore', () => ({
-  useServerStore: (selector: any) =>
-    selector({ customModelsDir: null, setCustomModelsDir: () => {}, serverUrl }),
-}));
+const serverState = () => ({ customModelsDir: null, setCustomModelsDir: () => {}, serverUrl, serverRevision });
+const useServerStore = Object.assign((selector: any) => selector(serverState()), { getState: serverState });
+mock.module('../src/stores/serverStore', () => ({ useServerStore }));
 mock.module('../src/components/ui/use-toast', () => ({ useToast: () => ({ toast }) }));
 mock.module('react-i18next', () => ({
   useTranslation: () => ({ t: (key: string) => key }),
@@ -70,6 +70,7 @@ const model = (overrides: Record<string, unknown> = {}) => ({
   ...overrides,
 });
 async function setup(models = [model()], downloads: any[] = []) {
+  serverRevision = 0;
   trigger.mockClear();
   cancel.mockClear();
   toast.mockClear();
@@ -377,14 +378,14 @@ test('a download response from a previous server cannot start tracking on the ne
   try {
     s.open();
     act(() => { s.button('models.actions.download').props.onClick(); });
-    serverUrl = 'http://server-b';
+    serverUrl = 'http://server-b'; serverRevision++;
     await act(async () => { s.view.update(<QueryClientProvider client={s.client}><ModelManagement /></QueryClientProvider>); });
     await act(async () => { finish(); await Promise.resolve(); });
     expect(downloadCallbacks.enabled).toBe(false);
     expect(downloadCallbacks.modelName).toBe('');
   } finally {
     s.finish();
-    serverUrl = 'http://server-a';
+    serverUrl = 'http://server-a'; serverRevision++;
     trigger.mockImplementation(async () => {});
   }
 });
@@ -395,13 +396,13 @@ test('switching servers clears tracking from the previous server', async () => {
     s.open();
     await act(async () => { s.button('models.actions.download').props.onClick(); });
     expect(downloadCallbacks.enabled).toBe(true);
-    serverUrl = 'http://server-b';
+    serverUrl = 'http://server-b'; serverRevision++;
     await act(async () => { s.view.update(<QueryClientProvider client={s.client}><ModelManagement /></QueryClientProvider>); });
     expect(downloadCallbacks.enabled).toBe(false);
     expect(downloadCallbacks.modelName).toBe('');
   } finally {
     s.finish();
-    serverUrl = 'http://server-a';
+    serverUrl = 'http://server-a'; serverRevision++;
   }
 });
 
@@ -412,16 +413,16 @@ test('a response from an earlier visit to the same server stays stale', async ()
   try {
     s.open();
     act(() => { s.button('models.actions.download').props.onClick(); });
-    serverUrl = 'http://server-b';
+    serverUrl = 'http://server-b'; serverRevision++;
     await act(async () => { s.view.update(<QueryClientProvider client={s.client}><ModelManagement /></QueryClientProvider>); });
-    serverUrl = 'http://server-a';
+    serverUrl = 'http://server-a'; serverRevision++;
     await act(async () => { s.view.update(<QueryClientProvider client={s.client}><ModelManagement /></QueryClientProvider>); });
     await act(async () => { finish(); await Promise.resolve(); });
     expect(downloadCallbacks.enabled).toBe(false);
     expect(downloadCallbacks.modelName).toBe('');
   } finally {
     s.finish();
-    serverUrl = 'http://server-a';
+    serverUrl = 'http://server-a'; serverRevision++;
     trigger.mockImplementation(async () => {});
   }
 });
@@ -433,14 +434,14 @@ test('failure from a previous server does not show a new-server error', async ()
   try {
     s.open();
     act(() => { s.button('models.actions.download').props.onClick(); });
-    serverUrl = 'http://server-b';
+    serverUrl = 'http://server-b'; serverRevision++;
     await act(async () => { s.view.update(<QueryClientProvider client={s.client}><ModelManagement /></QueryClientProvider>); });
     await act(async () => { fail(new Error('old server failed')); await Promise.resolve(); });
     expect(toast).not.toHaveBeenCalled();
     expect(downloadCallbacks.enabled).toBe(false);
   } finally {
     s.finish();
-    serverUrl = 'http://server-a';
+    serverUrl = 'http://server-a'; serverRevision++;
     trigger.mockImplementation(async () => {});
   }
 });
@@ -450,12 +451,12 @@ test('switching servers closes a model detail opened on the previous server', as
   try {
     s.open();
     expect(s.button('models.actions.download')).toBeDefined();
-    serverUrl = 'http://server-b';
+    serverUrl = 'http://server-b'; serverRevision++;
     await act(async () => { s.view.update(<QueryClientProvider client={s.client}><ModelManagement /></QueryClientProvider>); });
     expect(s.view.root.findAllByType('button').some((n) => n.children.includes('models.actions.download'))).toBe(false);
   } finally {
     s.finish();
-    serverUrl = 'http://server-a';
+    serverUrl = 'http://server-a'; serverRevision++;
   }
 });
 
@@ -488,7 +489,7 @@ test('clear-all from a previous server cannot clear the current server download'
   ]);
   try {
     await act(async () => { s.button('models.problems.clearAll').props.onClick(); await Promise.resolve(); });
-    serverUrl = 'http://server-b';
+    serverUrl = 'http://server-b'; serverRevision++;
     await act(async () => { s.view.update(<QueryClientProvider client={s.client}><ModelManagement /></QueryClientProvider>); });
     s.open('Base');
     await act(async () => { s.button('models.actions.download').props.onClick(); });
@@ -497,7 +498,82 @@ test('clear-all from a previous server cannot clear the current server download'
     expect(downloadCallbacks.enabled).toBe(true);
   } finally {
     s.finish();
-    serverUrl = 'http://server-a';
+    serverUrl = 'http://server-a'; serverRevision++;
+    clearAll.mockImplementation(async () => {});
+  }
+});
+
+
+test('an old download response is ignored before the server switch rerenders', async () => {
+  let finish = () => {};
+  trigger.mockImplementation(() => new Promise<void>((resolve) => { finish = resolve; }));
+  const s = await setup();
+  try {
+    s.open();
+    act(() => { s.button('models.actions.download').props.onClick(); });
+    serverUrl = 'http://server-b'; serverRevision++;
+    await act(async () => { finish(); await Promise.resolve(); });
+    expect(downloadCallbacks.enabled).toBe(false);
+    expect(downloadCallbacks.modelName).toBe('');
+  } finally {
+    s.finish(); serverUrl = 'http://server-a'; serverRevision = 0;
+    trigger.mockImplementation(async () => {});
+  }
+});
+
+test('a batched server round trip cannot revive an earlier download request', async () => {
+  let finish = () => {};
+  trigger.mockImplementation(() => new Promise<void>((resolve) => { finish = resolve; }));
+  const s = await setup();
+  try {
+    s.open();
+    act(() => { s.button('models.actions.download').props.onClick(); });
+    serverUrl = 'http://server-b'; serverRevision++;
+    serverUrl = 'http://server-a'; serverRevision++;
+    await act(async () => { finish(); await Promise.resolve(); });
+    expect(downloadCallbacks.enabled).toBe(false);
+    expect(downloadCallbacks.modelName).toBe('');
+  } finally {
+    s.finish(); serverUrl = 'http://server-a'; serverRevision = 0;
+    trigger.mockImplementation(async () => {});
+  }
+});
+
+test('an old-server download failure is silent before the new server rerenders', async () => {
+  let reject = (_error: Error) => {};
+  trigger.mockImplementation(() => new Promise<void>((_resolve, fail) => { reject = fail; }));
+  const s = await setup();
+  try {
+    s.open();
+    act(() => { s.button('models.actions.download').props.onClick(); });
+    serverUrl = 'http://server-b'; serverRevision++;
+    await act(async () => { reject(new Error('old server failure')); await Promise.resolve(); });
+    expect(toast).not.toHaveBeenCalled();
+    expect(downloadCallbacks.enabled).toBe(false);
+  } finally {
+    s.finish(); serverUrl = 'http://server-a'; serverRevision = 0;
+    trigger.mockImplementation(async () => {});
+  }
+});
+
+test('a clear-all response from an earlier visit cannot clear a newer download', async () => {
+  let finish = () => {};
+  clearAll.mockImplementation(() => new Promise<void>((resolve) => { finish = resolve; }));
+  const s = await setup([model(), model({ model_name: 'whisper-base', display_name: 'Base' })], [
+    { model_name: 'whisper-small', status: 'error', error: 'old failure', started_at: '2026-01-01' },
+  ]);
+  try {
+    await act(async () => { s.button('models.problems.clearAll').props.onClick(); await Promise.resolve(); });
+    serverUrl = 'http://server-b'; serverRevision++;
+    serverUrl = 'http://server-a'; serverRevision++;
+    await act(async () => { s.view.update(<QueryClientProvider client={s.client}><ModelManagement /></QueryClientProvider>); });
+    s.open('Base');
+    await act(async () => { s.button('models.actions.download').props.onClick(); });
+    await act(async () => { finish(); await new Promise((resolve) => setTimeout(resolve, 10)); });
+    expect(downloadCallbacks.modelName).toBe('whisper-base');
+    expect(downloadCallbacks.enabled).toBe(true);
+  } finally {
+    s.finish(); serverUrl = 'http://server-a'; serverRevision = 0;
     clearAll.mockImplementation(async () => {});
   }
 });
