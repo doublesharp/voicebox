@@ -734,6 +734,25 @@ fn run_session(
     Ok(())
 }
 
+// Render one preview callback independently of the physical output device.
+fn render_preview<T: Copy>(
+    output: &mut [T],
+    rate: u32,
+    channels: usize,
+    queue: &mut crate::audio_stream::PcmQueue,
+    controls: &PlaybackControls,
+    convert: impl Fn(f32) -> T,
+) {
+    output.fill(convert(0.0));
+    if controls.stopped.load(Ordering::Acquire) || controls.paused.load(Ordering::Acquire) {
+        return;
+    }
+    let volume = controls.volume();
+    queue.render(output, rate, channels, |sample| {
+        convert((sample * volume).clamp(-1.0, 1.0))
+    });
+}
+
 fn build_pcm_stream<T>(
     device: &Device,
     config: &StreamConfig,
@@ -757,7 +776,14 @@ where
                     return;
                 }
                 if let Ok(mut queue) = queue.try_lock() {
-                    queue.render(output, rate, channels, T::from_sample);
+                    render_preview(
+                        output,
+                        rate,
+                        channels,
+                        &mut queue,
+                        &controls,
+                        T::from_sample,
+                    );
                 }
             },
             move |error| {
@@ -922,6 +948,39 @@ fn run_pcm_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_volume_applies_to_each_channel_and_can_be_changed() {
+        let controls = PlaybackControls::new(0.0, 1.0);
+        controls.paused.store(false, Ordering::Release);
+        let mut queue = crate::audio_stream::PcmQueue::new(8000).unwrap();
+        queue.append(&[0.8, -0.4, 0.6, -0.2]).unwrap();
+        queue.finished = true;
+        let mut out = [0.0; 4];
+        controls.set_volume(0.5);
+        render_preview(&mut out, 8000, 2, &mut queue, &controls, |s| s);
+        assert_eq!(out, [0.4, 0.4, -0.2, -0.2]);
+        controls.set_volume(0.0);
+        render_preview(&mut out, 8000, 2, &mut queue, &controls, |s| s);
+        assert_eq!(out, [0.0; 4]);
+        assert!(queue.ended());
+    }
+
+    #[test]
+    fn paused_preview_is_silent_without_consuming_audio() {
+        let controls = PlaybackControls::new(0.0, 1.0);
+        let mut queue = crate::audio_stream::PcmQueue::new(8000).unwrap();
+        queue.append(&[0.25, 0.5]).unwrap();
+        queue.finished = true;
+        let mut out = [1.0; 2];
+        render_preview(&mut out, 8000, 1, &mut queue, &controls, |s| s);
+        assert_eq!(out, [0.0; 2]);
+        assert!(!queue.ended());
+        controls.paused.store(false, Ordering::Release);
+        render_preview(&mut out, 8000, 1, &mut queue, &controls, |s| s);
+        assert_eq!(out, [0.25, 0.5]);
+        assert!(queue.ended());
+    }
 
     #[test]
     fn binary_playback_preserves_bytes_and_routing_metadata() {
