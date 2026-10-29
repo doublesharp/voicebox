@@ -354,47 +354,37 @@ async def cancel_generation(generation_id: str, db: Session = Depends(get_db)):
     return {"message": "Generation cancellation requested"}
 
 
+def _generation_status_snapshot(bind, generation_id):
+    # The stream retains only primitive data; no transaction spans its yield.
+    with Session(bind=bind) as db:
+        gen = db.query(DBGeneration).filter_by(id=generation_id).first()
+        if gen is None:
+            return {"status": "not_found", "id": generation_id}
+        return {
+            "id": gen.id, "status": gen.status or "completed", "duration": gen.duration,
+            "error": gen.error, "source": gen.source,
+        }
+
+
 @router.get("/generate/{generation_id}/status")
 async def get_generation_status(generation_id: str, db: Session = Depends(get_db)):
-    """SSE endpoint that streams generation status updates."""
-    import json
+    """SSE status reads own short worker sessions, released before each event."""
+    bind = db.get_bind()
 
     async def event_stream():
         try:
             while True:
-                db.expire_all()
-                gen = db.query(DBGeneration).filter_by(id=generation_id).first()
-                if not gen:
-                    yield f"data: {json.dumps({'status': 'not_found', 'id': generation_id})}\n\n"
-                    return
-
-                payload = {
-                    "id": gen.id,
-                    "status": gen.status or "completed",
-                    "duration": gen.duration,
-                    "error": gen.error,
-                    # Agent-originated sources ("mcp", "rest") skip main-window
-                    # autoplay — the floating pill plays those directly.
-                    "source": gen.source,
-                }
+                payload = await asyncio.to_thread(_generation_status_snapshot, bind, generation_id)
                 yield f"data: {json.dumps(payload)}\n\n"
-
-                if (gen.status or "completed") in ("completed", "failed"):
+                if payload["status"] in ("completed", "failed", "not_found"):
                     return
-
                 await asyncio.sleep(1)
         except (BrokenPipeError, ConnectionResetError, asyncio.CancelledError):
             logger.debug("SSE client disconnected for generation %s", generation_id)
 
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no",
+    })
 
 
 @router.post("/generate/stream")

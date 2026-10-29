@@ -58,3 +58,17 @@ test('review conflicts retain HTTP status and current version for session recove
     expect(error).toMatchObject({ status: 409, currentRevision: 4, message: 'Review changed' });
   }
 });
+
+test('review approval requests compact project projection without changing replay identity', async () => {
+  let headers = new Headers();
+  let submitted: unknown;
+  const client = new ReviewClient('http://server', (async (_url, options) => {
+    headers = new Headers(options?.headers);
+    submitted = JSON.parse(String(options?.body));
+    return Response.json({ review: saved });
+  }) as typeof fetch);
+  const request = { operation_id: 'approve-exactly', expected_version: 1 };
+  await client.approve('p', 'r', request);
+  expect(headers.get('X-Studio-Projection')).toBe('compact');
+  expect(submitted).toEqual(request);
+});

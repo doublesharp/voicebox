@@ -14,7 +14,7 @@ def test_render_api_preserves_processing_selection(tmp_path, monkeypatch):
 
     class Delivery:
         def __init__(self, store):
-            pass
+            self.schedule = lambda coro: coro.close()
 
         def submit(self, project_id, **body):
             captured.append(body)

@@ -324,6 +324,8 @@ class ApiClient {
     if (query?.search) params.append('search', query.search);
     if (query?.limit) params.append('limit', query.limit.toString());
     if (query?.offset) params.append('offset', query.offset.toString());
+    if (query?.cursor) params.append('cursor', query.cursor);
+    if (query?.include_total === false) params.append('include_total', 'false');
 
     const queryString = params.toString();
     const endpoint = queryString ? `/history?${queryString}` : '/history';

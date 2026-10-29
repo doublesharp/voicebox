@@ -1,9 +1,7 @@
 """Story endpoints."""
 
-import io
-
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from ..utils.file_response import TemporaryFileResponse
 from sqlalchemy.orm import Session
 
 from .. import database, models
@@ -243,7 +241,7 @@ async def export_story_audio(
             raise HTTPException(status_code=404, detail="Story not found")
 
         try:
-            audio_bytes = await stories.export_story_audio(
+            audio_path = await stories.export_story_file(
                 story_id, db, fmt=fmt, chapters_mode=chapters_mode
             )
         except RuntimeError as e:
@@ -252,7 +250,7 @@ async def export_story_audio(
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
 
-        if not audio_bytes:
+        if audio_path is None:
             raise HTTPException(status_code=400, detail="Story has no audio items")
 
         safe_name = "".join(c for c in story.name if c.isalnum() or c in (" ", "-", "_")).strip()
@@ -260,8 +258,8 @@ async def export_story_audio(
             safe_name = "story"
         filename = f"{safe_name}.{fmt}"
 
-        return StreamingResponse(
-            io.BytesIO(audio_bytes),
+        return TemporaryFileResponse(
+            audio_path,
             media_type=_EXPORT_MIME[fmt],
             headers={"Content-Disposition": safe_content_disposition("attachment", filename)},
         )

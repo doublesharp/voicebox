@@ -90,7 +90,10 @@ export class ReviewClient implements ReviewTransport {
         ? {}
         : {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+              'Content-Type': 'application/json',
+              ...(approval ? { 'X-Studio-Projection': 'compact' } : {}),
+            },
             body: JSON.stringify(body),
           },
     );

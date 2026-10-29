@@ -93,6 +93,54 @@ interface CacheEntry {
   used: number;
 }
 
+interface WaveformEntry {
+  source: StoryAudioSource;
+  promise: Promise<StoryWaveform>;
+  resolve: (data: StoryWaveform) => void;
+  reject: (error: unknown) => void;
+  users: Set<symbol>;
+  controller: AbortController;
+}
+
+export function audioWaveformUrl(sourceUrl: string) {
+  const url = new URL(sourceUrl, globalThis.location?.href ?? 'http://localhost');
+  url.pathname = `${url.pathname.replace(/\/$/, '')}/waveform`;
+  url.searchParams.set('bins', '2048');
+  return /^https?:\/\//.test(sourceUrl) ? url.toString() : `${url.pathname}${url.search}`;
+}
+
+function readWaveform(value: unknown): StoryWaveform {
+  const data = value as {
+    frames: number;
+    sample_rate: number;
+    channels: number;
+    peaks: number[][];
+  };
+  if (
+    !data ||
+    !Number.isFinite(data.frames) ||
+    data.frames <= 0 ||
+    !Number.isFinite(data.sample_rate) ||
+    data.sample_rate <= 0 ||
+    !Number.isInteger(data.channels) ||
+    data.channels < 1 ||
+    !Array.isArray(data.peaks) ||
+    !data.peaks.length ||
+    data.peaks.length > 2048 ||
+    data.peaks.some(
+      (pair) => !Array.isArray(pair) || pair.length !== 2 || !pair.every(Number.isFinite),
+    )
+  ) {
+    throw new Error('Audio waveform is invalid');
+  }
+  return {
+    duration: data.frames / data.sample_rate,
+    peaks: [
+      Float32Array.from(data.peaks, ([low, high]) => (Math.abs(low) > Math.abs(high) ? low : high)),
+    ],
+  };
+}
+
 const aborted = () => new DOMException('Story audio request cancelled', 'AbortError');
 
 /**
@@ -105,6 +153,9 @@ export class StoryAudioCache {
   private queue: CacheEntry[] = [];
   private running = 0;
   private sequence = 0;
+  private waveformEntries = new Map<string, WaveformEntry>();
+  private waveformQueue: WaveformEntry[] = [];
+  private waveformRunning = 0;
 
   constructor(
     private decode: (data: ArrayBuffer) => Promise<AudioBuffer>,
@@ -150,10 +201,43 @@ export class StoryAudioCache {
       this.waveforms.set(source.key, waveform);
       return { promise: Promise.resolve(waveform), release: () => {} };
     }
-    const { promise, release } = this.retain(source);
+    let entry = this.waveformEntries.get(source.key);
+    if (!entry) {
+      let resolve!: WaveformEntry['resolve'];
+      let reject!: WaveformEntry['reject'];
+      const promise = new Promise<StoryWaveform>((yes, no) => {
+        resolve = yes;
+        reject = no;
+      });
+      entry = {
+        source,
+        promise,
+        resolve,
+        reject,
+        users: new Set(),
+        controller: new AbortController(),
+      };
+      const current = entry;
+      entry.controller.signal.addEventListener('abort', () => current.reject(aborted()), {
+        once: true,
+      });
+      void promise.catch(() => {});
+      this.waveformEntries.set(source.key, entry);
+      this.waveformQueue.push(entry);
+    }
+    const token = Symbol();
+    entry.users.add(token);
+    this.pumpWaveforms();
+    const current = entry;
     return {
-      promise: promise.then(({ peaks, duration }) => ({ peaks, duration })).finally(release),
-      release,
+      promise: entry.promise,
+      release: () => {
+        if (!current.users.delete(token) || current.users.size) return;
+        if (this.waveformEntries.get(source.key) === current) {
+          this.waveformEntries.delete(source.key);
+          current.controller.abort();
+        }
+      },
     };
   }
 
@@ -173,6 +257,45 @@ export class StoryAudioCache {
   clear() {
     for (const [key, entry] of this.entries) this.remove(key, entry);
     this.waveforms.clear();
+    for (const entry of this.waveformEntries.values()) entry.controller.abort();
+    this.waveformEntries.clear();
+    this.waveformQueue = [];
+  }
+
+  private pumpWaveforms() {
+    const concurrency = Math.max(1, this.options.concurrency ?? 3);
+    while (this.waveformRunning < concurrency && this.waveformQueue.length) {
+      const entry = this.waveformQueue.shift()!;
+      if (entry.controller.signal.aborted) continue;
+      this.waveformRunning++;
+      void this.loadWaveform(entry).finally(() => {
+        this.waveformRunning--;
+        this.pumpWaveforms();
+      });
+    }
+  }
+
+  private async loadWaveform(entry: WaveformEntry) {
+    try {
+      const response = await (this.options.fetch ?? globalThis.fetch)(
+        audioWaveformUrl(entry.source.url),
+        {
+          signal: entry.controller.signal,
+        },
+      );
+      if (!response.ok) throw new Error(`Audio waveform unavailable (${response.status})`);
+      const data = readWaveform(await response.json());
+      if (entry.controller.signal.aborted || this.waveformEntries.get(entry.source.key) !== entry)
+        throw aborted();
+      this.waveforms.set(entry.source.key, data);
+      while (this.waveforms.size > 256) this.waveforms.delete(this.waveforms.keys().next().value!);
+      entry.resolve(data);
+    } catch (error) {
+      entry.reject(error);
+    } finally {
+      if (this.waveformEntries.get(entry.source.key) === entry)
+        this.waveformEntries.delete(entry.source.key);
+    }
   }
 
   private release(key: string, token: symbol) {

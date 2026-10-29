@@ -3,7 +3,7 @@
 from datetime import UTC, datetime
 import uuid
 
-from sqlalchemy import Column, String, Integer, Float, DateTime, Text, ForeignKey, Boolean, JSON
+from sqlalchemy import Column, String, Integer, Float, DateTime, Text, ForeignKey, Boolean, JSON, Index
 from sqlalchemy.ext.declarative import declarative_base
 
 from ..utils.capture_chords import (
@@ -63,6 +63,10 @@ class Generation(Base):
     """A single TTS generation."""
 
     __tablename__ = "generations"
+    __table_args__ = (
+        Index("ix_generations_cursor", "created_at", "id"),
+        Index("ix_generations_profile_cursor", "profile_id", "created_at", "id"),
+    )
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     profile_id = Column(String, ForeignKey("profiles.id"), nullable=False, index=True)

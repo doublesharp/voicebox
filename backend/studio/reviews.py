@@ -2,7 +2,7 @@
 
 import json
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, StrictInt, StrictStr
 
 from .review_schema import approval_note, validate_review_content, validate_reviews
@@ -43,7 +43,12 @@ class StudioReviews:
                 ).fetchall()
             ]
 
-    def _mutate(self, project_id, revision_id, operation_id, expected_version, action, note="", checklist=None):
+    def _projection(self, db, project_id, response, *, compact=False):
+        if "project" in response:
+            response["project"] = self.store._receipt_projection(db, project_id, response["project"], compact=compact)
+        return response
+
+    def _mutate(self, project_id, revision_id, operation_id, expected_version, action, note="", checklist=None, *, compact=False):
         if not isinstance(operation_id, str) or not 1 <= len(operation_id) <= 200:
             raise ValueError("Review operation identity required")
         if type(expected_version) is not int or expected_version < 0:
@@ -61,7 +66,7 @@ class StudioReviews:
             if prior:
                 if prior["request"] != encode(request):
                     raise Conflict("Review operation identity reused with different content")
-                return json.loads(prior["response"])
+                return self._projection(db, project_id, json.loads(prior["response"]), compact=compact)
             review = self._get(db, project_id, revision_id)
             if review["version"] != expected_version or (action == "approve" and expected_version == 0):
                 raise Conflict("Review changed; save and acknowledge this review before approval", review["version"])
@@ -84,18 +89,24 @@ class StudioReviews:
                     "INSERT INTO approvals VALUES (?,?,?,?,?)",
                     (uid(), project_id, revision_id, approval_note(review), now()),
                 )
-                response = {"review": review, "project": self.store._project(db, project_id)}
+                response = {
+                    "review": review,
+                    "project": {
+                        "studio_receipt_version": 1,
+                        "project": self.store._project(db, project_id, compact=True),
+                    },
+                }
             db.execute(
                 "INSERT INTO review_operations VALUES (?,?,?,?)",
                 (project_id, operation_id, encode(request), encode(response)),
             )
-            return response
+            return self._projection(db, project_id, response, compact=compact)
 
     def save(self, project_id, revision_id, operation_id, expected_version, note, checklist):
         return self._mutate(project_id, revision_id, operation_id, expected_version, "save", note, checklist)
 
-    def approve(self, project_id, revision_id, operation_id, expected_version):
-        return self._mutate(project_id, revision_id, operation_id, expected_version, "approve")
+    def approve(self, project_id, revision_id, operation_id, expected_version, *, compact=False):
+        return self._mutate(project_id, revision_id, operation_id, expected_version, "approve", compact=compact)
 
 
 def restore_reviews(db, project_id, records):
@@ -153,7 +164,7 @@ def make_review_router(store):
         return call("save", project_id, revision_id, **body.model_dump())
 
     @router.post("/projects/{project_id}/reviews/{revision_id}/approvals")
-    def approve(project_id: str, revision_id: str, body: ApproveReview):
-        return call("approve", project_id, revision_id, **body.model_dump())
+    def approve(project_id: str, revision_id: str, body: ApproveReview, x_studio_projection: str | None = Header(default=None)):
+        return call("approve", project_id, revision_id, **body.model_dump(), compact=x_studio_projection == "compact")
 
     return router

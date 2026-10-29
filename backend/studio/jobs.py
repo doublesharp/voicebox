@@ -11,8 +11,9 @@ from .storage import Conflict, NotFound, encode, now, uid
 
 
 class StudioJobs:
-    def __init__(self, store, synth=None, enqueue=None, capability_resolver=None):
+    def __init__(self, store, synth=None, enqueue=None, capability_resolver=None, delivery_schedule=None):
         self.store = store
+        self.delivery_schedule = delivery_schedule
         self.synth = synth
         self.capability_resolver = capability_resolver or resolve_voice
         if enqueue is None:
@@ -155,7 +156,7 @@ class StudioJobs:
         else:
             from .delivery import StudioDelivery
 
-            delivery = StudioDelivery(self.store)
+            delivery = StudioDelivery(self.store, schedule=self.delivery_schedule)
             delivery.schedule(delivery.run(job_id))
         return self.get(job_id)
 
@@ -182,7 +183,7 @@ class StudioJobs:
             elif row["kind"] == "render":
                 from .delivery import StudioDelivery
 
-                delivery = StudioDelivery(self.store)
+                delivery = StudioDelivery(self.store, schedule=self.delivery_schedule)
                 delivery.schedule(delivery.run(row["id"]))
 
     def interrupt_on_startup(self):

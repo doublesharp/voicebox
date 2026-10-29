@@ -19,6 +19,40 @@ from ..utils.http import safe_content_disposition
 router = APIRouter()
 
 
+def _waveform_response(path, db, bins):
+    from ..utils.waveforms import waveform
+
+    resolved = config.resolve_storage_path(path)
+    if resolved is None or not resolved.is_file():
+        raise HTTPException(status_code=404, detail="Audio file not found")
+    # Cold envelopes can take time; they must not occupy the database pool.
+    db.close()
+    try:
+        return waveform(resolved, config.get_data_dir() / "audio-waveform-cache", bins)
+    except (ValueError, RuntimeError, OSError) as error:
+        raise HTTPException(status_code=422, detail="Audio waveform unavailable") from error
+
+
+@router.get("/audio/version/{version_id}/waveform")
+def get_version_waveform(version_id: str, bins: int = Query(2048, ge=32, le=2048), db: Session = Depends(get_db)):
+    from ..database import GenerationVersion
+
+    row = db.query(GenerationVersion).filter_by(id=version_id).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Version not found")
+    return _waveform_response(row.audio_path, db, bins)
+
+
+@router.get("/audio/{generation_id}/waveform")
+def get_generation_waveform(generation_id: str, bins: int = Query(2048, ge=32, le=2048), db: Session = Depends(get_db)):
+    from ..database import Generation
+
+    row = db.query(Generation).filter_by(id=generation_id).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Generation not found")
+    return _waveform_response(row.audio_path, db, bins)
+
+
 def _audio_media_type(path: Path) -> str:
     """Derive the Content-Type from the file extension.
 

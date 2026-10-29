@@ -70,10 +70,13 @@ export class StudioClient implements StudioTransport {
     }
     return response.json() as Promise<T>;
   }
-  private post<T>(path: string, body: unknown) {
+  private post<T>(path: string, body: unknown, compact = false) {
     return this.request<T>(path, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(compact ? { 'X-Studio-Projection': 'compact' } : {}),
+      },
       body: JSON.stringify(body),
     });
   }
@@ -109,13 +112,13 @@ export class StudioClient implements StudioTransport {
     );
   }
   command(id: string, input: StudioCommand) {
-    return this.post<StudioProject>(`/projects/${encodeURIComponent(id)}/commands`, input);
+    return this.post<StudioProject>(`/projects/${encodeURIComponent(id)}/commands`, input, true);
   }
   checkpoint(id: string, input: { operation_id: string; expected_revision: number; name: string }) {
-    return this.post<StudioProject>(`/projects/${encodeURIComponent(id)}/revisions`, input);
+    return this.post<StudioProject>(`/projects/${encodeURIComponent(id)}/revisions`, input, true);
   }
   approve(id: string, input: { operation_id: string; revision_id: string; note?: string }) {
-    return this.post<StudioProject>(`/projects/${encodeURIComponent(id)}/approvals`, input);
+    return this.post<StudioProject>(`/projects/${encodeURIComponent(id)}/approvals`, input, true);
   }
   engines(signal?: AbortSignal) {
     return this.request<{ items: StudioEngine[] }>('/engines', { signal });

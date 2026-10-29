@@ -35,7 +35,11 @@ const generation = {
   created_at: original.created_at,
   versions: [original, processed],
 } as HistoryResponse;
-let historyData = { items: [generation], total: 1 };
+let historyData: { items: HistoryResponse[]; total: number | null; next_cursor?: string | null } = {
+  items: [generation],
+  total: 1,
+};
+const historyQueries: Array<{ offset?: number; cursor?: string; include_total?: boolean }> = [];
 let laterPage: typeof historyData | undefined;
 let intersect: (() => void) | undefined;
 const mutation = { mutate: mock(() => {}), isPending: false, isSuccess: false };
@@ -54,11 +58,14 @@ const setDefault = mock(async () => ({ ...original, is_default: true }));
 const toast = mock(() => {});
 
 mock.module('../src/lib/hooks/useHistory', () => ({
-  useHistory: ({ offset }: { offset: number }) => ({
-    data: offset === 0 ? historyData : laterPage,
-    isLoading: false,
-    isFetching: false,
-  }),
+  useHistory: (query: { offset: number; cursor?: string; include_total?: boolean }) => {
+    historyQueries.push(query);
+    return {
+      data: query.offset === 0 && !query.cursor ? historyData : laterPage,
+      isLoading: false,
+      isFetching: false,
+    };
+  },
   useDeleteGeneration: () => deleteMutation,
   useClearFailedGenerations: () => clearMutation,
   useExportGeneration: () => mutation,
@@ -139,8 +146,8 @@ Object.defineProperty(globalThis, 'IntersectionObserver', {
 const { HistoryTable } = await import('../src/components/History/HistoryTable');
 let renderer: ReactTestRenderer;
 let client: QueryClient;
-function mount(items = [generation], total = items.length) {
-  historyData = { items, total };
+function mount(items = [generation], total = items.length, nextCursor?: string) {
+  historyData = { items, total, ...(nextCursor ? { next_cursor: nextCursor } : {}) };
   laterPage = undefined;
   client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   act(() => {
@@ -490,4 +497,37 @@ describe('generation version controls', () => {
       }),
     );
   });
+});
+
+test('large history collections mount only a bounded window of transcript cards', () => {
+  mount(
+    Array.from({ length: 1000 }, (_, index) => ({
+      ...generation,
+      id: `history-${index}`,
+      text: `Take ${index}`,
+    })),
+  );
+  const transcripts = renderer.root
+    .findAllByType('textarea')
+    .filter((node) => String(node.props['aria-label']).startsWith('Transcript for sample'));
+  expect(transcripts.length).toBeGreaterThan(0);
+  expect(transcripts.length).toBeLessThan(30);
+});
+
+test('older history pages use the server cursor without a deep offset or repeated total count', () => {
+  mount([generation], 2, 'older-boundary');
+  laterPage = {
+    items: [{ ...generation, id: 'older', text: 'Older take' }],
+    total: null,
+    next_cursor: null,
+  };
+  act(() => intersect!());
+  expect(historyQueries.at(-1)).toMatchObject({
+    offset: 0,
+    cursor: 'older-boundary',
+    include_total: false,
+  });
+  expect(renderer.root.findAllByType('textarea').map((node) => node.props.value)).toContain(
+    'Older take',
+  );
 });
