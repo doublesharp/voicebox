@@ -166,6 +166,8 @@ export function ProfileForm() {
   const [sampleMode, setSampleMode] = useState<'upload' | 'record' | 'system'>('record');
   const [audioDuration, setAudioDuration] = useState<number | null>(null);
   const [isValidatingAudio, setIsValidatingAudio] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const savingRef = useRef(false);
   const [avatarPreview, setAvatarPreview] = useState<string | null>(null);
   const [selectedPresetEngine, setSelectedPresetEngine] = useState<string>('kokoro');
   const [selectedPresetVoiceId, setSelectedPresetVoiceId] = useState<string>('');
@@ -196,10 +198,12 @@ export function ProfileForm() {
 
   // Validate audio duration when file is selected
   useEffect(() => {
+    let active = true;
     if (selectedFile && selectedFile instanceof File) {
       setIsValidatingAudio(true);
       getAudioDuration(selectedFile as File & { recordedDuration?: number })
         .then((duration) => {
+          if (!active) return;
           setAudioDuration(duration);
           if (duration > MAX_AUDIO_DURATION_SECONDS) {
             form.setError('sampleFile', {
@@ -214,6 +218,7 @@ export function ProfileForm() {
           }
         })
         .catch((error) => {
+          if (!active) return;
           console.error('Failed to get audio duration:', error);
           setAudioDuration(null);
           const isRecordedFile =
@@ -230,12 +235,14 @@ export function ProfileForm() {
           }
         })
         .finally(() => {
-          setIsValidatingAudio(false);
+          if (active) setIsValidatingAudio(false);
         });
     } else {
+      setIsValidatingAudio(false);
       setAudioDuration(null);
       form.clearErrors('sampleFile');
     }
+    return () => { active = false; };
   }, [selectedFile, form, t]);
 
   const {
@@ -513,6 +520,9 @@ export function ProfileForm() {
   }
 
   async function onSubmit(data: ProfileFormValues) {
+    if (savingRef.current) return;
+    savingRef.current = true;
+    setIsSaving(true);
     try {
       if (editingProfileId) {
         // Editing: update profile
@@ -691,8 +701,14 @@ export function ProfileForm() {
           return;
         }
 
+        // The user can replace the sample while asynchronous validation runs.
+        const sampleIsCurrent = () =>
+          useUIStore.getState().profileDialogOpen &&
+          form.getValues('sampleFile') === sampleFile &&
+          form.getValues('referenceText') === referenceText;
         try {
           const duration = await getAudioDuration(sampleFile);
+          if (!sampleIsCurrent()) return;
           if (duration > MAX_AUDIO_DURATION_SECONDS) {
             form.setError('sampleFile', {
               type: 'manual',
@@ -712,6 +728,7 @@ export function ProfileForm() {
             return;
           }
         } catch (error) {
+          if (!sampleIsCurrent()) return;
           form.setError('sampleFile', {
             type: 'manual',
             message: t('profileForm.validation.audioFailed'),
@@ -820,6 +837,9 @@ export function ProfileForm() {
         description: error instanceof Error ? error.message : t('profileForm.toast.saveFailed'),
         variant: 'destructive',
       });
+    } finally {
+      savingRef.current = false;
+      setIsSaving(false);
     }
   }
 
@@ -1477,7 +1497,7 @@ export function ProfileForm() {
                 <Button
                   type="submit"
                   disabled={
-                    createProfile.isPending || updateProfile.isPending || addSample.isPending
+                    isSaving || createProfile.isPending || updateProfile.isPending || addSample.isPending
                   }
                 >
                   {createProfile.isPending || updateProfile.isPending || addSample.isPending
