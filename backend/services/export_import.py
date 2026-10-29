@@ -163,6 +163,14 @@ async def import_profile_from_zip(file_bytes: bytes, db: Session) -> VoiceProfil
             
             if not isinstance(samples_data, dict):
                 raise ValueError("Invalid samples.json: must be a dictionary")
+
+            # Validate all entries before creating a persistent profile.
+            for filename in samples_data:
+                if not filename.endswith('.wav'):
+                    raise ValueError(f"Invalid sample filename: {filename} (must be .wav)")
+                zip_path = f"samples/{filename}"
+                if zip_path not in namelist:
+                    raise ValueError(f"Sample file not found in ZIP: {zip_path}")
             
             # Get unique profile name
             original_name = profile_data.get("name", "Imported Profile")
@@ -282,6 +290,8 @@ def export_generation_to_zip(generation_id: str, db: Session) -> bytes:
         version_entries = []
         for v in versions:
             v_path = config.resolve_storage_path(v.audio_path)
+            if v_path is None or not v_path.is_file():
+                raise ValueError(f"Audio file not found: {v.audio_path}")
             effects_chain = None
             if v.effects_chain:
                 effects_chain = json.loads(v.effects_chain)
@@ -323,8 +333,9 @@ def export_generation_to_zip(generation_id: str, db: Session) -> bytes:
         # Fallback: if no versions exist, include the generation's main audio
         if not versions:
             audio_path = config.resolve_storage_path(generation.audio_path)
-            if audio_path is not None and audio_path.exists():
-                zip_file.write(audio_path, f"audio/{audio_path.name}")
+            if audio_path is None or not audio_path.is_file():
+                raise ValueError(f"Audio file not found: {generation.audio_path}")
+            zip_file.write(audio_path, f"audio/{audio_path.name}")
     
     zip_buffer.seek(0)
     return zip_buffer.read()
@@ -384,6 +395,14 @@ async def import_generation_from_zip(file_bytes: bytes, db: Session) -> dict:
                 raise ValueError("No audio file found in ZIP archive")
             
             audio_file_path = audio_files[0]
+            default_version = next(
+                (version for version in manifest_data.get("versions", []) if version.get("is_default")),
+                None,
+            )
+            if default_version is not None:
+                audio_file_path = f"audio/{default_version.get('filename', '')}"
+                if audio_file_path not in audio_files:
+                    raise ValueError(f"Default version audio not found in ZIP: {audio_file_path}")
             
             # Check if we should match an existing profile or create metadata
             profile_id = None
