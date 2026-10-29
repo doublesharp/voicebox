@@ -716,7 +716,7 @@ class StoryItemCreate(BaseModel):
     """Request model for adding a generation to a story."""
 
     generation_id: str
-    start_time_ms: Optional[int] = None  # If not provided, will be calculated automatically
+    start_time_ms: Optional[int] = Field(None, ge=0)  # If omitted, calculated automatically
     track: Optional[int] = 0  # Track number (0 = main track)
 
 

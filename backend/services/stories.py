@@ -6,6 +6,7 @@ from typing import List, Optional
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import os
+import math
 import re
 import uuid
 import tempfile
@@ -289,6 +290,12 @@ async def add_item_to_story(
     generation = db.query(DBGeneration).filter_by(id=data.generation_id).first()
     if not generation:
         return None
+
+    # Do not commit an item that cannot be serialized or played. Incomplete
+    # and failed generations can have no audio path or known duration.
+    duration = audio_duration(generation.audio_path, fallback=generation.duration)
+    if not generation.audio_path or duration is None or not math.isfinite(duration) or duration <= 0:
+        raise ValueError("Generation has no playable audio")
 
     # Check if generation is already in story
     existing = db.query(DBStoryItem).filter_by(story_id=story_id, generation_id=data.generation_id).first()

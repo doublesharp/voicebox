@@ -74,7 +74,10 @@ async def add_story_item(
     db: Session = Depends(get_db),
 ):
     """Add a generation to a story."""
-    item = await stories.add_item_to_story(story_id, data, db)
+    try:
+        item = await stories.add_item_to_story(story_id, data, db)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     if not item:
         raise HTTPException(status_code=404, detail="Story or generation not found")
     return item
