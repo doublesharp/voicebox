@@ -916,6 +916,10 @@
       }
     },
     "captures": {
+      "saveError": {
+        "title": "Could not save capture settings",
+        "description": "Your changes were not saved. Try again."
+      },
       "dictation": {
         "title": "Dictation",
         "description": "Capture from anywhere on your machine with a global shortcut.",
