@@ -396,3 +396,266 @@ async def test_interrupted_audio_extraction_rolls_back_and_removes_temporary_fil
     assert db.query(Generation).count() == 0
     assert db.query(ProfileSample).count() == 0
     assert list(temp.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_generation_archive_roundtrip_preserves_all_takes_and_source_relationships(db, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, '_data_dir', tmp_path)
+    (tmp_path / 'one.wav').write_bytes(b'clean audio')
+    (tmp_path / 'two.wav').write_bytes(b'processed audio')
+    db.add(VoiceProfile(id='voice', name='Voice'))
+    db.add(Generation(id='original', profile_id='voice', text='Hello', language='en', duration=2,
+                      audio_path='two.wav', engine='chatterbox', model_size='small', synthesis_config='{"speed": 0.8}',
+                      source='rest', is_favorited=True, created_at=datetime(2024, 1, 2, 3, 4, 5, tzinfo=timezone.utc)))
+    db.add_all([
+        GenerationVersion(id='clean', generation_id='original', label='Clean', audio_path='one.wav', is_default=False,
+                          created_at=datetime(2023, 1, 2, tzinfo=timezone.utc)),
+        GenerationVersion(id='processed', generation_id='original', label='Processed', audio_path='two.wav',
+                          effects_chain='[{"type":"gain"}]', source_version_id='clean', is_default=True,
+                          created_at=datetime(2023, 1, 3, tzinfo=timezone.utc)),
+    ])
+    db.commit()
+    archive_bytes = export_import.export_generation_to_zip('original', db)
+    result = await export_import.import_generation_from_zip(archive_bytes, db)
+    imported = db.query(Generation).filter_by(id=result['id']).one()
+    versions = db.query(GenerationVersion).filter_by(generation_id=imported.id).all()
+    by_label = {v.label: v for v in versions}
+    assert set(by_label) == {'Clean', 'Processed'}
+    assert by_label['Clean'].id != 'clean'
+    assert by_label['Processed'].source_version_id == by_label['Clean'].id
+    assert json.loads(by_label['Processed'].effects_chain) == [{'type': 'gain'}]
+    assert by_label['Processed'].is_default is True
+    assert by_label['Clean'].is_default is False
+    assert by_label['Clean'].created_at.replace(tzinfo=timezone.utc) == datetime(2023, 1, 2, tzinfo=timezone.utc)
+    assert by_label['Processed'].created_at.replace(tzinfo=timezone.utc) == datetime(2023, 1, 3, tzinfo=timezone.utc)
+    assert imported.audio_path == by_label['Processed'].audio_path
+    assert config.resolve_storage_path(by_label['Clean'].audio_path).read_bytes() == b'clean audio'
+    assert config.resolve_storage_path(by_label['Processed'].audio_path).read_bytes() == b'processed audio'
+    assert (imported.engine, imported.model_size) == ('chatterbox', 'small')
+    assert json.loads(imported.synthesis_config) == {'speed': 0.8}
+    assert imported.source == 'rest' and imported.is_favorited is True
+    assert imported.created_at.replace(tzinfo=timezone.utc) == datetime(2024, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_missing_nondefault_take_is_rejected_before_any_write(db, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, '_data_dir', tmp_path)
+    db.add(VoiceProfile(id='voice', name='Voice'))
+    db.commit()
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, 'w') as z:
+        z.writestr('manifest.json', json.dumps({
+            'version': '1.0', 'profile': {'name': 'Voice'},
+            'generation': {'text': 'Hi', 'language': 'en', 'duration': 1},
+            'versions': [
+                {'id': 'missing', 'label': 'Missing', 'filename': 'missing.wav', 'is_default': False},
+                {'id': 'present', 'label': 'Present', 'filename': 'present.wav', 'is_default': True},
+            ],
+        }))
+        z.writestr('audio/present.wav', b'present')
+    with pytest.raises(ValueError, match='version audio not found'):
+        await export_import.import_generation_from_zip(output.getvalue(), db)
+    assert db.query(Generation).count() == 0
+    assert db.query(GenerationVersion).count() == 0
+    assert list(config.get_generations_dir().iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_generation_export_handles_takes_with_the_same_basename(db, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, '_data_dir', tmp_path)
+    (tmp_path / 'one').mkdir()
+    (tmp_path / 'two').mkdir()
+    (tmp_path / 'one' / 'take.wav').write_bytes(b'first')
+    (tmp_path / 'two' / 'take.wav').write_bytes(b'second')
+    db.add(VoiceProfile(id='voice', name='Voice'))
+    db.add(Generation(id='original', profile_id='voice', text='Hi', language='en', duration=1,
+                      audio_path='one/take.wav', created_at=datetime.now(timezone.utc)))
+    db.add_all([
+        GenerationVersion(id='one', generation_id='original', label='One', audio_path='one/take.wav', is_default=True),
+        GenerationVersion(id='two', generation_id='original', label='Two', audio_path='two/take.wav', is_default=False),
+    ])
+    db.commit()
+    result = await export_import.import_generation_from_zip(export_import.export_generation_to_zip('original', db), db)
+    versions = db.query(GenerationVersion).filter_by(generation_id=result['id']).all()
+    assert {v.label: config.resolve_storage_path(v.audio_path).read_bytes() for v in versions} == {'One': b'first', 'Two': b'second'}
+
+
+def generation_take_archive(versions, files=None):
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, 'w') as z:
+        z.writestr('manifest.json', json.dumps({
+            'version': '1.0', 'profile': {'name': 'Voice'},
+            'generation': {'text': 'Hi', 'language': 'en', 'duration': 1},
+            'versions': versions,
+        }))
+        for name, data in (files or {'one.wav': b'one', 'two.wav': b'two'}).items():
+            z.writestr('audio/' + name, data)
+    return output.getvalue()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('versions', [
+    [{'id': 'same', 'filename': 'one.wav'}, {'id': 'same', 'filename': 'two.wav'}],
+    [{'id': 'one', 'filename': 'one.wav', 'is_default': True}, {'id': 'two', 'filename': 'two.wav', 'is_default': True}],
+    [{'id': 'one', 'filename': 'one.wav', 'source_version_id': 'missing'}],
+    [{'id': 'one', 'filename': 'one.wav', 'source_version_id': 'two'}, {'id': 'two', 'filename': 'two.wav', 'source_version_id': 'one'}],
+    [{'id': 'one', 'filename': 'one.wav', 'effects_chain': 'invalid'}],
+    [{'id': 'one', 'filename': 'one.wav', 'is_default': 'false'}],
+    [{'id': 'one', 'filename': 'one.wav', 'created_at': 'not a date'}],
+])
+async def test_invalid_take_metadata_is_rejected_without_writes(versions, db, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, '_data_dir', tmp_path)
+    db.add(VoiceProfile(id='voice', name='Voice'))
+    db.commit()
+    with pytest.raises(ValueError):
+        await export_import.import_generation_from_zip(generation_take_archive(versions), db)
+    assert db.query(Generation).count() == 0
+    assert db.query(GenerationVersion).count() == 0
+    assert list(config.get_generations_dir().iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_forward_source_relationship_and_missing_default_are_restored(db, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, '_data_dir', tmp_path)
+    db.add(VoiceProfile(id='voice', name='Voice'))
+    db.commit()
+    versions = [
+        {'id': 'derived', 'label': 'Derived', 'filename': 'two.wav', 'source_version_id': 'original', 'effects_chain': []},
+        {'id': 'original', 'label': 'Original', 'filename': 'one.wav'},
+    ]
+    result = await export_import.import_generation_from_zip(generation_take_archive(versions), db)
+    rows = {v.label: v for v in db.query(GenerationVersion).filter_by(generation_id=result['id']).all()}
+    assert rows['Derived'].source_version_id == rows['Original'].id
+    assert rows['Derived'].is_default is True
+    assert db.get(Generation, result['id']).audio_path == rows['Derived'].audio_path
+
+
+@pytest.mark.asyncio
+async def test_import_commit_failure_removes_every_created_take(db, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, '_data_dir', tmp_path)
+    db.add(VoiceProfile(id='voice', name='Voice'))
+    db.commit()
+    existing = config.get_generations_dir() / 'keep.wav'
+    existing.write_bytes(b'keep')
+    versions = [{'id': 'one', 'filename': 'one.wav'}, {'id': 'two', 'filename': 'two.wav'}]
+    def fail_commit(): raise RuntimeError('commit failed')
+    monkeypatch.setattr(db, 'commit', fail_commit)
+    with pytest.raises(ValueError, match='commit failed'):
+        await export_import.import_generation_from_zip(generation_take_archive(versions), db)
+    assert db.query(Generation).count() == 0
+    assert db.query(GenerationVersion).count() == 0
+    assert list(config.get_generations_dir().iterdir()) == [existing]
+    assert existing.read_bytes() == b'keep'
+
+
+@pytest.mark.asyncio
+async def test_import_failure_on_second_take_removes_first_take(db, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, '_data_dir', tmp_path)
+    db.add(VoiceProfile(id='voice', name='Voice'))
+    db.commit()
+    existing = config.get_generations_dir() / 'keep.wav'
+    existing.write_bytes(b'keep')
+    versions = [{'id': 'one', 'filename': 'one.wav'}, {'id': 'two', 'filename': 'two.wav'}]
+    data = generation_take_archive(versions)
+    original_open = zipfile.ZipFile.open
+    def fail_second(self, name, *args, **kwargs):
+        if name == 'audio/two.wav': raise OSError('second take failed')
+        return original_open(self, name, *args, **kwargs)
+    monkeypatch.setattr(zipfile.ZipFile, 'open', fail_second)
+    with pytest.raises(ValueError, match='second take failed'):
+        await export_import.import_generation_from_zip(data, db)
+    assert db.query(Generation).count() == 0
+    assert db.query(GenerationVersion).count() == 0
+    assert list(config.get_generations_dir().iterdir()) == [existing]
+    assert existing.read_bytes() == b'keep'
+
+
+@pytest.mark.asyncio
+async def test_legacy_single_audio_import_creates_one_default_take(db, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, '_data_dir', tmp_path)
+    db.add(VoiceProfile(id='voice', name='Voice'))
+    db.commit()
+    result = await export_import.import_generation_from_zip(generation_take_archive([]), db)
+    generation = db.get(Generation, result['id'])
+    version = db.query(GenerationVersion).filter_by(generation_id=result['id']).one()
+    assert version.label == 'original'
+    assert version.is_default is True
+    assert version.audio_path == generation.audio_path
+    assert config.resolve_storage_path(version.audio_path).read_bytes() == b'one'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('field,value', [
+    ('created_at', 'not a date'),
+    ('created_at', 42),
+    ('source', 42),
+    ('synthesis_config', {'unexpected': 'object'}),
+    ('is_favorited', 'yes'),
+])
+async def test_invalid_generation_metadata_is_rejected_before_writing(field, value, db, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, '_data_dir', tmp_path)
+    db.add(VoiceProfile(id='voice', name='Voice'))
+    db.commit()
+    data = io.BytesIO()
+    generation = {'text': 'Hi', 'language': 'en', 'duration': 1, field: value}
+    with zipfile.ZipFile(data, 'w') as z:
+        z.writestr('manifest.json', json.dumps({'version': '1.0', 'generation': generation}))
+        z.writestr('audio/one.wav', b'one')
+    with pytest.raises(ValueError):
+        await export_import.import_generation_from_zip(data.getvalue(), db)
+    assert db.query(Generation).count() == 0
+    assert db.query(GenerationVersion).count() == 0
+    assert list(config.get_generations_dir().iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_committed_generation_import_does_not_depend_on_post_commit_refresh(db, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, '_data_dir', tmp_path)
+    db.add(VoiceProfile(id='voice', name='Voice'))
+    db.commit()
+    def fail_refresh(*args, **kwargs):
+        raise RuntimeError('refresh unavailable after commit')
+    monkeypatch.setattr(db, 'refresh', fail_refresh)
+    result = await export_import.import_generation_from_zip(generation_take_archive([]), db)
+    assert db.query(Generation).filter_by(id=result['id']).one().text == 'Hi'
+    assert db.query(GenerationVersion).filter_by(generation_id=result['id']).count() == 1
+
+
+def test_generation_export_uses_the_validated_take_path(db, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, '_data_dir', tmp_path)
+    audio = tmp_path / 'take.wav'
+    audio.write_bytes(b'take')
+    db.add(VoiceProfile(id='voice', name='Voice'))
+    db.add(Generation(id='original', profile_id='voice', text='Hi', language='en', duration=1,
+                      audio_path='take.wav', created_at=datetime.now(timezone.utc)))
+    db.add(GenerationVersion(id='one', generation_id='original', label='One', audio_path='take.wav', is_default=True))
+    db.commit()
+    original_resolve = config.resolve_storage_path
+    calls = 0
+    def intermittent_resolve(path):
+        nonlocal calls
+        calls += 1
+        return original_resolve(path) if calls == 1 else None
+    monkeypatch.setattr(config, 'resolve_storage_path', intermittent_resolve)
+    archive_bytes = export_import.export_generation_to_zip('original', db)
+    with zipfile.ZipFile(io.BytesIO(archive_bytes)) as z:
+        assert z.read('audio/take.wav') == b'take'
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_forward_source_import_succeeds_with_sqlite_foreign_keys_enabled(db, monkeypatch, tmp_path):
+    from sqlalchemy import text
+    monkeypatch.setattr(config, '_data_dir', tmp_path)
+    db.execute(text('PRAGMA foreign_keys=ON'))
+    assert db.execute(text('PRAGMA foreign_keys')).scalar_one() == 1
+    db.add(VoiceProfile(id='voice', name='Voice'))
+    db.commit()
+    versions = [
+        {'id': 'derived', 'label': 'Derived', 'filename': 'two.wav', 'source_version_id': 'original'},
+        {'id': 'original', 'label': 'Original', 'filename': 'one.wav'},
+    ]
+    result = await export_import.import_generation_from_zip(generation_take_archive(versions), db)
+    rows = {v.label: v for v in db.query(GenerationVersion).filter_by(generation_id=result['id']).all()}
+    assert rows['Derived'].source_version_id == rows['Original'].id
+    assert db.execute(text('PRAGMA foreign_key_check')).all() == []
