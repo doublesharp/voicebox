@@ -20,20 +20,25 @@ export function useRestoreActiveTasks() {
 
   // Track which downloads we've seen to detect new ones
   const seenDownloadsRef = useRef<Set<string>>(new Set());
+  const requestVersion = useRef(0);
 
   const fetchActiveTasks = useCallback(async () => {
+    const version = ++requestVersion.current;
+    const activeIdAtStart = useGenerationStore.getState().activeGenerationId;
     try {
       const tasks = await apiClient.getActiveTasks();
+      if (requestVersion.current !== version) return;
+      const activeIdUnchanged = useGenerationStore.getState().activeGenerationId === activeIdAtStart;
 
       // Restore pending generations (e.g., after page refresh)
       if (tasks.generations.length > 0) {
-        setActiveGenerationId(tasks.generations[0].task_id);
+        if (activeIdUnchanged) setActiveGenerationId(tasks.generations[0].task_id);
         for (const gen of tasks.generations) {
           addPendingGeneration(gen.task_id);
         }
       } else {
         const currentId = useGenerationStore.getState().activeGenerationId;
-        if (currentId) {
+        if (currentId && activeIdUnchanged) {
           setActiveGenerationId(null);
         }
       }
@@ -68,7 +73,10 @@ export function useRestoreActiveTasks() {
     // Poll for active tasks
     const interval = setInterval(fetchActiveTasks, POLL_INTERVAL);
 
-    return () => clearInterval(interval);
+    return () => {
+      ++requestVersion.current;
+      clearInterval(interval);
+    };
   }, [fetchActiveTasks]);
 
   return activeDownloads;
