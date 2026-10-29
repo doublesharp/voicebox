@@ -35,11 +35,13 @@ beforeEach(() => {
   globalThis.getComputedStyle = (() => ({
     getPropertyValue: () => '0 0% 100%',
   })) as unknown as typeof getComputedStyle;
-  globalThis.fetch = mock(async () => ({
-    ok: true,
-    arrayBuffer: async () => new ArrayBuffer(4),
-  })) as unknown as typeof fetch;
+  globalThis.fetch = mock(async () =>
+    Response.json({ frames: 24000, sample_rate: 24000, channels: 1, peaks: [[-0.2, 0.2]] }),
+  ) as unknown as typeof fetch;
   globalThis.AudioContext = class {
+    constructor() {
+      throw new Error('Waveform display must not decode full audio');
+    }
     state = 'running';
     async close() {
       this.state = 'closed';
@@ -86,7 +88,7 @@ test('zoom redraws cached peaks without rebuilding or loading the source again',
   expect(createWave.mock.results[0].value.load).not.toHaveBeenCalled();
 });
 
-test('split waveforms share the same pending source decode', async () => {
+test('split waveforms share the same pending peak envelope', async () => {
   await act(async () => {
     renderer = create(
       <>

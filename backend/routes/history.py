@@ -23,8 +23,10 @@ router = APIRouter()
 async def list_history(
     profile_id: str | None = None,
     search: str | None = None,
-    limit: int = 50,
-    offset: int = 0,
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    cursor: str | None = Query(default=None, max_length=2048),
+    include_total: bool = True,
     db: Session = Depends(get_db),
 ):
     """List generation history with optional filters."""
@@ -33,8 +35,13 @@ async def list_history(
         search=search,
         limit=limit,
         offset=offset,
+        cursor=cursor,
+        include_total=include_total,
     )
-    return await history.list_generations(query, db)
+    try:
+        return await history.list_generations(query, db)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
 
 
 @router.get("/history/stats")

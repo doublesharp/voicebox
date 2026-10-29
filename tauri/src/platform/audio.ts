@@ -36,10 +36,16 @@ export const tauriAudio: PlatformAudio = {
   },
 
   async playToDevices(audioData, deviceIds, options): Promise<NativePlaybackSession> {
-    return await invoke('play_audio_to_devices', {
-      audioData: Array.from(audioData),
-      deviceIds: [...new Set(deviceIds)],
-      options,
+    // Headers require ASCII on every webview transport. JSON Unicode escapes
+    // preserve device identifiers without expanding the audio byte buffer.
+    const metadata = JSON.stringify({ deviceIds: [...new Set(deviceIds)], options }).replace(
+      /[\u007f-\uffff]/g,
+      (character) => `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`,
+    );
+    return await invoke('play_audio_to_devices', audioData, {
+      headers: {
+        'x-voicebox-playback': metadata,
+      },
     });
   },
 

@@ -164,6 +164,8 @@ class HistoryQuery(BaseModel):
     search: Optional[str] = None
     limit: int = Field(default=50, ge=1, le=100)
     offset: int = Field(default=0, ge=0)
+    cursor: Optional[str] = Field(default=None, max_length=2048)
+    include_total: bool = True
 
 
 class HistoryResponse(BaseModel):
@@ -195,7 +197,8 @@ class HistoryListResponse(BaseModel):
     """Response model for history list."""
 
     items: List[HistoryResponse]
-    total: int
+    total: Optional[int] = None
+    next_cursor: Optional[str] = None
 
 
 class TranscriptionRequest(BaseModel):

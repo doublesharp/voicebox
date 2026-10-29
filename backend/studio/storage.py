@@ -14,6 +14,9 @@ from pathlib import Path
 
 from .timing import nearest_sample, resampled_frames
 
+UNDO_MAX_STATES = 100
+UNDO_MAX_BYTES = 8 * 1024 * 1024
+
 
 def uid():
     return str(uuid.uuid4())
@@ -25,6 +28,27 @@ def now():
 
 def encode(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def _history_json(states):
+    """Retain recent undo states without rewriting an unlimited edit history.
+
+    One snapshot larger than the budget is retained so the last edit remains
+    undoable even for a project whose document itself exceeds the budget.
+    Named checkpoints and acknowledged operation receipts are never pruned.
+    """
+    selected = []
+    size = 2
+    for state in reversed(states[-UNDO_MAX_STATES:]):
+        raw = encode(state)
+        additional = len(raw) + bool(selected)
+        if selected and size + additional > UNDO_MAX_BYTES:
+            break
+        selected.append(raw)
+        size += additional
+        if size > UNDO_MAX_BYTES:
+            break
+    return "[" + ",".join(reversed(selected)) + "]"
 
 
 class Conflict(Exception):
@@ -138,7 +162,10 @@ class StudioStore:
             ]
 
     def _project(self, db, project_id, *, compact=False):
-        row = db.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+        row = db.execute(
+            "SELECT id,name,client_label,revision,created_at,updated_at,document FROM projects WHERE id=?",
+            (project_id,),
+        ).fetchone()
         if row is None:
             raise NotFound("Project not found")
         result = {k: row[k] for k in ("id", "name", "client_label", "revision", "created_at", "updated_at")}
@@ -204,7 +231,39 @@ class StudioStore:
             result["document"] = json.loads(result["document"])
             return result
 
-    def _operation(self, db, project_id, operation_id, request):
+    def _receipt_projection(self, db, project_id, receipt, *, compact=False):
+        if receipt.get("studio_receipt_version") != 1:
+            # Legacy responses remain exactly replayable. Compact clients can
+            # still omit their inline checkpoint documents on the wire.
+            if compact and isinstance(receipt.get("revisions"), list):
+                receipt["revisions"] = [
+                    {key: value for key, value in revision.items() if key != "document"}
+                    for revision in receipt["revisions"]
+                ]
+            return receipt
+        response = receipt["project"]
+        if compact or not response["revisions"]:
+            return response
+        # Checkpoints are immutable and retained independently of undo. Only
+        # their IDs are repeated in each receipt; metadata stays frozen in it.
+        ids = [revision["id"] for revision in response["revisions"]]
+        documents = {}
+        for start in range(0, len(ids), 500):
+            batch = ids[start:start + 500]
+            placeholders = ",".join("?" for _ in batch)
+            for row in db.execute(
+                f"SELECT id,document FROM revisions WHERE project_id=? AND id IN ({placeholders})",
+                [project_id, *batch],
+            ):
+                documents[row["id"]] = json.loads(row["document"])
+        if len(documents) != len(set(ids)):
+            raise NotFound("Saved operation checkpoint is unavailable")
+        response["revisions"] = [
+            {**revision, "document": documents[revision["id"]]} for revision in response["revisions"]
+        ]
+        return response
+
+    def _operation(self, db, project_id, operation_id, request, *, compact=False):
         if not isinstance(operation_id, str) or not operation_id.strip():
             raise ValueError("operation_id is required")
         old = db.execute(
@@ -213,20 +272,21 @@ class StudioStore:
         if old:
             if old["request"] != encode(request):
                 raise Conflict("operation_id already used with different input")
-            return json.loads(old["response"])
+            return self._receipt_projection(db, project_id, json.loads(old["response"]), compact=compact)
         return None
 
-    def _record(self, db, project_id, operation_id, request):
-        response = self._project(db, project_id)
+    def _record(self, db, project_id, operation_id, request, *, compact=False):
+        response = self._project(db, project_id, compact=True)
+        receipt = {"studio_receipt_version": 1, "project": response}
         db.execute(
-            "INSERT INTO operations VALUES (?,?,?,?)", (project_id, operation_id, encode(request), encode(response))
+            "INSERT INTO operations VALUES (?,?,?,?)", (project_id, operation_id, encode(request), encode(receipt))
         )
-        return response
+        return self._receipt_projection(db, project_id, receipt, compact=compact)
 
-    def command(self, project_id, operation_id, expected_revision, type, payload):
+    def command(self, project_id, operation_id, expected_revision, type, payload, *, compact=False):
         published = []
         try:
-            return self._command(project_id, operation_id, expected_revision, type, payload, published)
+            return self._command(project_id, operation_id, expected_revision, type, payload, published, compact=compact)
         except BaseException:
             # _command has exited its transaction before checking uncertain commits.
             from .publication import discard_unregistered
@@ -235,15 +295,15 @@ class StudioStore:
                 discard_unregistered(db, published)
             raise
 
-    def _command(self, project_id, operation_id, expected_revision, type, payload, published):
+    def _command(self, project_id, operation_id, expected_revision, type, payload, published, *, compact=False):
         request = dict(expected_revision=expected_revision, type=type, payload=payload)
         voice_snapshot = None
         if type == "assign_voice":
             with self.connect() as db:
-                prior = self._operation(db, project_id, operation_id, request)
+                prior = self._operation(db, project_id, operation_id, request, compact=compact)
                 if prior is not None:
                     return prior
-                project = self._project(db, project_id)
+                project = self._project(db, project_id, compact=True)
                 if project["revision"] != expected_revision:
                     raise Conflict("Project revision changed", project["revision"])
                 ids = payload.get("passage_ids")
@@ -262,7 +322,7 @@ class StudioStore:
             voice_snapshot = self.voice_resolver(self, project_id, payload.get("profile_id"), **kwargs)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            prior = self._operation(db, project_id, operation_id, request)
+            prior = self._operation(db, project_id, operation_id, request, compact=compact)
             if prior is not None:
                 return prior
             row = db.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
@@ -301,7 +361,7 @@ class StudioStore:
                 redo.clear()
             from .archive import _validate_document
 
-            project = self._project(db, project_id)
+            project = self._project(db, project_id, compact=True)
             _validate_document(
                 state["document"], {a["id"]: a for a in project["assets"]}, {t["id"]: t for t in project["takes"]}
             )
@@ -312,13 +372,13 @@ class StudioStore:
                     state["name"],
                     state["client_label"],
                     encode(state["document"]),
-                    encode(undo),
-                    encode(redo),
+                    _history_json(undo),
+                    _history_json(redo),
                     now(),
                     project_id,
                 ),
             )
-            return self._record(db, project_id, operation_id, request)
+            return self._record(db, project_id, operation_id, request, **({"compact": True} if compact else {}))
 
     def _remember_intents(self, db, project_id, doc):
         for p in doc["passages"]:
@@ -666,14 +726,14 @@ class StudioStore:
         ):
             raise ValueError("Invalid clip range or gain")
 
-    def checkpoint(self, project_id, operation_id, expected_revision, name):
+    def checkpoint(self, project_id, operation_id, expected_revision, name, *, compact=False):
         request = dict(action="checkpoint", expected_revision=expected_revision, name=name)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            prior = self._operation(db, project_id, operation_id, request)
+            prior = self._operation(db, project_id, operation_id, request, compact=compact)
             if prior is not None:
                 return prior
-            project = self._project(db, project_id)
+            project = self._project(db, project_id, compact=True)
             if project["revision"] != expected_revision:
                 raise Conflict("Project revision changed", project["revision"])
             if not isinstance(name, str) or not name.strip():
@@ -682,13 +742,13 @@ class StudioStore:
                 "INSERT INTO revisions VALUES (?,?,?,?,?,?)",
                 (uid(), project_id, name.strip(), now(), encode(project["document"]), expected_revision),
             )
-            return self._record(db, project_id, operation_id, request)
+            return self._record(db, project_id, operation_id, request, **({"compact": True} if compact else {}))
 
-    def approve(self, project_id, operation_id, revision_id, note=None):
+    def approve(self, project_id, operation_id, revision_id, note=None, *, compact=False):
         request = dict(action="approve", revision_id=revision_id, note=note)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            prior = self._operation(db, project_id, operation_id, request)
+            prior = self._operation(db, project_id, operation_id, request, compact=compact)
             if prior is not None:
                 return prior
             if not db.execute(
@@ -696,7 +756,7 @@ class StudioStore:
             ).fetchone():
                 raise NotFound("Revision not found")
             db.execute("INSERT INTO approvals VALUES (?,?,?,?,?)", (uid(), project_id, revision_id, note, now()))
-            return self._record(db, project_id, operation_id, request)
+            return self._record(db, project_id, operation_id, request, **({"compact": True} if compact else {}))
 
     def add_asset(self, project_id, source):
         from .publication import discard_unregistered, publish_audio

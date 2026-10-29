@@ -7,6 +7,7 @@ import { Slider } from '@/components/ui/slider';
 import { apiClient } from '@/lib/api/client';
 import { NativePlaybackController, type NativePlaybackUpdate } from '@/lib/audio/nativePlayback';
 import { bindPlaybackPresentation } from '@/lib/audio/playbackPresentation';
+import { storyAudioCache } from '@/lib/audio/storyAudioCache';
 import { formatAudioDuration } from '@/lib/utils/audio';
 import { debug } from '@/lib/utils/debug';
 import { usePlatform } from '@/platform/PlatformContext';
@@ -362,7 +363,8 @@ function AudioPlayerSession() {
   // Load audio when URL changes (reuses the existing WaveSurfer instance)
   useEffect(() => {
     const wavesurfer = wavesurferRef.current;
-    if (!wavesurfer || !wsReady) return;
+    if (!wavesurfer || !wsReady || !routingReady) return;
+    let active = true;
 
     // Invalidate pending fetch/start requests before resetting or replacing media.
     void nativeControllerRef.current
@@ -407,21 +409,47 @@ function AudioPlayerSession() {
     setCurrentTime(0);
     setDuration(0);
 
-    wavesurfer
-      .load(audioUrl)
+    const waveform = useNativePlayback
+      ? storyAudioCache.retainWaveform({
+          key: JSON.stringify([audioUrl, sourceGeneration]),
+          url: audioUrl,
+        })
+      : null;
+    const load = waveform
+      ? waveform.promise.then(({ peaks, duration: sourceDuration }) => {
+          if (!active || !sourceIsCurrent()) return;
+          // A native-routed waveform has no media URL: Rust is the only
+          // owner that fetches and decodes the actual audio recording.
+          return wavesurfer.load('', peaks, sourceDuration);
+        })
+      : wavesurfer.load(audioUrl);
+    load
       .then(() => {
-        if (!sourceIsCurrent() || wavesurferRef.current !== wavesurfer) return;
+        if (!active || !sourceIsCurrent() || wavesurferRef.current !== wavesurfer) return;
         debug.log('Audio loaded into WaveSurfer');
         loadingRef.current = false;
       })
       .catch((err) => {
-        if (!sourceIsCurrent() || wavesurferRef.current !== wavesurfer) return;
+        if (!active || !sourceIsCurrent() || wavesurferRef.current !== wavesurfer) return;
         debug.error('Failed to load audio:', err);
         loadingRef.current = false;
         setIsLoading(false);
         setError(`Failed to load audio: ${err instanceof Error ? err.message : String(err)}`);
       });
-  }, [audioUrl, wsReady, sourceIsCurrent, setCurrentTime, setDuration]);
+    return () => {
+      active = false;
+      waveform?.release();
+    };
+  }, [
+    audioUrl,
+    sourceGeneration,
+    wsReady,
+    sourceIsCurrent,
+    setCurrentTime,
+    setDuration,
+    routingReady,
+    useNativePlayback,
+  ]);
 
   // Sync play/pause state (only when user clicks play/pause button, not auto-sync)
   // This effect is kept for external state changes but should be minimal

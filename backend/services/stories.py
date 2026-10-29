@@ -5,7 +5,6 @@ Story management module.
 from typing import List, Optional
 from dataclasses import dataclass
 from datetime import UTC, datetime
-import asyncio
 import os
 import re
 import uuid
@@ -36,9 +35,8 @@ from ..database import (
     VoiceProfile as DBVoiceProfile,
 )
 from .history import _get_versions_for_generation, _get_versions_for_generations
-from ..utils.audio import load_audio, protect_audio_peak, save_audio
 from ..utils.audio_metadata import audio_duration
-import numpy as np
+from ..utils.async_work import run_blocking
 
 
 def _selected_item_audio(item: DBStoryItem, generation: DBGeneration, versions) -> tuple:
@@ -973,6 +971,8 @@ def _ffmpeg_encode(
     out_path: Path,
     fmt: str,
     chapters: Optional[List[_Chapter]],
+    *,
+    cancelled=None,
 ) -> None:
     """Transcode WAV → fmt with optional embedded chapter metadata.
 
@@ -983,7 +983,7 @@ def _ffmpeg_encode(
         if chapters:
             meta_path = wav_path.with_suffix(".chapters.txt")
             _write_ffmetadata(chapters, meta_path)
-        encode_audio(wav_path, out_path, fmt, metadata_path=meta_path)
+        encode_audio(wav_path, out_path, fmt, metadata_path=meta_path, cancelled=cancelled)
     finally:
         if meta_path is not None:
             meta_path.unlink(missing_ok=True)
@@ -1001,194 +1001,45 @@ def _make_tempfile(suffix: str) -> Path:
     return Path(name)
 
 
-async def export_story_audio(
-    story_id: str,
-    db: Session,
-    fmt: str = "wav",
-    chapters_mode: str = "none",
-) -> Optional[bytes]:
-    """
-    Export story as a single mixed audio file with timecode-based mixing.
+async def export_story_file(story_id: str, db: Session, fmt: str = "wav", chapters_mode: str = "none") -> Optional[Path]:
+    """Snapshot row references on their owning thread, then mix bounded blocks off-loop."""
+    from ..database import GenerationVersion
+    from .story_export import render_story_file
 
-    Args:
-        story_id: Story ID
-        db: Database session
-        fmt: Output container — "wav" (default), "m4b", or "mp3".
-        chapters_mode: "none" (default) leaves chapter metadata off; "auto"
-            derives one chapter per story item, titled from its generation
-            text. WAV ignores this — chapters are an m4b/mp3 feature.
-
-    Returns:
-        Audio file bytes or None if story not found
-    """
-    story = db.query(DBStory).filter_by(id=story_id).first()
-    if not story:
+    if not db.query(DBStory).filter_by(id=story_id).first():
         return None
-
-    # Get all items ordered by start_time_ms, including dangling rows so an
-    # incomplete story cannot be exported as if it were complete.
-    items = (
-        db.query(DBStoryItem, DBGeneration)
-        .outerjoin(DBGeneration, DBStoryItem.generation_id == DBGeneration.id)
-        .filter(DBStoryItem.story_id == story_id)
-        .order_by(DBStoryItem.start_time_ms)
-        .all()
-    )
-
+    items = (db.query(DBStoryItem, DBGeneration).outerjoin(DBGeneration, DBStoryItem.generation_id == DBGeneration.id)
+             .filter(DBStoryItem.story_id == story_id).order_by(DBStoryItem.start_time_ms).all())
     if not items:
         return None
-
-    # Retain source rates and channels until a common mix format is known.
-    audio_data = []
-
+    fmt = (fmt or "wav").lower()
+    if fmt not in ("wav", "mp3", "m4b"):
+        raise ValueError(f"Unsupported export format: {fmt}")
+    clips = []
     for item, generation in items:
         if generation is None:
             raise ValueError(f"Story item {item.id} references a missing generation")
-        # Resolve audio path: use pinned version if set, otherwise generation default
-        resolved_audio_path = generation.audio_path
-        if getattr(item, "version_id", None):
-            from ..database import GenerationVersion as DBGenerationVersion
-
-            version = db.query(DBGenerationVersion).filter_by(
-                id=item.version_id, generation_id=generation.id,
-            ).first()
+        stored = generation.audio_path
+        if item.version_id:
+            version = db.query(GenerationVersion).filter_by(id=item.version_id, generation_id=generation.id).first()
             if version is None:
                 raise ValueError(f"Story item {item.id} references a missing audio version")
-            resolved_audio_path = version.audio_path
-
-        audio_path = config.resolve_storage_path(resolved_audio_path)
-        if audio_path is None or not audio_path.is_file():
+            stored = version.audio_path
+        path = config.resolve_storage_path(stored)
+        if path is None:
             raise ValueError(f"Story item {item.id} audio file is missing")
+        clips.append(dict(id=item.id, path=str(path), trim_start_ms=item.trim_start_ms or 0,
+                          trim_end_ms=item.trim_end_ms or 0, start_time_ms=item.start_time_ms,
+                          volume=1.0 if item.volume is None else float(item.volume), text=generation.text))
+    return await render_story_file(clips, fmt, chapters_mode)
 
-        try:
-            audio, sr = await asyncio.to_thread(load_audio, str(audio_path), sample_rate=None, mono=False)
-        except Exception as exc:
-            raise ValueError(f"Story item {item.id} audio could not be read") from exc
-        try:
-            # librosa uses (channels, frames), while soundfile writes
-            # (frames, channels). Mono is kept as a single channel here.
-            audio = audio[:, np.newaxis] if audio.ndim == 1 else audio.T
 
-            # Get trim values
-            trim_start_ms = getattr(item, "trim_start_ms", 0)
-            trim_end_ms = getattr(item, "trim_end_ms", 0)
-
-            # Slice audio based on trim values
-            trim_start_sample = int((trim_start_ms / 1000.0) * sr)
-            trim_end_sample = int((trim_end_ms / 1000.0) * sr)
-
-            # Extract the trimmed portion
-            if trim_end_ms > 0:
-                trimmed_audio = (
-                    audio[trim_start_sample:-trim_end_sample] if trim_end_sample > 0 else audio[trim_start_sample:]
-                )
-            else:
-                trimmed_audio = audio[trim_start_sample:]
-            if len(trimmed_audio) == 0:
-                raise ValueError(f"Story item {item.id} has no audio after trimming")
-
-            # Apply per-clip volume to the export mix.
-            stored_volume = getattr(item, "volume", None)
-            volume = 1.0 if stored_volume is None else float(stored_volume)
-            if volume != 1.0:
-                trimmed_audio = trimmed_audio * volume
-
-            # Store audio with its timecode info
-            start_time_ms = item.start_time_ms
-
-            audio_data.append(
-                {
-                    "audio": trimmed_audio,
-                    "sample_rate": sr,
-                    "start_time_ms": start_time_ms,
-                    "duration_ms": len(trimmed_audio) / sr * 1000,
-                    "text": generation.text,
-                }
-            )
-        except ValueError:
-            raise
-        except Exception as exc:
-            raise ValueError(f"Story item {item.id} audio could not be processed") from exc
-
-    if not audio_data:
+async def export_story_audio(story_id: str, db: Session, fmt: str = "wav", chapters_mode: str = "none") -> Optional[bytes]:
+    """Compatibility helper; HTTP delivery uses the file-backed variant directly."""
+    path = await export_story_file(story_id, db, fmt, chapters_mode)
+    if path is None:
         return None
-
-    sample_rate = max(data["sample_rate"] for data in audio_data)
-    channels = max(data["audio"].shape[1] for data in audio_data)
-    for data in audio_data:
-        audio = data["audio"]
-        if data["sample_rate"] != sample_rate:
-            from librosa import resample
-
-            audio = await asyncio.to_thread(
-                resample, audio, orig_sr=data["sample_rate"], target_sr=sample_rate, axis=0
-            )
-        if audio.shape[1] == 1 and channels > 1:
-            audio = np.repeat(audio, channels, axis=1)
-        elif audio.shape[1] < channels:
-            audio = np.pad(audio, ((0, 0), (0, channels - audio.shape[1])))
-        data["audio"] = audio
-        data["duration_ms"] = len(audio) / sample_rate * 1000
-
-    # Selected versions may include longer effects tails than generation
-    # metadata. Allocate from the actual rendered samples, including trims.
-    total_samples = max(
-        int(data["start_time_ms"] / 1000 * sample_rate) + len(data["audio"]) for data in audio_data
-    )
-    if total_samples <= 0:
-        return None
-    max_end_time_ms = int(np.ceil(total_samples / sample_rate * 1000))
-
-    # Create output buffer initialized to zeros
-    final_audio = np.zeros((total_samples, channels), dtype=np.float32)
-
-    # Mix each audio segment at its timecode position
-    for data in audio_data:
-        audio = data["audio"]
-        start_time_ms = data["start_time_ms"]
-
-        # Calculate start sample index
-        start_sample = int((start_time_ms / 1000.0) * sample_rate)
-
-        # Ensure we don't exceed buffer bounds
-        audio_length = len(audio)
-        end_sample = min(start_sample + audio_length, total_samples)
-
-        if start_sample < total_samples:
-            # Trim audio if it extends beyond buffer
-            audio_to_mix = audio[: end_sample - start_sample]
-
-            # Mix: add audio to existing buffer (overlapping audio will sum)
-            # Normalize to prevent clipping (simple approach: divide by max)
-            final_audio[start_sample:end_sample] += audio_to_mix
-
-    final_audio = protect_audio_peak(final_audio)
-    if channels == 1:
-        final_audio = final_audio[:, 0]
-
-    fmt = (fmt or "wav").lower()
-    if fmt not in ("wav", "m4b", "mp3"):
-        raise ValueError(f"Unsupported export format: {fmt}")
-
-    chapters: Optional[List[_Chapter]] = None
-    if fmt != "wav" and chapters_mode == "auto":
-        chapters = _derive_chapters_auto(audio_data, max_end_time_ms) or None
-
-    wav_path = _make_tempfile(suffix=".wav")
-    out_path: Optional[Path] = None
     try:
-        save_audio(final_audio, str(wav_path), sample_rate)
-        if fmt == "wav":
-            return wav_path.read_bytes()
-
-        out_suffix = ".m4b" if fmt == "m4b" else ".mp3"
-        out_path = _make_tempfile(suffix=out_suffix)
-        # ffmpeg is CPU-bound and can run for several seconds on a real
-        # audiobook — offload to a worker thread so it doesn't block the
-        # FastAPI event loop while it runs.
-        await asyncio.to_thread(_ffmpeg_encode, wav_path, out_path, fmt, chapters)
-        return out_path.read_bytes()
+        return await run_blocking(path.read_bytes)
     finally:
-        wav_path.unlink(missing_ok=True)
-        if out_path is not None:
-            out_path.unlink(missing_ok=True)
+        path.unlink(missing_ok=True)

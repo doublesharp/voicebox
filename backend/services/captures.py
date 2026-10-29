@@ -21,6 +21,7 @@ from .. import config
 from ..database import Capture as DBCapture
 from ..models import CaptureResponse, RefinementFlagsModel
 from ..utils.audio import load_audio
+from ..utils.async_work import run_blocking, run_owned
 from .refinement import RefinementFlags, refine_transcript
 from .transcribe import get_whisper_model
 
@@ -57,6 +58,35 @@ def _to_response(row: DBCapture) -> CaptureResponse:
     )
 
 
+def _prepare_capture_audio(raw_path, suffix, audio_bytes, written_files):
+    # The caller retains this ledger until the worker drains, including cancellation.
+    with raw_path.open("xb") as output:
+        written_files.append(raw_path)
+        output.write(audio_bytes)
+    try:
+        audio, sr = load_audio(str(raw_path))
+        duration_ms = int(len(audio) / sr * 1000) if sr else None
+    except Exception as decode_err:
+        logger.warning("Could not decode capture %s (%s): %r", raw_path.stem, suffix, decode_err)
+        audio, sr, duration_ms = None, None, None
+    if audio is None or sr is None:
+        if suffix not in WHISPER_NATIVE_FORMATS:
+            raise ValueError(f"Could not decode {suffix} audio — the recording may be empty or corrupt")
+        audio_path = raw_path
+    elif suffix == ".wav":
+        audio_path = raw_path
+    else:
+        audio_path = raw_path.with_suffix(".wav")
+        with audio_path.open("xb"):
+            pass
+        written_files.append(audio_path)
+        sf.write(str(audio_path), audio, sr, format="WAV")
+        with contextlib.suppress(OSError):
+            raw_path.unlink()
+            written_files.remove(raw_path)
+    return audio_path, duration_ms
+
+
 async def create_capture(
     *,
     audio_bytes: bytes,
@@ -79,52 +109,13 @@ async def create_capture(
     written_files: list[Path] = []
 
     try:
-        # Reserve files before writing so a partial write can be cleaned up
-        # without ever overwriting an existing capture.
-        with raw_path.open("xb") as output:
-            written_files.append(raw_path)
-            output.write(audio_bytes)
-
-        # Decode once with librosa — its audioread fallback handles webm/opus
-        # via ffmpeg, which miniaudio (used inside mlx-audio's whisper) can't.
-        # The decoded array gives us an accurate duration and becomes the
-        # canonical WAV we hand to whisper.
-        try:
-            audio, sr = load_audio(str(raw_path))
-            duration_ms = int((len(audio) / sr) * 1000) if sr else None
-        except Exception as decode_err:
-            logger.warning(
-                "Could not decode capture %s (%s): %r", capture_id, suffix, decode_err
-            )
-            audio, sr = None, None
-            duration_ms = None
-
-        if audio is None or sr is None:
-            # Decode failed. Only pass the file straight to whisper if the
-            # source is a format its miniaudio loader can still read — webm,
-            # m4a, etc. would just 500 later. Surface a clean error instead.
-            if suffix not in WHISPER_NATIVE_FORMATS:
-                raise ValueError(
-                    f"Could not decode {suffix} audio — the recording may be empty or corrupt"
-                )
-            audio_path = raw_path
-        elif suffix == ".wav":
-            audio_path = raw_path
-        else:
-            # Transcode to WAV so downstream loaders (miniaudio, soundfile) work
-            # regardless of what format the client shipped.
-            audio_path = config.get_captures_dir() / f"{capture_id}.wav"
-            with audio_path.open("xb"):
-                pass
-            written_files.append(audio_path)
-            sf.write(str(audio_path), audio, sr, format="WAV")
-            with contextlib.suppress(OSError):
-                raw_path.unlink()
-                written_files.remove(raw_path)
+        audio_path, duration_ms = await run_blocking(
+            _prepare_capture_audio, raw_path, suffix, audio_bytes, written_files,
+        )
 
         whisper = get_whisper_model()
         resolved_stt = stt_model or whisper.model_size
-        transcript = await whisper.transcribe(str(audio_path), language, resolved_stt)
+        transcript = await run_owned(whisper.transcribe(str(audio_path), language, resolved_stt))
 
         row = DBCapture(
             id=capture_id,
@@ -137,7 +128,7 @@ async def create_capture(
         )
         db.add(row)
         db.commit()
-    except Exception:
+    except BaseException:
         # Anything between the first write and the commit means the audio on
         # disk has no row pointing at it — clean up so data/captures doesn't
         # accumulate orphan blobs across failed transcribes.

@@ -131,6 +131,8 @@ export interface HistoryQuery {
   search?: string;
   limit?: number;
   offset?: number;
+  cursor?: string;
+  include_total?: boolean;
 }
 
 export interface HistoryResponse extends GenerationResponse {
@@ -141,7 +143,8 @@ export interface HistoryResponse extends GenerationResponse {
 
 export interface HistoryListResponse {
   items: HistoryResponse[];
-  total: number;
+  total: number | null;
+  next_cursor?: string | null;
 }
 
 export type WhisperModelSize = 'base' | 'small' | 'medium' | 'large' | 'turbo';

@@ -1,5 +1,5 @@
 import { Headphones, Pause, Play } from 'lucide-react';
-import { useSyncExternalStore } from 'react';
+import { useMemo, useSyncExternalStore } from 'react';
 import { Input } from '@/components/ui/input';
 import { AudioMeters } from './AudioMeters';
 import { useStudio, useStudioPlayhead } from './context';
@@ -11,6 +11,10 @@ export function StudioTransport({ toggleTransport }: { toggleTransport: () => vo
   const { playback, project, setPlayhead } = useStudio();
   const audio = useSyncExternalStore(playback.subscribe, playback.getSnapshot);
   const playhead = useStudioPlayhead();
+  const duration = useMemo(
+    () => timelineEnd(project.document, project.assets) / project.document.sample_rate,
+    [project.document, project.assets],
+  );
   return (
     <>
       <footer className="studio-transport">
@@ -33,7 +37,7 @@ export function StudioTransport({ toggleTransport }: { toggleTransport: () => vo
         </StudioButton>
         <div className="studio-transport-time">
           <span className="studio-mono">{formatTime(playhead)}</span>
-          <small>/ {formatTime(timelineEnd(project.document, project.assets) / 48000)}</small>
+          <small>/ {formatTime(duration)}</small>
         </div>
         <Field label="Playhead (s)">
           <Input

@@ -12,6 +12,8 @@ const actualButton = await import('../src/components/ui/button');
 const listeners = new Map<string, ((...args: unknown[]) => void)[]>();
 let playing = false;
 let currentTime = 0;
+let nativeRoute = true;
+let routingPending = false;
 let nativeListener: (event: NativePlaybackEvent) => void = () => {};
 const play = mock(async () => {
   playing = true;
@@ -24,13 +26,14 @@ const wave = {
     listeners.set(name, [...(listeners.get(name) ?? []), listener]);
     return () => {};
   },
-  load: async () => {
+  load: mock(async (..._args: unknown[]) => {
     listeners.get('ready')?.forEach((fn) => {
       fn();
     });
-  },
+  }),
   getDuration: () => 5,
   getCurrentTime: () => currentTime,
+  getRenderer: () => ({ renderProgress() {} }),
   getMediaElement: () => ({}),
   setVolume: () => {},
   setMuted: () => {},
@@ -78,9 +81,16 @@ const platform = {
 mock.module('@tanstack/react-query', () => ({
   ...actualQuery,
   useQuery: ({ queryKey }: { queryKey: string[] }) => ({
-    data:
-      queryKey[0] === 'channels'
-        ? [{ id: 'route', is_default: false, device_ids: ['device_speakers'] }]
+    data: routingPending
+      ? undefined
+      : queryKey[0] === 'channels'
+        ? [
+            {
+              id: 'route',
+              is_default: !nativeRoute,
+              device_ids: nativeRoute ? ['device_speakers'] : [],
+            },
+          ]
         : { channel_ids: ['route'] },
   }),
 }));
@@ -101,7 +111,11 @@ const originalWindow = globalThis.window;
 const originalRaf = globalThis.requestAnimationFrame;
 const originalCancel = globalThis.cancelAnimationFrame;
 const originalStyle = globalThis.getComputedStyle;
-globalThis.fetch = mock(async () => new Response(new Uint8Array(4))) as unknown as typeof fetch;
+globalThis.fetch = mock(async (url: string) =>
+  url.includes('/waveform')
+    ? Response.json({ frames: 120000, sample_rate: 24000, channels: 1, peaks: [[-0.25, 0.5]] })
+    : new Response(new Uint8Array(4)),
+) as unknown as typeof fetch;
 globalThis.document = {
   documentElement: {},
   addEventListener: () => {},
@@ -126,6 +140,8 @@ afterEach(async () => {
   listeners.clear();
   playing = false;
   currentTime = 0;
+  nativeRoute = true;
+  routingPending = false;
   nativeListener = () => {};
   controlPlayback.mockClear();
   playToDevices.mockImplementation(
@@ -284,4 +300,89 @@ test('a delayed native pause cannot change a later selection of the same clip', 
     await pause;
   });
   expect(usePlayerStore.getState()).toMatchObject({ audioId: 'a', isPlaying: true, duration: 5 });
+});
+
+test('custom native routing loads only compact peaks into WaveSurfer before native playback', async () => {
+  wave.load.mockClear();
+  usePlayerStore.getState().setAudio('/audio/compact', 'compact', 'profile');
+  await act(async () => {
+    renderer = create(<AudioPlayer />, {
+      createNodeMock: () => ({ getBoundingClientRect: () => ({ width: 800, height: 80 }) }),
+    });
+  });
+  expect(wave.load).toHaveBeenCalledTimes(1);
+  expect(wave.load.mock.calls[0][0]).toBe('');
+  expect(wave.load.mock.calls[0][1]).toEqual([new Float32Array([0.5])]);
+  expect(wave.load.mock.calls[0][2]).toBe(5);
+  expect(playToDevices).not.toHaveBeenCalled();
+});
+
+test('pending routing cannot trigger a full audio decode, and switching to default output reloads playable media', async () => {
+  wave.load.mockClear();
+  routingPending = true;
+  usePlayerStore.getState().setAudio('/audio/routing', 'routing', 'profile');
+  await act(async () => {
+    renderer = create(<AudioPlayer />, {
+      createNodeMock: () => ({ getBoundingClientRect: () => ({ width: 800, height: 80 }) }),
+    });
+  });
+  expect(wave.load).not.toHaveBeenCalled();
+  routingPending = false;
+  await act(async () => {
+    renderer!.update(<AudioPlayer />);
+  });
+  expect(wave.load.mock.calls[0][0]).toBe('');
+  playToDevices.mockImplementation(async () => ({
+    session_id: 'route-switch',
+    duration: 5,
+    position: 0,
+  }));
+  await act(async () => {
+    await renderer!.root
+      .findAllByType('button')
+      .find((node) => node.props['aria-label'] === 'Play')!
+      .props.onClick();
+  });
+  const stops = stopPlayback.mock.calls.length;
+  nativeRoute = false;
+  await act(async () => {
+    renderer!.update(<AudioPlayer />);
+  });
+  expect(wave.load.mock.calls.at(-1)![0]).toBe('/audio/routing');
+  expect(stopPlayback.mock.calls.length).toBeGreaterThan(stops);
+});
+
+test('closing while peaks are pending discards an ignored-abort response without starting media', async () => {
+  wave.load.mockClear();
+  const fetcher = globalThis.fetch;
+  let finish!: (response: Response) => void;
+  let signal!: AbortSignal;
+  globalThis.fetch = ((_: unknown, options: RequestInit) => {
+    signal = options.signal!;
+    return new Promise<Response>((resolve) => {
+      finish = resolve;
+    });
+  }) as typeof fetch;
+  try {
+    usePlayerStore.getState().setAudio('/audio/pending-peaks', 'pending-peaks', 'profile');
+    await act(async () => {
+      renderer = create(<AudioPlayer />, {
+        createNodeMock: () => ({ getBoundingClientRect: () => ({ width: 800, height: 80 }) }),
+      });
+    });
+    await act(async () => {
+      renderer!.root
+        .findAllByType('button')
+        .find((node) => node.props['aria-label'] === 'Close player')!
+        .props.onClick();
+    });
+    expect(signal.aborted).toBe(true);
+    await act(async () => {
+      finish(Response.json({ frames: 120000, sample_rate: 24000, channels: 1, peaks: [[0, 0.5]] }));
+    });
+    expect(wave.load).not.toHaveBeenCalled();
+    expect(playToDevices).not.toHaveBeenCalled();
+  } finally {
+    globalThis.fetch = fetcher;
+  }
 });

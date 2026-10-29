@@ -332,6 +332,8 @@ def _migrate_add_indexes(engine, tables: set[str]) -> None:
         ("ix_generations_profile_id", "generations", "profile_id"),
         ("ix_generations_created_at", "generations", "created_at"),
         ("ix_generations_status", "generations", "status"),
+        ("ix_generations_cursor", "generations", "created_at, id"),
+        ("ix_generations_profile_cursor", "generations", "profile_id, created_at, id"),
         # story_items — every story lookup filters by story_id; join on generation_id
         ("ix_story_items_story_id", "story_items", "story_id"),
         ("ix_story_items_generation_id", "story_items", "generation_id"),

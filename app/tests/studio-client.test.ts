@@ -415,3 +415,37 @@ test('retrying a rejected request revokes dismissal before a later response can 
   expect(() => submission.discardRejected()).toThrow();
   expect(submission.pending()[0].body).toEqual(original);
 });
+
+test('project mutations request compact projection without changing durable command identity', async () => {
+  const requests: Array<{ url: string; headers: Headers; body: unknown }> = [];
+  const client = new StudioClient('http://server', (async (url, options) => {
+    requests.push({
+      url: String(url),
+      headers: new Headers(options?.headers),
+      body: JSON.parse(String(options?.body)),
+    });
+    return Response.json({ revision: 1, revisions: [] });
+  }) as typeof fetch);
+  const command = {
+    operation_id: 'edit',
+    expected_revision: 0,
+    type: 'undo',
+    payload: {},
+  } as const;
+  await client.command('project', command);
+  await client.checkpoint('project', {
+    operation_id: 'checkpoint',
+    expected_revision: 1,
+    name: 'Named',
+  });
+  await client.approve('project', { operation_id: 'approve', revision_id: 'checkpoint' });
+  expect(
+    requests.every((request) => request.headers.get('X-Studio-Projection') === 'compact'),
+  ).toBe(true);
+  expect(requests[0].body).toEqual(command);
+  expect(requests.map((request) => new URL(request.url).pathname.split('/').at(-1))).toEqual([
+    'commands',
+    'revisions',
+    'approvals',
+  ]);
+});
