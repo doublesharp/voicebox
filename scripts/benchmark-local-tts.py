@@ -57,8 +57,6 @@ def validate(settings):
         raise ValueError("unsupported engine; only audited Qwen adapters are admitted")
     if settings.backend not in ("mlx", "pytorch"):
         raise ValueError("backend must be explicit: mlx or pytorch")
-    if settings.backend == "mlx" and settings.engine != "qwen":
-        raise ValueError("CustomVoice and VoiceDesign adapters use pytorch")
     if settings.model not in ("1.7B", "0.6B") or (
         settings.engine == "qwen_voice_design" and settings.model != "1.7B"
     ):
@@ -147,7 +145,7 @@ def admit_cached_model(settings):
                "qwen_voice_design": "VoiceDesign"}[settings.engine]
     repo_id = f"Qwen/Qwen3-TTS-12Hz-{settings.model}-{variant}"
     if settings.backend == "mlx":
-        repo_id = f"mlx-community/Qwen3-TTS-12Hz-{settings.model}-Base-bf16"
+        repo_id = f"mlx-community/Qwen3-TTS-12Hz-{settings.model}-{variant}-bf16"
     cache = settings.cache_root.resolve()
     repo = cache / ("models--" + repo_id.replace("/", "--"))
     try:
@@ -256,6 +254,8 @@ def create_adapter(settings, admitted, output):
     modules = {
         ("qwen", "mlx"): ("mlx_backend", "MLXTTSBackend"),
         ("qwen", "pytorch"): ("pytorch_backend", "PyTorchTTSBackend"),
+        ("qwen_custom_voice", "mlx"): ("qwen_mlx_styles_backend", "QwenMLXCustomVoiceBackend"),
+        ("qwen_voice_design", "mlx"): ("qwen_mlx_styles_backend", "QwenMLXVoiceDesignBackend"),
         ("qwen_custom_voice", "pytorch"): ("qwen_custom_voice_backend", "QwenCustomVoiceBackend"),
         ("qwen_voice_design", "pytorch"): ("qwen_voice_design_backend", "QwenVoiceDesignBackend"),
     }

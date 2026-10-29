@@ -224,7 +224,7 @@ def test_duration_and_total_artifact_budget(settings, monkeypatch):
 
 
 @pytest.mark.parametrize("change", [
-    {"engine": "remote"}, {"backend": "auto"}, {"backend": "mlx"}, {"model": "2B"},
+    {"engine": "remote"}, {"backend": "auto"}, {"model": "2B"},
     {"engine": "qwen_voice_design", "model": "0.6B"}, {"language": "auto"},
     {"text": " "}, {"text": "a" * 2001}, {"warm_repeats": -1}, {"warm_repeats": 21},
     {"seed": -1}, {"seed": 2**32}, {"max_audio_seconds": float("nan")}, {"max_audio_seconds": 121},
@@ -362,6 +362,8 @@ def test_read_json_size_is_bounded(tmp_path):
 @pytest.mark.parametrize("engine,backend,module,class_name", [
     ("qwen", "mlx", "mlx_backend", "MLXTTSBackend"),
     ("qwen", "pytorch", "pytorch_backend", "PyTorchTTSBackend"),
+    ("qwen_custom_voice", "mlx", "qwen_mlx_styles_backend", "QwenMLXCustomVoiceBackend"),
+    ("qwen_voice_design", "mlx", "qwen_mlx_styles_backend", "QwenMLXVoiceDesignBackend"),
     ("qwen_custom_voice", "pytorch", "qwen_custom_voice_backend", "QwenCustomVoiceBackend"),
     ("qwen_voice_design", "pytorch", "qwen_voice_design_backend", "QwenVoiceDesignBackend"),
 ])
@@ -562,3 +564,22 @@ def test_nonfinite_json_is_refused_before_model_loading(settings, cached):
     (snapshot / "generation_config.json").write_text('{"temperature": NaN}')
     with pytest.raises(ValueError, match="nonfinite JSON"):
         bench.admit_cached_model(settings)
+
+
+@pytest.mark.parametrize("engine,variant,mode", [
+    ("qwen_custom_voice", "CustomVoice", "custom_voice"),
+    ("qwen_voice_design", "VoiceDesign", "voice_design"),
+])
+def test_mlx_style_admission_matches_integrated_backend(settings, cached, engine, variant, mode):
+    repo, snapshot = cached
+    mlx_repo = repo.with_name(f"models--mlx-community--Qwen3-TTS-12Hz-1.7B-{variant}-bf16")
+    repo.rename(mlx_repo)
+    snapshot = mlx_repo / "snapshots" / snapshot.name
+    (snapshot / "config.json").write_text(json.dumps({"tts_model_type": mode}))
+    selected = replace(settings, backend="mlx", engine=engine,
+                       preset_voice="Ryan" if mode == "custom_voice" else None,
+                       design_prompt="A clear natural voice." if mode == "voice_design" else None)
+    bench.validate(selected)
+    admitted = bench.admit_cached_model(selected)
+    assert admitted["repo_id"] == f"mlx-community/Qwen3-TTS-12Hz-1.7B-{variant}-bf16"
+    assert admitted["snapshot"] == str(snapshot)

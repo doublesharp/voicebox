@@ -397,13 +397,18 @@ async def test_registry_load_readiness_cache_inventory_and_unload_use_same_varia
     from huggingface_hub import constants
 
     from backend.backends import base
-    from backend.routes.models import _scan_model_inventory
+    from backend.routes.models import get_model_status
 
     monkeypatch.setattr(backends, "get_backend_type", lambda: "mlx")
     monkeypatch.setattr(backends, "_tts_backends", {})
     monkeypatch.setattr(constants, "HF_HUB_CACHE", str(tmp_path))
     # Use the real local cache reader for backend readiness and inventory.
     monkeypatch.setattr(runtime.styles, "is_model_cached", base.is_model_cached)
+
+    async def downloaded(cfg):
+        status = await get_model_status()
+        return next(item.downloaded for item in status.models if item.model_name == cfg.model_name)
+
     configs = [c for c in backends.get_tts_model_configs() if c.engine in ("qwen_custom_voice", "qwen_voice_design")]
     for cfg in configs:
         backend = backends.get_tts_backend_for_engine(cfg.engine)
@@ -412,7 +417,7 @@ async def test_registry_load_readiness_cache_inventory_and_unload_use_same_varia
         (snapshot / "model.safetensors").write_bytes(b"fake-weight-inventory-only")
         assert backend._get_model_path(cfg.model_size) == cfg.hf_repo_id
         assert backend._is_model_cached(cfg.model_size)
-        assert _scan_model_inventory([cfg])[cfg.model_name][0] is True
+        assert await downloaded(cfg) is True
         await backends.ensure_model_cached_or_raise(cfg.engine, cfg.model_size)
         await backends.get_model_load_func(cfg)()
         assert backends.check_model_loaded(cfg)
@@ -426,7 +431,7 @@ async def test_registry_load_readiness_cache_inventory_and_unload_use_same_varia
         assert not backends.unload_model_by_config(cfg)
         (snapshot / "model.safetensors").unlink()
         assert not backend._is_model_cached(cfg.model_size)
-        assert _scan_model_inventory([cfg])[cfg.model_name][0] is False
+        assert await downloaded(cfg) is False
         from fastapi import HTTPException
 
         with pytest.raises(HTTPException):

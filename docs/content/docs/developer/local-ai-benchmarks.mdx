@@ -13,8 +13,8 @@ Use an explicit local reference you are authorized to use for Base models.
 | Engine | Backend | Model size | Required voice argument |
 | --- | --- | --- | --- |
 | `qwen` | `mlx` or `pytorch` | `0.6B`, `1.7B` | `--reference /absolute/reference.wav --reference-text "Transcript"` |
-| `qwen_custom_voice` | `pytorch` | `0.6B`, `1.7B` | `--preset-voice Ryan` (or another built-in Qwen speaker) |
-| `qwen_voice_design` | `pytorch` | `1.7B` | `--design-prompt "A clear voice with natural pacing."` |
+| `qwen_custom_voice` | `mlx` or `pytorch` | `0.6B`, `1.7B` | `--preset-voice Ryan` (or another built-in Qwen speaker) |
+| `qwen_voice_design` | `mlx` or `pytorch` | `1.7B` | `--design-prompt "A clear voice with natural pacing."` |
 
 Other adapters are refused until their complete offline asset dependencies have
 an admission policy. Language is required: `zh`, `en`, `ja`, `ko`, `de`, `fr`,
@@ -101,8 +101,8 @@ construction have a separate `adapter_init` duration.
 - Warm distributions include only warm generations and report count, p50 and p95
   using linear interpolation at `(n - 1) * q`. With zero warm repeats the
   distributions are `null`. A tiny sample count gives weak tail estimates.
-- Existing adapters return complete arrays, including MLX adapters that consume
-  an internal generator. `first_model_audio_s` is therefore `null` with an
+- This runner calls the complete-array `generate()` API, including for MLX
+  adapters that also offer a separate `generate_stream()` API. `first_model_audio_s` is therefore `null` with an
   explanation. Complete-array elapsed time is **not TTFA**. There is no audio
   playback, first-audible-device latency or streaming-latency measurement.
 
