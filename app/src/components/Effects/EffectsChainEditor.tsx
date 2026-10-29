@@ -17,7 +17,7 @@ import {
 import { CSS } from '@dnd-kit/utilities';
 import { useQuery } from '@tanstack/react-query';
 import { ChevronDown, ChevronRight, GripVertical, Plus, Power, Trash2 } from 'lucide-react';
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
@@ -48,15 +48,27 @@ interface EffectsChainEditorProps {
   onChange: (chain: EffectConfig[]) => void;
   compact?: boolean;
   showPresets?: boolean;
+  excludedTypes?: string[];
+  commitParametersOnRelease?: boolean;
+  disabled?: boolean;
 }
 
 export function EffectsChainEditor({
   value,
-  onChange,
+  onChange: applyChange,
   compact = false,
   showPresets = true,
+  excludedTypes = [],
+  commitParametersOnRelease = false,
+  disabled = false,
 }: EffectsChainEditorProps) {
   const { t } = useTranslation();
+  const onChange = useCallback(
+    (chain: EffectConfig[]) => {
+      if (!disabled) applyChange(chain);
+    },
+    [applyChange, disabled],
+  );
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
   // Maintain stable IDs for each effect across renders.
@@ -102,6 +114,7 @@ export function EffectsChainEditor({
   }, [availableEffects]);
 
   function addEffect(type: string) {
+    if (excludedTypes.includes(type)) return;
     const def = effectsMap.get(type);
     if (!def) return;
     const params: Record<string, number> = {};
@@ -173,6 +186,7 @@ export function EffectsChainEditor({
       {showPresets && (
         <div className="flex items-center gap-2">
           <Select
+            disabled={disabled}
             onValueChange={(id) => {
               const preset = presets?.find((p) => p.id === id);
               if (preset) loadPreset(preset);
@@ -205,6 +219,7 @@ export function EffectsChainEditor({
 
           {value.length > 0 && (
             <Button
+              disabled={disabled}
               variant="ghost"
               size="sm"
               className="h-8 px-2 text-xs text-muted-foreground"
@@ -226,6 +241,8 @@ export function EffectsChainEditor({
               effect={effect}
               index={index}
               effectDef={effectsMap.get(effect.type)}
+              commitParametersOnRelease={commitParametersOnRelease}
+              disabled={disabled}
               isExpanded={expandedId === effect._id}
               onToggleExpand={() => setExpandedId(expandedId === effect._id ? null : effect._id)}
               onRemove={() => removeEffect(index)}
@@ -238,17 +255,19 @@ export function EffectsChainEditor({
 
       {/* Add effect */}
       {availableEffects && (
-        <Select onValueChange={addEffect}>
+        <Select onValueChange={addEffect} disabled={disabled}>
           <SelectTrigger className="h-8 border-dashed text-xs text-muted-foreground focus:ring-0 focus:ring-offset-0">
             <Plus className="mr-1 h-3.5 w-3.5" />
             <SelectValue placeholder={t('effects.chain.addEffect')} />
           </SelectTrigger>
           <SelectContent>
-            {availableEffects.effects.map((e) => (
-              <SelectItem key={e.type} value={e.type}>
-                {t(`effects.types.${e.type}.label`, { defaultValue: e.label })}
-              </SelectItem>
-            ))}
+            {availableEffects.effects
+              .filter((e) => !excludedTypes.includes(e.type))
+              .map((e) => (
+                <SelectItem key={e.type} value={e.type}>
+                  {t(`effects.types.${e.type}.label`, { defaultValue: e.label })}
+                </SelectItem>
+              ))}
           </SelectContent>
         </Select>
       )}
@@ -261,6 +280,7 @@ export function EffectsChainEditor({
 // ---------------------------------------------------------------------------
 
 interface SortableEffectItemProps {
+  disabled?: boolean;
   id: string;
   effect: EffectConfig;
   index: number;
@@ -270,6 +290,7 @@ interface SortableEffectItemProps {
   onRemove: () => void;
   onToggleEnabled: () => void;
   onUpdateParam: (paramName: string, paramValue: number) => void;
+  commitParametersOnRelease?: boolean;
 }
 
 function SortableEffectItem({
@@ -281,10 +302,13 @@ function SortableEffectItem({
   onRemove,
   onToggleEnabled,
   onUpdateParam,
+  commitParametersOnRelease = false,
+  disabled = false,
 }: SortableEffectItemProps) {
   const { t } = useTranslation();
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id,
+    disabled,
   });
 
   const style = {
@@ -326,6 +350,7 @@ function SortableEffectItem({
           className="p-0.5 text-muted-foreground/50 hover:text-muted-foreground cursor-grab active:cursor-grabbing touch-none"
           {...attributes}
           {...listeners}
+          disabled={disabled}
         >
           <GripVertical className="h-3.5 w-3.5" />
         </button>
@@ -343,6 +368,7 @@ function SortableEffectItem({
             effect.enabled ? 'text-primary' : 'text-muted-foreground hover:text-foreground',
           )}
           onClick={onToggleEnabled}
+          disabled={disabled}
           title={effect.enabled ? t('effects.chain.disable') : t('effects.chain.enable')}
         >
           <Power className="h-3.5 w-3.5" />
@@ -352,6 +378,7 @@ function SortableEffectItem({
           type="button"
           className="p-0.5 text-muted-foreground "
           onClick={onRemove}
+          disabled={disabled}
           title={t('effects.chain.remove')}
         >
           <Trash2 className="h-3.5 w-3.5" />
@@ -377,12 +404,14 @@ function SortableEffectItem({
                     )}
                   </span>
                 </div>
-                <Slider
+                <EffectParameterSlider
                   min={paramDef.min}
                   max={paramDef.max}
                   step={paramDef.step}
-                  value={[currentValue]}
-                  onValueChange={([v]) => onUpdateParam(paramName, v)}
+                  value={currentValue}
+                  commitOnRelease={commitParametersOnRelease}
+                  disabled={disabled}
+                  onChange={(v) => onUpdateParam(paramName, v)}
                 />
               </div>
             );
@@ -390,5 +419,46 @@ function SortableEffectItem({
         </div>
       )}
     </div>
+  );
+}
+
+function EffectParameterSlider({
+  min,
+  max,
+  step,
+  value,
+  commitOnRelease,
+  disabled,
+  onChange,
+}: {
+  min: number;
+  max: number;
+  step: number;
+  value: number;
+  commitOnRelease: boolean;
+  disabled: boolean;
+  onChange: (value: number) => void;
+}) {
+  const [draft, setDraft] = useState(value);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: Becoming disabled cancels an uncommitted gesture even when the saved value did not change.
+  useEffect(() => setDraft(value), [value, disabled]);
+  return (
+    <Slider
+      min={min}
+      max={max}
+      step={step}
+      value={[commitOnRelease ? draft : value]}
+      disabled={disabled}
+      onValueChange={([next]) => {
+        if (!disabled) commitOnRelease ? setDraft(next) : onChange(next);
+      }}
+      onValueCommit={
+        commitOnRelease
+          ? ([next]) => {
+              if (!disabled) onChange(next);
+            }
+          : undefined
+      }
+    />
   );
 }

@@ -644,7 +644,7 @@ test('render restart retains exact checkpoint, encoding and idempotency body', a
       .props.onChange({ target: { checked: true } }),
   );
   await act(async () => {
-    await sheetButton('Render dry stems').props.onClick();
+    await sheetButton('Render processed stems').props.onClick();
   });
   act(() => renderer.unmount());
   first.session.dispose();
@@ -665,7 +665,7 @@ test('delivery stale consent is explicit, revision-bound and includes recorded v
   p.revisions[0].document.passages[0].text = 'The corrected script.';
   p.revisions.push({ ...p.revisions[0], id: 'second', name: 'Another checkpoint' });
   const { renders } = await mount(<Deliver />, { project: p });
-  expect(sheetButton('Render mix').props.disabled).toBe(true);
+  expect(sheetButton('Render processed mix').props.disabled).toBe(true);
   expect(
     sheetElements()
       .map((node) => textContent(node.props.children))
@@ -676,19 +676,19 @@ test('delivery stale consent is explicit, revision-bound and includes recorded v
   );
   expect(consent).toBeDefined();
   act(() => consent!.props.onChange({ target: { checked: true } }));
-  expect(sheetButton('Render mix').props.disabled).toBe(false);
+  expect(sheetButton('Render processed mix').props.disabled).toBe(false);
   const select = sheetElements().find(
     (node) => node.type === 'select' && node.props.value === 'checkpoint',
   )!;
   act(() => select.props.onChange({ target: { value: 'second' } }));
-  expect(sheetButton('Render mix').props.disabled).toBe(true);
+  expect(sheetButton('Render processed mix').props.disabled).toBe(true);
   expect(renders).toHaveLength(0);
   const secondConsent = sheetElements().find(
     (node) => node.props['aria-label'] === 'Use earlier recording',
   )!;
   act(() => secondConsent.props.onChange({ target: { checked: true } }));
   await act(async () => {
-    await sheetButton('Render mix').props.onClick();
+    await sheetButton('Render processed mix').props.onClick();
   });
   expect(renders[0]).toMatchObject({ revision_id: 'second', allow_stale_audio: true });
 });
@@ -707,7 +707,7 @@ test('direction-only mismatch requires consent and structural errors remain bloc
   );
   expect(checkbox).toBeDefined();
   act(() => checkbox!.props.onChange({ target: { checked: true } }));
-  expect(sheetButton('Render mix').props.disabled).toBe(true);
+  expect(sheetButton('Render processed mix').props.disabled).toBe(true);
   expect(renders).toHaveLength(0);
 });
 

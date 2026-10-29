@@ -16,6 +16,9 @@ export interface StudioPassage {
   selected_take_id: string | null;
   locked: boolean;
 }
+
+import type { EffectConfig } from '@/lib/api/types';
+
 export interface StudioTrack {
   id: string;
   name: string;
@@ -23,6 +26,8 @@ export interface StudioTrack {
   mute: boolean;
   solo: boolean;
   gain: number;
+  effect_gain_db?: number;
+  effects_chain?: EffectConfig[];
 }
 export interface StudioClip {
   id: string;
@@ -46,7 +51,13 @@ export interface StudioDocument {
   tracks: StudioTrack[];
   clips: StudioClip[];
   take_annotations?: Record<string, { name: string; note: string }>;
-  mix: { target_lufs: number; max_true_peak_dbtp: number; normalize: boolean };
+  mix: {
+    target_lufs: number;
+    max_true_peak_dbtp: number;
+    normalize: boolean;
+    master_gain?: number;
+    limiter?: boolean;
+  };
 }
 export interface AuditionLevel {
   method: 'sample_rms_v1';
@@ -110,6 +121,7 @@ export interface LocalApproval {
   created_at: string;
 }
 export interface StudioDeliverable {
+  processing?: 'dry' | 'processed' | 'master';
   id: string;
   revision_id: string;
   kind: string;

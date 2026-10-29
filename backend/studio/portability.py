@@ -5,6 +5,7 @@ import shutil
 
 import soundfile as sf
 
+from .archive_scope import unavailable_references, voice_snapshots
 from .publication import discard_unregistered, publish_audio
 from .review_schema import remap_reviews, validate_reviews
 from .reviews import restore_reviews
@@ -35,6 +36,9 @@ def import_archive(store, archive_path):
         mapping = {project["id"]: uid()}
         for asset in assets:
             mapping[asset["id"]] = uid()
+        for voice_snapshot in voice_snapshots(project):
+            for ident in unavailable_references(voice_snapshot):
+                mapping.setdefault(ident, uid())
         for section in ("takes", "revisions", "approvals"):
             for item in project.get(section, []):
                 mapping[item["id"]] = uid()
@@ -54,6 +58,8 @@ def import_archive(store, archive_path):
         def voice(value):
             if not isinstance(value, dict):
                 return value
+            if "unavailable_references" in value:
+                value["unavailable_references"] = [ref(x) for x in value["unavailable_references"]]
             for sample in value.get("samples", []):
                 sample["asset_id"] = ref(sample["asset_id"])
             if "reference_assets" in value:
@@ -84,6 +90,8 @@ def import_archive(store, archive_path):
         imported = copy.deepcopy(project)
         imported["id"] = ref(imported["id"])
         document(imported["document"])
+        if payload.get("scope") is not None:
+            imported["document"]["archive_scope"] = payload["scope"]
         for take in imported.get("takes", []):
             for key in ("id", "asset_id", "passage_id"):
                 take[key] = ref(take[key])

@@ -15,7 +15,6 @@ import {
   VolumeX,
 } from 'lucide-react';
 import { memo, type RefObject, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { StoryClipWaveform as ClipWaveform } from '@/lib/audio/storyWaveform';
 import { Button } from '@/components/ui/button';
 import {
   DropdownMenu,
@@ -28,6 +27,7 @@ import { Slider } from '@/components/ui/slider';
 import { useToast } from '@/components/ui/use-toast';
 import { apiClient } from '@/lib/api/client';
 import type { StoryItemDetail } from '@/lib/api/types';
+import { StoryClipWaveform as ClipWaveform } from '@/lib/audio/storyWaveform';
 import {
   useDuplicateStoryItem,
   useMoveStoryItem,
@@ -40,6 +40,7 @@ import {
 import { cn } from '@/lib/utils/cn';
 import { useGenerationStore } from '@/stores/generationStore';
 import { useStoryStore } from '@/stores/storyStore';
+import { CreateStudioCopyButton } from './CreateStudioCopyButton';
 
 function StoryPlaybackNotice({ storyId }: { storyId: string }) {
   const error = useStoryStore((state) =>
@@ -1043,9 +1044,9 @@ export const StoryTrackEditor = memo(function StoryTrackEditor({
 
         <StoryPlaybackNotice storyId={storyId} />
         {/* Toolbar */}
-        <div className="flex items-center justify-between px-3 py-2 border-b bg-muted/30 mt-2">
+        <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 border-b bg-muted/30 mt-2">
           {/* Play controls - left side */}
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <Button
               variant="ghost"
               size="icon"
@@ -1071,6 +1072,7 @@ export const StoryTrackEditor = memo(function StoryTrackEditor({
               totalDurationMs={totalDurationMs}
               formatTime={formatTime}
             />
+            <CreateStudioCopyButton storyId={storyId} />
           </div>
 
           {/* Clip editing controls - center */}

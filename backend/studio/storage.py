@@ -417,7 +417,7 @@ class StudioStore:
                         self._validate_clip(db, project_id, doc, clip)
         elif kind == "update_track":
             track = find(tracks, payload.get("track_id"))
-            for key in ("name", "mute", "solo", "gain"):
+            for key in ("name", "mute", "solo", "gain", "effect_gain_db", "effects_chain"):
                 if key in payload:
                     track[key] = payload[key]
             if (
@@ -426,16 +426,23 @@ class StudioStore:
                 or type(track["mute"]) is not bool
                 or type(track["solo"]) is not bool
                 or not _gain(track["gain"])
+                or not _finite(track.get("effect_gain_db", 0))
+                or not -40 <= track.get("effect_gain_db", 0) <= 40
             ):
                 raise ValueError("Invalid track")
+            from .processing import validate_chain
+            validate_chain(track.get("effects_chain", []))
         elif kind == "update_mix":
-            for key in ("target_lufs", "max_true_peak_dbtp", "normalize"):
+            for key in ("target_lufs", "max_true_peak_dbtp", "normalize", "master_gain", "limiter"):
                 if key in payload:
                     doc["mix"][key] = payload[key]
             m = doc["mix"]
             if (
                 any(not _finite(m[k]) for k in ("target_lufs", "max_true_peak_dbtp"))
                 or type(m["normalize"]) is not bool
+                or not _finite(m.get("master_gain", 1))
+                or not 0 <= m.get("master_gain", 1) <= 16
+                or type(m.get("limiter", False)) is not bool
             ):
                 raise ValueError("Invalid mix")
         elif kind in ("update_clip", "duplicate_clip", "delete_clip", "split_clip"):
@@ -543,16 +550,14 @@ class StudioStore:
 
     def _voice_track(self, db, project_id, doc, take, passage):
         tracks, clips = doc["tracks"], doc["clips"]
+        from .voice_identity import frozen_identity
+
         frozen = json.loads(take["request"]).get("passage", {})
-        voice = copy.deepcopy(frozen.get("voice_snapshot", passage.get("voice_snapshot")))
-        identity = copy.deepcopy(voice)
-        if identity:
-            identity.pop("name", None)
-            for sample in identity.get("samples", []):
-                source = db.execute(
-                    "SELECT hash FROM assets WHERE id=? AND project_id=?", (sample["asset_id"], project_id)
-                ).fetchone()
-                sample["asset_id"] = source["hash"] if source else sample["asset_id"]
+        voice = frozen.get("voice_snapshot", passage.get("voice_snapshot"))
+        def asset_hash(ident):
+            source = db.execute("SELECT hash FROM assets WHERE id=? AND project_id=?", (ident, project_id)).fetchone()
+            return source["hash"] if source else None
+        identity = frozen_identity(dict(take), asset_hash)
         voice_key = hashlib.sha256(encode(identity).encode()).hexdigest()
         track = next((t for t in tracks if t.get("voice_key") == voice_key), None)
         if track is None:

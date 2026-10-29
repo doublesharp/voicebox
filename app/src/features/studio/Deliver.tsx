@@ -9,6 +9,11 @@ import {
   DialogTrigger,
 } from '@/components/ui/dialog';
 import { usePlatform } from '@/platform/PlatformContext';
+import {
+  ArchiveScopeControls,
+  archiveScopeQuery,
+  completeArchiveScope,
+} from './ArchiveScopeControls';
 import { useStudio } from './context';
 import { isJobActive, preflight, staleRecordings } from './domain';
 import { operationId } from './session';
@@ -21,6 +26,9 @@ export function Deliver() {
   const { project, client, session, revisionId, setRevisionId } = studio;
   const [kind, setKind] = useState<'mix' | 'stems'>('mix');
   const [format, setFormat] = useState<'wav' | 'mp3'>('wav');
+  const [processing, setProcessing] = useState<'dry' | 'processed'>('processed');
+  const [publication, setPublication] = useState('');
+  const [archiveScope, setArchiveScope] = useState(completeArchiveScope);
   const {
     request,
     rejected,
@@ -52,6 +60,7 @@ export function Deliver() {
           revision_id: revision!.id,
           kind,
           format,
+          processing,
           ...(allowStale ? { allow_stale_audio: true } : {}),
         }),
         (input) => client.render(project.id, input),
@@ -99,7 +108,7 @@ export function Deliver() {
               onChange={(event) => setKind(event.target.value as 'mix' | 'stems')}
             >
               <option value="mix">Stereo mix</option>
-              <option value="stems">Dry track stems</option>
+              <option value="stems">Track stems</option>
             </select>
           </Field>
           <Field label="Format">
@@ -113,9 +122,19 @@ export function Deliver() {
             </select>
           </Field>
         </div>
+        <Field label="Processing">
+          <select
+            value={processing}
+            disabled={studio.actionBusy || !!request}
+            onChange={(event) => setProcessing(event.target.value as 'dry' | 'processed')}
+          >
+            <option value="dry">Dry</option>
+            <option value="processed">Processed</option>
+          </select>
+        </Field>
         <p className="studio-note">
-          Dry track stems preserve clip and track gain, fades, and placement. Master normalization
-          applies only to the mix.
+          Dry output retains arrangement gain, fades and placement. Processed stems apply track
+          effects; master gain, ceiling and normalization apply only to the processed mix.
         </p>
         <div className="studio-preflight" aria-live="polite">
           <h3>Preflight</h3>
@@ -193,7 +212,7 @@ export function Deliver() {
             ? 'Submitting…'
             : request
               ? 'Retry same render request'
-              : `Render ${kind === 'mix' ? 'mix' : 'dry stems'}`}
+              : `Render ${processing} ${kind === 'mix' ? 'mix' : 'stems'}`}
         </StudioButton>
         {!!jobs.length && (
           <div className="studio-job-list">
@@ -262,6 +281,7 @@ export function Deliver() {
         {files.map((file) => (
           <div className="studio-deliverable" key={file.id}>
             <strong>{file.filename || `${file.kind}.${file.format}`}</strong>
+            <p>{file.processing ?? 'Existing render'}</p>
             <div className="studio-action-row">
               <StudioButton
                 onClick={() =>
@@ -277,11 +297,25 @@ export function Deliver() {
                 disabled={studio.actionBusy}
                 onClick={() =>
                   void studio.runAction(async () => {
-                    const blob = await client.download(client.deliverableDownload(file.id));
-                    await platform.filesystem.saveFile(
-                      file.filename || `${safeName}-${file.kind}.${file.format}`,
-                      blob,
-                      [{ name: 'Audio', extensions: [file.format] }],
+                    setPublication('');
+                    const name = file.filename || `${safeName}-${file.kind}.${file.format}`;
+                    const url = client.deliverableDownload(file.id);
+                    const filters = [{ name: 'Audio', extensions: [file.format] }];
+                    const receipt = platform.filesystem.saveFromUrl
+                      ? await platform.filesystem.saveFromUrl(name, url, filters)
+                      : await platform.filesystem.saveFile(
+                          name,
+                          await client.download(url),
+                          filters,
+                        );
+                    setPublication(
+                      receipt?.status === 'saved'
+                        ? 'File saved.'
+                        : receipt?.status === 'cancelled'
+                          ? 'Save cancelled.'
+                          : receipt?.status === 'download_started'
+                            ? 'Download started.'
+                            : 'Save requested; destination confirmation unavailable.',
                     );
                   })
                 }
@@ -299,15 +333,41 @@ export function Deliver() {
             </details>
           </div>
         ))}
+        {publication && <output aria-live="polite">{publication}</output>}
         <div className="studio-divider" />
+        <ArchiveScopeControls
+          value={archiveScope}
+          onChange={setArchiveScope}
+          disabled={studio.actionBusy}
+        />
         <StudioButton
           disabled={studio.actionBusy}
           onClick={() =>
             void studio.runAction(async () => {
-              const blob = await client.download(client.archiveUrl(project.id));
-              await platform.filesystem.saveFile(`${safeName}.studio.zip`, blob, [
-                { name: 'Studio project archive', extensions: ['zip'] },
-              ]);
+              setPublication('');
+              await session.flush();
+              if (session.getSnapshot().status !== 'saved')
+                throw new Error(
+                  'Save the current draft before exporting an archive. Preserve or reconcile its recovery copy first.',
+                );
+              const url = `${client.archiveUrl(project.id)}?${archiveScopeQuery(archiveScope)}`;
+              const filters = [{ name: 'Studio project archive', extensions: ['zip'] }];
+              const receipt = platform.filesystem.saveFromUrl
+                ? await platform.filesystem.saveFromUrl(`${safeName}.studio.zip`, url, filters)
+                : await platform.filesystem.saveFile(
+                    `${safeName}.studio.zip`,
+                    await client.download(url),
+                    filters,
+                  );
+              setPublication(
+                receipt?.status === 'saved'
+                  ? 'Archive saved.'
+                  : receipt?.status === 'cancelled'
+                    ? 'Save cancelled.'
+                    : receipt?.status === 'download_started'
+                      ? 'Download started.'
+                      : 'Save requested; destination confirmation unavailable.',
+              );
             })
           }
         >

@@ -1,11 +1,12 @@
 """HTTP interface for the independent studio store."""
 
 import zipfile
+from typing import Literal
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictStr
 from .jobs import StudioJobs
 from .storage import Conflict, NotFound, uid
 
@@ -42,6 +43,7 @@ class Render(BaseModel):
     kind: str
     format: str
     allow_stale_audio: bool = False
+    processing: Literal["dry", "processed"] | None = None
 
 
 class Generate(BaseModel):
@@ -50,6 +52,10 @@ class Generate(BaseModel):
     count: int = Field(ge=1, le=3)
     adopt: bool
     commercial_only: bool = False
+
+
+class StoryImport(BaseModel):
+    idempotency_key: StrictStr | None = Field(default=None, min_length=1, max_length=200)
 
 
 def make_router(store, jobs=None):
@@ -146,7 +152,11 @@ def make_router(store, jobs=None):
         )
 
     @router.get("/projects/{project_id}/archive")
-    def archive(project_id: str):
+    def archive(
+        project_id: str,
+        take_scope: Literal["all", "used"] = "all",
+        include_regeneration_references: bool = True,
+    ):
         from .archive import write_archive
         from .reviews import StudioReviews
 
@@ -154,7 +164,10 @@ def make_router(store, jobs=None):
         project["reviews"] = call(StudioReviews(store).export, project_id)
         target = store.root / (".archive-" + uid() + ".zip")
         try:
-            call(write_archive, project, project["assets"], store.asset_path, target)
+            call(
+                write_archive, project, project["assets"], store.asset_path, target,
+                take_scope=take_scope, include_regeneration_references=include_regeneration_references,
+            )
         except BaseException:
             target.unlink(missing_ok=True)
             raise
@@ -182,13 +195,13 @@ def make_router(store, jobs=None):
             await file.close()
 
     @router.post("/imports/story/{story_id}")
-    def import_legacy_story(story_id: str):
+    def import_legacy_story(story_id: str, body: StoryImport | None = None):
         from ..database import get_db
         from .story import import_story
 
         db = next(get_db())
         try:
-            return call(import_story, store, story_id, db)
+            return call(import_story, store, story_id, db, idempotency_key=body.idempotency_key if body else None)
         finally:
             db.close()
 

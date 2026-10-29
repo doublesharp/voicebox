@@ -145,7 +145,7 @@ class StudioJobs:
             )
             db.execute("UPDATE jobs SET status='cancelled',updated_at=? WHERE status='cancelling'", (now(),))
             interrupted = db.execute(
-                "SELECT a.job_id,a.attempt,j.status FROM job_attempts a JOIN jobs j ON j.id=a.job_id WHERE a.phase IN ('running','loading_model','generating','processing','cancelling') AND j.status IN ('interrupted','cancelled')"
+                "SELECT a.job_id,a.attempt,j.status FROM job_attempts a JOIN jobs j ON j.id=a.job_id WHERE a.phase IN ('running','loading_model','generating','processing','mixing','encoding','metering','publishing','cancelling') AND j.status IN ('interrupted','cancelled')"
             ).fetchall()
             for item in interrupted:
                 phase(db, item["job_id"], item["attempt"], item["status"])
