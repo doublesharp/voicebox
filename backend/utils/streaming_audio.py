@@ -10,6 +10,8 @@ import asyncio
 import math
 import struct
 from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import aclosing
+from numbers import Integral
 
 import numpy as np
 
@@ -31,35 +33,70 @@ async def iter_speech_audio(
     trim_fn=None,
     runaway_detector=None,
 ) -> AsyncIterator[tuple[np.ndarray, int]]:
-    """Yield validated audio while retaining only a short crossfade tail.
+    """Stream native frames, retaining buffered validation when it needs a whole utterance.
 
-    Engine generation remains one utterance at a time. This portable path
-    reduces long-script latency without pretending every engine exposes a
-    token/codec streaming interface.
+    Codec frames are consecutive samples. Only text-utterance boundaries are
+    crossfaded. The caller owns serialized inference for this iterator's lifetime.
     """
     pending = np.empty(0, dtype=np.float32)
     sample_rate = None
+    native = getattr(backend, "generate_stream", None)
+    use_native = callable(native) and trim_fn is None and runaway_detector is None
+
+    async def utterance_audio(chunk_text, chunk_seed):
+        if use_native:
+            async with aclosing(native(chunk_text, voice_prompt, language, chunk_seed, instruct)) as stream:
+                async for audio, rate in stream:
+                    yield audio, rate
+        else:
+            yield await generate_chunked(
+                backend, chunk_text, voice_prompt, language=language,
+                seed=chunk_seed, instruct=instruct, max_chunk_chars=max_chunk_chars,
+                crossfade_ms=crossfade_ms, trim_fn=trim_fn,
+                runaway_detector=runaway_detector,
+            )
+
     for index, chunk_text in enumerate(split_text_into_chunks(text, max_chunk_chars)):
         check_inference_cancelled()
-        audio, rate = await generate_chunked(
-            backend, chunk_text, voice_prompt, language=language,
-            seed=seed + index if seed is not None else None, instruct=instruct,
-            max_chunk_chars=max_chunk_chars, crossfade_ms=crossfade_ms,
-            trim_fn=trim_fn, runaway_detector=runaway_detector,
-        )
-        check_inference_cancelled()
-        if rate <= 0 or (sample_rate is not None and rate != sample_rate):
-            raise ValueError("The audio sample rate changed during incremental generation")
-        sample_rate = rate
-        audio = protect_audio_peak(np.asarray(audio, dtype=np.float32))
-        if audio.ndim != 1:
-            raise ValueError("Incremental preview requires mono audio")
-        overlap = int(rate * crossfade_ms / 1000)
-        joined = concatenate_audio_chunks([pending, audio], rate, crossfade_ms) if pending.size else audio
-        keep = min(overlap, joined.size)
-        if joined.size > keep:
-            yield joined[:-keep] if keep else joined, rate
-        pending = joined[-keep:].copy() if keep else np.empty(0, dtype=np.float32)
+        started = False
+        received = False
+        head = np.empty(0, dtype=np.float32)
+        async with aclosing(utterance_audio(chunk_text, seed + index if seed is not None else None)) as stream:
+            async for audio, rate in stream:
+                check_inference_cancelled()
+                if (not isinstance(rate, Integral) or isinstance(rate, bool) or rate <= 0
+                        or (sample_rate is not None and rate != sample_rate)):
+                    raise ValueError("The audio sample rate changed or is invalid during incremental generation")
+                sample_rate = int(rate)
+                audio = np.asarray(audio, dtype=np.float32)
+                if audio.ndim != 1:
+                    raise ValueError("Incremental preview requires mono audio")
+                audio = protect_audio_peak(audio)
+                if not audio.size:
+                    continue
+                received = True
+                overlap = int(sample_rate * crossfade_ms / 1000)
+                if not started:
+                    head = np.concatenate([head, audio]) if head.size else audio
+                    if head.size < overlap:
+                        continue
+                    joined = concatenate_audio_chunks([pending, head], sample_rate, crossfade_ms) if pending.size else head
+                    head = np.empty(0, dtype=np.float32)
+                    started = True
+                else:
+                    joined = np.concatenate([pending, audio]) if pending.size else audio
+                keep = min(overlap, joined.size)
+                if joined.size > keep:
+                    yield joined[:-keep] if keep else joined, sample_rate
+                pending = joined[-keep:].copy() if keep else np.empty(0, dtype=np.float32)
+        if not received:
+            raise ValueError("The speech engine returned no audio")
+        if not started:
+            # An entire short utterance can be smaller than the requested join.
+            joined = concatenate_audio_chunks([pending, head], sample_rate, crossfade_ms) if pending.size else head
+            # Both the retained tail and this entire utterance fit in one
+            # overlap, so their join remains a tail until more speech arrives.
+            pending = joined.copy()
     if pending.size and sample_rate is not None:
         yield pending, sample_rate
 

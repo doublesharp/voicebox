@@ -57,7 +57,7 @@ def _adapter_runtime(engine):
     """Match get_tts_backend_for_engine without importing or constructing models."""
     from ..utils.platform_detect import get_backend_type
 
-    backend = get_backend_type() if engine in ("qwen", "chatterbox") else "pytorch"
+    backend = get_backend_type() if engine in ("qwen", "chatterbox", "qwen_custom_voice", "qwen_voice_design") else "pytorch"
     adapters = {
         "qwen": ("mlx_backend", "MLXTTSBackend", ())
         if backend == "mlx"
@@ -66,8 +66,12 @@ def _adapter_runtime(engine):
         if backend == "mlx"
         else ("chatterbox_backend", "ChatterboxTTSBackend", ("chatterbox-tts",)),
         "chatterbox_turbo": ("chatterbox_turbo_backend", "ChatterboxTurboTTSBackend", ("chatterbox-tts",)),
-        "qwen_custom_voice": ("qwen_custom_voice_backend", "QwenCustomVoiceBackend", ("qwen-tts",)),
-        "qwen_voice_design": ("qwen_voice_design_backend", "QwenVoiceDesignBackend", ("qwen-tts",)),
+        "qwen_custom_voice": ("qwen_mlx_styles_backend", "QwenMLXCustomVoiceBackend", ())
+        if backend == "mlx"
+        else ("qwen_custom_voice_backend", "QwenCustomVoiceBackend", ("qwen-tts",)),
+        "qwen_voice_design": ("qwen_mlx_styles_backend", "QwenMLXVoiceDesignBackend", ())
+        if backend == "mlx"
+        else ("qwen_voice_design_backend", "QwenVoiceDesignBackend", ("qwen-tts",)),
         "luxtts": ("luxtts_backend", "LuxTTSBackend", ("Zipvoice",)),
         "tada": ("hume_backend", "HumeTadaBackend", ("hume-tada",)),
         "kokoro": ("kokoro_backend", "KokoroTTSBackend", ("kokoro", "misaki")),

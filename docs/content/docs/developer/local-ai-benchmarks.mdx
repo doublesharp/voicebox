@@ -1,0 +1,158 @@
+---
+title: "Local AI benchmarks"
+description: "Reproducible, offline benchmarks of existing local Qwen TTS adapters"
+---
+
+`scripts/benchmark-local-tts.py` measures one existing Voicebox TTS adapter in a
+fresh process. It calls the adapter directly and does not start an API server,
+discover voice profiles, upload audio, contact providers or download models.
+Use an explicit local reference you are authorized to use for Base models.
+
+## Supported configurations
+
+| Engine | Backend | Model size | Required voice argument |
+| --- | --- | --- | --- |
+| `qwen` | `mlx` or `pytorch` | `0.6B`, `1.7B` | `--reference /absolute/reference.wav --reference-text "Transcript"` |
+| `qwen_custom_voice` | `mlx` or `pytorch` | `0.6B`, `1.7B` | `--preset-voice Ryan` (or another built-in Qwen speaker) |
+| `qwen_voice_design` | `mlx` or `pytorch` | `1.7B` | `--design-prompt "A clear voice with natural pacing."` |
+
+Other adapters are refused until their complete offline asset dependencies have
+an admission policy. Language is required: `zh`, `en`, `ja`, `ko`, `de`, `fr`,
+`ru`, `pt`, `es` or `it`. `--instruct` is supported for CustomVoice and
+VoiceDesign; Base rejects it because the existing adapter ignores instructions.
+There is no automatic backend, language, preset or reference fallback.
+
+## Run using existing local dependencies
+
+Confirm `/Volumes/Scratch` is mounted first. Do not install packages into a
+shared environment. This example uses the existing research environment and
+cached MLX Qwen Base 1.7B. The explicit reference must already exist; the CLI
+accepts nonempty PCM WAV up to 30 seconds and 16 MiB.
+
+```bash
+mount | rg '/Volumes/Scratch'
+mkdir -p /Volumes/Scratch/voicebox/tmp/local-ai-20261029/track-c
+
+PYTHONDONTWRITEBYTECODE=1 \
+TMPDIR=/Volumes/Scratch/voicebox/tmp/local-ai-20261029/track-c \
+/Volumes/Scratch/voicebox/tmp/edit-delete-audio-versions/build-venv/bin/python -B \
+  scripts/benchmark-local-tts.py \
+  --engine qwen --backend mlx --model 1.7B --language en \
+  --cache-root /Volumes/Scratch/voicebox/cache/huggingface/hub \
+  --reference /Volumes/Scratch/voicebox/tmp/local-ai-20261029/track-c/reference.wav \
+  --reference-text "The exact transcript of the local reference." \
+  --text "The quick brown fox jumps over the lazy dog." \
+  --seed 42 --warm-repeats 3 --max-audio-seconds 30 \
+  --output-root /Volumes/Scratch/voicebox/reports/local-ai-20261029/track-c/qwen-run-001
+```
+
+Choose a **new** output directory for every attempt, including retries after a
+failure. The CLI refuses existing output roots and symlink components. Artifact
+files use exclusive, directory-relative opens; they cannot overwrite existing
+files or follow artifact symlinks. Scratch must be mounted, and the output root
+must be an absolute subdirectory of `/Volumes/Scratch` without `..` components.
+Runtime data, Python bytecode configuration, library caches and temporary files
+are redirected beneath the run's `runtime/` directory. No model weights are
+copied. Never commit run outputs.
+
+`--cache-root` names the Hugging Face **hub directory**, containing
+`models--.../refs/main` and snapshots, not its parent `huggingface/` directory.
+Admission checks the selected revision, required tokenizer/configuration files,
+codec weights and every weight shard. Missing/empty assets, incomplete downloads,
+foreign cache aliases and file escapes are refused before importing an adapter.
+The selected snapshot is pinned on that adapter instance. No cache aliases are
+created and the shared model cache is left unchanged. Admission checks presence
+and shard completeness, not cryptographic integrity of large weight blobs;
+corrupt assets can still fail during loading.
+
+The standalone process sets Hugging Face and Transformers offline flags before
+imports and blocks in-process Internet socket connections, datagrams and DNS
+lookups. A missing lazy dependency fails the run. The CLI does not repair a cache
+or retry online. It is intended for a fresh process; importing the module is
+inert, while calling `main()` installs a permanent process audit hook.
+
+## Interpret the results
+
+`results.json` records configuration, seed, exact text/reference transcript,
+reference SHA-256, model repository/revision/configuration, generation defaults,
+Python/package versions, OS/architecture, Git commit/dirty state, runner and
+adapter source hashes. Preserve this provenance when comparing runs. A fixed
+seed makes the requested configuration reproducible; bit-identical output across
+devices, versions and nondeterministic kernels is not guaranteed.
+
+The runner imports/constructs one adapter, loads it once, prepares the voice
+prompt once with shared prompt caching disabled, generates once, then performs
+`--warm-repeats` additional generations using that same loaded model and prompt.
+The first generation is marked `cold`; this means first use in this process.
+Filesystem caches and shared weights are never flushed. Adapter import and
+construction have a separate `adapter_init` duration.
+
+- Stage durations use `perf_counter_ns`, a monotonic clock. Load, reference
+  preparation and each generation are measured separately. WAV IO and output
+  validation are excluded from these stage timings.
+- MLX Base prepares reference metadata in its prompt method. Its actual reference
+  encoding happens inside generation and is included in generation time.
+- `duration_s = samples / sample_rate` measures the returned mono audio, including
+  any silence the adapter returns. The runner applies no extra trimming.
+- `wall_audio_rtf = generation_s / duration_s`: **smaller is better**; `1` means
+  one second of wall time per second of generated audio. The separate cold RTF
+  includes load, reference preparation and first generation; adapter initialization
+  remains separate.
+- Warm distributions include only warm generations and report count, p50 and p95
+  using linear interpolation at `(n - 1) * q`. With zero warm repeats the
+  distributions are `null`. A tiny sample count gives weak tail estimates.
+- This runner calls the complete-array `generate()` API, including for MLX
+  adapters that also offer a separate `generate_stream()` API. `first_model_audio_s` is therefore `null` with an
+  explanation. Complete-array elapsed time is **not TTFA**. There is no audio
+  playback, first-audible-device latency or streaming-latency measurement.
+
+Runs allow 0–20 warm repeats and 1–2000 text characters. Returned audio must be
+finite, nonempty, mono and within the requested duration limit (maximum 120
+seconds). Sample rates must be positive integers up to 192 kHz. WAV artifacts
+are PCM16, clipping samples outside `[-1, 1]` with the clipped count recorded.
+The total WAV budget is 128 MiB. These limits bound calls and saved artifacts;
+they do not impose an interruptible model timeout or token cap inside the
+existing adapter. A stuck native inference still requires process supervision.
+
+Failures exit with code `2`. Once a run directory is admitted, model and
+generation errors produce `status: "failed"`, the failing stage and any completed
+runs in `results.json`; these partial runs are not a successful benchmark. The
+adapter is unloaded in `finally`, including after load or reference failures.
+Cleanup errors also fail the report. Unsafe configuration/output paths fail
+before a report directory is admitted. A filesystem failure may prevent saving
+the report itself.
+
+## Verification limits
+
+The deterministic suite uses safe adapters and small generated PCM references:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+TMPDIR=/Volumes/Scratch/voicebox/tmp/local-ai-20261029/track-c \
+/Volumes/Scratch/voicebox/tmp/edit-delete-audio-versions/build-venv/bin/python -B \
+  -m pytest -q -p no:cacheprovider \
+  --basetemp=/Volumes/Scratch/voicebox/tmp/local-ai-20261029/track-c/pytest-check \
+  scripts/tests/test_benchmark_local_tts.py
+```
+
+It verifies calculations, configuration/asset admission, snapshot pinning, WAV
+artifacts, no-download refusal, a real CLI refusal smoke, network guards and
+cleanup under failures. Fakes establish runner behavior only. Native MLX/Metal,
+PyTorch CPU/CUDA, actual cached checkpoint inference, language/voice fidelity,
+speech quality, frozen builds and cross-platform performance require separate
+qualification with existing local weights. No model-quality claim follows from
+these tests. Instrumented runner coverage likewise does not qualify the adapters
+or their model libraries.
+
+## Recorded integration smoke
+
+The integrated runner completed CustomVoice **0.6B MLX BF16**, revision
+`6415d95f88be018ff9e46813119dc3bc12261328`, offline on Apple M2 Max / 96 GiB.
+For “Hello from Voicebox. This speech was generated locally.”, Ryan, seed 42
+and “Speak clearly and calmly.”, the first generation took 7.38 seconds and the
+three warm generations had p50 **6.13 seconds**, p95 **6.35 seconds**. All returned
+4.96 seconds of finite mono 24 kHz audio. This tiny smoke sample qualifies the
+runner/checkpoint integration, not comparative model quality, reliable tail
+latency, CUDA performance or first audible device latency. Exact source hashes,
+configuration, timings and WAVs remain on Scratch at
+`reports/local-ai-20261029/benchmark-custom-001/`.

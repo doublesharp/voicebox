@@ -393,7 +393,7 @@ def _scan_model_inventory(configurations):
     try:
         from huggingface_hub import scan_cache_dir
 
-        repositories = {repo.repo_id: repo for repo in scan_cache_dir().repos}
+        repositories = {repo.repo_id: repo for repo in scan_cache_dir(hf_constants.HF_HUB_CACHE).repos}
     except Exception:
         pass
 

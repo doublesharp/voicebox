@@ -34,7 +34,8 @@ async def test_model_status_scan_runs_off_loop_and_shares_disk_inventory(tmp_pat
     monkeypatch.setattr(backends, "check_model_loaded", lambda _: loaded)
     monkeypatch.setattr(model_routes, "get_task_manager", lambda: SimpleNamespace(get_pending_downloads=list))
 
-    def scan():
+    def scan(cache_dir=None):
+        assert cache_dir == str(tmp_path)
         scan_threads.append(threading.get_ident())
         return SimpleNamespace(repos=[])
 
