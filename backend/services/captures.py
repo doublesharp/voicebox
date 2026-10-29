@@ -228,8 +228,8 @@ async def retranscribe_capture(
 
     row.transcript_raw = transcript
     row.stt_model = resolved_stt
-    if language:
-        row.language = language
+    # The transcript now reflects this request, including automatic detection.
+    row.language = language
     # Refined text is stale after a fresh STT pass — force a re-refine.
     row.transcript_refined = None
     row.llm_model = None
