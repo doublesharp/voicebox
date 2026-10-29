@@ -1,24 +1,26 @@
 {
-  "fill": "automatic",
+  "fill": {
+    "solid": "srgb:0.08235,0.09412,0.11765,1.00000"
+  },
   "groups": [
     {
       "layers": [
         {
-          "image-name": "Voicebox_Microphone.png",
-          "name": "Voicebox_Microphone",
+          "image-name": "DoubleSharp.png",
+          "name": "DoubleSharp",
           "position": {
-            "scale": 0.36,
-            "translation-in-points": [0.140625, 270.1875]
+            "scale": 1,
+            "translation-in-points": [0, 0]
           }
         }
       ],
       "shadow": {
         "kind": "neutral",
-        "opacity": 0.5
+        "opacity": 0
       },
       "translucency": {
-        "enabled": true,
-        "value": 0.5
+        "enabled": false,
+        "value": 0
       }
     }
   ],
