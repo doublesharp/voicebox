@@ -79,8 +79,11 @@ async def create_capture(
     written_files: list[Path] = []
 
     try:
-        raw_path.write_bytes(audio_bytes)
-        written_files.append(raw_path)
+        # Reserve files before writing so a partial write can be cleaned up
+        # without ever overwriting an existing capture.
+        with raw_path.open("xb") as output:
+            written_files.append(raw_path)
+            output.write(audio_bytes)
 
         # Decode once with librosa — its audioread fallback handles webm/opus
         # via ffmpeg, which miniaudio (used inside mlx-audio's whisper) can't.
@@ -111,8 +114,10 @@ async def create_capture(
             # Transcode to WAV so downstream loaders (miniaudio, soundfile) work
             # regardless of what format the client shipped.
             audio_path = config.get_captures_dir() / f"{capture_id}.wav"
-            sf.write(str(audio_path), audio, sr, format="WAV")
+            with audio_path.open("xb"):
+                pass
             written_files.append(audio_path)
+            sf.write(str(audio_path), audio, sr, format="WAV")
             with contextlib.suppress(OSError):
                 raw_path.unlink()
                 written_files.remove(raw_path)
@@ -132,18 +137,22 @@ async def create_capture(
         )
         db.add(row)
         db.commit()
-        db.refresh(row)
     except Exception:
         # Anything between the first write and the commit means the audio on
         # disk has no row pointing at it — clean up so data/captures doesn't
         # accumulate orphan blobs across failed transcribes.
-        for path in written_files:
-            try:
-                path.unlink()
-            except OSError:
-                pass
+        try:
+            db.rollback()
+        finally:
+            for path in written_files:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
         raise
 
+    # The row owns the files after commit, even if refreshing it fails.
+    db.refresh(row)
     return _to_response(row)
 
 
@@ -170,14 +179,16 @@ def delete_capture(capture_id: str, db: Session) -> bool:
         return False
 
     resolved = config.resolve_storage_path(row.audio_path)
-    if resolved and resolved.exists():
-        try:
-            resolved.unlink()
-        except OSError:
-            logger.exception("Failed to remove capture audio %s", resolved)
-
     db.delete(row)
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    if resolved is not None:
+        from .history import _remove_deleted_audio
+
+        _remove_deleted_audio({resolved}, db)
     return True
 
 
