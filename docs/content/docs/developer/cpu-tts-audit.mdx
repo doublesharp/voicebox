@@ -1,0 +1,155 @@
+---
+title: "CPU cloning engine audit"
+description: "MOSS ONNX integration and the gates for Pocket TTS and Chatterbox Nano"
+---
+
+The October 29, 2026 evaluation selected **MOSS-TTS-Nano ONNX** for local CPU
+voice cloning, including Chinese and English, without replacing Voicebox's
+Torch or Transformers versions. Pocket TTS and Chatterbox Nano remain deferred.
+The selection establishes a useful CPU option; it does not establish a quality
+ranking or a controlled speed advantage over LuxTTS or Chatterbox Turbo.
+
+## Candidate decisions
+
+| Candidate | Official source and license | Runtime/dependency finding | Decision |
+| --- | --- | --- | --- |
+| Pocket TTS 4.0.1 | [Kyutai source](https://github.com/kyutai-labs/pocket-tts/tree/a922b912dfa366975294afb568d815b305acde5d), MIT; [cloning weights](https://huggingface.co/kyutai/pocket-tts), CC BY 4.0 with access conditions | Python 3.10–3.14, Torch >=2.5, NumPy >=2. The pinned cloning checkpoint request returned HTTP 401/GatedRepoError with existing local authentication. Upstream supports encoded voice states and real streaming, but its non-cloning fallback cannot satisfy a cloned profile. | Defer until approved model access exists and NumPy 2 compatibility is qualified. No alternate mirror, fallback preset, or license acceptance was attempted. |
+| Chatterbox Nano | [Resemble source](https://github.com/resemble-ai/chatterbox/tree/5de7a54aa4e5e2baadb0182dde554908b48b85c2), MIT; [110M checkpoint](https://huggingface.co/ResembleAI/chatterbox-nano), MIT | Current source loads through `ChatterboxTurboTTS(..., nano=True)` and pins Transformers 5.2.0, Torch/Torchaudio 2.6 on Python <3.14, and a moving Perth Git branch. Voicebox currently caps Transformers at 4.57.6. Nano is not an argument supported by every previously shipped Chatterbox runtime. | Defer rather than silently replace the shared stack or register an untested flag against an older package. Revisit as a compatible family update with Turbo regression and frozen inference. |
+| MOSS-TTS-Nano ONNX | [OpenMOSS source](https://github.com/OpenMOSS/MOSS-TTS-Nano/tree/8b7bcc9341b3b4ef3a3a58ba1338a7d85ff133eb), Apache 2.0; [TTS ONNX model](https://huggingface.co/OpenMOSS-Team/MOSS-TTS-Nano-100M-ONNX), Apache 2.0; [codec ONNX model](https://huggingface.co/OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano-ONNX), Apache 2.0 | The package's default installer pins Torch/Torchaudio 2.7.0 and Transformers 4.57.1. Its low-level `ort_cpu_runtime` imports only standard library, NumPy and ONNX Runtime. It works with the app's NumPy 1.26.4 and ONNX Runtime 1.31.1; SentencePiece 0.2.1 supplies text tokenization. | Select the low-level ONNX path, install source without dependencies, and keep the existing shared Torch/Transformers stack. |
+
+The upstream Pocket, Nano and MOSS speed statements are vendor measurements,
+not measurements of Voicebox on this machine. LuxTTS's existing adapter uses
+its ZipVoice/LinaCodec stack, an internal Whisper reference transcription and
+48 kHz output. Turbo already provides CPU English cloning and paralinguistic
+tags. MOSS adds an independently qualified small ONNX CPU path and additional
+languages; it does not replace those capabilities.
+
+## Pinned package and model identity
+
+Install the audited package with dependencies disabled:
+
+```sh
+python -m pip install --no-deps 'moss-tts-nano @ git+https://github.com/OpenMOSS/MOSS-TTS-Nano.git@8b7bcc9341b3b4ef3a3a58ba1338a7d85ff133eb'
+python -m pip install 'sentencepiece==0.2.1'
+```
+
+ONNX Runtime 1.31.1 was used for the local evaluation; the upstream minimum is
+1.20. Install a platform wheel compatible with the application's NumPy and
+Python stack. Do not install the upstream package normally: its unrelated
+PyTorch inference dependencies would replace shared versions.
+
+The adapter exports `TTS_REPO`, `TTS_REVISION`, `TTS_FILES`, `CODEC_REPO`,
+`CODEC_REVISION`, `CODEC_FILES`, `SOURCE_REVISION`, `PREPROCESS_VERSION` and
+`LANGUAGES`. Model identity is:
+
+| Component | Revision | Selected assets |
+| --- | --- | --- |
+| `OpenMOSS-Team/MOSS-TTS-Nano-100M-ONNX` | `f52645cb467506d8e18e746ddd59482685b74e58` | Manifest, metadata, SentencePiece model, prefill/decode/local graphs, both external weight files |
+| `OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano-ONNX` | `ceff0d0749bfb3fa2d61149794ec6feef0d1e1ae` | Codec metadata, encoder, full/step decoder, both external weight files |
+
+The two snapshots total approximately 763 MB in decimal units. Readiness checks
+require both exact snapshots and every required asset. The snapshot paths retain
+their named symlinks: resolving the manifest or metadata into Hugging Face blob
+storage breaks sibling graph and external-data lookup. The adapter maps the
+companion codec snapshot explicitly and never rewrites the downloaded manifest.
+
+The upstream README says 20 languages but its table enumerates 19:
+`zh, en, de, es, fr, ja, it, hu, ko, ru, fa, ar, pl, pt, cs, da, sv, el, tr`.
+`LANGUAGES` preserves that audited list. Voicebox exposes the intersection with
+its existing supported API/UI languages. The model infers language from text;
+there is no invented upstream language-selection parameter. Only English local
+speech generation was evaluated in this pass; multilingual speech quality
+remains a separate listening gate.
+
+## Adapter behavior and boundaries
+
+`MossTTSBackend` runs reference encoding, load and synthesis on CPU workers under
+the shared inference scheduler. Cancellation retains ownership until the physical
+worker exits, and synthesis observes cancellation between native frame calls.
+An unload during load or reference encoding cannot republish model/cache state.
+
+Prompts contain actual encoded audio tokens, never a filename standing in for a
+cache hit. Eight in-memory CPU entries are retained. Keys include source and both
+model revisions, preprocessing version, reference transcript and exact reference
+bytes. Encoding reads the same owned bytes that were hashed. Each caller receives
+a separate array, and upstream receives a separate nested list per generation.
+Returning to a prior voice cannot inherit tokens from another voice. Unload
+clears the cache. The cache deliberately has no persistent serialization or
+unbounded global tensor store.
+
+Input is bounded to 64 MiB and the first ten seconds of mono/stereo audio,
+converted with SoundFile float32 and SciPy polyphase resampling to 48 kHz stereo.
+No torchaudio file I/O, torchcodec, internal ASR, WeTextProcessing download, cloud
+service, built-in voice or reference fallback is used. Missing/mismatched cloned
+prompts fail closed. Instructions fail explicitly because this path has no style
+instruction API. Text is split into at most 75-token requests; empty, nonfinite
+and frame-limit outputs fail rather than becoming silent or truncated successes.
+The upstream stereo waveform is downmixed to finite float32 mono at 48 kHz for
+Voicebox's audio contract. This integration returns complete audio and does not
+advertise native streaming.
+
+## Frozen packaging audit
+
+The reachable import tree is `moss_tts_backend -> ort_cpu_runtime -> numpy,
+onnxruntime`, plus SentencePiece, existing SoundFile/SciPy preprocessing and the
+existing model downloader/progress helpers. The imported upstream module contains
+no `inspect.getsource`, `typeguard`, `torch.jit.script`, `torch.load`, Hugging Face
+authentication call or hardcoded system data directory. The high-level upstream
+`onnx_tts_runtime` does use `torchaudio.load`; Voicebox never imports that module.
+
+Required PyInstaller additions:
+
+- Hidden imports: `backend.backends.moss_tts_backend`, `ort_cpu_runtime`.
+- Collect all: `onnxruntime`, `sentencepiece`, including their platform native
+  libraries. Existing NumPy/SciPy/SoundFile collection remains necessary.
+- Copy metadata: `onnxruntime`, `sentencepiece`, `moss-tts-nano`. The MOSS wheel
+  contains `licenses/LICENSE`; include it with package metadata/third-party
+  notices for Apache attribution.
+- No new `/usr/share` data override, external executable, unpinned model config,
+  or model weight bundled inside the application is needed.
+
+The upstream top-level `ort_cpu_runtime.py` is installed by its wheel and must
+be available to PyInstaller's analysis environment. Add the source install to
+all special-install paths (development, release, CI and Docker). A successful
+development import does not qualify a frozen app: clean-cache download, pinned
+readiness, loading and real synthesis must still run in the actual frozen binary.
+
+## Verification scope
+
+The initial focused test recorded the missing CPU engine as RED. Thirteen
+boundary tests then passed, including actual encoded cache reuse, content
+invalidation, independent voice state, unload races, exact snapshot readiness,
+invalid reference/output handling and physical cancellation. Combined unit and
+real offline synthesis coverage traced threads in the actual changed adapter:
+200 of 208 executable statements (96%) in the first complete run. Coverage 6.5
+requires a source directory for this run: selecting the dotted backend module
+causes its discovery helper to import and remove parent dependencies, reloading
+NumPy and invalidating that test setup.
+
+Real offline inference used an explicitly synthetic reference. The Phase 0
+low-level process loaded in 4.83 s, encoded in 0.29 s and generated 2.56 s of
+stereo audio in 1.45 s, with peak RSS about 1.97 GB and no Torch import. The
+application adapter also generated finite mono audio, reused encoded prompts,
+produced identical audio for a fixed seed before and after a synthetic reference
+switch, and cleared state on unload. These observations qualify runtime wiring
+and speaker-state isolation. Concurrent native builds and coverage overhead
+prevent treating these figures as a controlled performance comparison. They do
+not establish listening quality, speaker similarity, multilingual pronunciation,
+frontend interaction, or frozen packaging by themselves.
+
+A later untraced comparison used the same synthetic reference and English text,
+four CPU threads per runtime, and separate processes. Concurrent native build
+activity remained present, so these are individual observations, not benchmark
+promises:
+
+| Observed CPU run | Model load | First reference encoding | Encoded cache hit | Generation / output duration | Peak process RSS |
+| --- | --- | --- | --- | --- | --- |
+| MOSS ONNX | 9.65 s | 2.28 s | 32.8 ms | 1.79 s / 2.32 s (warm repeat 1.40 s) | 2.29 GB |
+| Existing Chatterbox Turbo | 39.28 s | 1.28 s | 1.98 ms | 5.61 s / 2.54 s | 8.44 GB |
+
+Both adapters reused actual conditioning, and both synthesized offline. The
+memory observations support MOSS as a useful lower-memory CPU alternative;
+they do not compare speaker similarity or expressiveness. The already cached
+local Whisper Base model independently transcribed the MOSS sample exactly as
+its target sentence: “This is a local CPU speech test.” This is a small
+intelligibility check, not a listening-quality or multilingual evaluation.

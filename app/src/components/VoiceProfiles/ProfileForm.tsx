@@ -75,6 +75,7 @@ const DEFAULT_ENGINE_OPTIONS = [
   { value: 'qwen', label: 'Qwen3-TTS' },
   { value: 'qwen_custom_voice', label: 'Qwen CustomVoice' },
   { value: 'qwen_voice_design', label: 'Qwen VoiceDesign' },
+  { value: 'moss_tts', label: 'MOSS-TTS Nano (CPU)' },
   { value: 'luxtts', label: 'LuxTTS' },
   { value: 'chatterbox', label: 'Chatterbox' },
   { value: 'chatterbox_turbo', label: 'Chatterbox Turbo' },

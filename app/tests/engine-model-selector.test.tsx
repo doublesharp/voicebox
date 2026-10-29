@@ -12,6 +12,11 @@ mock.module('../src/components/ui/select', () => ({
   SelectTrigger: pass,
   SelectValue: () => null,
 }));
+let advertisedModelNames = new Set<string>();
+let variantsLoading = false;
+mock.module('../src/lib/hooks/useAvailableTtsModels', () => ({
+  useAvailableTtsModels: () => ({ names: advertisedModelNames, loading: variantsLoading }),
+}));
 const { EngineModelSelector, isProfileCompatibleWithEngine } = await import(
   '../src/components/Generation/EngineModelSelector'
 );
@@ -33,6 +38,8 @@ function choose(value: string) {
   act(() => view.root.findByType('selector' as never).props.onValueChange(value));
 }
 afterEach(() => {
+  advertisedModelNames = new Set();
+  variantsLoading = false;
   if (view) act(() => view.unmount());
 });
 afterAll(() => mock.restore());
@@ -89,4 +96,31 @@ test('engine and model selection preserve supported languages and reset unsuppor
   });
   choose('chatterbox_turbo');
   expect(form.getValues()).toMatchObject({ engine: 'chatterbox_turbo', language: 'en' });
+});
+
+test('CPU MOSS cloning is selectable for cloned voices and never offered as a preset', () => {
+  mount({ profile: { voice_type: 'cloned' }, engine: 'qwen' });
+  expect(values()).toContain('moss_tts');
+  choose('moss_tts');
+  expect(form.getValues('engine')).toBe('moss_tts');
+  expect(isProfileCompatibleWithEngine({ voice_type: 'preset', preset_engine: 'kokoro' } as any, 'moss_tts')).toBe(false);
+});
+
+
+test('quantized variants require matching advertisement by the connected server', () => {
+  advertisedModelNames = new Set(['qwen-tts-1.7B-8bit']);
+  mount({ profile: { voice_type: 'cloned' } });
+  expect(values()).toContain('qwen:1.7B-8bit');
+  expect(values()).not.toContain('qwen:1.7B-4bit');
+  choose('qwen:1.7B-8bit');
+  expect(form.getValues('modelSize')).toBe('1.7B-8bit');
+});
+
+test('a saved quantized selection waits for discovery rather than silently switching precision', () => {
+  variantsLoading = true;
+  mount({ engine: 'qwen', size: '1.7B-4bit' });
+  expect(form.getValues('modelSize')).toBe('1.7B-4bit');
+  variantsLoading = false;
+  act(() => view.update(<Harness engine="qwen" size="1.7B-4bit" />));
+  expect(form.getValues('modelSize')).toBe('1.7B');
 });

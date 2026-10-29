@@ -1,4 +1,5 @@
 import { useEffect } from 'react';
+import { useAvailableTtsModels } from '@/lib/hooks/useAvailableTtsModels';
 import type { UseFormReturn } from 'react-hook-form';
 import { FormControl } from '@/components/ui/form';
 import {
@@ -22,6 +23,7 @@ const ENGINE_OPTIONS = [
   { value: 'qwen_custom_voice:1.7B', label: 'Qwen CustomVoice 1.7B', engine: 'qwen_custom_voice' },
   { value: 'qwen_custom_voice:0.6B', label: 'Qwen CustomVoice 0.6B', engine: 'qwen_custom_voice' },
   { value: 'qwen_voice_design', label: 'Qwen VoiceDesign 1.7B', engine: 'qwen_voice_design' },
+  { value: 'moss_tts', label: 'MOSS-TTS Nano (CPU)', engine: 'moss_tts' },
   { value: 'luxtts', label: 'LuxTTS', engine: 'luxtts' },
   { value: 'chatterbox', label: 'Chatterbox', engine: 'chatterbox' },
   { value: 'chatterbox_turbo', label: 'Chatterbox Turbo', engine: 'chatterbox_turbo' },
@@ -35,6 +37,7 @@ const ENGINE_DESCRIPTIONS: Record<string, string> = {
   qwen: 'Multi-language, two sizes',
   qwen_custom_voice: '9 preset voices, instruct control',
   qwen_voice_design: 'Voices described in plain language',
+  moss_tts: 'CPU voice cloning, multiple languages',
   luxtts: 'Fast, English-focused',
   chatterbox: '23 languages, incl. Hebrew',
   chatterbox_turbo: 'English, [laugh] [cough] tags',
@@ -54,14 +57,21 @@ const CLONING_ENGINES = new Set([
   'chatterbox_turbo',
   'tada',
   'omnivoice',
+  'moss_tts',
 ]);
 
 /** Engines that synthesise a voice from a written description. */
 export const DESIGN_ENGINES = new Set(['qwen_voice_design']);
 
-function getAvailableOptions(selectedProfile?: VoiceProfileResponse | null) {
-  if (!selectedProfile) return ENGINE_OPTIONS;
-  return ENGINE_OPTIONS.filter((opt) => isProfileCompatibleWithEngine(selectedProfile, opt.engine));
+const OPTIONAL_OPTIONS = [
+  { value: 'qwen:1.7B-8bit', label: 'Qwen3-TTS 1.7B 8-bit (Experimental)', engine: 'qwen', modelName: 'qwen-tts-1.7B-8bit' },
+  { value: 'qwen:1.7B-4bit', label: 'Qwen3-TTS 1.7B 4-bit (Experimental)', engine: 'qwen', modelName: 'qwen-tts-1.7B-4bit' },
+] as const;
+
+function getAvailableOptions(selectedProfile: VoiceProfileResponse | null | undefined, names: ReadonlySet<string>) {
+  const options = [...ENGINE_OPTIONS, ...OPTIONAL_OPTIONS.filter((option) => names.has(option.modelName))];
+  if (!selectedProfile) return options;
+  return options.filter((opt) => isProfileCompatibleWithEngine(selectedProfile, opt.engine));
 }
 
 function getSelectValue(engine: string, modelSize?: string): string {
@@ -75,7 +85,7 @@ export function applyEngineSelection(form: UseFormReturn<GenerationFormValues>, 
   if (value.startsWith('qwen_custom_voice:')) {
     const [, modelSize] = value.split(':');
     form.setValue('engine', 'qwen_custom_voice');
-    form.setValue('modelSize', modelSize as '1.7B' | '0.6B');
+    form.setValue('modelSize', modelSize as '1.7B' | '0.6B' | '1.7B-8bit' | '1.7B-4bit');
     const currentLang = form.getValues('language');
     const available = getLanguageOptionsForEngine('qwen_custom_voice');
     if (!available.some((l) => l.value === currentLang)) {
@@ -84,7 +94,7 @@ export function applyEngineSelection(form: UseFormReturn<GenerationFormValues>, 
   } else if (value.startsWith('qwen:')) {
     const [, modelSize] = value.split(':');
     form.setValue('engine', 'qwen');
-    form.setValue('modelSize', modelSize as '1.7B' | '0.6B');
+    form.setValue('modelSize', modelSize as '1.7B' | '0.6B' | '1.7B-8bit' | '1.7B-4bit');
     // Validate language is supported by Qwen
     const currentLang = form.getValues('language');
     const available = getLanguageOptionsForEngine('qwen');
@@ -132,11 +142,14 @@ export function EngineModelSelector({ form, compact, selectedProfile }: EngineMo
   const modelSize = form.watch('modelSize');
   const language = form.watch('language');
   const selectValue = getSelectValue(engine, modelSize);
-  const availableOptions = getAvailableOptions(selectedProfile);
+  const discovered = useAvailableTtsModels();
+  const availableOptions = getAvailableOptions(selectedProfile, discovered.names);
 
   const currentEngineAvailable = availableOptions.some((opt) => opt.value === selectValue);
 
   useEffect(() => {
+    if (discovered.loading && engine === 'qwen' && modelSize?.endsWith('bit') &&
+        (!selectedProfile || isProfileCompatibleWithEngine(selectedProfile, engine))) return;
     if (!currentEngineAvailable && availableOptions.length > 0) {
       const fallback =
         availableOptions.find((option) => option.engine === engine) ?? availableOptions[0];
@@ -147,7 +160,7 @@ export function EngineModelSelector({ form, compact, selectedProfile }: EngineMo
     if (!languages.some((option) => option.value === language)) {
       form.setValue('language', languages[0]?.value ?? 'en');
     }
-  }, [availableOptions, currentEngineAvailable, engine, form, language, modelSize]);
+  }, [availableOptions, currentEngineAvailable, discovered.loading, engine, form, language, modelSize, selectedProfile]);
 
   const itemClass = compact ? 'text-xs text-muted-foreground' : undefined;
   const triggerClass = compact

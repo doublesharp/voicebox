@@ -4,6 +4,7 @@ These are level heuristics, not speech recognition, source separation, or a
 guarantee that a recording will make a good voice. Keep that distinction in the UI.
 """
 
+import hashlib
 import math
 import subprocess
 import unicodedata
@@ -78,6 +79,48 @@ def compare_transcripts(reference, recognized=None):
     }
 
 
+
+def suggest_reference_segments(samples, sample_rate):
+    """Rank short level-based candidates without modifying the original samples.
+
+    This cannot detect speakers, words, noise sources or sentence boundaries.
+    A person must audition the proposed intervals and supply matching text.
+    """
+    window = max(1, round(sample_rate * 0.02))
+    energy = np.mean(np.square(samples, dtype=np.float64), axis=1)
+    starts = np.arange(0, len(samples), window)
+    lengths = np.minimum(window, len(samples) - starts)
+    rms = np.sqrt(np.add.reduceat(energy, starts) / lengths)
+    active = np.flatnonzero(rms >= 10 ** (-45 / 20))
+    if not len(active):
+        return []
+    first = max(0, int(starts[active[0]]) - round(.1 * sample_rate))
+    last = min(len(samples), int(starts[active[-1]] + lengths[active[-1]]) + round(.1 * sample_rate))
+    candidates = []
+    for start in range(first, max(first + 1, last - 3 * sample_rate + 1), max(1, sample_rate // 2)):
+        for seconds in (5, 10, 15):
+            end = min(last, start + seconds * sample_rate)
+            if end - start < 3 * sample_rate:
+                continue
+            block = samples[start:end]
+            clipped = float(np.mean(np.abs(block) >= .999))
+            selected = (starts >= start) & (starts < end)
+            quiet = float(np.mean(rms[selected] < 10 ** (-45 / 20)))
+            score = (1 - quiet) - 8 * clipped + .002 * (end - start) / sample_rate
+            candidates.append({"start_seconds": start / sample_rate, "end_seconds": end / sample_rate,
+                               "duration_seconds": (end - start) / sample_rate,
+                               "clipped_fraction": clipped, "silence_fraction": quiet,
+                               "score": round(score, 6)})
+    chosen = []
+    for candidate in sorted(candidates, key=lambda value: -value["score"]):
+        if any(max(0, min(candidate["end_seconds"], item["end_seconds"]) - max(candidate["start_seconds"], item["start_seconds"]))
+               / min(candidate["duration_seconds"], item["duration_seconds"]) > .7 for item in chosen):
+            continue
+        chosen.append(candidate)
+        if len(chosen) == 3:
+            break
+    return [{"rank": index + 1, **value} for index, value in enumerate(chosen)]
+
 def analyze_reference(audio, sample_rate, transcript="", recognized_text=None):
     samples = np.asarray(audio, dtype=np.float32)
     if samples.ndim == 1:
@@ -134,6 +177,8 @@ def analyze_reference(audio, sample_rate, transcript="", recognized_text=None):
               "Choose a clear section of speech no longer than 30 seconds before adding it to a voice.")
     return {
         "method": "reference_levels_v1", "duration_seconds": duration,
+        "decoded_audio_sha256": hashlib.sha256(samples.astype("<f4").tobytes()).hexdigest(),
+        "suggested_segments": suggest_reference_segments(samples, sample_rate),
         "sample_rate": sample_rate, "channels": samples.shape[1],
         "peak_dbfs": _db(peak), "rms_dbfs": rms_db,
         "clipped_fraction": clipped, "silence_fraction": silence,

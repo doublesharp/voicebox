@@ -46,11 +46,16 @@ def mock_profiles_dir(monkeypatch, tmp_path):
     return tmp_path
 
 
-def test_engine_is_registered():
+@pytest.mark.parametrize("runtime", ["mlx", "pytorch"])
+def test_engine_is_registered(monkeypatch, runtime):
+    from backend import backends
+
+    monkeypatch.setattr(backends, "get_backend_type", lambda: runtime)
     assert "qwen_voice_design" in TTS_ENGINES
     configs = [c for c in get_tts_model_configs() if c.engine == "qwen_voice_design"]
     assert [c.model_name for c in configs] == ["qwen-voice-design-1.7B"]
-    assert configs[0].hf_repo_id == "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+    expected = "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16" if runtime == "mlx" else "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+    assert configs[0].hf_repo_id == expected
 
 
 def test_generation_request_accepts_engine():

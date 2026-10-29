@@ -13,7 +13,7 @@ function text(value: unknown): string {
 function button(label: string) {
   return renderer.root.findAllByType('button').find((node) => text(node.props.children) === label)!;
 }
-async function mount() {
+async function mount(withSpeechReview = false) {
   const commands: Array<{ type: string; payload: unknown }> = [];
   const generations: unknown[] = [];
   const auditions: unknown[][] = [];
@@ -21,6 +21,7 @@ async function mount() {
   const passage = {
     id: 'line',
     text: 'Hello Ada',
+    language: 'en',
     selected_take_id: 'base',
     locked: false,
     voice_snapshot: { engine: 'test' },
@@ -28,9 +29,50 @@ async function mount() {
   const context = {
     project: {
       id: 'p',
-      document: { sample_rate: 48000, passages: [passage] },
-      takes: ['base', 'donor'].map((id) => ({ id, passage_id: 'line', asset_id: id, text: id })),
-      assets: ['base', 'donor'].map((id) => ({ id, frames: 48000, sample_rate: 48000 })),
+      document: {
+        sample_rate: 48000,
+        passages: [passage],
+        speech_reviews: withSpeechReview
+          ? [
+              {
+                source: {
+                  asset_hash: 'a'.repeat(64),
+                  take_text: 'base',
+                  take_engine: 'fixture',
+                  take_model: null,
+                  script_text: 'Hello Ada',
+                  language: 'en',
+                },
+                recognized_text: 'Hello Eva',
+                words: [],
+                recognizer: { backend: 'fixture', model_size: 'base' },
+                differences: [
+                  {
+                    kind: 'substitution',
+                    expected: 'Ada',
+                    recognized: 'Eva',
+                    expected_start: 1,
+                    audition: { start: 0.2, end: 0.6 },
+                  },
+                ],
+              },
+            ]
+          : [],
+      },
+      takes: ['base', 'donor'].map((id) => ({
+        id,
+        passage_id: 'line',
+        asset_id: id,
+        text: id,
+        engine: 'fixture',
+        model_size: null,
+      })),
+      assets: ['base', 'donor'].map((id) => ({
+        id,
+        frames: 48000,
+        sample_rate: 48000,
+        hash: 'a'.repeat(64),
+      })),
     },
     client: {
       baseUrl: 'http://test',
@@ -158,4 +200,20 @@ test('comping retains the explicit order of phrases and rejects an empty source 
       ],
     },
   });
+});
+
+test('an advisory substitution prepares editable phrase fields without generating, composing or adopting', async () => {
+  const value = await mount(true);
+  act(() => button('Prepare replacement phrase').props.onClick());
+  expect(renderer.root.findByProps({ 'aria-label': 'Replacement phrase text' }).props.value).toBe(
+    'Ada',
+  );
+  expect(renderer.root.findByProps({ 'aria-label': 'Replace from seconds' }).props.value).toBe(
+    '0.2',
+  );
+  expect(renderer.root.findByProps({ 'aria-label': 'Replace through seconds' }).props.value).toBe(
+    '0.6',
+  );
+  expect(value.commands).toEqual([]);
+  expect(value.generations).toEqual([]);
 });

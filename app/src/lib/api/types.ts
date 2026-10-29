@@ -70,7 +70,7 @@ export interface GenerationRequest {
   text: string;
   language: LanguageCode;
   seed?: number;
-  model_size?: '1.7B' | '0.6B' | '1B' | '3B';
+  model_size?: '1.7B' | '0.6B' | '1B' | '3B' | '1.7B-8bit' | '1.7B-4bit';
   engine?:
     | 'qwen'
     | 'qwen_custom_voice'
@@ -80,7 +80,8 @@ export interface GenerationRequest {
     | 'chatterbox_turbo'
     | 'tada'
     | 'kokoro'
-    | 'omnivoice';
+    | 'omnivoice'
+    | 'moss_tts';
   instruct?: string;
   /** When true and the profile has a personality prompt, input text is rewritten in-character before TTS. */
   personality?: boolean;
@@ -360,6 +361,9 @@ export interface ModelProgress {
 }
 
 export interface ModelStatus {
+  revision?: string | null;
+  license?: string | null;
+  auxiliary_revisions?: Record<string, string>;
   model_name: string;
   display_name: string;
   hf_repo_id?: string; // HuggingFace repository ID
@@ -599,4 +603,23 @@ export interface CloudStatus {
   key_prefix: string | null;
   connected_at: string | null;
   dashboard_url: string;
+}
+
+export interface ModelResidencyPolicy {
+  max_resident_engines: number;
+  estimated_weight_budget_mb: number;
+}
+
+export interface ModelResidencyStatus {
+  policy: ModelResidencyPolicy;
+  persistence: 'session';
+  budget_basis: string;
+  selected_model: string | null;
+  resident_models: { model_name: string; engine: string; estimated_weight_mb: number }[];
+  last_voice_prewarm: { model_name: string; profile_id: string } | null;
+}
+
+export interface ModelPrewarmResult extends ModelResidencyStatus {
+  mode: 'weights_only' | 'voice';
+  audio_saved: false;
 }

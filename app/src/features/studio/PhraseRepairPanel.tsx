@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { useStudio } from './context';
+import { SpeechReviewPanel } from './SpeechReviewPanel';
 import { operationId } from './session';
 import { useDurableSubmission } from './submissions';
 import type { StudioPassage } from './types';
@@ -167,6 +168,21 @@ export function PhraseRepairPanel({
   return (
     <details className="studio-advanced studio-phrase-repairs">
       <summary>Phrase repairs &amp; comping</summary>
+      <SpeechReviewPanel
+        passage={passage}
+        onRepair={(takeId, suggestion) => {
+          setMode('repair');
+          setBaseId(takeId);
+          setPhraseText(suggestion.expected);
+          if (suggestion.kind === 'substitution' && suggestion.audition) {
+            setReplaceStart(String(suggestion.audition.start));
+            setReplaceEnd(String(suggestion.audition.end));
+          }
+          setError(
+            'Listen to the original and choose the exact repair interval before composing. The suggestion does not generate or adopt audio.',
+          );
+        }}
+      />
       <p className="studio-note">
         Generate a replacement word or phrase, then choose exact source ranges by listening. A new
         take preserves every original; use it from Takes after review. Crossfades overlap the joins

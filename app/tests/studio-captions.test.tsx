@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from 'bun:test';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { CaptionsPanel } from '../src/features/studio/CaptionsPanel';
-import { CaptionsClient, type CaptionStatus } from '../src/features/studio/captions-client';
+import { type CaptionStatus, CaptionsClient } from '../src/features/studio/captions-client';
 import { StudioContext, type StudioContextValue } from '../src/features/studio/context';
 import { PlatformProvider } from '../src/platform/PlatformContext';
 import type { Platform } from '../src/platform/types';
@@ -299,4 +299,26 @@ test('the caption dialog can start and stop narration without closing the refere
     await button('Stop narration preview').props.onClick();
   });
   expect(stops).toBe(1);
+});
+
+test('recognized word timings are requested as an unreviewed proposal through the saved project command', async () => {
+  const data = fixture();
+  await data.render();
+  await act(async () => {
+    await button('Use recognized word timings').props.onClick();
+  });
+  expect(data.commands).toEqual([{ type: 'recognize_captions', payload: {} }]);
+  expect(data.saves).toEqual([]);
+});
+
+test('recognized captions refuse unreconciled local edits', async () => {
+  const data = fixture();
+  await data.render();
+  data.context.session.getSnapshot = (() => ({ status: 'error' })) as never;
+  await act(async () => {
+    await expect(button('Use recognized word timings').props.onClick()).rejects.toThrow(
+      'Save and reconcile',
+    );
+  });
+  expect(data.commands).toEqual([]);
 });

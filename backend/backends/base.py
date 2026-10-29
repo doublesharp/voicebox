@@ -46,6 +46,7 @@ def is_model_cached(
     *,
     weight_extensions: tuple[str, ...] = (".safetensors", ".bin"),
     required_files: Optional[list[str]] = None,
+    revision: Optional[str] = None,
 ) -> bool:
     """
     Check if a HuggingFace model is fully cached locally.
@@ -67,12 +68,24 @@ def is_model_cached(
         if not repo_cache.exists():
             return False
 
-        if has_in_progress_download(repo_cache / "blobs"):
-            logger.debug(f"Found in-progress .incomplete file for {hf_repo}")
-            return False
-
         snapshots_dir = repo_cache / "snapshots"
         if not snapshots_dir.exists():
+            return False
+
+        if revision is not None:
+            import re
+
+            if re.fullmatch(r"[a-fA-F0-9]{40,64}", revision) is None:
+                return False
+            snapshot = snapshots_dir / revision
+            if not snapshot.is_dir():
+                return False
+            if required_files:
+                return all((snapshot / name).is_file() and (snapshot / name).resolve().is_relative_to(repo_cache.resolve()) for name in required_files)
+            return any(path.is_file() for ext in weight_extensions for path in snapshot.rglob(f"*{ext}"))
+
+        if has_in_progress_download(repo_cache / "blobs"):
+            logger.debug(f"Found in-progress .incomplete file for {hf_repo}")
             return False
 
         if required_files:

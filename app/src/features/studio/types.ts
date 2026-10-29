@@ -50,6 +50,7 @@ export interface StudioDocument {
   passages: StudioPassage[];
   tracks: StudioTrack[];
   clips: StudioClip[];
+  speech_reviews?: import('./speech-review-client').SpeechReview[];
   pronunciation_rules?: import('./pronunciation').PronunciationRule[];
   video_reference?: {
     name: string;
@@ -184,6 +185,8 @@ export type StudioCommandType =
   | 'set_video_reference'
   | 'set_scene_target'
   | 'estimate_captions'
+  | 'recognize_captions'
+  | 'set_speech_review'
   | 'set_captions'
   | 'compose_take'
   | 'update_project'

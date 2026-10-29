@@ -72,6 +72,9 @@ export interface PlatformAudio {
     deviceIds: string[],
     options?: { startTime?: number; volume?: number },
   ): Promise<NativePlaybackSession>;
+  startPcmStream?(sampleRate: number, deviceIds: string[]): Promise<NativePlaybackSession>;
+  appendPcmStream?(sessionId: string, pcm: Uint8Array): Promise<void>;
+  finishPcmStream?(sessionId: string): Promise<void>;
   controlPlayback(sessionId: string, control: NativePlaybackControl): Promise<void>;
   subscribeToPlayback(callback: (event: NativePlaybackEvent) => void): Promise<() => void>;
   stopPlayback(sessionId?: string): Promise<void>;

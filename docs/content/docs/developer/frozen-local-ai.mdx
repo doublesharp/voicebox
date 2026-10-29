@@ -1,0 +1,72 @@
+---
+title: "Frozen local AI verification"
+description: "Build destinations and runtime checks for the macOS local speech backend"
+---
+
+The build driver keeps its existing default destinations under `backend/`.
+Callers can place disposable output on their approved build volume with
+`--distpath`, `--workpath`, and `--specpath`. The corresponding environment
+variables are `VOICEBOX_PYINSTALLER_DISTPATH`, `VOICEBOX_PYINSTALLER_WORKPATH`,
+and `VOICEBOX_PYINSTALLER_SPECPATH`; command arguments take precedence. Relative
+paths resolve before the driver changes its working directory. Both the speech
+server and the small MCP shim support these destinations.
+
+```sh
+export VOICEBOX_FREEZE_WORK_DIR="/absolute/approved-build-root"
+export TMPDIR="$VOICEBOX_FREEZE_WORK_DIR/tmp"
+export PYINSTALLER_CONFIG_DIR="$VOICEBOX_FREEZE_WORK_DIR/pyinstaller-cache"
+mkdir -p "$TMPDIR"
+python backend/build_binary.py \
+  --distpath "$VOICEBOX_FREEZE_WORK_DIR/dist" \
+  --workpath "$VOICEBOX_FREEZE_WORK_DIR/work" \
+  --specpath "$VOICEBOX_FREEZE_WORK_DIR/spec"
+```
+
+macOS uses an unpacked backend directory. Launch its executable beside its
+support files; copying only the executable is insufficient. The production
+Tauri bundle places that directory under `Contents/Resources/backend`.
+Windows and Linux retain their existing build modes.
+
+```sh
+export HF_HOME="$VOICEBOX_FREEZE_WORK_DIR/hf-home"
+export VOICEBOX_MODELS_DIR="$VOICEBOX_FREEZE_WORK_DIR/models"
+"$VOICEBOX_FREEZE_WORK_DIR/dist/voicebox-server/voicebox-server" \
+  --host 127.0.0.1 --port 18502 \
+  --data-dir "$VOICEBOX_FREEZE_WORK_DIR/data"
+```
+
+## MOSS dependency closure
+
+The [CPU engine audit](./cpu-tts-audit) records the pinned upstream source and
+model identities. Setup, release and Docker install that source with
+`--no-deps`; its unrelated Torch pins must not replace the shared stack.
+The reachable path is `moss_tts_backend → ort_cpu_runtime → NumPy/ONNX Runtime`,
+plus SentencePiece and the existing SoundFile/SciPy preprocessing.
+
+The freeze includes the adapter and `ort_cpu_runtime` as hidden imports and
+collects ONNX Runtime and SentencePiece with their native libraries. It copies
+all three distributions' metadata, including the MOSS Apache license. The
+upstream CLI, text normalizer and Torch runtime are not used. No new system data
+path override or model weight embedded in the executable is required.
+
+## Qualification boundaries
+
+A build or `--help` result establishes neither synthesis nor downloads. Verify
+an initially empty model cache through the real download/progress/load path,
+then restart offline with `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` and
+exercise a synthetic cloned profile, repeated synthesis, voice prewarm, unload,
+and recovery after restoring a deliberately missing task-owned model asset.
+Keep the user's own data directory and shared model files untouched.
+
+The October 29 macOS arm64 dependency build passed an actual initially empty
+MOSS download: both exact snapshots and their 16 selected assets became ready,
+SSE progress completed, the ONNX model loaded, and explicit unload cleared the
+loaded state. Its standalone binary started from a read-only working directory
+with host `PYTHONPATH` removed. The bundle retained the ONNX Runtime native
+library and extension, SentencePiece extension, and MOSS license metadata.
+
+Further inference and final source-closure results belong to their recorded
+artifact hashes. Packaged backend inference, Tauri launch, webview interaction,
+physical audio-device changes, release signing, and other operating systems
+remain separate checks. Raw receipts and generated artifacts belong outside
+Git; retain only short maintained results in documentation.

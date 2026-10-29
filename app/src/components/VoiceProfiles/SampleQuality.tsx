@@ -3,6 +3,16 @@ import { Button } from '@/components/ui/button';
 import { useServerStore } from '@/stores/serverStore';
 
 interface QualityReport {
+  decoded_audio_sha256?: string;
+  suggested_segments?: Array<{
+    rank: number;
+    start_seconds: number;
+    end_seconds: number;
+    duration_seconds: number;
+    clipped_fraction: number;
+    silence_fraction: number;
+    score: number;
+  }>;
   duration_seconds: number;
   clipped_fraction: number;
   silence_fraction: number;
@@ -41,6 +51,18 @@ function validReport(value: QualityReport) {
         typeof value[key as keyof QualityReport] === 'number' &&
         Number.isFinite(value[key as keyof QualityReport]),
     ) &&
+    (value.suggested_segments === undefined ||
+      (Array.isArray(value.suggested_segments) &&
+        value.suggested_segments.length <= 3 &&
+        value.suggested_segments.every(
+          (item) =>
+            item &&
+            Number.isFinite(item.start_seconds) &&
+            Number.isFinite(item.end_seconds) &&
+            item.start_seconds >= 0 &&
+            item.end_seconds > item.start_seconds &&
+            item.end_seconds <= value.duration_seconds,
+        ))) &&
     Array.isArray(value.issues) &&
     value.issues.every(
       (item) =>
@@ -72,6 +94,18 @@ export function SampleQuality({ file, audioUrl, referenceText, language }: Props
   const [recognized, setRecognized] = useState<{ epoch: number; text: string } | null>(null);
   const [busy, setBusy] = useState<{ epoch: number; type: 'levels' | 'transcript' } | null>(null);
   const [error, setError] = useState<{ epoch: number; message: string } | null>(null);
+  const audio = useRef<HTMLAudioElement | null>(null);
+  const auditionEnd = useRef<number | null>(null);
+  const [auditionUrl, setAuditionUrl] = useState('');
+  useEffect(() => {
+    const local = file ? URL.createObjectURL(file) : (audioUrl ?? '');
+    setAuditionUrl(local);
+    return () => {
+      audio.current?.pause();
+      auditionEnd.current = null;
+      if (file && local) URL.revokeObjectURL(local);
+    };
+  }, [file, audioUrl]);
   const isCurrent = useCallback(
     (requestEpoch: number) => mounted.current && identity.current.epoch === requestEpoch,
     [],
@@ -211,6 +245,61 @@ export function SampleQuality({ file, audioUrl, referenceText, language }: Props
             <p>No level warnings found. Listen for background noise, music, or other speakers.</p>
           )}
         </>
+      )}
+      {!!currentReport?.suggested_segments?.length && (
+        <div className="space-y-2">
+          <p className="font-medium">Suggested reference intervals</p>
+          <p>
+            Ranked by audible level, quiet time and clipping. These do not detect speaker identity
+            or sentence boundaries. Listen, then trim a copy and match its transcript; the original
+            is kept.
+          </p>
+          {/* biome-ignore lint/a11y/useMediaCaption: The supplied reference transcript remains visible; automatic captions would imply verified wording. */}
+          <audio
+            ref={(element) => {
+              if (audio.current && audio.current !== element) audio.current.pause();
+              audio.current = element;
+            }}
+            src={auditionUrl}
+            controls
+            preload="metadata"
+            aria-label="Original reference audition"
+            onTimeUpdate={() => {
+              if (
+                audio.current &&
+                auditionEnd.current !== null &&
+                audio.current.currentTime >= auditionEnd.current
+              ) {
+                audio.current.pause();
+                auditionEnd.current = null;
+              }
+            }}
+          />
+          {currentReport.suggested_segments.map((segment) => (
+            <Button
+              key={segment.rank}
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={() => {
+                if (!audio.current) return;
+                auditionEnd.current = segment.end_seconds;
+                audio.current.currentTime = segment.start_seconds;
+                void audio.current.play().catch(() => {
+                  if (isCurrent(epoch))
+                    setError({
+                      epoch,
+                      message:
+                        'Playback was blocked. Use the original reference controls to listen.',
+                    });
+                });
+              }}
+            >
+              Audition suggestion {segment.rank}: {segment.start_seconds.toFixed(1)}–
+              {segment.end_seconds.toFixed(1)} s
+            </Button>
+          ))}
+        </div>
       )}
       <div className="border-t border-border/60 pt-3 space-y-2">
         {transcript === null ? (

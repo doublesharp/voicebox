@@ -417,7 +417,11 @@ class StudioStore:
             from .pronunciation import apply_pronunciation_command
 
             apply_pronunciation_command(doc, payload)
-        elif kind in ("set_video_reference", "set_scene_target", "estimate_captions", "set_captions"):
+        elif kind == "set_speech_review":
+            from .speech_review import save_review
+
+            save_review(self, db, project_id, doc, payload)
+        elif kind in ("set_video_reference", "set_scene_target", "estimate_captions", "recognize_captions", "set_captions"):
             from .captions import apply_caption_command
 
             apply_caption_command(self, db, project_id, doc, kind, payload)

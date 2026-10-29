@@ -22,7 +22,16 @@ def is_apple_silicon():
     return platform.system() == "Darwin" and platform.machine() == "arm64"
 
 
-def build_server(cuda=False, rocm=False):
+def _output_paths(backend_dir, distpath=None, workpath=None, specpath=None):
+    """Resolve caller-owned destinations before the build changes directory."""
+    return {
+        "distpath": Path(distpath or os.environ.get("VOICEBOX_PYINSTALLER_DISTPATH") or backend_dir / "dist").expanduser().resolve(),
+        "workpath": Path(workpath or os.environ.get("VOICEBOX_PYINSTALLER_WORKPATH") or backend_dir / "build").expanduser().resolve(),
+        "specpath": Path(specpath or os.environ.get("VOICEBOX_PYINSTALLER_SPECPATH") or backend_dir).expanduser().resolve(),
+    }
+
+
+def build_server(cuda=False, rocm=False, *, distpath=None, workpath=None, specpath=None):
     """Build Python server as standalone binary.
 
     Args:
@@ -34,7 +43,8 @@ def build_server(cuda=False, rocm=False):
     if cuda and rocm:
         raise ValueError("Cannot build with both CUDA and ROCm support")
 
-    backend_dir = Path(__file__).parent
+    backend_dir = Path(__file__).resolve().parent
+    outputs = _output_paths(backend_dir, distpath, workpath, specpath)
 
     if rocm:
         binary_name = "voicebox-server-rocm"
@@ -93,6 +103,19 @@ def build_server(cuda=False, rocm=False):
     if qwen_tts_path and Path(qwen_tts_path).exists():
         args.extend(["--paths", str(qwen_tts_path)])
         logger.info("Using local qwen_tts source from: %s", qwen_tts_path)
+
+    # MOSS uses only the audited ONNX runtime, not its Torch/CLI wrappers.
+    # Native wheel collection retains ORT's capi dylib/extension and the
+    # SentencePiece extension; metadata includes the MOSS Apache license.
+    args.extend([
+        "--hidden-import", "backend.backends.moss_tts_backend",
+        "--hidden-import", "ort_cpu_runtime",
+        "--collect-all", "onnxruntime",
+        "--collect-all", "sentencepiece",
+        "--copy-metadata", "onnxruntime",
+        "--copy-metadata", "sentencepiece",
+        "--copy-metadata", "moss-tts-nano",
+    ])
 
     # Add common hidden imports
     args.extend(
@@ -521,8 +544,8 @@ def build_server(cuda=False, rocm=False):
     elif not cuda and not rocm:
         logger.info("Building for non-Apple Silicon platform - PyTorch only")
 
-    dist_dir = str(backend_dir / "dist")
-    build_dir = str(backend_dir / "build")
+    dist_dir = str(outputs["distpath"])
+    build_dir = str(outputs["workpath"])
 
     args.extend(
         [
@@ -530,6 +553,8 @@ def build_server(cuda=False, rocm=False):
             dist_dir,
             "--workpath",
             build_dir,
+            "--specpath",
+            str(outputs["specpath"]),
             "--noconfirm",
             "--clean",
         ]
@@ -723,17 +748,18 @@ def build_server(cuda=False, rocm=False):
             )
 
 
-    logger.info("Binary built in %s", backend_dir / "dist" / binary_name)
+    logger.info("Binary built in %s", outputs["distpath"] / binary_name)
 
 
-def build_shim():
+def build_shim(*, distpath=None, workpath=None, specpath=None):
     """Build the voicebox-mcp stdio shim as a tiny standalone binary.
 
     This is the bridge for MCP clients that only speak stdio — it proxies
     JSON-RPC to the main voicebox-server's /mcp endpoint. Keep it small: no
     torch, no ML deps, just httpx + asyncio.
     """
-    backend_dir = Path(__file__).parent
+    backend_dir = Path(__file__).resolve().parent
+    outputs = _output_paths(backend_dir, distpath, workpath, specpath)
 
     args = [
         "mcp_shim/__main__.py",
@@ -798,14 +824,16 @@ def build_shim():
         "mcp",
     ]
 
-    dist_dir = str(backend_dir / "dist")
-    build_dir = str(backend_dir / "build")
+    dist_dir = str(outputs["distpath"])
+    build_dir = str(outputs["workpath"])
     args.extend(
         [
             "--distpath",
             dist_dir,
             "--workpath",
             build_dir,
+            "--specpath",
+            str(outputs["specpath"]),
             "--noconfirm",
             "--clean",
         ]
@@ -813,7 +841,7 @@ def build_shim():
 
     os.chdir(backend_dir)
     PyInstaller.__main__.run(args)
-    logger.info("Shim built: %s", backend_dir / "dist" / "voicebox-mcp")
+    logger.info("Shim built: %s", outputs["distpath"] / "voicebox-mcp")
 
 
 if __name__ == "__main__":
@@ -833,9 +861,12 @@ if __name__ == "__main__":
         action="store_true",
         help="Build the voicebox-mcp stdio shim binary instead of the server",
     )
+    for option in ("distpath", "workpath", "specpath"):
+        parser.add_argument(f"--{option}", help=f"PyInstaller {option}; also VOICEBOX_PYINSTALLER_{option.upper()}")
     cli_args = parser.parse_args()
+    destinations = {name: getattr(cli_args, name) for name in ("distpath", "workpath", "specpath")}
     if cli_args.shim:
-        build_shim()
+        build_shim(**destinations)
     else:
-        build_server(cuda=cli_args.cuda, rocm=cli_args.rocm)
+        build_server(cuda=cli_args.cuda, rocm=cli_args.rocm, **destinations)
 

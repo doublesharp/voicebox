@@ -23,7 +23,11 @@ jobs:
         run: bun run test:upstream
 
       - name: Playback lifecycle regressions
-        run: bun run test:playback
+        run: |
+          bun run test:playback
+          bun test app/tests/incremental-preview.test.ts app/tests/incremental-preview-hook.test.tsx
+          bun test app/tests/tauri-audio-binary.test.ts
+          bun test app/tests/composer-lifecycle.test.tsx
 
       - name: Voice, story and model regressions
         run: |

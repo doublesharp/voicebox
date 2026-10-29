@@ -23,6 +23,7 @@ import {
 import { Textarea } from '@/components/ui/textarea';
 import { useToast } from '@/components/ui/use-toast';
 import { apiClient } from '@/lib/api/client';
+import { useSpeechPreview } from '@/lib/audio/useSpeechPreview';
 import { engineSupportsInstruct } from '@/lib/constants/engines';
 import { getLanguageOptionsForEngine, type LanguageCode } from '@/lib/constants/languages';
 import { useGenerationForm } from '@/lib/hooks/useGenerationForm';
@@ -91,6 +92,9 @@ export function FloatingGenerateBox({
   const { data: currentStory } = useStory(selectedStoryId);
   const addPendingStoryAdd = useGenerationStore((s) => s.addPendingStoryAdd);
   const { toast } = useToast();
+  const preview = useSpeechPreview(selectedProfileId, (description) => {
+    toast({ title: 'Speech preview failed', description, variant: 'destructive' });
+  });
 
   const composeMutation = useMutation({
     mutationFn: (profileId: string) => apiClient.composeWithPersonality(profileId),
@@ -302,6 +306,7 @@ export function FloatingGenerateBox({
   }, [isExpanded, layout]);
 
   async function onSubmit(data: Parameters<typeof handleSubmit>[0]) {
+    await preview.stop();
     await handleSubmit(data, selectedProfileId);
   }
 
@@ -658,6 +663,46 @@ export function FloatingGenerateBox({
                 </Hint>
               )}
               <span className="flex-1" />
+              {preview.available && (
+                <Hint content="Listen to your script at normal speed without effects or loudness normalization. Preview is not saved; Generate creates the finished audio.">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="h-9 rounded-lg"
+                    disabled={
+                      !selectedProfileId || (!preview.active && (!script.trim() || isPending))
+                    }
+                    onClick={() => {
+                      if (preview.active) {
+                        void preview.stop();
+                        return;
+                      }
+                      void form.handleSubmit(async (values) => {
+                        if (!selectedProfileId) return;
+                        const previewEngine = values.engine || 'qwen';
+                        await preview.start({
+                          profile_id: selectedProfileId,
+                          text: values.text,
+                          language: values.language,
+                          engine: previewEngine,
+                          model_size: ['qwen', 'qwen_custom_voice', 'tada'].includes(previewEngine)
+                            ? values.modelSize
+                            : undefined,
+                          seed: values.seed,
+                          instruct: engineSupportsInstruct(previewEngine)
+                            ? values.instruct || undefined
+                            : undefined,
+                          normalize: false,
+                          effects_chain: [],
+                          speed: 1,
+                        });
+                      })();
+                    }}
+                  >
+                    {preview.active ? 'Stop preview' : 'Preview speech'}
+                  </Button>
+                </Hint>
+              )}
               <Hint content="Command or Control + Enter">
                 <Button
                   type="submit"

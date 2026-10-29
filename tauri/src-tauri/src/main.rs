@@ -5,6 +5,7 @@ mod accessibility;
 mod audio_capture;
 mod audio_output;
 mod audio_pcm;
+mod audio_stream;
 mod clipboard;
 mod focus_capture;
 #[cfg(desktop)]
@@ -1021,6 +1022,42 @@ async fn play_audio_to_devices(
 }
 
 #[command]
+async fn start_audio_pcm_stream(
+    app: tauri::AppHandle,
+    state: State<'_, audio_output::AudioOutputState>,
+    sample_rate: u32,
+    device_ids: Vec<String>,
+) -> Result<audio_output::PlaybackSession, String> {
+    state.start_pcm_stream(app, sample_rate, device_ids).await
+}
+
+#[command]
+async fn append_audio_pcm_stream(
+    state: State<'_, audio_output::AudioOutputState>,
+    request: tauri::ipc::Request<'_>,
+) -> Result<(), String> {
+    let id = request
+        .headers()
+        .get("x-voicebox-session")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| value.len() <= 128)
+        .ok_or("Missing preview session")?
+        .to_owned();
+    let tauri::ipc::InvokeBody::Raw(pcm) = request.body() else {
+        return Err("Preview requires binary PCM".into());
+    };
+    state.append_pcm_stream(&id, pcm.clone()).await
+}
+
+#[command]
+fn finish_audio_pcm_stream(
+    state: State<'_, audio_output::AudioOutputState>,
+    session_id: String,
+) -> Result<(), String> {
+    state.finish_pcm_stream(&session_id)
+}
+
+#[command]
 fn control_audio_playback(
     state: State<'_, audio_output::AudioOutputState>,
     session_id: String,
@@ -1607,6 +1644,9 @@ pub fn run() {
             is_system_audio_supported,
             list_audio_output_devices,
             play_audio_to_devices,
+            start_audio_pcm_stream,
+            append_audio_pcm_stream,
+            finish_audio_pcm_stream,
             stop_audio_playback,
             control_audio_playback,
             debug_clipboard_roundtrip,

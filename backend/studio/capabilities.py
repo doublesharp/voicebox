@@ -49,6 +49,7 @@ SEED_ENGINES = frozenset(
         "tada",
         "kokoro",
         "omnivoice",
+        "moss_tts",
     )
 )
 
@@ -58,6 +59,8 @@ def _adapter_runtime(engine):
     from ..utils.platform_detect import get_backend_type
 
     backend = get_backend_type() if engine in ("qwen", "chatterbox", "qwen_custom_voice", "qwen_voice_design") else "pytorch"
+    if engine == "moss_tts":
+        backend = "onnx-cpu"
     adapters = {
         "qwen": ("mlx_backend", "MLXTTSBackend", ())
         if backend == "mlx"
@@ -72,6 +75,7 @@ def _adapter_runtime(engine):
         "qwen_voice_design": ("qwen_mlx_styles_backend", "QwenMLXVoiceDesignBackend", ())
         if backend == "mlx"
         else ("qwen_voice_design_backend", "QwenVoiceDesignBackend", ("qwen-tts",)),
+        "moss_tts": ("moss_tts_backend", "MossTTSBackend", ("onnxruntime", "sentencepiece", "moss-tts-nano")),
         "luxtts": ("luxtts_backend", "LuxTTSBackend", ("Zipvoice",)),
         "tada": ("hume_backend", "HumeTadaBackend", ("hume-tada",)),
         "kokoro": ("kokoro_backend", "KokoroTTSBackend", ("kokoro", "misaki")),
@@ -80,7 +84,7 @@ def _adapter_runtime(engine):
     if engine not in adapters:
         raise ValueError(f"No Studio runtime identity is registered for engine {engine!r}")
     module, adapter, engine_packages = adapters[engine]
-    runtime_packages = ("mlx", "mlx-audio") if backend == "mlx" else ("torch", "torchaudio")
+    runtime_packages = ("onnxruntime",) if backend == "onnx-cpu" else ("mlx", "mlx-audio") if backend == "mlx" else ("torch", "torchaudio")
     versions = {}
     for package in (*runtime_packages, *engine_packages, "numpy", "transformers", "huggingface-hub", "safetensors"):
         try:
@@ -109,7 +113,9 @@ def capability_for_config(cfg):
         "model_name": cfg.model_name,
         "hf_repo_id": cfg.hf_repo_id,
         "aux_hf_repo_ids": list(cfg.aux_hf_repo_ids),
-        "weights_revision": None,
+        "weights_revision": getattr(cfg, "revision", None),
+        "aux_weights_revisions": dict(getattr(cfg, "aux_revisions", {})),
+        "license": getattr(cfg, "license", None),
         **runtime,
         "platform": platform.system(),
         "machine": platform.machine(),

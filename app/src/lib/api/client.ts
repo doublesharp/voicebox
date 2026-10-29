@@ -33,6 +33,9 @@ import type {
   MCPClientBindingListResponse,
   MCPClientBindingUpsert,
   ModelDownloadRequest,
+  ModelResidencyPolicy,
+  ModelResidencyStatus,
+  ModelPrewarmResult,
   ModelStatusListResponse,
   PersonalityTextResponse,
   PresetVoice,
@@ -277,6 +280,22 @@ class ApiClient {
       method: 'POST',
       body: JSON.stringify(data),
     });
+  }
+
+  /** Unsaved preview. The caller consumes PCM as it arrives and owns cancellation. */
+  async previewSpeech(data: GenerationRequest, signal: AbortSignal): Promise<Response> {
+    const response = await fetch(`${this.getBaseUrl()}/generate/stream?incremental=true`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...data, normalize: false, effects_chain: [], speed: 1 }),
+      signal,
+    });
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({ detail: response.statusText }));
+      throw new Error(formatErrorDetail(error?.detail, `HTTP error! status: ${response.status}`));
+    }
+    if (!response.body) throw new Error('Audio preview response has no stream');
+    return response;
   }
 
   async retryGeneration(generationId: string): Promise<GenerationResponse> {
@@ -558,6 +577,27 @@ class ApiClient {
   }
 
   // Model Management
+  async getModelResidency(): Promise<ModelResidencyStatus> {
+    return this.request<ModelResidencyStatus>('/models/residency');
+  }
+
+  async updateModelResidency(policy: ModelResidencyPolicy): Promise<ModelResidencyStatus> {
+    return this.request<ModelResidencyStatus>('/models/residency', {
+      method: 'PUT',
+      body: JSON.stringify(policy),
+    });
+  }
+
+  async prewarmModel(modelName: string, profileId?: string): Promise<ModelPrewarmResult> {
+    return this.request<ModelPrewarmResult>('/models/prewarm', {
+      method: 'POST',
+      body: JSON.stringify({
+        model_name: modelName,
+        ...(profileId ? { profile_id: profileId } : {}),
+      }),
+    });
+  }
+
   async getModelStatus(): Promise<ModelStatusListResponse> {
     return this.request<ModelStatusListResponse>('/models/status');
   }

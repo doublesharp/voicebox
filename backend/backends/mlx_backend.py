@@ -79,6 +79,9 @@ class MLXTTSBackend:
             "0.6B": "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16",
         }
 
+        from .qwen_mlx_variants import QWEN_MLX_QUANTIZED_VARIANTS
+
+        mlx_model_map.update(QWEN_MLX_QUANTIZED_VARIANTS)
         if model_size not in mlx_model_map:
             raise ValueError(f"Unknown model size: {model_size}")
 
@@ -88,6 +91,10 @@ class MLXTTSBackend:
         return hf_model_id
 
     def _is_model_cached(self, model_size: str) -> bool:
+        from .qwen_mlx_variants import QWEN_MLX_QUANTIZED_REVISIONS, QWEN_MLX_REQUIRED_FILES
+
+        if model_size in QWEN_MLX_QUANTIZED_REVISIONS:
+            return is_model_cached(self._get_model_path(model_size), revision=QWEN_MLX_QUANTIZED_REVISIONS[model_size], required_files=list(QWEN_MLX_REQUIRED_FILES))
         return is_model_cached(
             self._get_model_path(model_size),
             weight_extensions=(".safetensors", ".bin", ".npz"),
@@ -135,7 +142,11 @@ class MLXTTSBackend:
             from mlx_audio.tts import load
 
             logger.info("Loading MLX TTS model %s...", model_size)
+            from .qwen_mlx_variants import QWEN_MLX_QUANTIZED_REVISIONS, QWEN_MLX_REQUIRED_FILES
+            if model_size in QWEN_MLX_QUANTIZED_REVISIONS:
+                from huggingface_hub import snapshot_download
 
+                model_path = snapshot_download(model_path, revision=QWEN_MLX_QUANTIZED_REVISIONS[model_size], allow_patterns=list(QWEN_MLX_REQUIRED_FILES), max_workers=2)
             self.model = load(model_path)
 
         self._reference_cache.bind(self.model)
@@ -408,6 +419,8 @@ class MLXSTTBackend:
     def __init__(self, model_size: str = "base"):
         self.model = None
         self.model_size = model_size
+        self._recognition_revision = None
+        self._load_epoch = 0
         # See MLXTTSBackend._op_lock — same reason.
         self._op_lock = asyncio.Lock()
 
@@ -450,6 +463,7 @@ class MLXSTTBackend:
             logger.info("Loading MLX Whisper model %s...", model_size)
 
             self.model = load(model_name)
+            self._recognition_revision = None
 
         self.model_size = model_size
         logger.info("MLX Whisper model %s loaded successfully", model_size)
@@ -459,6 +473,8 @@ class MLXSTTBackend:
         self._unload_model_sync()
 
     def _unload_model_sync(self):
+        self._load_epoch += 1
+        self._recognition_revision = None
         if self.model is not None:
             del self.model
             self.model = None
@@ -532,3 +548,51 @@ class MLXSTTBackend:
 
         async with self._op_lock:
             return await _run_on_mlx_thread(_reload_and_transcribe_sync)
+
+
+    async def transcribe_detailed(self, audio_path, language=None, model_size=None):
+        """Cached-only recognition with words, pinned to one local snapshot.
+
+        Keep loading, decoding and result materialization on the MLX worker.
+        Cancellation drains that worker before releasing the operation lock.
+        """
+        from ..utils.async_work import run_owned
+        from ..utils.whisper_timing import recognized_word_timing
+
+        resolved_size = model_size or self.model_size
+        epoch = self._load_epoch
+
+        def recognize():
+            model = None
+            try:
+                if self.model is None or self.model_size != resolved_size:
+                    from huggingface_hub import snapshot_download
+                    from mlx_audio.stt import load
+                    from huggingface_hub import constants as hf_constants
+
+                    repo = WHISPER_HF_REPOS.get(resolved_size, f"openai/whisper-{resolved_size}")
+                    snapshot = snapshot_download(repo_id=repo, local_files_only=True,
+                                                 cache_dir=hf_constants.HF_HUB_CACHE)
+                    loaded = load(snapshot)
+                    if epoch != self._load_epoch:
+                        del loaded
+                        raise RuntimeError("Whisper was unloaded during recognition loading")
+                    self.model = loaded
+                    self.model_size = resolved_size
+                    self._recognition_revision = Path(snapshot).name
+                model = self.model
+                options = {"word_timestamps": True}
+                if language:
+                    options["language"] = language
+                with recognized_word_timing(model):
+                    result = model.generate(str(audio_path), **options)
+                # Return plain CPU metadata, never lazy arrays/native model state.
+                return {"text": result.get("text", "") if isinstance(result, dict) else result.text,
+                        "segments": result.get("segments", []) if isinstance(result, dict) else result.segments}
+            finally:
+                del model
+                if self.model is None:
+                    empty_mlx_cache()
+
+        async with self._op_lock:
+            return await run_owned(_run_on_mlx_thread(recognize))

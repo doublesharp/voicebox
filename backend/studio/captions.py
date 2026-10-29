@@ -89,6 +89,9 @@ def _cues(values, doc):
 
 def validate_caption_document(doc, assets=None, takes=None):
     """Validate optional data on commands, archives, and restored documents."""
+    from .speech_review import validate_reviews
+
+    validate_reviews(doc)
     if "video_reference" in doc:
         _video(doc["video_reference"])
     targets = doc.get("scene_targets", {})
@@ -213,6 +216,45 @@ def estimate_captions(doc, assets, takes):
     return {"source_fingerprint": source_fingerprint(doc, assets, takes), "reviewed": False, "cues": cues}
 
 
+
+def recognized_captions(project):
+    """Map whole recognized words into audible clip coordinates for review."""
+    from .speech_review import review_key, source_identity
+    from .timing import nearest_sample
+
+    doc = project["document"]
+    reports = {report["source_key"]: report for report in doc.get("speech_reviews", [])}
+    cues = []
+    for source in _sources(doc, project["assets"], project["takes"]):
+        if not source["text"].strip():
+            continue
+        take = source["take"]
+        if take is None:
+            raise ValueError("Recognized captions require a reviewed take for every narration clip")
+        identity, _ = source_identity(project, take["id"])
+        report = reports.get(review_key(identity))
+        if report is None or not report["words"]:
+            raise ValueError("Run speech review for each current narration take before using recognized word timings")
+        clip, rate = source["clip"], doc["sample_rate"]
+        low = clip["trim_start_sample"]
+        high = low + source["length"]
+        for word in report["words"]:
+            start, end = nearest_sample(word["start"] * rate), nearest_sample(word["end"] * rate)
+            # A partially trimmed word is not reliably spoken. Omit it rather
+            # than pretend the supplied script was aligned to the audible part.
+            if low <= start < end <= high:
+                cues.append({"id": uid(), "clip_id": clip["id"],
+                             "start_sample": clip["start_sample"] + start - low,
+                             "end_sample": clip["start_sample"] + end - low,
+                             "text": word["word"]})
+    if not cues:
+        raise ValueError("No complete recognized words remain in the current audible ranges")
+    cues.sort(key=lambda cue: (cue["start_sample"], cue["end_sample"]))
+    result = {"source_fingerprint": source_fingerprint(doc, project["assets"], project["takes"]),
+              "reviewed": False, "cues": cues}
+    _cues(cues, doc)
+    return result
+
 def caption_status(doc, assets, takes):
     validate_caption_document(doc)
     fingerprint = source_fingerprint(doc, assets, takes)
@@ -272,10 +314,14 @@ def apply_caption_command(store, db, project_id, doc, kind, payload):
                 raise ValueError("Invalid scene target")
             _range(payload, "scene target")
             targets[passage_id] = {key: payload[key] for key in ("start_sample", "end_sample")}
-    elif kind in ("estimate_captions", "set_captions"):
+    elif kind in ("estimate_captions", "recognize_captions", "set_captions"):
         project = store._project(db, project_id)
         assets, takes = project["assets"], project["takes"]
-        if kind == "estimate_captions":
+        if kind == "recognize_captions":
+            if payload:
+                raise ValueError("Recognized captions require no payload")
+            doc["captions"] = recognized_captions({**project, "document": doc})
+        elif kind == "estimate_captions":
             if payload:
                 raise ValueError("Caption estimates require no payload")
             doc["captions"] = estimate_captions(doc, assets, takes)
@@ -320,6 +366,9 @@ def export_captions(doc, assets, takes, format):  # noqa: A002 - transport calls
 
 def make_caption_router(store):
     router = APIRouter()
+    from .speech_review import make_speech_router
+
+    router.include_router(make_speech_router(store))
 
     def project_value(project_id):
         try:

@@ -1,3 +1,4 @@
+import { ModelResidencyControls } from './ModelResidencyControls';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   ChevronDown,
@@ -53,6 +54,12 @@ async function fetchHuggingFaceModelInfo(repoId: string): Promise<HuggingFaceMod
 }
 
 const MODEL_DESCRIPTIONS: Record<string, string> = {
+  'moss-tts':
+    'Local multilingual CPU voice cloning with an ONNX runtime. Reference audio required; 48 kHz mono output.',
+  'qwen-tts-1.7B-8bit':
+    'Experimental MLX 8-bit Base voice cloning. Lower weight memory; compare speech quality before choosing it for delivery.',
+  'qwen-tts-1.7B-4bit':
+    'Experimental MLX 4-bit Base voice cloning. Lower weight memory; compare speech quality before choosing it for delivery.',
   'qwen-tts-1.7B':
     'High-quality multilingual TTS by Alibaba. Supports 10 languages with natural prosody and voice cloning from short reference audio.',
   'qwen-tts-0.6B':
@@ -421,7 +428,8 @@ export function ModelManagement() {
         m.model_name.startsWith('chatterbox') ||
         m.model_name.startsWith('tada') ||
         m.model_name.startsWith('kokoro') ||
-        m.model_name.startsWith('omnivoice'),
+        m.model_name.startsWith('omnivoice') ||
+        m.model_name === 'moss-tts',
     ) ?? [];
   const whisperModels = modelStatus?.models.filter((m) => m.model_name.startsWith('whisper')) ?? [];
   const llmModels = modelStatus?.models.filter((m) => m.model_name.startsWith('qwen3-')) ?? [];
@@ -447,6 +455,7 @@ export function ModelManagement() {
 
   // Derive license from HF data
   const license =
+    freshSelectedModel?.license ||
     hfModelInfo?.cardData?.license ||
     hfModelInfo?.tags?.find((tag) => tag.startsWith('license:'))?.replace('license:', '');
 
@@ -534,6 +543,8 @@ export function ModelManagement() {
       )}
 
       {/* Model list */}
+      <ModelResidencyControls models={voiceModels} />
+
       {isLoading ? (
         <div className="flex items-center justify-center py-16">
           <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
@@ -807,6 +818,26 @@ export function ModelManagement() {
                     )}
                   </div>
                 )}
+
+                <div className="space-y-1 text-xs text-muted-foreground">
+                  <p>
+                    Checkpoint license:{' '}
+                    {freshSelectedModel.license
+                      ? formatLicense(freshSelectedModel.license)
+                      : 'Unknown'}
+                  </p>
+                  <p className="break-all">
+                    Pinned revision:{' '}
+                    <span className="font-mono">{freshSelectedModel.revision || 'Unknown'}</span>
+                  </p>
+                  {Object.entries(freshSelectedModel.auxiliary_revisions || {}).map(
+                    ([repo, revision]) => (
+                      <p key={repo} className="break-all">
+                        {repo}: <span className="font-mono">{revision}</span>
+                      </p>
+                    ),
+                  )}
+                </div>
 
                 {/* Disk size */}
                 {freshSelectedModel.downloaded && freshSelectedModel.size_mb && (

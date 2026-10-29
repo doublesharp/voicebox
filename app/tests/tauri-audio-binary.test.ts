@@ -32,3 +32,19 @@ test('binary playback routing metadata safely preserves Unicode device identifie
   expect([...metadata].every((character) => character.charCodeAt(0) < 127)).toBe(true);
   expect(JSON.parse(metadata).deviceIds).toEqual(['device_日本語_🎧']);
 });
+
+test('incremental preview keeps PCM binary and addresses append/finish to one native session', async () => {
+  calls.length = 0;
+  const pcm = new Uint8Array([0, 127, 255, 0]);
+  await tauriAudio.startPcmStream!(24000, ['selected-device']);
+  await tauriAudio.appendPcmStream!('native-7', pcm);
+  await tauriAudio.finishPcmStream!('native-7');
+  expect(calls[0]).toEqual([
+    'start_audio_pcm_stream',
+    { sampleRate: 24000, deviceIds: ['selected-device'] },
+  ]);
+  expect(calls[1][0]).toBe('append_audio_pcm_stream');
+  expect(calls[1][1]).toBe(pcm);
+  expect(calls[1][2]).toEqual({ headers: { 'x-voicebox-session': 'native-7' } });
+  expect(calls[2]).toEqual(['finish_audio_pcm_stream', { sessionId: 'native-7' }]);
+});

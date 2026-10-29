@@ -125,6 +125,8 @@ setup-python:
     # OmniVoice requires transformers>=5.3; we vendor the one class it
     # needs from 5.x (see backend/vendor/higgs_audio_v2_tokenizer).
     "{{ python }}" -m pip install --no-deps omnivoice
+    # MOSS ONNX only: retain the shared Torch/Transformers versions.
+    "{{ python }}" -m pip install --no-deps "moss-tts-nano @ git+https://github.com/OpenMOSS/MOSS-TTS-Nano.git@8b7bcc9341b3b4ef3a3a58ba1338a7d85ff133eb"
     # Apple Silicon: install MLX backend
     if [ "$(uname -m)" = "arm64" ] && [ "$(uname)" = "Darwin" ]; then
         echo "Detected Apple Silicon — installing MLX dependencies..."
@@ -211,6 +213,7 @@ setup-python:
     Invoke-Pip install --no-deps chatterbox-tts; \
     Invoke-Pip install --no-deps hume-tada; \
     Invoke-Pip install --no-deps omnivoice; \
+    Invoke-Pip install --no-deps "moss-tts-nano @ git+https://github.com/OpenMOSS/MOSS-TTS-Nano.git@8b7bcc9341b3b4ef3a3a58ba1338a7d85ff133eb"; \
     Invoke-Pip install git+https://github.com/QwenLM/Qwen3-TTS.git; \
     Invoke-Pip install pyinstaller ruff pytest pytest-asyncio openai -q; \
     Write-Host "Python environment ready."

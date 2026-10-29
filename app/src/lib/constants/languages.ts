@@ -67,6 +67,7 @@ export const ENGINE_LANGUAGES: Record<string, readonly LanguageCode[]> = {
     'zh',
   ],
   chatterbox_turbo: ['en'],
+  moss_tts: ['zh', 'en', 'de', 'es', 'fr', 'ja', 'it', 'ko', 'ru', 'ar', 'pl', 'pt', 'da', 'sv', 'el', 'tr'],
   tada: ['en', 'ar', 'zh', 'de', 'es', 'fr', 'it', 'ja', 'pl', 'pt'],
   kokoro: ['en', 'es', 'fr', 'hi', 'it', 'pt', 'ja', 'zh'],
   qwen_custom_voice: ['zh', 'en', 'ja', 'ko', 'de', 'fr', 'ru', 'pt', 'es', 'it'],

@@ -107,9 +107,9 @@ class GenerationRequest(SpeechDeliverySettings):
     text: str = Field(..., min_length=1, max_length=50000)
     language: str = Field(default="en", pattern="^(zh|en|ja|ko|de|fr|ru|pt|es|it|he|ar|da|el|fi|hi|ms|nl|no|pl|sv|sw|tr)$")
     seed: Optional[int] = Field(None, ge=0)
-    model_size: Optional[str] = Field(default="1.7B", pattern="^(1\\.7B|0\\.6B|1B|3B)$")
+    model_size: Optional[str] = Field(default="1.7B", pattern="^(1\\.7B|0\\.6B|1B|3B|1\\.7B-(8|4)bit)$")
     instruct: Optional[str] = Field(None, max_length=500)
-    engine: Optional[str] = Field(default=None, pattern="^(qwen|qwen_custom_voice|qwen_voice_design|luxtts|chatterbox|chatterbox_turbo|tada|kokoro|omnivoice)$")
+    engine: Optional[str] = Field(default=None, pattern="^(qwen|qwen_custom_voice|qwen_voice_design|luxtts|chatterbox|chatterbox_turbo|tada|kokoro|omnivoice|moss_tts)$")
     personality: bool = Field(
         default=False,
         description="When true and the profile has a personality prompt, the input text is rewritten in-character before TTS.",
@@ -127,6 +127,8 @@ class GenerationRequest(SpeechDeliverySettings):
 
     @model_validator(mode="after")
     def validate_delivery_engine(self):
+        if self.model_size and self.model_size.endswith("bit") and self.engine not in (None, "qwen"):
+            raise ValueError("Quantized MLX model variants require the Qwen Base engine")
         if self.engine is not None:
             self.chatterbox_options(self.engine)
         return self
@@ -385,7 +387,7 @@ class MCPClientBindingResponse(BaseModel):
     profile_id: Optional[str] = None
     default_engine: Optional[str] = Field(
         None,
-        pattern="^(qwen|qwen_custom_voice|qwen_voice_design|luxtts|chatterbox|chatterbox_turbo|tada|kokoro|omnivoice)$",
+        pattern="^(qwen|qwen_custom_voice|qwen_voice_design|luxtts|chatterbox|chatterbox_turbo|tada|kokoro|omnivoice|moss_tts)$",
     )
     default_personality: bool = False
     last_seen_at: Optional[datetime] = None
@@ -404,7 +406,7 @@ class MCPClientBindingUpsert(BaseModel):
     profile_id: Optional[str] = None
     default_engine: Optional[str] = Field(
         None,
-        pattern="^(qwen|qwen_custom_voice|qwen_voice_design|luxtts|chatterbox|chatterbox_turbo|tada|kokoro|omnivoice)$",
+        pattern="^(qwen|qwen_custom_voice|qwen_voice_design|luxtts|chatterbox|chatterbox_turbo|tada|kokoro|omnivoice|moss_tts)$",
     )
     default_personality: bool = False
 
@@ -423,7 +425,7 @@ class SpeakRequest(BaseModel):
     )
     engine: Optional[str] = Field(
         None,
-        pattern="^(qwen|qwen_custom_voice|qwen_voice_design|luxtts|chatterbox|chatterbox_turbo|tada|kokoro|omnivoice)$",
+        pattern="^(qwen|qwen_custom_voice|qwen_voice_design|luxtts|chatterbox|chatterbox_turbo|tada|kokoro|omnivoice|moss_tts)$",
     )
     personality: Optional[bool] = Field(
         None,
@@ -540,6 +542,9 @@ class ModelStatus(BaseModel):
     model_name: str
     display_name: str
     hf_repo_id: Optional[str] = None  # HuggingFace repository ID
+    revision: Optional[str] = None
+    license: Optional[str] = None
+    auxiliary_revisions: dict[str, str] = Field(default_factory=dict)
     downloaded: bool
     downloading: bool = False  # True if download is in progress
     size_mb: Optional[float] = None

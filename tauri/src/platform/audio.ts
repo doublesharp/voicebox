@@ -49,6 +49,20 @@ export const tauriAudio: PlatformAudio = {
     });
   },
 
+  async startPcmStream(sampleRate, deviceIds): Promise<NativePlaybackSession> {
+    return await invoke('start_audio_pcm_stream', { sampleRate, deviceIds });
+  },
+
+  async appendPcmStream(sessionId, pcm): Promise<void> {
+    await invoke('append_audio_pcm_stream', pcm, {
+      headers: { 'x-voicebox-session': sessionId },
+    });
+  },
+
+  async finishPcmStream(sessionId): Promise<void> {
+    await invoke('finish_audio_pcm_stream', { sessionId });
+  },
+
   async controlPlayback(sessionId, control): Promise<void> {
     await invoke('control_audio_playback', { sessionId, control });
   },

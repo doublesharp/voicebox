@@ -138,3 +138,76 @@ test('saved samples wait for an explicit check and surface actionable missing-mo
   });
   expect(text()).toContain('Download Whisper');
 });
+
+test('ranked interval audition seeks the original recording without changing the supplied transcript', async () => {
+  globalThis.fetch = (async () =>
+    Response.json({
+      ...report,
+      suggested_segments: [
+        {
+          rank: 1,
+          start_seconds: 1,
+          end_seconds: 4,
+          duration_seconds: 3,
+          clipped_fraction: 0,
+          silence_fraction: 0,
+          score: 1,
+        },
+      ],
+    })) as typeof fetch;
+  const audio = { currentTime: 0, play: mock(async () => {}), pause: mock(() => {}) };
+  const recording = file('original.wav');
+  await act(async () => {
+    renderer = create(<SampleQuality file={recording} referenceText="The original words" />, {
+      createNodeMock: (element) => (element.type === 'audio' ? audio : null),
+    });
+  });
+  act(() => button('Audition suggestion 1').props.onClick());
+  expect(audio.currentTime).toBe(1);
+  expect(audio.play).toHaveBeenCalledTimes(1);
+  expect(text()).toContain('the original is kept');
+  audio.currentTime = 4.1;
+  act(() => renderer!.root.findByType('audio').props.onTimeUpdate());
+  expect(audio.pause).toHaveBeenCalled();
+  expect(requests.filter((url) => url.endsWith('/transcribe'))).toEqual([]);
+});
+
+test('blocked interval playback gives an actionable error and stops the original on unmount', async () => {
+  globalThis.fetch = (async () =>
+    Response.json({
+      ...report,
+      suggested_segments: [
+        {
+          rank: 1,
+          start_seconds: 1,
+          end_seconds: 4,
+          duration_seconds: 3,
+          clipped_fraction: 0,
+          silence_fraction: 0,
+          score: 1,
+        },
+      ],
+    })) as typeof fetch;
+  const audio = {
+    currentTime: 0,
+    play: mock(async () => {
+      throw new Error('blocked');
+    }),
+    pause: mock(() => {}),
+  };
+  await act(async () => {
+    renderer = create(
+      <SampleQuality file={file('original.wav')} referenceText="The original words" />,
+      {
+        createNodeMock: (element) => (element.type === 'audio' ? audio : null),
+      },
+    );
+  });
+  await act(async () => {
+    button('Audition suggestion 1').props.onClick();
+  });
+  expect(text()).toContain('Playback was blocked');
+  act(() => renderer!.unmount());
+  renderer = null;
+  expect(audio.pause).toHaveBeenCalled();
+});

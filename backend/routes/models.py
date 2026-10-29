@@ -418,7 +418,13 @@ def _scan_model_inventory(configurations):
                     file.stat().st_size for file in repo_cache.rglob("*")
                     if file.is_file() and not file.name.endswith(".incomplete")
                 ) / (1024 * 1024)
-            if downloaded and not all(is_model_cached(repo) for repo in configuration.aux_hf_repo_ids):
+            revision = getattr(configuration, "revision", None)
+            if revision:
+                downloaded = is_model_cached(repo_id, revision=revision, required_files=list(configuration.required_files))
+                size_mb = sum(path.stat().st_size for path in (repo_cache / "snapshots" / revision).rglob("*") if path.is_file()) / (1024 * 1024) if downloaded else None
+            aux_revisions = getattr(configuration, "aux_revisions", {})
+            aux_files = getattr(configuration, "aux_required_files", {})
+            if downloaded and not all(is_model_cached(repo, revision=aux_revisions.get(repo), required_files=list(aux_files.get(repo, ()))) for repo in configuration.aux_hf_repo_ids):
                 downloaded = False
         except Exception:
             pass
@@ -442,7 +448,7 @@ async def get_model_status():
         for task in task_manager.get_pending_downloads()
     ))
     key = (str(hf_constants.HF_HUB_CACHE), tuple(
-        (cfg.model_name, cfg.hf_repo_id, tuple(cfg.aux_hf_repo_ids)) for cfg in configurations
+        (cfg.model_name, cfg.hf_repo_id, tuple(cfg.aux_hf_repo_ids), getattr(cfg, "revision", None), tuple(sorted(getattr(cfg, "aux_revisions", {}).items()))) for cfg in configurations
     ), pending)
     inventory = await model_inventory.get(key, lambda: _scan_model_inventory(configurations))
     model_to_repo = {cfg.model_name: cfg.hf_repo_id for cfg in configurations}
@@ -459,6 +465,9 @@ async def get_model_status():
             model_name=cfg.model_name,
             display_name=cfg.display_name,
             hf_repo_id=cfg.hf_repo_id,
+            revision=getattr(cfg, "revision", None),
+            license=getattr(cfg, "license", None),
+            auxiliary_revisions=dict(getattr(cfg, "aux_revisions", {})),
             downloaded=downloaded and not downloading,
             downloading=downloading,
             size_mb=None if downloading else size_mb,

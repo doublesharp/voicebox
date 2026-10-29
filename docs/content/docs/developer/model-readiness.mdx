@@ -1,0 +1,78 @@
+---
+title: "Model readiness and residency"
+description: "Session limits and explicit local TTS model or voice prewarming"
+---
+
+The Models page offers session limits and **Warm model weights** for downloaded
+speech models. Warming is explicit. It uses cached assets and cannot start a
+model download. Model weights can be ready before a particular voice has been
+prepared; the UI describes that result as weights-only readiness.
+
+By default, one TTS engine remains resident, with an estimated weight budget of
+16384 MB. Selecting another model releases the least recently selected other
+engine when necessary. Limits permit 1–4 resident engines and 512–65536 MB.
+They apply to normal registry-mediated TTS loads, including model management
+and generation. They preserve the existing default Qwen BF16 selection and do
+not change STT or LLM residency.
+
+The budget uses the larger of the declared model size and cached weight-file
+bytes, including companion repositories. This is **an estimated weight budget,
+not a runtime RAM limit**. Activations, native runtime arenas and allocator
+caches can require substantially more memory. Limits are held in server memory
+and reset when the server process restarts; they do not change stored user
+settings.
+
+## API
+
+| Method and path | Body | Result |
+| --- | --- | --- |
+| `GET /models/residency` | — | Policy, resident TTS models and estimates, selected model, last completed voice prewarm |
+| `PUT /models/residency` | `{"max_resident_engines": 1, "estimated_weight_budget_mb": 16384}` | Validated session policy and current state; refuses a budget that cannot retain the selected model |
+| `POST /models/prewarm` | `{"model_name": "moss-tts"}` | `mode: "weights_only"`; no voice synthesis |
+| `POST /models/prewarm` | `{"model_name": "moss-tts", "profile_id": "existing-profile-id"}` | `mode: "voice"`; short synthesis using exactly that profile, then discards the waveform |
+
+Voice prewarm validates the real profile's engine and language. Cloned profiles
+must currently have exactly one existing reference sample: the endpoint refuses
+a multi-sample profile instead of writing combined reference audio or selecting
+one sample as a substitute. Preset and designed profiles use their exact stored
+voice identity. The ordinary generation path keeps its existing multi-sample
+behavior. Use weights-only warm when voice prewarm is unavailable.
+
+Prewarm creates no generation/history row and saves no generated or combined
+reference audio. Existing encoded-prompt caches remain available. Successful
+voice results record `last_voice_prewarm`; this is the last completed warmup,
+not a guarantee about a future profile selection. Another model selection,
+eviction, unload or process restart can invalidate readiness.
+
+## Ownership and failures
+
+Residency changes and prewarm run under the same scheduler as generation. A
+cancelled request retains the resource until its physical native operation
+finishes. No active TTS model is evicted underneath inference. Cancellation is
+checked after short synthesis before publishing success. A newly loaded warmup
+model is dropped after cancelled warmup; later requests can load their selected
+model normally.
+
+An ordinary warmup failure restores previously resident cached models where
+available and does not publish a successful voice warm. Restoration performs no
+automatic downloads. Eviction clears identifiable CPU prompt-cache entries only
+for their owning model and uses the backend's own unload lifecycle. STT/LLM
+models and their caches are not selected for eviction.
+
+## Verification boundary
+
+Behavioral tests reproduce the original unbounded two-engine switch, the legacy
+single-model request-size mismatch and cancelled-warm success publication,
+then verify their corrections. Tests cover budgets/refusal without side effects,
+LRU eviction, repeated cancellation, failure restoration, exact profile identity,
+HTTP validation and real isolated SQLite. A default-size buffered speech request
+runs through the actual HTTP handler and returns WAV data without history/audio
+persistence. The persisted generation-service path also verifies that the
+`None` size used for single-model engines is normalized before variant guards.
+
+The controls have component checks for downloaded-only actions, integer limits,
+weights-only results and visible backend refusals. These checks and a typecheck
+do not establish rendered layout or a packaged desktop journey. One real local
+CPU model was also warmed offline with an explicitly synthetic reference;
+encoded reference reuse and zero persisted application files were verified.
+Frozen application and browser/native UI qualification remain separate gates.

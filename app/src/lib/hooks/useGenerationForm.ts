@@ -32,7 +32,7 @@ const generationSchema = z.preprocess(
     text: z.string().min(1, '').max(50000),
     language: z.enum(LANGUAGE_CODES as [LanguageCode, ...LanguageCode[]]),
     seed: z.number().int().optional(),
-    modelSize: z.enum(['1.7B', '0.6B', '1B', '3B']).optional(),
+    modelSize: z.enum(['1.7B', '0.6B', '1B', '3B', '1.7B-8bit', '1.7B-4bit']).optional(),
     instruct: z.string().max(500).optional(),
     engine: z
       .enum([
@@ -45,6 +45,7 @@ const generationSchema = z.preprocess(
         'tada',
         'kokoro',
         'omnivoice',
+        'moss_tts',
       ])
       .optional(),
     personality: z.boolean().optional(),
@@ -134,50 +135,20 @@ export function useGenerationForm(options: UseGenerationFormOptions = {}) {
       // Capture all request inputs at submission, before the model status request.
       const effectsChain = options.getEffectsChain?.();
       const engine = data.engine || 'qwen';
-      const modelName =
-        engine === 'luxtts'
-          ? 'luxtts'
-          : engine === 'chatterbox'
-            ? 'chatterbox-tts'
-            : engine === 'chatterbox_turbo'
-              ? 'chatterbox-turbo'
-              : engine === 'tada'
-                ? data.modelSize === '3B'
-                  ? 'tada-3b-ml'
-                  : 'tada-1b'
-                : engine === 'kokoro'
-                  ? 'kokoro'
-                  : engine === 'qwen_voice_design'
-                    ? 'qwen-voice-design-1.7B'
-                    : engine === 'omnivoice'
-                      ? 'omnivoice'
-                      : engine === 'qwen_custom_voice'
-                        ? `qwen-custom-voice-${data.modelSize}`
-                        : `qwen-tts-${data.modelSize}`;
-      const displayName =
-        engine === 'luxtts'
-          ? 'LuxTTS'
-          : engine === 'chatterbox'
-            ? 'Chatterbox TTS'
-            : engine === 'chatterbox_turbo'
-              ? 'Chatterbox Turbo'
-              : engine === 'tada'
-                ? data.modelSize === '3B'
-                  ? 'TADA 3B Multilingual'
-                  : 'TADA 1B'
-                : engine === 'kokoro'
-                  ? 'Kokoro 82M'
-                  : engine === 'qwen_voice_design'
-                    ? 'Qwen VoiceDesign 1.7B'
-                    : engine === 'omnivoice'
-                      ? 'OmniVoice'
-                      : engine === 'qwen_custom_voice'
-                        ? data.modelSize === '1.7B'
-                          ? 'Qwen CustomVoice 1.7B'
-                          : 'Qwen CustomVoice 0.6B'
-                        : data.modelSize === '1.7B'
-                          ? 'Qwen TTS 1.7B'
-                          : 'Qwen TTS 0.6B';
+      const namedModels: Record<string, [string, string]> = {
+        luxtts: ['luxtts', 'LuxTTS'],
+        chatterbox: ['chatterbox-tts', 'Chatterbox TTS'],
+        chatterbox_turbo: ['chatterbox-turbo', 'Chatterbox Turbo'],
+        moss_tts: ['moss-tts', 'MOSS-TTS Nano (CPU)'],
+        tada: data.modelSize === '3B' ? ['tada-3b-ml', 'TADA 3B Multilingual'] : ['tada-1b', 'TADA 1B'],
+        kokoro: ['kokoro', 'Kokoro 82M'],
+        qwen_voice_design: ['qwen-voice-design-1.7B', 'Qwen VoiceDesign 1.7B'],
+        omnivoice: ['omnivoice', 'OmniVoice'],
+        qwen_custom_voice: [`qwen-custom-voice-${data.modelSize || '1.7B'}`, `Qwen CustomVoice ${data.modelSize || '1.7B'}`],
+      };
+      const [modelName, displayName] = namedModels[engine] ?? [
+        `qwen-tts-${data.modelSize || '1.7B'}`, `Qwen TTS ${data.modelSize || '1.7B'}`,
+      ];
 
       // Check if model needs downloading
       try {

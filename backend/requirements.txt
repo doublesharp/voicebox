@@ -55,6 +55,12 @@ torchaudio
 # tensorboardX and webdataset are demo/training-only and deliberately skipped.
 pydub
 
+# MOSS-TTS-Nano CPU ONNX path. The source package is installed --no-deps
+# in setup/release/Docker because its Torch 2.7 pins conflict with this stack.
+# Only ort_cpu_runtime is imported; CLI/normalizer/Torch wrappers are unused.
+onnxruntime>=1.20
+sentencepiece==0.2.1
+
 # Kokoro TTS (lightweight 82M-param engine)
 kokoro>=0.9.4
 misaki[en,ja,zh]>=0.9.4

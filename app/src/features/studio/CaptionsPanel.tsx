@@ -183,6 +183,24 @@ export function CaptionsPanel() {
   return (
     <section className="studio-captions" aria-label="Video timing and captions">
       <h3>Video timing &amp; captions</h3>
+      <p className="studio-note">
+        Speech reviews in Phrase repairs can supply recognized word timings. These describe what
+        Whisper recognized, not forced alignment of the script. Review wording and timing before
+        export.
+      </p>
+      <StudioButton
+        disabled={disabled}
+        onClick={() =>
+          studio.runAction(async () => {
+            await session.flush();
+            if (session.getSnapshot().status !== 'saved')
+              throw new Error('Save and reconcile before creating recognized captions.');
+            await session.command('recognize_captions', {});
+          })
+        }
+      >
+        Use recognized word timings
+      </StudioButton>
       <div className="studio-action-row">
         <StudioButton
           disabled={studio.actionBusy || (playback.mode === 'idle' && !document.clips.length)}

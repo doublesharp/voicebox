@@ -45,6 +45,22 @@ const toasts: Record<string, unknown>[] = [];
 let generationError: Error | undefined;
 let storyRoute = false;
 let hiddenProfile = false;
+let previewAvailable = false;
+let previewActive = false;
+const previewRequests: Record<string, unknown>[] = [];
+let previewStops = 0;
+mock.module('../src/lib/audio/useSpeechPreview', () => ({
+  useSpeechPreview: () => ({
+    available: previewAvailable,
+    active: previewActive,
+    start: async (request: Record<string, unknown>) => {
+      previewRequests.push(request);
+    },
+    stop: async () => {
+      previewStops++;
+    },
+  }),
+}));
 mock.module('../src/lib/api/client', () => ({
   apiClient: {
     composeWithPersonality: (id: string) => compose(id),
@@ -248,6 +264,10 @@ afterEach(() => {
   statusCalls = 0;
   storyRoute = false;
   hiddenProfile = false;
+  previewAvailable = false;
+  previewActive = false;
+  previewRequests.length = 0;
+  previewStops = 0;
   profiles = structuredClone(initialProfiles);
 });
 
@@ -546,4 +566,41 @@ test('empty and overlong text are rejected before model lookup and generation', 
   expect(statusCalls).toBe(0);
   expect(useGenerationDraftStore.getState().submitting).toBe(false);
   expect(renderer.root.findByType('textarea').props.value).toHaveLength(50001);
+});
+
+test('desktop preview speaks the current script without saving or clearing the draft; stop remains explicit', async () => {
+  previewAvailable = true;
+  mount();
+  act(() => ui.getState().setSelectedProfileId('b'));
+  type('Keep this draft for the finished take.');
+  await act(async () => {
+    renderer.root
+      .findAllByType('button')
+      .find((button) => button.children.includes('Preview speech'))!
+      .props.onClick();
+    await Promise.resolve();
+  });
+  expect(previewRequests).toEqual([
+    expect.objectContaining({
+      profile_id: 'b',
+      text: 'Keep this draft for the finished take.',
+      engine: 'qwen',
+      normalize: false,
+      speed: 1,
+      effects_chain: [],
+    }),
+  ]);
+  expect(requests).toEqual([]);
+  expect(renderer.root.findByType('textarea').props.value).toBe(
+    'Keep this draft for the finished take.',
+  );
+  previewActive = true;
+  rerender();
+  await act(async () => {
+    renderer.root
+      .findAllByType('button')
+      .find((button) => button.children.includes('Stop preview'))!
+      .props.onClick();
+  });
+  expect(previewStops).toBe(1);
 });

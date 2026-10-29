@@ -61,6 +61,11 @@ class ModelConfig:
     # Extra HF repos the backend fetches at load time (e.g. a shared
     # tokenizer); download status and delete must account for them too.
     aux_hf_repo_ids: tuple[str, ...] = ()
+    revision: str | None = None
+    aux_revisions: dict[str, str] = field(default_factory=dict)
+    required_files: tuple[str, ...] = ()
+    aux_required_files: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    license: str | None = None
     model_size: str = "default"
     size_mb: int = 0
     needs_trim: bool = False
@@ -239,6 +244,7 @@ TTS_ENGINES = {
     "tada": "TADA",
     "kokoro": "Kokoro",
     "omnivoice": "OmniVoice",
+    "moss_tts": "MOSS-TTS Nano",
 }
 
 LLM_ENGINES = {
@@ -260,7 +266,7 @@ def _get_qwen_model_configs() -> list[ModelConfig]:
     # codec noise. Retry only the affected text as smaller chunks.
     retries_runaway = backend_type == "mlx"
 
-    return [
+    configs = [
         ModelConfig(
             model_name="qwen-tts-1.7B",
             display_name="Qwen TTS 1.7B",
@@ -284,6 +290,27 @@ def _get_qwen_model_configs() -> list[ModelConfig]:
             languages=["zh", "en", "ja", "ko", "de", "fr", "ru", "pt", "es", "it"],
         ),
     ]
+
+    if backend_type == "mlx":
+        from .qwen_mlx_variants import QWEN_MLX_QUANTIZED_VARIANTS, QWEN_MLX_QUANTIZED_REVISIONS, QWEN_MLX_REQUIRED_FILES
+
+        configs.extend(
+            ModelConfig(
+                model_name=f"qwen-tts-{size}",
+                display_name=f"Qwen TTS {size} (Experimental)",
+                engine="qwen",
+                hf_repo_id=repo,
+                revision=QWEN_MLX_QUANTIZED_REVISIONS[size],
+                required_files=QWEN_MLX_REQUIRED_FILES,
+                license="apache-2.0",
+                model_size=size,
+                size_mb=3100 if size.endswith("8bit") else 2400,
+                retries_runaway=True,
+                languages=list(LANGUAGE_CODE_TO_NAME),
+            )
+            for size, repo in QWEN_MLX_QUANTIZED_VARIANTS.items()
+        )
+    return configs
 
 
 def _get_qwen_custom_voice_configs() -> list[ModelConfig]:
@@ -353,7 +380,16 @@ def _get_non_qwen_tts_configs() -> list[ModelConfig]:
         chatterbox_size_mb = 3200
         chatterbox_aux_repos = ()
 
+    from .moss_tts_backend import TTS_REPO, TTS_REVISION, TTS_FILES, CODEC_REPO, CODEC_REVISION, CODEC_FILES
+
     return [
+        ModelConfig(
+            model_name="moss-tts", display_name="MOSS-TTS Nano (CPU)", engine="moss_tts",
+            hf_repo_id=TTS_REPO, revision=TTS_REVISION, required_files=TTS_FILES,
+            aux_hf_repo_ids=(CODEC_REPO,), aux_revisions={CODEC_REPO: CODEC_REVISION},
+            aux_required_files={CODEC_REPO: CODEC_FILES}, license="apache-2.0", size_mb=763,
+            languages=["zh", "en", "de", "es", "fr", "ja", "it", "ko", "ru", "ar", "pl", "pt", "da", "sv", "el", "tr"],
+        ),
         ModelConfig(
             model_name="luxtts",
             display_name="LuxTTS (Fast, CPU-friendly)",
@@ -636,8 +672,24 @@ def engine_has_model_sizes(engine: str) -> bool:
     return len(configs) > 1
 
 
-async def load_engine_model(engine: str, model_size: str = "default") -> None:
+def _normalize_engine_model_size(engine: str, model_size: Optional[str]) -> str:
+    """Generation stores None for single-model engines; retain their canonical id."""
+    if model_size is not None:
+        return model_size
+    configurations = [c for c in get_tts_model_configs() if c.engine == engine]
+    if len(configurations) == 1:
+        return configurations[0].model_size
+    if not configurations:
+        return "default"
+    backend = get_tts_backend_for_engine(engine)
+    return getattr(backend, "model_size", None) or configurations[0].model_size
+
+
+async def _load_engine_model_unmanaged(engine: str, model_size: Optional[str] = "default") -> None:
     """Load a model for the given engine, handling engines with multiple model sizes."""
+    model_size = _normalize_engine_model_size(engine, model_size)
+    if model_size.endswith("bit") and engine != "qwen":
+        raise ValueError("Quantized MLX model variants require the Qwen Base engine")
     backend = get_tts_backend_for_engine(engine)
     if engine in ("qwen", "qwen_custom_voice"):
         await backend.load_model_async(model_size)
@@ -645,6 +697,19 @@ async def load_engine_model(engine: str, model_size: str = "default") -> None:
         await backend.load_model(model_size)
     else:
         await backend.load_model()
+
+
+async def load_engine_model(engine: str, model_size: Optional[str] = "default") -> None:
+    """Load the selected TTS model within the shared residency and inference owner."""
+    from ..services.model_residency import _model_config, model_residency
+
+    model_size = _normalize_engine_model_size(engine, model_size)
+    if model_size.endswith("bit") and engine != "qwen":
+        raise ValueError("Quantized MLX model variants require the Qwen Base engine")
+    configuration = _model_config(engine, model_size)
+    await model_residency.load_model(
+        configuration, lambda: _load_engine_model_unmanaged(engine, configuration.model_size)
+    )
 
 
 async def ensure_model_cached_or_raise(engine: str, model_size: str = "default") -> None:
@@ -760,6 +825,9 @@ def get_model_load_func(config: ModelConfig):
     from . import get_tts_backend_for_engine
     from ..services import tts, transcribe
 
+    if config.engine in TTS_ENGINES:
+        return lambda: load_engine_model(config.engine, config.model_size)
+
     if config.engine == "whisper":
         return lambda: transcribe.get_whisper_model().load_model(config.model_size)
 
@@ -848,6 +916,10 @@ def get_tts_backend_for_engine(engine: str) -> TTSBackend:
             from .omnivoice_backend import OmniVoiceBackend
 
             backend = OmniVoiceBackend()
+        elif engine == "moss_tts":
+            from .moss_tts_backend import MossTTSBackend
+
+            backend = MossTTSBackend()
         elif engine == "qwen_custom_voice":
             if get_backend_type() == "mlx":
                 from .qwen_mlx_styles_backend import QwenMLXCustomVoiceBackend

@@ -81,10 +81,13 @@ pub struct PlaybackControl {
     pub volume: Option<f32>,
 }
 
+type StreamQueues = Arc<Mutex<Vec<Arc<Mutex<crate::audio_stream::PcmQueue>>>>>;
+
 struct SessionHandle {
     id: String,
     controls: Arc<PlaybackControls>,
     wake: mpsc::Sender<()>,
+    streaming: Option<StreamQueues>,
 }
 
 /// CPAL streams are created and retained by their owner thread. The Tauri
@@ -140,6 +143,9 @@ impl AudioOutputState {
                 session.id == session_id && !session.controls.stopped.load(Ordering::Acquire)
             })
             .ok_or("Playback session has ended")?;
+        if control.position.is_some() && session.streaming.is_some() {
+            return Err("Speech preview cannot seek".into());
+        }
         if let Some(position) = control.position {
             session.controls.seek(position);
         }
@@ -150,6 +156,151 @@ impl AudioOutputState {
             session.controls.paused.store(paused, Ordering::Release);
         }
         let _ = session.wake.send(());
+        Ok(())
+    }
+
+    /// Start a continuous output using the same process-wide owner as clips.
+    pub async fn start_pcm_stream(
+        &self,
+        app: tauri::AppHandle,
+        rate: u32,
+        ids: Vec<String>,
+    ) -> Result<PlaybackSession, String> {
+        crate::audio_stream::PcmQueue::new(rate)?;
+        let id = format!("native-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
+        let controls = Arc::new(PlaybackControls::new(0.0, 1.0));
+        let queues: StreamQueues = Arc::new(Mutex::new(Vec::new()));
+        let (wake, receiver) = mpsc::channel();
+        {
+            let mut active = self
+                .active
+                .lock()
+                .map_err(|_| "Audio session state unavailable")?;
+            if let Some(previous) = active.take() {
+                previous.controls.stop();
+                let _ = previous.wake.send(());
+            }
+            *active = Some(SessionHandle {
+                id: id.clone(),
+                controls: controls.clone(),
+                wake,
+                streaming: Some(queues.clone()),
+            });
+        }
+        let (sender, ready) = tokio::sync::oneshot::channel();
+        let active = self.active.clone();
+        let worker_id = id.clone();
+        let worker_controls = controls.clone();
+        let spawned = std::thread::Builder::new()
+            .name(format!("voicebox-{id}"))
+            .spawn(move || {
+                let mut ready = Some(sender);
+                if let Err(error) = run_pcm_session(
+                    &app,
+                    &worker_id,
+                    rate,
+                    ids,
+                    worker_controls.clone(),
+                    queues,
+                    receiver,
+                    &mut ready,
+                ) {
+                    if let Some(sender) = ready.take() {
+                        let _ = sender.send(Err(error.clone()));
+                    }
+                    let stopped = worker_controls.stopped.load(Ordering::Acquire);
+                    emit(
+                        &app,
+                        &worker_id,
+                        if stopped { "stopped" } else { "error" },
+                        0.0,
+                        0.0,
+                        if stopped { None } else { Some(error) },
+                    );
+                }
+                worker_controls.stop();
+                if let Ok(mut active) = active.lock() {
+                    if active
+                        .as_ref()
+                        .is_some_and(|current| current.id == worker_id)
+                    {
+                        active.take();
+                    }
+                }
+            });
+        if let Err(error) = spawned {
+            controls.stop();
+            self.stop_playback(Some(&id))?;
+            return Err(format!("Unable to start preview output: {error}"));
+        }
+        ready
+            .await
+            .map_err(|_| "Preview worker exited during startup".to_string())?
+    }
+
+    fn stream_queues(&self, id: &str) -> Result<(StreamQueues, Arc<PlaybackControls>), String> {
+        let active = self
+            .active
+            .lock()
+            .map_err(|_| "Audio session state unavailable")?;
+        let session = active
+            .as_ref()
+            .filter(|session| session.id == id && !session.controls.stopped.load(Ordering::Acquire))
+            .ok_or("Preview session has ended")?;
+        Ok((
+            session.streaming.clone().ok_or("Not a preview session")?,
+            session.controls.clone(),
+        ))
+    }
+
+    /// Backpressure is async and bounded. No audio callback waits on IPC.
+    pub async fn append_pcm_stream(&self, id: &str, pcm: Vec<u8>) -> Result<(), String> {
+        if pcm.is_empty() || pcm.len() % 2 != 0 || pcm.len() > 8192 {
+            return Err("Invalid PCM preview block".into());
+        }
+        let samples: Vec<f32> = pcm
+            .chunks_exact(2)
+            .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]]) as f32 / 32768.0)
+            .collect();
+        let (queues, controls) = self.stream_queues(id)?;
+        let start = Instant::now();
+        loop {
+            if controls.stopped.load(Ordering::Acquire) {
+                return Err("Preview session has ended".into());
+            }
+            {
+                let queues = queues.lock().map_err(|_| "Preview queue unavailable")?;
+                let mut locked = queues
+                    .iter()
+                    .map(|queue| queue.lock().map_err(|_| "Preview queue unavailable"))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if locked.iter().any(|queue| queue.finished) {
+                    return Err("Preview already finished".into());
+                }
+                if !locked.is_empty() && locked.iter().all(|queue| queue.can_append(samples.len()))
+                {
+                    for queue in &mut locked {
+                        queue.append(&samples)?;
+                    }
+                    return Ok(());
+                }
+            }
+            if start.elapsed() > Duration::from_secs(15) {
+                return Err("Audio output is not consuming the preview".into());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    pub fn finish_pcm_stream(&self, id: &str) -> Result<(), String> {
+        let (queues, _) = self.stream_queues(id)?;
+        let queues = queues.lock().map_err(|_| "Preview queue unavailable")?;
+        for queue in queues.iter() {
+            queue
+                .lock()
+                .map_err(|_| "Preview queue unavailable")?
+                .finished = true;
+        }
         Ok(())
     }
 
@@ -207,6 +358,7 @@ impl AudioOutputState {
                 id: id.clone(),
                 controls: controls.clone(),
                 wake,
+                streaming: None,
             });
         }
         let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
@@ -582,6 +734,191 @@ fn run_session(
     Ok(())
 }
 
+fn build_pcm_stream<T>(
+    device: &Device,
+    config: &StreamConfig,
+    queue: Arc<Mutex<crate::audio_stream::PcmQueue>>,
+    controls: Arc<PlaybackControls>,
+    errors: mpsc::Sender<String>,
+) -> Result<cpal::Stream, String>
+where
+    T: cpal::SizedSample + cpal::FromSample<f32>,
+{
+    let rate = config.sample_rate.0;
+    let channels = config.channels as usize;
+    device
+        .build_output_stream(
+            config,
+            move |output: &mut [T], _: &cpal::OutputCallbackInfo| {
+                output.fill(T::from_sample(0.0));
+                if controls.stopped.load(Ordering::Acquire)
+                    || controls.paused.load(Ordering::Acquire)
+                {
+                    return;
+                }
+                if let Ok(mut queue) = queue.try_lock() {
+                    queue.render(output, rate, channels, T::from_sample);
+                }
+            },
+            move |error| {
+                let _ = errors.send(error.to_string());
+            },
+            None,
+        )
+        .map_err(|error| format!("Unable to open preview output: {error}"))
+}
+
+fn run_pcm_session(
+    app: &tauri::AppHandle,
+    id: &str,
+    rate: u32,
+    ids: Vec<String>,
+    controls: Arc<PlaybackControls>,
+    queues: StreamQueues,
+    wake: mpsc::Receiver<()>,
+    ready: &mut Option<tokio::sync::oneshot::Sender<Result<PlaybackSession, String>>>,
+) -> Result<(), String> {
+    let host = cpal::default_host();
+    let devices: Vec<Device> = if ids.is_empty() {
+        vec![host
+            .default_output_device()
+            .ok_or("No default audio output is available")?]
+    } else {
+        let devices: Vec<Device> = host
+            .output_devices()
+            .map_err(|error| error.to_string())?
+            .collect();
+        let names = devices
+            .iter()
+            .map(|device| device.name().map_err(|error| error.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let selected: HashSet<usize> = selected_device_indices(&names, &ids)?.into_iter().collect();
+        devices
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, device)| selected.contains(&index).then_some(device))
+            .collect()
+    };
+    let output_names = devices
+        .iter()
+        .map(|device| device.name().map_err(|error| error.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let default_route = ids.is_empty();
+    let mut streams = Vec::new();
+    let (errors, receiver) = mpsc::channel();
+    for device in devices {
+        if controls.stopped.load(Ordering::Acquire) {
+            return Err("Preview cancelled".into());
+        }
+        let supported = device
+            .default_output_config()
+            .map_err(|error| error.to_string())?;
+        let config: StreamConfig = supported.clone().into();
+        let queue = Arc::new(Mutex::new(crate::audio_stream::PcmQueue::new(rate)?));
+        let stream = match supported.sample_format() {
+            SampleFormat::F32 => build_pcm_stream::<f32>(
+                &device,
+                &config,
+                queue.clone(),
+                controls.clone(),
+                errors.clone(),
+            ),
+            SampleFormat::I16 => build_pcm_stream::<i16>(
+                &device,
+                &config,
+                queue.clone(),
+                controls.clone(),
+                errors.clone(),
+            ),
+            SampleFormat::U16 => build_pcm_stream::<u16>(
+                &device,
+                &config,
+                queue.clone(),
+                controls.clone(),
+                errors.clone(),
+            ),
+            format => Err(format!("Unsupported output format: {format:?}")),
+        }?;
+        queues
+            .lock()
+            .map_err(|_| "Preview queue unavailable")?
+            .push(queue);
+        streams.push(stream);
+    }
+    for stream in &streams {
+        stream.play().map_err(|error| error.to_string())?;
+    }
+    if controls.stopped.load(Ordering::Acquire) {
+        return Err("Preview cancelled".into());
+    }
+    controls.paused.store(false, Ordering::Release);
+    if let Some(sender) = ready.take() {
+        if sender
+            .send(Ok(PlaybackSession {
+                session_id: id.into(),
+                duration: 0.0,
+                position: 0.0,
+            }))
+            .is_err()
+        {
+            controls.stop();
+        }
+    }
+    let mut last_event = Instant::now();
+    let mut last_device_check = Instant::now();
+    loop {
+        let _ = wake.recv_timeout(Duration::from_millis(20));
+        if last_device_check.elapsed() >= Duration::from_secs(1) {
+            if default_route {
+                let current = host
+                    .default_output_device()
+                    .and_then(|device| device.name().ok());
+                if current.as_ref() != output_names.first() {
+                    return Err("Audio output changed; preview stopped".into());
+                }
+            } else {
+                let available = host
+                    .output_devices()
+                    .map_err(|error| error.to_string())?
+                    .filter_map(|device| device.name().ok())
+                    .collect::<Vec<_>>();
+                if output_names.iter().any(|name| !available.contains(name)) {
+                    return Err("A selected audio output disconnected".into());
+                }
+            }
+            last_device_check = Instant::now();
+        }
+        let (position, ended) = {
+            let queues = queues.lock().map_err(|_| "Preview queue unavailable")?;
+            let locked = queues
+                .iter()
+                .map(|queue| queue.lock().map_err(|_| "Preview queue unavailable"))
+                .collect::<Result<Vec<_>, _>>()?;
+            (
+                locked.first().map_or(0.0, |queue| queue.position()),
+                locked.iter().all(|queue| queue.ended()),
+            )
+        };
+        if controls.stopped.load(Ordering::Acquire) {
+            emit(app, id, "stopped", position, 0.0, None);
+            break;
+        }
+        if let Ok(error) = receiver.try_recv() {
+            return Err(format!("Audio output disconnected: {error}"));
+        }
+        if ended {
+            emit(app, id, "ended", position, position, None);
+            break;
+        }
+        if last_event.elapsed() >= Duration::from_millis(100) {
+            emit(app, id, "playing", position, 0.0, None);
+            last_event = Instant::now();
+        }
+    }
+    drop(streams);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -690,6 +1027,7 @@ mod tests {
             id: "current".into(),
             controls: controls.clone(),
             wake,
+            streaming: None,
         });
         assert!(state
             .control_playback(
@@ -740,6 +1078,7 @@ mod tests {
             id: "current".into(),
             controls: controls.clone(),
             wake,
+            streaming: None,
         });
         for control in [
             PlaybackControl {
@@ -779,6 +1118,7 @@ mod tests {
             id: "current".into(),
             controls: controls.clone(),
             wake,
+            streaming: None,
         });
         state.stop_playback(None).unwrap();
         assert!(controls.stopped.load(Ordering::Acquire));
@@ -801,5 +1141,230 @@ mod tests {
                 .unwrap(),
             vec![0, 1]
         );
+    }
+    #[tokio::test]
+    async fn preview_queue_rejects_stale_finish_and_append_and_stop_unblocks_backpressure() {
+        let state = Arc::new(AudioOutputState::new());
+        let controls = Arc::new(PlaybackControls::new(0.0, 1.0));
+        let queue = Arc::new(Mutex::new(
+            crate::audio_stream::PcmQueue::new(8000).unwrap(),
+        ));
+        let queues = Arc::new(Mutex::new(vec![queue.clone()]));
+        let (wake, _receiver) = mpsc::channel();
+        *state.active.lock().unwrap() = Some(SessionHandle {
+            id: "current-preview".into(),
+            controls: controls.clone(),
+            wake,
+            streaming: Some(queues),
+        });
+        assert!(state.append_pcm_stream("old", vec![0, 0]).await.is_err());
+        assert!(state.finish_pcm_stream("old").is_err());
+        assert!(state
+            .append_pcm_stream("current-preview", vec![0])
+            .await
+            .is_err());
+        assert!(state
+            .append_pcm_stream("current-preview", vec![0; 8194])
+            .await
+            .is_err());
+        state
+            .append_pcm_stream("current-preview", vec![0; 8192])
+            .await
+            .unwrap();
+        assert_eq!(queue.lock().unwrap().samples_len_for_test(), 4096);
+        queue.lock().unwrap().append(&vec![0.25; 11904]).unwrap();
+        let pending_state = state.clone();
+        let pending = tokio::spawn(async move {
+            pending_state
+                .append_pcm_stream("current-preview", vec![0, 0])
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!pending.is_finished());
+        state.stop_playback(Some("old")).unwrap();
+        assert!(!controls.stopped.load(Ordering::Acquire));
+        for _ in 0..10 {
+            state.stop_playback(Some("current-preview")).unwrap();
+        }
+        assert!(pending.await.unwrap().is_err());
+        assert!(state.finish_pcm_stream("current-preview").is_err());
+    }
+
+    /// Opt-in host proof: uses the production CPAL callback, no webview/mock device.
+    #[test]
+    #[ignore = "plays sound on the host; run explicitly for native qualification"]
+    fn preview_live_output_consumes_before_finish_and_recovers_from_underrun() {
+        let host = cpal::default_host();
+        let device = host.default_output_device().expect("No host output device");
+        let supported = device.default_output_config().unwrap();
+        let config: StreamConfig = supported.clone().into();
+        let queue = Arc::new(Mutex::new(
+            crate::audio_stream::PcmQueue::new(24000).unwrap(),
+        ));
+        let controls = Arc::new(PlaybackControls::new(0.0, 1.0));
+        let (errors, receiver) = mpsc::channel();
+        let stream = match supported.sample_format() {
+            SampleFormat::F32 => {
+                build_pcm_stream::<f32>(&device, &config, queue.clone(), controls.clone(), errors)
+            }
+            SampleFormat::I16 => {
+                build_pcm_stream::<i16>(&device, &config, queue.clone(), controls.clone(), errors)
+            }
+            SampleFormat::U16 => {
+                build_pcm_stream::<u16>(&device, &config, queue.clone(), controls.clone(), errors)
+            }
+            format => panic!("Unsupported output format: {format:?}"),
+        }
+        .unwrap();
+        stream.play().unwrap();
+        controls.paused.store(false, Ordering::Release);
+        let tone: Vec<f32> = (0..2400)
+            .map(|frame| (frame as f32 * 330.0 * std::f32::consts::TAU / 24000.0).sin() * 0.04)
+            .collect();
+        queue.lock().unwrap().append(&tone).unwrap();
+        let start = Instant::now();
+        while queue.lock().unwrap().position() == 0.0 && start.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            queue.lock().unwrap().position() > 0.0,
+            "No native callbacks consumed PCM"
+        );
+        assert!(!queue.lock().unwrap().finished);
+        println!("NATIVE_CALLBACK_BEFORE_FINISH output={} source_rate=24000 output_rate={} first_callback_ms={}", device.name().unwrap(), config.sample_rate.0, start.elapsed().as_millis());
+        std::thread::sleep(Duration::from_millis(175));
+        assert!(
+            !queue.lock().unwrap().ended(),
+            "Underrun must not terminate output"
+        );
+        queue.lock().unwrap().append(&tone).unwrap();
+        queue.lock().unwrap().finished = true;
+        let deadline = Instant::now();
+        while !queue.lock().unwrap().ended() && deadline.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(queue.lock().unwrap().ended());
+        assert!(receiver.try_recv().is_err());
+        controls.stop();
+        drop(stream);
+    }
+    /// Explicit local-backend qualification; neither contacts a default service
+    /// nor creates or changes a voice profile. The caller provides a test profile.
+    #[test]
+    #[ignore = "requires a prepared local backend/profile and plays sound"]
+    fn preview_live_http_reaches_native_callback_before_response_finishes() {
+        use std::io::Read;
+        let endpoint =
+            std::env::var("VOICEBOX_TEST_PREVIEW_URL").expect("Provide local preview endpoint");
+        assert!(
+            endpoint.starts_with("http://127.0.0.1:"),
+            "Runtime test accepts loopback only"
+        );
+        let body: serde_json::Value = serde_json::from_str(
+            &std::env::var("VOICEBOX_TEST_PREVIEW_BODY").expect("Provide test profile request"),
+        )
+        .unwrap();
+        assert_eq!(body["normalize"], false);
+        assert_eq!(body["effects_chain"], serde_json::json!([]));
+        let started = Instant::now();
+        let mut response = reqwest::blocking::Client::new()
+            .post(endpoint)
+            .json(&body)
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let mut header = [0u8; 44];
+        response.read_exact(&mut header).unwrap();
+        assert_eq!(&header[..4], b"RIFF");
+        assert_eq!(&header[8..16], b"WAVEfmt ");
+        assert_eq!(u16::from_le_bytes(header[20..22].try_into().unwrap()), 1);
+        assert_eq!(u16::from_le_bytes(header[22..24].try_into().unwrap()), 1);
+        assert_eq!(u16::from_le_bytes(header[34..36].try_into().unwrap()), 16);
+        let rate = u32::from_le_bytes(header[24..28].try_into().unwrap());
+        let header_ms = started.elapsed().as_millis();
+        let device = cpal::default_host()
+            .default_output_device()
+            .expect("No host output device");
+        let supported = device.default_output_config().unwrap();
+        let config: StreamConfig = supported.clone().into();
+        let queue = Arc::new(Mutex::new(
+            crate::audio_stream::PcmQueue::new(rate).unwrap(),
+        ));
+        let controls = Arc::new(PlaybackControls::new(0.0, 1.0));
+        let state = AudioOutputState::new();
+        let (wake, _receiver) = mpsc::channel();
+        *state.active.lock().unwrap() = Some(SessionHandle {
+            id: "live-http".into(),
+            controls: controls.clone(),
+            wake,
+            streaming: Some(Arc::new(Mutex::new(vec![queue.clone()]))),
+        });
+        let (errors, error_receiver) = mpsc::channel();
+        let stream = match supported.sample_format() {
+            SampleFormat::F32 => {
+                build_pcm_stream::<f32>(&device, &config, queue.clone(), controls.clone(), errors)
+            }
+            SampleFormat::I16 => {
+                build_pcm_stream::<i16>(&device, &config, queue.clone(), controls.clone(), errors)
+            }
+            SampleFormat::U16 => {
+                build_pcm_stream::<u16>(&device, &config, queue.clone(), controls.clone(), errors)
+            }
+            format => panic!("Unsupported output format: {format:?}"),
+        }
+        .unwrap();
+        stream.play().unwrap();
+        controls.paused.store(false, Ordering::Release);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut bytes = [0u8; 8192];
+        let mut carry = Vec::new();
+        let mut total = 0usize;
+        let mut chunks = 0usize;
+        let mut first_callback_ms = None;
+        loop {
+            let count = response.read(&mut bytes).unwrap();
+            if count == 0 {
+                break;
+            }
+            carry.extend_from_slice(&bytes[..count]);
+            let count = (carry.len() / 2 * 2).min(8192);
+            if count == 0 {
+                continue;
+            }
+            let block = carry.drain(..count).collect::<Vec<_>>();
+            total += block.len();
+            chunks += 1;
+            runtime
+                .block_on(state.append_pcm_stream("live-http", block))
+                .unwrap();
+            if first_callback_ms.is_none() {
+                let first = Instant::now();
+                while queue.lock().unwrap().position() == 0.0
+                    && first.elapsed() < Duration::from_secs(2)
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                if queue.lock().unwrap().position() > 0.0 {
+                    first_callback_ms = Some(started.elapsed().as_millis());
+                }
+            }
+        }
+        assert!(carry.is_empty());
+        assert!(total > 0);
+        assert!(chunks > 1);
+        assert!(!queue.lock().unwrap().finished);
+        let response_ms = started.elapsed().as_millis();
+        assert!(first_callback_ms.expect("No native callback before EOF") < response_ms);
+        state.finish_pcm_stream("live-http").unwrap();
+        let draining = Instant::now();
+        while !queue.lock().unwrap().ended() && draining.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(queue.lock().unwrap().ended());
+        assert!(error_receiver.try_recv().is_err());
+        state.stop_playback(Some("live-http")).unwrap();
+        drop(stream);
+        println!("LIVE_PREVIEW_HTTP_CPAl {{\"device\":{:?},\"source_rate\":{},\"device_rate\":{},\"header_ms\":{},\"first_callback_ms\":{},\"response_eof_ms\":{},\"pcm_bytes\":{},\"blocks\":{}}}", device.name().unwrap(), rate, config.sample_rate.0, header_ms, first_callback_ms.unwrap(), response_ms, total, chunks);
     }
 }
