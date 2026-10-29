@@ -427,13 +427,19 @@ export function FloatingGenerateBox({
                                         ? 'bg-accent text-accent-foreground border border-accent hover:bg-accent/90'
                                         : 'bg-card border border-border hover:bg-background/50',
                                     )}
-                                    aria-label={active ? t('generation.persona.ariaLabelActive') : t('generation.persona.ariaLabelInactive')}
+                                    aria-label={
+                                      active
+                                        ? t('generation.persona.ariaLabelActive')
+                                        : t('generation.persona.ariaLabelInactive')
+                                    }
                                     aria-pressed={active}
                                   >
                                     <Wand2 className="h-4 w-4" />
                                   </Button>
                                   <span className="pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-2 whitespace-nowrap rounded-md bg-popover px-3 py-1.5 text-xs text-popover-foreground border border-border opacity-0 transition-opacity group-hover:opacity-100 z-[9999]">
-                                    {active ? t('generation.persona.tooltipActive') : t('generation.persona.tooltipInactive')}
+                                    {active
+                                      ? t('generation.persona.tooltipActive')
+                                      : t('generation.persona.tooltipInactive')}
                                   </span>
                                 </div>
                               </FormControl>
@@ -558,9 +564,9 @@ export function FloatingGenerateBox({
                 transition={{ duration: 0.3, ease: 'easeOut' }}
                 className=" mt-3"
               >
-                <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center gap-2">
                   {showVoiceSelector && (
-                    <div className="flex-1">
+                    <div className="min-w-0 flex-[1_1_5.5rem]">
                       <Select
                         value={selectedProfileId || ''}
                         onValueChange={(value) => setSelectedProfileId(value || null)}
@@ -579,7 +585,6 @@ export function FloatingGenerateBox({
                     </div>
                   )}
 
-
                   <FormField
                     control={form.control}
                     name="language"
@@ -588,7 +593,7 @@ export function FloatingGenerateBox({
                         form.watch('engine') || 'qwen',
                       );
                       return (
-                        <FormItem className="flex-1 space-y-0">
+                        <FormItem className="min-w-0 flex-[1_1_5.5rem] space-y-0">
                           <Select onValueChange={field.onChange} value={field.value}>
                             <FormControl>
                               <SelectTrigger className="h-8 text-xs bg-card border-border rounded-full hover:bg-background/50 transition-all">
@@ -609,11 +614,11 @@ export function FloatingGenerateBox({
                     }}
                   />
 
-                  <FormItem className="flex-1 space-y-0">
+                  <FormItem className="min-w-0 flex-[1_1_5.5rem] space-y-0">
                     <EngineModelSelector form={form} compact />
                   </FormItem>
 
-                  <FormItem className="flex-1 space-y-0">
+                  <FormItem className="min-w-0 flex-[1_1_5.5rem] space-y-0">
                     <Select
                       value={selectedPresetId || 'none'}
                       onValueChange={(value) =>

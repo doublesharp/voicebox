@@ -87,9 +87,9 @@ export function StoryContent() {
   // Track editor is shown when story has items
   const hasBottomBar = story && story.items.length > 0;
 
-  // Clear the floating generate box (always visible on this route) and the
+  // Clear the floating generate box, including its wrapped controls, and the
   // track editor bar when it's showing.
-  const FLOATING_BOX_CLEARANCE = 140;
+  const FLOATING_BOX_CLEARANCE = 180;
   const bottomPadding = hasBottomBar
     ? trackEditorHeight + FLOATING_BOX_CLEARANCE
     : FLOATING_BOX_CLEARANCE;
@@ -296,7 +296,7 @@ export function StoryContent() {
 
   if (!selectedStoryId) {
     return (
-      <div className="flex items-center justify-center h-full text-muted-foreground">
+      <div className="flex items-center justify-center h-full max-lg:pb-[180px] text-muted-foreground">
         <div className="text-center">
           <p className="text-lg font-medium mb-2">{t('storyContent.selectStory.title')}</p>
           <p className="text-sm">{t('storyContent.selectStory.hint')}</p>
@@ -307,7 +307,7 @@ export function StoryContent() {
 
   if (isLoading) {
     return (
-      <div className="flex items-center justify-center h-full">
+      <div className="flex items-center justify-center h-full max-lg:pb-[180px]">
         <div className="text-muted-foreground">{t('storyContent.loading')}</div>
       </div>
     );
@@ -315,7 +315,7 @@ export function StoryContent() {
 
   if (!story) {
     return (
-      <div className="flex items-center justify-center h-full text-muted-foreground">
+      <div className="flex items-center justify-center h-full max-lg:pb-[180px] text-muted-foreground">
         <div className="text-center">
           <p className="text-lg font-medium mb-2">{t('storyContent.notFound.title')}</p>
           <p className="text-sm">{t('storyContent.notFound.hint')}</p>
@@ -372,14 +372,18 @@ export function StoryContent() {
       <div className="absolute top-0 left-0 right-0 h-20 bg-gradient-to-b from-background to-transparent z-10 pointer-events-none" />
 
       {/* Header */}
-      <div className="absolute top-0 left-0 right-0 z-20 flex items-center justify-between px-1">
-        <div>
-          <h2 className="text-2xl font-bold">{story.name}</h2>
+      <div className="absolute top-0 left-0 right-0 z-20 flex items-center justify-between gap-3 px-1">
+        <div className="min-w-0 flex-1">
+          <h2 className="truncate text-2xl font-bold" title={story.name}>
+            {story.name}
+          </h2>
           {story.description && (
-            <p className="text-sm text-muted-foreground mt-1">{story.description}</p>
+            <p className="truncate text-sm text-muted-foreground mt-1" title={story.description}>
+              {story.description}
+            </p>
           )}
         </div>
-        <div className="flex gap-2 items-center">
+        <div className="flex shrink-0 gap-2 items-center">
           <AnimatePresence>
             {pendingCount > 0 && (
               <motion.div

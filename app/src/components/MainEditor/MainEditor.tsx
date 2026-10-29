@@ -78,8 +78,13 @@ export function MainEditor() {
   };
 
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-2 lg:gap-6 h-full min-h-0 overflow-hidden relative">
-      <div className="flex flex-col min-h-0 overflow-hidden relative lg:overflow-hidden">
+    <div
+      className={cn(
+        'grid grid-cols-1 lg:grid-cols-2 lg:gap-6 h-full min-h-0 overflow-y-auto lg:overflow-hidden relative lg:pb-0',
+        isPlayerVisible ? 'pb-64' : 'pb-36',
+      )}
+    >
+      <div className="flex flex-col min-h-[300px] lg:min-h-0 overflow-hidden relative lg:overflow-hidden">
         <div className="absolute top-0 left-0 right-0 h-16 bg-gradient-to-b from-background to-transparent z-0 pointer-events-none" />
 
         <div className="absolute top-0 left-0 right-0 z-10">
@@ -117,7 +122,7 @@ export function MainEditor() {
         </div>
       </div>
 
-      <div className="flex flex-col min-h-0 overflow-hidden">
+      <div className="flex flex-col min-h-[160px] lg:min-h-0 overflow-hidden">
         <HistoryTable />
       </div>
 

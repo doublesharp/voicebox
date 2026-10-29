@@ -11,8 +11,10 @@ import type {
   StoryItemTrim,
   StoryItemVersionUpdate,
   StoryItemVolumeUpdate,
+  StoryResponse,
 } from '@/lib/api/types';
 import { usePlatform } from '@/platform/PlatformContext';
+import { useStoryStore } from '@/stores/storyStore';
 
 export function useStories() {
   return useQuery({
@@ -58,8 +60,20 @@ export function useDeleteStory() {
 
   return useMutation({
     mutationFn: (storyId: string) => apiClient.deleteStory(storyId),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['stories'] });
+    onSuccess: async (_, storyId) => {
+      await Promise.all([
+        queryClient.cancelQueries({ queryKey: ['stories'], exact: true }),
+        queryClient.cancelQueries({ queryKey: ['stories', storyId], exact: true }),
+      ]);
+      // Prune cached choices before clearing selection so auto-selection cannot
+      // reopen the deleted Story while a list refresh is still pending.
+      queryClient.setQueryData<StoryResponse[]>(['stories'], (stories) =>
+        stories?.filter((story) => story.id !== storyId),
+      );
+      queryClient.removeQueries({ queryKey: ['stories', storyId], exact: true });
+      const current = useStoryStore.getState();
+      if (current.selectedStoryId === storyId) current.setSelectedStoryId(null);
+      return queryClient.invalidateQueries({ queryKey: ['stories'], exact: true });
     },
   });
 }

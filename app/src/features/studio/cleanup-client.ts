@@ -88,7 +88,8 @@ export class CleanupClient implements CleanupTransport {
     action?: CleanupAction,
     body?: CleanupBody | RestoreBody,
   ): Promise<unknown> {
-    const response = await this.fetcher(
+    const fetcher = this.fetcher;
+    const response = await fetcher(
       `${this.baseUrl}/studio/v1/projects/${encodeURIComponent(project)}/storage${action ? `/${action}` : ''}`,
       body
         ? {
