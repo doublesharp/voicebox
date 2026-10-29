@@ -143,18 +143,35 @@ mock.module('../src/components/ui/textarea', () => ({
 mock.module('../src/components/ui/select', () => ({
   Select: (props: Record<string, unknown>) => createElement('mock-select', props),
   SelectContent: pass,
-  SelectItem: pass,
+  SelectItem: (props: Record<string, unknown>) => createElement('mock-option', props),
   SelectTrigger: pass,
   SelectValue: () => null,
 }));
 mock.module('../src/components/Generation/EngineModelSelector', () => ({
   getEngineDescription: () => 'Engine capabilities',
-  EngineModelSelector: ({ form }: { form: { setValue: (key: string, value: string) => void } }) => (
-    <button
-      type="button"
-      aria-label="choose-engine"
-      onClick={() => form.setValue('engine', 'luxtts')}
-    />
+  EngineModelSelector: ({
+    form,
+    selectedProfile,
+  }: {
+    form: { setValue: (key: string, value: string) => void };
+    selectedProfile?: { id: string };
+  }) => (
+    <>
+      <button
+        type="button"
+        aria-label="choose-engine"
+        data-profile-id={selectedProfile?.id}
+        onClick={() => form.setValue('engine', 'luxtts')}
+      />
+      <button
+        type="button"
+        aria-label="choose-tada-1b"
+        onClick={() => {
+          form.setValue('engine', 'tada');
+          form.setValue('modelSize', '1B');
+        }}
+      />
+    </>
   ),
 }));
 mock.module('../src/components/Generation/SpeechSettings', () => ({ SpeechSettings: () => null }));
@@ -188,6 +205,30 @@ function type(text: string) {
     renderer.root.findByType('textarea').props.onChange({ target: { value: text, name: 'text' } });
   });
 }
+
+test('engine options receive the selected voice profile', () => {
+  mount();
+  expect(
+    renderer.root.findByProps({ 'aria-label': 'choose-engine' }).props['data-profile-id'],
+  ).toBe('a');
+  act(() => ui.getState().setSelectedProfileId('b'));
+  expect(
+    renderer.root.findByProps({ 'aria-label': 'choose-engine' }).props['data-profile-id'],
+  ).toBe('b');
+});
+
+test('TADA 1B offers only English in the language selector', () => {
+  mount();
+  act(() => renderer.root.findByProps({ 'aria-label': 'choose-tada-1b' }).props.onClick());
+  const languageSelect = renderer.root
+    .findAllByType('mock-select' as never)
+    .find((node) =>
+      node.findAllByType('mock-option' as never).some((option) => option.props.value === 'en'),
+    );
+  expect(
+    languageSelect?.findAllByType('mock-option' as never).map((option) => option.props.value),
+  ).toEqual(['en']);
+});
 afterEach(() => {
   act(() => renderer?.unmount());
   useGenerationDraftStore.setState({

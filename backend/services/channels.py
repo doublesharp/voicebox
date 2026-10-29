@@ -22,6 +22,11 @@ from ..database import (
 )
 
 
+def _require_unique(values: List[str], label: str) -> None:
+    if len(values) != len(set(values)):
+        raise ValueError(f"Duplicate {label} are not allowed")
+
+
 async def list_channels(db: Session) -> List[AudioChannelResponse]:
     """List all audio channels."""
     channels = db.query(DBAudioChannel).all()
@@ -71,6 +76,7 @@ async def create_channel(
     db: Session,
 ) -> AudioChannelResponse:
     """Create a new audio channel."""
+    _require_unique(data.device_ids, "device IDs")
     # Check if name already exists
     existing = db.query(DBAudioChannel).filter_by(name=data.name).first()
     if existing:
@@ -119,6 +125,9 @@ async def update_channel(
     
     if channel.is_default:
         raise ValueError("Cannot modify the default channel")
+
+    if data.device_ids is not None:
+        _require_unique(data.device_ids, "device IDs")
     
     # Update name if provided
     if data.name is not None:
@@ -199,6 +208,7 @@ async def set_channel_voices(
     db: Session,
 ) -> None:
     """Set which voices are assigned to a channel."""
+    _require_unique(data.profile_ids, "profile IDs")
     # Verify channel exists
     channel = db.query(DBAudioChannel).filter_by(id=channel_id).first()
     if not channel:
@@ -238,6 +248,7 @@ async def set_profile_channels(
     db: Session,
 ) -> None:
     """Set which channels a profile is assigned to."""
+    _require_unique(data.channel_ids, "channel IDs")
     # Verify profile exists
     profile = db.query(DBVoiceProfile).filter_by(id=profile_id).first()
     if not profile:

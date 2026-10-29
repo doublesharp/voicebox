@@ -506,7 +506,8 @@ function ProjectWorkspace({
               disabled={!canMutate}
               onBlur={(event) => {
                 const name = event.target.value.trim();
-                if (name && name !== project.name) void session.command('update_project', { name });
+                if (!name) event.target.value = project.name;
+                else if (name !== project.name) void session.command('update_project', { name });
               }}
               onKeyDown={(event) => {
                 if (event.key === 'Enter') event.currentTarget.blur();

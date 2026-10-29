@@ -93,3 +93,55 @@ pub fn key_from_str(name: &str) -> Option<Key> {
         _ => return None,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn browser_and_legacy_names_resolve_to_the_same_physical_keys() {
+        for (canonical, legacy, expected) in [
+            ("AltLeft", "Alt", Key::AltLeft),
+            ("AltRight", "AltGr", Key::AltRight),
+            ("Enter", "Return", Key::Enter),
+            ("ArrowUp", "UpArrow", Key::ArrowUp),
+            ("ArrowDown", "DownArrow", Key::ArrowDown),
+            ("ArrowLeft", "LeftArrow", Key::ArrowLeft),
+            ("ArrowRight", "RightArrow", Key::ArrowRight),
+            ("BracketLeft", "LeftBracket", Key::BracketLeft),
+            ("BracketRight", "RightBracket", Key::BracketRight),
+            ("Backquote", "BackQuote", Key::Backtick),
+            ("Semicolon", "SemiColon", Key::Semicolon),
+            ("Backslash", "BackSlash", Key::Backslash),
+            ("Period", "Dot", Key::Period),
+            ("Digit0", "Num0", Key::Digit0),
+            ("Digit9", "Num9", Key::Digit9),
+        ] {
+            assert_eq!(key_from_str(canonical), Some(expected));
+            assert_eq!(key_from_str(legacy), Some(expected));
+        }
+    }
+
+    #[test]
+    fn modifiers_remain_distinct_and_unknown_keys_are_rejected() {
+        for (name, key) in [
+            ("ControlLeft", Key::ControlLeft),
+            ("ControlRight", Key::ControlRight),
+            ("ShiftLeft", Key::ShiftLeft),
+            ("ShiftRight", Key::ShiftRight),
+            ("MetaLeft", Key::MetaLeft),
+            ("MetaRight", Key::MetaRight),
+            ("KeyA", Key::A),
+            ("KeyZ", Key::Z),
+            ("F1", Key::F1),
+            ("F12", Key::F12),
+            ("Space", Key::Space),
+            ("Escape", Key::Escape),
+        ] {
+            assert_eq!(key_from_str(name), Some(key));
+        }
+        for unknown in ["", "KeyAA", "F13", "NumpadAdd", "Unidentified"] {
+            assert_eq!(key_from_str(unknown), None);
+        }
+    }
+}

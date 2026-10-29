@@ -14,6 +14,7 @@ import re
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 
 
 def source_snapshot(root):
@@ -77,6 +78,18 @@ def merge_lines(paths, root, source_files):
     }
 
 
+def run_check(command, *, cwd, env, timeout):
+    """Bound each subprocess and make timeout a failed check, with captured output."""
+    try:
+        return subprocess.run(command, cwd=cwd, env=env, capture_output=True, text=True,
+                              timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        def decoded(value):
+            return value.decode(errors="replace") if isinstance(value, bytes) else value or ""
+        return SimpleNamespace(returncode=124, stdout=decoded(error.stdout),
+                               stderr=decoded(error.stderr) + f"\nTimed out after {timeout:.1f}s\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, default=Path(__file__).resolve().parent.parent)
@@ -85,7 +98,13 @@ def main():
     parser.add_argument("--instrumentation-root", type=Path,
                         help="Scratch tooling directory with Istanbul instrument 6.0.3 and coverage 3.2.2")
     parser.add_argument("--test", action="append", help="Explicit app/tests basename; repeat to select files")
+    parser.add_argument("--timeout-seconds", type=float, default=30,
+                        help="Maximum time for one check (default: 30 seconds)")
+    parser.add_argument("--max-seconds", type=float, default=180,
+                        help="Maximum total check time (default: 180 seconds)")
     args = parser.parse_args()
+    if args.timeout_seconds <= 0 or args.max_seconds <= 0:
+        parser.error("Timeouts must be positive")
     scratch = Path("/Volumes/Scratch")
     if not scratch.is_mount():
         parser.error("Scratch is not mounted; refusing to write disposable output elsewhere")
@@ -119,10 +138,16 @@ def main():
             command.extend(["--coverage", "--coverage-reporter=lcov", "--coverage-dir", str(output / test.stem)])
         checks.append((test.stem, [*command, str(test)], root))
     results = []
+    deadline = time.monotonic() + args.max_seconds
+    budget_exhausted = False
     for name, command, cwd in checks:
         start = time.monotonic()
+        remaining = deadline - start
+        if remaining <= 0:
+            budget_exhausted = True
+            break
         run_env = {**env, "VOICEBOX_COVERAGE_FILE": str(output / f"{name}.coverage.json")}
-        result = subprocess.run(command, cwd=cwd, env=run_env, capture_output=True, text=True)
+        result = run_check(command, cwd=cwd, env=run_env, timeout=min(args.timeout_seconds, remaining))
         log = result.stdout + result.stderr
         (output / f"{name}.log").write_text(log)
         count = re.search(r"(\d+) pass", log)
@@ -139,15 +164,16 @@ def main():
         "sourceStableDuringRun": stable,
         "testFiles": len(tests),
         "passingTests": sum(row["tests"] or 0 for row in results),
-        "failedChecks": [row["check"] for row in results if row["exitCode"]],
+        "failedChecks": [row["check"] for row in results if row["exitCode"]] + (["suite-time-budget"] if budget_exhausted else []),
+        "checksCompleted": len(results),
         "results": results,
     }
     if args.instrumentation_root:
         missing = [p.stem for p in tests if not (output / f"{p.stem}.coverage.json").is_file()]
         summary["missingCoverageFiles"] = missing
-        merge = subprocess.run(["bun", str(root / "scripts/coverage-merge.ts"), str(root),
-                                str(output), str(args.instrumentation_root.resolve())],
-                               cwd=root, env=env, capture_output=True, text=True)
+        merge = run_check(["bun", str(root / "scripts/coverage-merge.ts"), str(root),
+                           str(output), str(args.instrumentation_root.resolve())],
+                          cwd=root, env=env, timeout=args.timeout_seconds)
         (output / "coverage-merge.log").write_text(merge.stderr)
         if merge.returncode:
             summary["failedChecks"].append("coverage-merge")

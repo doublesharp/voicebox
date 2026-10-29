@@ -715,12 +715,23 @@ async def update_story_item_times(
 
     # Get all items for this story
     items = db.query(DBStoryItem).filter_by(story_id=story_id).all()
-    item_map = {item.generation_id: item for item in items}
+    item_map = {}
+    ambiguous_ids = set()
+    for item in items:
+        if item.generation_id in item_map:
+            ambiguous_ids.add(item.generation_id)
+        item_map[item.generation_id] = item
 
-    # Verify all generation IDs belong to this story and update timecodes
+    # Validate the entire request before changing any item. Generation IDs
+    # cannot identify one clip after a split or duplication.
+    seen = set()
     for update in data.updates:
-        if update.generation_id not in item_map:
+        if (update.generation_id not in item_map or update.generation_id in ambiguous_ids
+                or update.generation_id in seen):
             return False
+        seen.add(update.generation_id)
+
+    for update in data.updates:
         item_map[update.generation_id].start_time_ms = update.start_time_ms
 
     # Update story updated_at
@@ -765,7 +776,9 @@ async def reorder_story_items(
     item_map = {item.generation_id: (item, gen, profile_name) for item, gen, profile_name in items_with_gen}
 
     # Verify all generation IDs belong to this story
-    if set(generation_ids) != set(item_map.keys()):
+    if (len(items_with_gen) != len(item_map)
+            or len(generation_ids) != len(item_map)
+            or set(generation_ids) != set(item_map.keys())):
         return None
 
     version_info = _get_versions_for_generations(list(item_map), db)
@@ -829,6 +842,7 @@ async def set_story_item_version(
         return None
 
     # Validate version_id belongs to this generation if provided
+    selected_audio_path = generation.audio_path
     if data.version_id:
         from ..database import GenerationVersion as DBGenerationVersion
 
@@ -842,6 +856,12 @@ async def set_story_item_version(
         )
         if not version:
             return None
+        selected_audio_path = version.audio_path
+
+    selected_duration = audio_duration(selected_audio_path, fallback=generation.duration)
+    trim_ms = item.trim_start_ms + item.trim_end_ms
+    if trim_ms and trim_ms >= int((selected_duration or 0.0) * 1000):
+        return None
 
     item.version_id = data.version_id
 
@@ -1005,10 +1025,11 @@ async def export_story_audio(
     if not story:
         return None
 
-    # Get all items ordered by start_time_ms
+    # Get all items ordered by start_time_ms, including dangling rows so an
+    # incomplete story cannot be exported as if it were complete.
     items = (
         db.query(DBStoryItem, DBGeneration)
-        .join(DBGeneration, DBStoryItem.generation_id == DBGeneration.id)
+        .outerjoin(DBGeneration, DBStoryItem.generation_id == DBGeneration.id)
         .filter(DBStoryItem.story_id == story_id)
         .order_by(DBStoryItem.start_time_ms)
         .all()
@@ -1021,21 +1042,29 @@ async def export_story_audio(
     audio_data = []
 
     for item, generation in items:
+        if generation is None:
+            raise ValueError(f"Story item {item.id} references a missing generation")
         # Resolve audio path: use pinned version if set, otherwise generation default
         resolved_audio_path = generation.audio_path
         if getattr(item, "version_id", None):
             from ..database import GenerationVersion as DBGenerationVersion
 
-            version = db.query(DBGenerationVersion).filter_by(id=item.version_id).first()
-            if version:
-                resolved_audio_path = version.audio_path
+            version = db.query(DBGenerationVersion).filter_by(
+                id=item.version_id, generation_id=generation.id,
+            ).first()
+            if version is None:
+                raise ValueError(f"Story item {item.id} references a missing audio version")
+            resolved_audio_path = version.audio_path
 
         audio_path = config.resolve_storage_path(resolved_audio_path)
-        if audio_path is None or not audio_path.exists():
-            continue
+        if audio_path is None or not audio_path.is_file():
+            raise ValueError(f"Story item {item.id} audio file is missing")
 
         try:
             audio, sr = await asyncio.to_thread(load_audio, str(audio_path), sample_rate=None, mono=False)
+        except Exception as exc:
+            raise ValueError(f"Story item {item.id} audio could not be read") from exc
+        try:
             # librosa uses (channels, frames), while soundfile writes
             # (frames, channels). Mono is kept as a single channel here.
             audio = audio[:, np.newaxis] if audio.ndim == 1 else audio.T
@@ -1056,7 +1085,7 @@ async def export_story_audio(
             else:
                 trimmed_audio = audio[trim_start_sample:]
             if len(trimmed_audio) == 0:
-                continue
+                raise ValueError(f"Story item {item.id} has no audio after trimming")
 
             # Apply per-clip volume to the export mix.
             stored_volume = getattr(item, "volume", None)
@@ -1076,9 +1105,10 @@ async def export_story_audio(
                     "text": generation.text,
                 }
             )
-        except Exception:
-            # Skip files that can't be loaded
-            continue
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(f"Story item {item.id} audio could not be processed") from exc
 
     if not audio_data:
         return None

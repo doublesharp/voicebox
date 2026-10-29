@@ -829,6 +829,7 @@ export function ProfileForm() {
       const hasContent =
         values.name ||
         values.description ||
+        values.personality ||
         values.referenceText ||
         values.sampleFile ||
         designPrompt.trim();

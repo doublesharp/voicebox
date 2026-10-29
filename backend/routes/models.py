@@ -165,12 +165,12 @@ async def unload_model_by_name(model_name: str):
 
 
 @router.get("/models/progress/{model_name}")
-async def get_model_progress(model_name: str):
+async def get_model_progress(model_name: str, include_terminal: bool = False):
     """Get model download progress via Server-Sent Events."""
     progress_manager = get_progress_manager()
 
     async def event_generator():
-        async for event in progress_manager.subscribe(model_name):
+        async for event in progress_manager.subscribe(model_name, include_terminal=include_terminal):
             yield event
 
     return StreamingResponse(
@@ -359,7 +359,10 @@ async def get_model_status():
                         for rev in repo.revisions:
                             for f in rev.files:
                                 fname = f.file_name.lower()
-                                if fname.endswith((".safetensors", ".bin", ".pt", ".pth", ".npz")):
+                                if (
+                                    fname.endswith((".safetensors", ".bin", ".pt", ".pth", ".npz"))
+                                    and f.file_path.is_file()
+                                ):
                                     has_model_weights = True
                                     break
                             if has_model_weights:
@@ -396,11 +399,11 @@ async def get_model_status():
                             has_model_files = False
                             if snapshots_dir.exists():
                                 has_model_files = (
-                                    any(snapshots_dir.rglob("*.bin"))
-                                    or any(snapshots_dir.rglob("*.safetensors"))
-                                    or any(snapshots_dir.rglob("*.pt"))
-                                    or any(snapshots_dir.rglob("*.pth"))
-                                    or any(snapshots_dir.rglob("*.npz"))
+                                    any(path.is_file() for path in snapshots_dir.rglob("*.bin"))
+                                    or any(path.is_file() for path in snapshots_dir.rglob("*.safetensors"))
+                                    or any(path.is_file() for path in snapshots_dir.rglob("*.pt"))
+                                    or any(path.is_file() for path in snapshots_dir.rglob("*.pth"))
+                                    or any(path.is_file() for path in snapshots_dir.rglob("*.npz"))
                                 )
 
                             if has_model_files:
@@ -480,14 +483,23 @@ async def trigger_model_download(request: models.ModelDownloadRequest):
     if not config:
         raise HTTPException(status_code=400, detail=f"Unknown model: {request.model_name}")
 
+    existing = next((task for task in task_manager.get_active_downloads()
+                     if task.model_name == request.model_name), None)
+    progress = progress_manager.get_progress(request.model_name)
+    if ((existing is not None and existing.status in ("downloading", "extracting"))
+            or (existing is None and progress and progress.get("status") in ("downloading", "extracting"))):
+        raise HTTPException(status_code=409, detail=f"Model {request.model_name} is already downloading")
+
     load_func = get_model_load_func(config)
 
     async def download_in_background():
         try:
             await _run_model_work(config, load_func)
+            progress_manager.mark_complete(request.model_name)
             task_manager.complete_download(request.model_name)
         except Exception as e:
             task_manager.error_download(request.model_name, str(e))
+            progress_manager.mark_error(request.model_name, str(e))
 
     task_manager.start_download(request.model_name)
 
@@ -509,6 +521,13 @@ async def cancel_model_download(request: models.ModelDownloadRequest):
     """Cancel or dismiss an errored/stale download task."""
     task_manager = get_task_manager()
     progress_manager = get_progress_manager()
+
+    task = next((task for task in task_manager.get_active_downloads()
+                 if task.model_name == request.model_name), None)
+    progress = progress_manager.get_progress(request.model_name)
+    if ((task is not None and task.status in ("downloading", "extracting"))
+            or (task is None and progress and progress.get("status") in ("downloading", "extracting"))):
+        raise HTTPException(status_code=409, detail="A running download cannot be dismissed")
 
     removed = task_manager.cancel_download(request.model_name)
 

@@ -100,7 +100,7 @@ export function applyEngineSelection(form: UseFormReturn<GenerationFormValues>, 
       form.setValue('language', 'en');
     } else {
       const currentLang = form.getValues('language');
-      const available = getLanguageOptionsForEngine('tada');
+      const available = getLanguageOptionsForEngine('tada', modelSize);
       if (!available.some((l) => l.value === currentLang)) {
         form.setValue('language', available[0]?.value ?? 'en');
       }
@@ -130,6 +130,7 @@ interface EngineModelSelectorProps {
 export function EngineModelSelector({ form, compact, selectedProfile }: EngineModelSelectorProps) {
   const engine = form.watch('engine') || 'qwen';
   const modelSize = form.watch('modelSize');
+  const language = form.watch('language');
   const selectValue = getSelectValue(engine, modelSize);
   const availableOptions = getAvailableOptions(selectedProfile);
 
@@ -137,9 +138,16 @@ export function EngineModelSelector({ form, compact, selectedProfile }: EngineMo
 
   useEffect(() => {
     if (!currentEngineAvailable && availableOptions.length > 0) {
-      applyEngineSelection(form, availableOptions[0].value);
+      const fallback =
+        availableOptions.find((option) => option.engine === engine) ?? availableOptions[0];
+      applyEngineSelection(form, fallback.value);
+      return;
     }
-  }, [availableOptions, currentEngineAvailable, form]);
+    const languages = getLanguageOptionsForEngine(engine, modelSize);
+    if (!languages.some((option) => option.value === language)) {
+      form.setValue('language', languages[0]?.value ?? 'en');
+    }
+  }, [availableOptions, currentEngineAvailable, engine, form, language, modelSize]);
 
   const itemClass = compact ? 'text-xs text-muted-foreground' : undefined;
   const triggerClass = compact
@@ -179,7 +187,6 @@ export function isProfileCompatibleWithEngine(
 ): boolean {
   const voiceType = profile.voice_type || 'cloned';
   if (voiceType === 'preset') return profile.preset_engine === engine;
-  if (voiceType === 'cloned') return CLONING_ENGINES.has(engine);
   if (voiceType === 'designed') return DESIGN_ENGINES.has(engine);
-  return true;
+  return CLONING_ENGINES.has(engine);
 }

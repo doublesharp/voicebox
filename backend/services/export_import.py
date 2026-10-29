@@ -8,6 +8,7 @@ Also handles exporting individual generations.
 import json
 import zipfile
 import io
+import shutil
 from pathlib import Path
 from typing import Optional
 from sqlalchemy.orm import Session
@@ -163,6 +164,14 @@ async def import_profile_from_zip(file_bytes: bytes, db: Session) -> VoiceProfil
             
             if not isinstance(samples_data, dict):
                 raise ValueError("Invalid samples.json: must be a dictionary")
+
+            # Validate all entries before creating a persistent profile.
+            for filename in samples_data:
+                if not filename.endswith('.wav'):
+                    raise ValueError(f"Invalid sample filename: {filename} (must be .wav)")
+                zip_path = f"samples/{filename}"
+                if zip_path not in namelist:
+                    raise ValueError(f"Sample file not found in ZIP: {zip_path}")
             
             # Get unique profile name
             original_name = profile_data.get("name", "Imported Profile")
@@ -175,61 +184,47 @@ async def import_profile_from_zip(file_bytes: bytes, db: Session) -> VoiceProfil
                 language=profile_data.get("language", "en"),
             )
             
-            profile = await create_profile(profile_create, db)
+            profile_dir = None
+            try:
+                profile = await create_profile(profile_create, db, commit=False)
+                profile_dir = config.get_profiles_dir() / profile.id
+                for filename, reference_text in samples_data.items():
+                    import tempfile
+                    tmp_path = None
+                    try:
+                        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                            tmp_path = tmp.name
+                            tmp.write(zip_file.read(f"samples/{filename}"))
+                        await add_profile_sample(
+                            profile.id, tmp_path, reference_text, db, commit=False,
+                        )
+                    finally:
+                        if tmp_path is not None:
+                            Path(tmp_path).unlink(missing_ok=True)
+                db.commit()
+            except BaseException:
+                db.rollback()
+                if profile_dir is not None:
+                    shutil.rmtree(profile_dir, ignore_errors=True)
+                raise
 
-            # Extract and add samples
-            profile_dir = config.get_profiles_dir() / profile.id
-            profile_dir.mkdir(parents=True, exist_ok=True)
-
-            # Handle avatar if present
+            # Avatar import is optional and happens after the profile is committed.
             avatar_files = [f for f in namelist if f.startswith("avatar.")]
             if avatar_files:
                 try:
-                    avatar_file = avatar_files[0]
-                    # Extract to temporary file
                     import tempfile
+                    avatar_file = avatar_files[0]
                     with tempfile.NamedTemporaryFile(suffix=Path(avatar_file).suffix, delete=False) as tmp:
                         tmp.write(zip_file.read(avatar_file))
                         tmp_path = tmp.name
-
                     try:
                         from .profiles import upload_avatar
                         await upload_avatar(profile.id, tmp_path, db)
                     finally:
                         Path(tmp_path).unlink(missing_ok=True)
-                except Exception as e:
-                    # Avatar import is optional - continue even if it fails
+                except Exception:
                     pass
 
-            for filename, reference_text in samples_data.items():
-                # Validate filename
-                if not filename.endswith('.wav'):
-                    raise ValueError(f"Invalid sample filename: {filename} (must be .wav)")
-                
-                # Extract audio file to temp location
-                zip_path = f"samples/{filename}"
-                
-                if zip_path not in namelist:
-                    raise ValueError(f"Sample file not found in ZIP: {zip_path}")
-                
-                # Extract to temporary file
-                import tempfile
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                    tmp.write(zip_file.read(zip_path))
-                    tmp_path = tmp.name
-                
-                try:
-                    # Add sample to profile
-                    await add_profile_sample(
-                        profile.id,
-                        tmp_path,
-                        reference_text,
-                        db,
-                    )
-                finally:
-                    # Clean up temp file
-                    Path(tmp_path).unlink(missing_ok=True)
-            
             return profile
             
     except zipfile.BadZipFile:
@@ -282,6 +277,8 @@ def export_generation_to_zip(generation_id: str, db: Session) -> bytes:
         version_entries = []
         for v in versions:
             v_path = config.resolve_storage_path(v.audio_path)
+            if v_path is None or not v_path.is_file():
+                raise ValueError(f"Audio file not found: {v.audio_path}")
             effects_chain = None
             if v.effects_chain:
                 effects_chain = json.loads(v.effects_chain)
@@ -323,8 +320,9 @@ def export_generation_to_zip(generation_id: str, db: Session) -> bytes:
         # Fallback: if no versions exist, include the generation's main audio
         if not versions:
             audio_path = config.resolve_storage_path(generation.audio_path)
-            if audio_path is not None and audio_path.exists():
-                zip_file.write(audio_path, f"audio/{audio_path.name}")
+            if audio_path is None or not audio_path.is_file():
+                raise ValueError(f"Audio file not found: {generation.audio_path}")
+            zip_file.write(audio_path, f"audio/{audio_path.name}")
     
     zip_buffer.seek(0)
     return zip_buffer.read()
@@ -384,6 +382,14 @@ async def import_generation_from_zip(file_bytes: bytes, db: Session) -> dict:
                 raise ValueError("No audio file found in ZIP archive")
             
             audio_file_path = audio_files[0]
+            default_version = next(
+                (version for version in manifest_data.get("versions", []) if version.get("is_default")),
+                None,
+            )
+            if default_version is not None:
+                audio_file_path = f"audio/{default_version.get('filename', '')}"
+                if audio_file_path not in audio_files:
+                    raise ValueError(f"Default version audio not found in ZIP: {audio_file_path}")
             
             # Check if we should match an existing profile or create metadata
             profile_id = None
@@ -406,11 +412,11 @@ async def import_generation_from_zip(file_bytes: bytes, db: Session) -> dict:
                     raise ValueError("No voice profiles found. Please create a profile before importing generations.")
             
             # Extract audio file to temporary location
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                tmp.write(zip_file.read(audio_file_path))
-                tmp_path = tmp.name
-            
+            tmp_path = None
             try:
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                    tmp_path = tmp.name
+                    tmp.write(zip_file.read(audio_file_path))
                 # Create generations directory
                 generations_dir = config.get_generations_dir()
                 generations_dir.mkdir(parents=True, exist_ok=True)
@@ -420,23 +426,25 @@ async def import_generation_from_zip(file_bytes: bytes, db: Session) -> dict:
                 
                 # Copy audio to generations directory
                 audio_dest = generations_dir / f"{new_generation_id}.wav"
-                shutil.copy(tmp_path, audio_dest)
-                
-                # Create generation record
-                db_generation = DBGeneration(
-                    id=new_generation_id,
-                    profile_id=profile_id,
-                    text=generation_data["text"],
-                    language=generation_data["language"],
-                    audio_path=config.to_storage_path(audio_dest),
-                    duration=generation_data["duration"],
-                    seed=generation_data.get("seed"),
-                    instruct=generation_data.get("instruct"),
-                    created_at=datetime.now(UTC),
-                )
-                
-                db.add(db_generation)
-                db.commit()
+                try:
+                    shutil.copy(tmp_path, audio_dest)
+                    db_generation = DBGeneration(
+                        id=new_generation_id,
+                        profile_id=profile_id,
+                        text=generation_data["text"],
+                        language=generation_data["language"],
+                        audio_path=config.to_storage_path(audio_dest),
+                        duration=generation_data["duration"],
+                        seed=generation_data.get("seed"),
+                        instruct=generation_data.get("instruct"),
+                        created_at=datetime.now(UTC),
+                    )
+                    db.add(db_generation)
+                    db.commit()
+                except BaseException:
+                    db.rollback()
+                    audio_dest.unlink(missing_ok=True)
+                    raise
                 db.refresh(db_generation)
                 
                 return {
@@ -449,7 +457,8 @@ async def import_generation_from_zip(file_bytes: bytes, db: Session) -> dict:
                 
             finally:
                 # Clean up temp file
-                Path(tmp_path).unlink(missing_ok=True)
+                if tmp_path is not None:
+                    Path(tmp_path).unlink(missing_ok=True)
             
     except zipfile.BadZipFile:
         raise ValueError("Invalid ZIP file")

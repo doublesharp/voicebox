@@ -249,6 +249,7 @@ export function ModelManagement() {
     modelName: downloadingModel || '',
     displayName: downloadingDisplayName || '',
     enabled: !!downloadingModel && !!downloadingDisplayName,
+    includeTerminalSnapshot: true,
     onComplete: handleDownloadComplete,
     onError: handleDownloadError,
   });
@@ -432,15 +433,17 @@ export function ModelManagement() {
     { label: t('models.sections.languageModels'), models: llmModels },
   ];
 
-  // Get detail modal state for selected model
-  const selectedState = selectedModel ? getModelState(selectedModel) : null;
-  const selectedError = selectedModel ? erroredDownloads.get(selectedModel.model_name) : undefined;
-
   // Keep selectedModel data fresh from query results
   const freshSelectedModel =
     selectedModel && modelStatus
       ? modelStatus.models.find((m) => m.model_name === selectedModel.model_name) || selectedModel
       : selectedModel;
+
+  // Derive the detail actions from the same fresh data shown in the modal.
+  const selectedState = freshSelectedModel ? getModelState(freshSelectedModel) : null;
+  const selectedError = freshSelectedModel
+    ? erroredDownloads.get(freshSelectedModel.model_name)
+    : undefined;
 
   // Derive license from HF data
   const license =
@@ -867,18 +870,12 @@ export function ModelManagement() {
                             </>
                           );
                         })()}
+                        <p className="text-xs text-muted-foreground">
+                          {t('models.progress.cannotCancel', {
+                            defaultValue: 'Downloads cannot be cancelled once started.',
+                          })}
+                        </p>
                       </div>
-                      <Button
-                        size="sm"
-                        onClick={() => handleCancel(freshSelectedModel.model_name)}
-                        variant="ghost"
-                        disabled={
-                          cancelMutation.isPending &&
-                          cancelMutation.variables === freshSelectedModel.model_name
-                        }
-                      >
-                        <X className="h-4 w-4" />
-                      </Button>
                     </>
                   ) : freshSelectedModel.downloaded ? (
                     <div className="flex gap-2 flex-1">

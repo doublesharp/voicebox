@@ -55,6 +55,32 @@ def _resolve_generation_engine(data: models.GenerationRequest, profile) -> str:
     return data.engine or profiles.default_engine_for_profile(profile)
 
 
+def _enqueue_generation_or_recover(generation_id, coro, db, previous_state=None):
+    """Do not leave a persisted generation active if admission fails."""
+    try:
+        enqueue_generation(generation_id, coro)
+    except Exception as exc:
+        coro.close()
+        row = db.query(DBGeneration).filter_by(id=generation_id).first()
+        if row is not None:
+            if previous_state is None:
+                row.status = "failed"
+                row.error = "Generation queue unavailable"
+            else:
+                for field, value in previous_state.items():
+                    setattr(row, field, value)
+            try:
+                db.commit()
+            except Exception:
+                db.rollback()
+                logger.exception("Could not recover generation %s after queue admission failed", generation_id)
+        raise HTTPException(status_code=503, detail="Generation queue unavailable") from exc
+
+
+def _generation_recovery_state(gen):
+    return {name: getattr(gen, name) for name in ("status", "error", "audio_path", "duration", "synthesis_config")}
+
+
 @router.post("/generate", response_model=models.GenerationResponse)
 async def generate_speech(
     data: models.GenerationRequest,
@@ -130,13 +156,7 @@ async def generate_speech(
         synthesis_config=synthesis_config,
     )
 
-    task_manager.start_generation(
-        task_id=generation_id,
-        profile_id=data.profile_id,
-        text=text,
-    )
-
-    enqueue_generation(
+    _enqueue_generation_or_recover(
         generation_id,
         run_generation(
             generation_id=generation_id,
@@ -153,8 +173,10 @@ async def generate_speech(
             max_chunk_chars=data.max_chunk_chars,
             crossfade_ms=data.crossfade_ms,
             **{name: getattr(data, name) for name in models.SPEECH_DELIVERY_FIELDS},
-        )
+        ),
+        db,
     )
+    task_manager.start_generation(task_id=generation_id, profile_id=data.profile_id, text=text)
 
     return generation
 
@@ -209,6 +231,7 @@ async def retry_generation(generation_id: str, db: Session = Depends(get_db)):
 
     model_size = (gen.model_size or "1.7B") if engine_has_model_sizes(gen.engine or "qwen") else None
     synthesis_config = _replay_synthesis_config(gen)
+    previous_state = _generation_recovery_state(gen)
     if gen.synthesis_config is None:
         gen.synthesis_config = json.dumps({"version": 1, **synthesis_config})
     gen.status = "generating"
@@ -219,13 +242,7 @@ async def retry_generation(generation_id: str, db: Session = Depends(get_db)):
     db.refresh(gen)
 
     task_manager = get_task_manager()
-    task_manager.start_generation(
-        task_id=generation_id,
-        profile_id=gen.profile_id,
-        text=gen.text,
-    )
-
-    enqueue_generation(
+    _enqueue_generation_or_recover(
         generation_id,
         run_generation(
             generation_id=generation_id,
@@ -238,8 +255,11 @@ async def retry_generation(generation_id: str, db: Session = Depends(get_db)):
             instruct=gen.instruct,
             **synthesis_config,
             mode="retry",
-        )
+        ),
+        db,
+        previous_state,
     )
+    task_manager.start_generation(task_id=generation_id, profile_id=gen.profile_id, text=gen.text)
 
     return models.GenerationResponse.model_validate(gen)
 
@@ -260,6 +280,7 @@ async def regenerate_generation(generation_id: str, db: Session = Depends(get_db
 
     model_size = (gen.model_size or "1.7B") if engine_has_model_sizes(gen.engine or "qwen") else None
     synthesis_config = _replay_synthesis_config(gen)
+    previous_state = _generation_recovery_state(gen)
     if gen.synthesis_config is None:
         gen.synthesis_config = json.dumps({"version": 1, **synthesis_config})
     gen.status = "generating"
@@ -268,15 +289,9 @@ async def regenerate_generation(generation_id: str, db: Session = Depends(get_db
     db.refresh(gen)
 
     task_manager = get_task_manager()
-    task_manager.start_generation(
-        task_id=generation_id,
-        profile_id=gen.profile_id,
-        text=gen.text,
-    )
-
     version_id = str(uuid.uuid4())
 
-    enqueue_generation(
+    _enqueue_generation_or_recover(
         generation_id,
         run_generation(
             generation_id=generation_id,
@@ -290,8 +305,11 @@ async def regenerate_generation(generation_id: str, db: Session = Depends(get_db
             **synthesis_config,
             mode="regenerate",
             version_id=version_id,
-        )
+        ),
+        db,
+        previous_state,
     )
+    task_manager.start_generation(task_id=generation_id, profile_id=gen.profile_id, text=gen.text)
 
     return models.GenerationResponse.model_validate(gen)
 

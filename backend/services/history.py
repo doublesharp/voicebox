@@ -8,28 +8,93 @@ from datetime import UTC, datetime
 import logging
 import uuid
 import shutil
+import os
 from pathlib import Path
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
 
 from ..models import GenerationRequest, GenerationResponse, HistoryQuery, HistoryResponse, HistoryListResponse, GenerationVersionResponse, EffectConfig
-from ..database import Generation as DBGeneration, GenerationVersion as DBGenerationVersion, StoryItem as DBStoryItem, VoiceProfile as DBVoiceProfile
+from ..database import Capture as DBCapture, Generation as DBGeneration, GenerationVersion as DBGenerationVersion, ProfileSample as DBProfileSample, StoryItem as DBStoryItem, VoiceProfile as DBVoiceProfile
 from .. import config
 
 logger = logging.getLogger(__name__)
 
 
-def _delete_generation_children(generation_id: str, db: Session, commit: bool = True) -> None:
-    """Remove the rows that reference a generation, plus any version audio files.
+def _delete_generation_children(generation_id: str, db: Session) -> set[Path]:
+    """Remove dependent rows and collect version audio for post-commit cleanup.
 
     Story items and versions both point at the generation by a non-null FK.
     The story detail query inner-joins generations, so a leftover story item
     vanishes from the timeline while staying in the table forever.
     """
-    from . import versions as versions_mod
-
     db.query(DBStoryItem).filter_by(generation_id=generation_id).delete()
-    versions_mod.delete_versions_for_generation(generation_id, db, commit=commit)
+    paths = set()
+    for version in db.query(DBGenerationVersion).filter_by(generation_id=generation_id).all():
+        path = config.resolve_storage_path(version.audio_path)
+        if path is not None:
+            paths.add(path)
+        db.delete(version)
+    return paths
+
+
+def _saved_file_paths(db: Session):
+    """Yield both stored and resolved paths of files referenced by saved rows."""
+    for column in (DBGeneration.audio_path, DBGenerationVersion.audio_path,
+                   DBProfileSample.audio_path, DBCapture.audio_path, DBVoiceProfile.avatar_path):
+        for (stored_path,) in db.query(column).filter(column.isnot(None)).yield_per(1000):
+            yield stored_path, config.resolve_storage_path(stored_path)
+
+
+def _directory_has_saved_files(directory: Path, db: Session) -> bool:
+    """Fail closed if a surviving reference may live under this directory."""
+    root = Path(os.path.abspath(directory))
+    resolved_root = directory.resolve()
+    try:
+        for stored, resolved in _saved_file_paths(db):
+            raw = Path(stored)
+            if not raw.is_absolute():
+                if raw.parts and raw.parts[0] == "data":
+                    raw = Path(*raw.parts[1:])
+                raw = config.get_data_dir() / raw
+            lexical = Path(os.path.abspath(raw))
+            if lexical.is_relative_to(root) or (resolved is not None and resolved.is_relative_to(resolved_root)):
+                return True
+    except Exception:
+        db.rollback()
+        logger.warning("Could not verify saved files in profile directory %s; retaining it", directory, exc_info=True)
+        return True
+    return False
+
+
+def _remove_deleted_audio(paths: set[Path], db: Session) -> None:
+    """Clean up after commit, preserving paths still referenced by saved data."""
+    if not paths:
+        return
+    remaining = set(paths)
+    try:
+        # Resolve legacy and absolute spellings too; comparing database strings
+        # alone can miss two rows that point at the same file.
+        for _, resolved in _saved_file_paths(db):
+            remaining.discard(resolved)
+            if not remaining:
+                return
+    except Exception:
+        db.rollback()
+        logger.warning("Could not verify surviving audio references; retaining deleted audio", exc_info=True)
+        return
+    for path in remaining:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Could not delete unreferenced audio %s", path, exc_info=True)
+
+
+def _queue_generation_delete(generation: DBGeneration, db: Session, paths: set[Path]) -> None:
+    paths.update(_delete_generation_children(generation.id, db))
+    path = config.resolve_storage_path(generation.audio_path)
+    if path is not None:
+        paths.add(path)
+    db.delete(generation)
 
 
 def _get_versions_for_generations(generation_ids: list[str], db: Session) -> dict:
@@ -299,25 +364,14 @@ async def delete_generation(
     if not generation:
         return False
 
-    # Delete all version files and records; the rows are committed together
-    # with the generation row below (one commit for the whole delete).
-    _delete_generation_children(generation_id, db, commit=False)
-
-    # Delete main audio file (if not already removed by version cleanup)
-    if generation.audio_path:
-        audio_path = config.resolve_storage_path(generation.audio_path)
-        if audio_path is not None and audio_path.exists():
-            try:
-                audio_path.unlink()
-            except OSError:
-                # Version files are already gone by now, so rolling back would
-                # leave rows pointing at missing audio. Mirror the sweep below:
-                # keep going and leave the locked file as an orphan instead.
-                logger.warning("Could not delete generation audio %s", audio_path)
-
-    # Delete from database
-    db.delete(generation)
-    db.commit()
+    paths: set[Path] = set()
+    _queue_generation_delete(generation, db, paths)
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    _remove_deleted_audio(paths, db)
     
     return True
 
@@ -334,33 +388,24 @@ async def delete_failed_generations(db: Session) -> int:
         Number of generations deleted.
     """
     failed = db.query(DBGeneration).filter(DBGeneration.status == "failed").all()
-    count = 0
+    paths: set[Path] = set()
     for generation in failed:
-        # Clean up version files/rows first; one commit at the end.
-        _delete_generation_children(generation.id, db, commit=False)
+        _queue_generation_delete(generation, db, paths)
 
-        # Remove the main audio file if it somehow made it to disk.
-        if generation.audio_path:
-            audio_path = config.resolve_storage_path(generation.audio_path)
-            if audio_path is not None and audio_path.exists():
-                try:
-                    audio_path.unlink()
-                except OSError:
-                    # Best-effort cleanup — don't abort the whole sweep
-                    # if a single file can't be removed.
-                    logger.warning("Could not delete generation audio %s", audio_path)
-
-        db.delete(generation)
-        count += 1
-
-    db.commit()
-    return count
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    _remove_deleted_audio(paths, db)
+    return len(failed)
 
 
 async def delete_generations_by_profile(
     profile_id: str,
     db: Session,
     commit: bool = True,
+    pending_audio_paths: Optional[set[Path]] = None,
 ) -> int:
     """
     Delete all generations for a profile.
@@ -371,35 +416,28 @@ async def delete_generations_by_profile(
         commit: Commit at the end. Pass False when the caller owns the
             transaction (e.g. deleting the profile itself) so the whole
             cascade lands in one commit.
+        pending_audio_paths: Required when commit is False; the caller must
+            clean these paths after its transaction commits.
 
     Returns:
         Number of generations deleted
     """
+    if not commit and pending_audio_paths is None:
+        raise ValueError("pending_audio_paths is required when the caller owns the transaction")
+    paths = pending_audio_paths if pending_audio_paths is not None else set()
     generations = db.query(DBGeneration).filter_by(profile_id=profile_id).all()
-    
-    count = 0
     for generation in generations:
-        # Delete associated version files and rows first
-        _delete_generation_children(generation.id, db, commit=commit)
-
-        # Delete audio file
-        audio_path = config.resolve_storage_path(generation.audio_path)
-        if audio_path is not None and audio_path.exists():
-            try:
-                audio_path.unlink()
-            except OSError:
-                # A file locked by playback shouldn't abort the whole sweep
-                # and leave the profile half-deleted.
-                logger.warning("Could not delete generation audio %s", audio_path)
-
-        # Delete from database
-        db.delete(generation)
-        count += 1
+        _queue_generation_delete(generation, db, paths)
 
     if commit:
-        db.commit()
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        _remove_deleted_audio(paths, db)
 
-    return count
+    return len(generations)
 
 
 async def get_generation_stats(db: Session) -> dict:

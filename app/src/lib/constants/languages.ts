@@ -101,8 +101,11 @@ export const ENGINE_LANGUAGES: Record<string, readonly LanguageCode[]> = {
 } as const;
 
 /** Helper: get language options for a given engine. */
-export function getLanguageOptionsForEngine(engine: string) {
-  const codes = ENGINE_LANGUAGES[engine] ?? ENGINE_LANGUAGES.qwen;
+export function getLanguageOptionsForEngine(engine: string, modelSize?: string) {
+  const codes: readonly LanguageCode[] =
+    engine === 'tada' && modelSize !== '3B'
+      ? ['en']
+      : (ENGINE_LANGUAGES[engine] ?? ENGINE_LANGUAGES.qwen);
   return codes.map((code) => ({
     value: code,
     label: ALL_LANGUAGES[code],

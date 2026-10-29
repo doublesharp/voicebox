@@ -162,33 +162,28 @@ async def add_profile_sample(
     _uploaded_ext = Path(file.filename or "").suffix.lower()
     file_suffix = _uploaded_ext if _uploaded_ext in _allowed_audio_exts else ".wav"
 
-    with tempfile.NamedTemporaryFile(suffix=file_suffix, delete=False) as tmp:
-        total_size = 0
-        while chunk := await file.read(SAMPLE_UPLOAD_CHUNK_SIZE):
-            total_size += len(chunk)
-            if total_size > SAMPLE_MAX_FILE_SIZE:
-                Path(tmp.name).unlink(missing_ok=True)
-                raise HTTPException(
-                    status_code=413,
-                    detail=f"File too large (max {SAMPLE_MAX_FILE_SIZE // (1024 * 1024)} MB)",
-                )
-            tmp.write(chunk)
-        tmp_path = tmp.name
-
+    tmp_path = None
     try:
-        sample = await profiles.add_profile_sample(
-            profile_id,
-            tmp_path,
-            reference_text,
-            db,
-        )
-        return sample
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to process audio file: {str(e)}")
+        with tempfile.NamedTemporaryFile(suffix=file_suffix, delete=False) as tmp:
+            tmp_path = tmp.name
+            total_size = 0
+            while chunk := await file.read(SAMPLE_UPLOAD_CHUNK_SIZE):
+                total_size += len(chunk)
+                if total_size > SAMPLE_MAX_FILE_SIZE:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File too large (max {SAMPLE_MAX_FILE_SIZE // (1024 * 1024)} MB)",
+                    )
+                tmp.write(chunk)
+        try:
+            return await profiles.add_profile_sample(profile_id, tmp_path, reference_text, db)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to process audio file: {str(e)}")
     finally:
-        Path(tmp_path).unlink(missing_ok=True)
+        if tmp_path is not None:
+            Path(tmp_path).unlink(missing_ok=True)
 
 
 @router.get("/profiles/{profile_id}/samples", response_model=list[models.ProfileSampleResponse])
@@ -232,18 +227,19 @@ async def upload_profile_avatar(
     db: Session = Depends(get_db),
 ):
     """Upload or update avatar image for a profile."""
-    with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename or "").suffix) as tmp:
-        content = await file.read()
-        tmp.write(content)
-        tmp_path = tmp.name
-
+    tmp_path = None
     try:
-        profile = await profiles.upload_avatar(profile_id, tmp_path, db)
-        return profile
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename or "").suffix) as tmp:
+            tmp_path = tmp.name
+            content = await file.read()
+            tmp.write(content)
+        try:
+            return await profiles.upload_avatar(profile_id, tmp_path, db)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
     finally:
-        Path(tmp_path).unlink(missing_ok=True)
+        if tmp_path is not None:
+            Path(tmp_path).unlink(missing_ok=True)
 
 
 @router.get("/profiles/{profile_id}/avatar")
@@ -301,6 +297,8 @@ async def export_profile(
             media_type="application/zip",
             headers={"Content-Disposition": safe_content_disposition("attachment", filename)},
         )
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

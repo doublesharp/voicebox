@@ -174,6 +174,8 @@ def validate_profile_engine(profile, engine: str) -> None:
 async def create_profile(
     data: VoiceProfileCreate,
     db: Session,
+    *,
+    commit: bool = True,
 ) -> VoiceProfileResponse:
     """
     Create a new voice profile.
@@ -228,7 +230,10 @@ async def create_profile(
     )
 
     db.add(db_profile)
-    db.commit()
+    if commit:
+        db.commit()
+    else:
+        db.flush()
     db.refresh(db_profile)
 
     profile_dir = config.get_profiles_dir() / db_profile.id
@@ -242,6 +247,8 @@ async def add_profile_sample(
     audio_path: str,
     reference_text: str,
     db: Session,
+    *,
+    commit: bool = True,
 ) -> ProfileSampleResponse:
     """
     Add a sample to a voice profile.
@@ -273,20 +280,27 @@ async def add_profile_sample(
     profile_dir.mkdir(parents=True, exist_ok=True)
 
     dest_path = profile_dir / f"{sample_id}.wav"
-    await asyncio.to_thread(save_audio, audio, str(dest_path), sr)
+    try:
+        await asyncio.to_thread(save_audio, audio, str(dest_path), sr)
 
-    db_sample = DBProfileSample(
-        id=sample_id,
-        profile_id=profile_id,
-        audio_path=config.to_storage_path(dest_path),
-        reference_text=reference_text,
-    )
+        db_sample = DBProfileSample(
+            id=sample_id,
+            profile_id=profile_id,
+            audio_path=config.to_storage_path(dest_path),
+            reference_text=reference_text,
+        )
+        db.add(db_sample)
+        profile.updated_at = datetime.now(UTC)
 
-    db.add(db_sample)
-
-    profile.updated_at = datetime.now(UTC)
-
-    db.commit()
+        if commit:
+            db.commit()
+        else:
+            db.flush()
+    except Exception:
+        if commit:
+            db.rollback()
+        dest_path.unlink(missing_ok=True)
+        raise
     db.refresh(db_sample)
 
     # Invalidate combined audio cache for this profile
@@ -478,7 +492,10 @@ async def delete_profile(
     # Generations carry a non-null FK to the profile and the history query
     # inner-joins profiles, so anything left behind here becomes a row the UI
     # can never show and a .wav in data/generations the user can never reclaim.
-    deleted_generations = await history.delete_generations_by_profile(profile_id, db, commit=False)
+    pending_audio_paths = set()
+    deleted_generations = await history.delete_generations_by_profile(
+        profile_id, db, commit=False, pending_audio_paths=pending_audio_paths,
+    )
     if deleted_generations:
         logger.info("Deleted %d generations belonging to profile %s", deleted_generations, profile_id)
 
@@ -494,11 +511,25 @@ async def delete_profile(
     )
 
     db.delete(profile)
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
 
-    profile_dir = config.get_profiles_dir() / profile_id
+    history._remove_deleted_audio(pending_audio_paths, db)
+
+    profiles_dir = config.get_profiles_dir()
+    profile_dir = profiles_dir / profile_id
     if profile_dir.exists():
-        shutil.rmtree(profile_dir)
+        if (profile_dir.is_symlink() or profile_dir.resolve().parent != profiles_dir.resolve()
+                or history._directory_has_saved_files(profile_dir, db)):
+            logger.warning("Retaining deleted profile directory %s because it may contain saved data", profile_dir)
+        else:
+            try:
+                shutil.rmtree(profile_dir)
+            except OSError:
+                logger.warning("Could not remove deleted profile directory %s", profile_dir, exc_info=True)
 
     # Clean up combined audio cache files for this profile
     clear_profile_cache(profile_id)
@@ -528,11 +559,15 @@ async def delete_profile_sample(
     profile_id = sample.profile_id
 
     audio_path = config.resolve_storage_path(sample.audio_path)
-    if audio_path is not None and audio_path.exists():
-        audio_path.unlink()
-
     db.delete(sample)
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    if audio_path is not None:
+        history._remove_deleted_audio({audio_path}, db)
 
     # Invalidate combined audio cache for this profile
     # Since the sample set changed, any cached combined audio is now stale
@@ -721,10 +756,7 @@ async def upload_avatar(
     if not is_valid:
         raise ValueError(error_msg)
 
-    if profile.avatar_path:
-        old_avatar = config.resolve_storage_path(profile.avatar_path)
-        if old_avatar is not None and old_avatar.exists():
-            old_avatar.unlink()
+    old_avatar = config.resolve_storage_path(profile.avatar_path)
 
     # Determine file extension from uploaded file
     from PIL import Image
@@ -740,14 +772,20 @@ async def upload_avatar(
 
     profile_dir = config.get_profiles_dir() / profile_id
     profile_dir.mkdir(parents=True, exist_ok=True)
-    output_path = profile_dir / f"avatar{ext}"
+    output_path = profile_dir / f"avatar-{uuid.uuid4().hex}{ext}"
 
-    process_avatar(image_path, str(output_path))
+    try:
+        process_avatar(image_path, str(output_path))
+        profile.avatar_path = config.to_storage_path(output_path)
+        profile.updated_at = datetime.now(UTC)
+        db.commit()
+    except Exception:
+        db.rollback()
+        output_path.unlink(missing_ok=True)
+        raise
 
-    profile.avatar_path = config.to_storage_path(output_path)
-    profile.updated_at = datetime.now(UTC)
-
-    db.commit()
+    if old_avatar is not None:
+        history._remove_deleted_audio({old_avatar}, db)
     db.refresh(profile)
 
     return _profile_to_response(profile)
@@ -772,12 +810,14 @@ async def delete_avatar(
         return False
 
     avatar_path = config.resolve_storage_path(profile.avatar_path)
-    if avatar_path is not None and avatar_path.exists():
-        avatar_path.unlink()
-
     profile.avatar_path = None
     profile.updated_at = datetime.now(UTC)
-
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    if avatar_path is not None:
+        history._remove_deleted_audio({avatar_path}, db)
 
     return True

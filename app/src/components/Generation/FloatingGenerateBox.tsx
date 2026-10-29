@@ -56,6 +56,8 @@ export function FloatingGenerateBox({
   const [isExpanded, setIsExpanded] = useState(false);
   const [isInstructExpanded, setIsInstructExpanded] = useState(false);
   const selectedPresetId = useGenerationDraftStore((state) => state.presetId);
+  const draftProfileId = useGenerationDraftStore((state) => state.profileId);
+  const profileApplied = useGenerationDraftStore((state) => state.profileApplied);
   const setSelectedPresetId = useGenerationDraftStore((state) => state.setPresetId);
   const mountedRef = useRef(false);
   const profileIdentity = useRef({ id: selectedProfileId, revision: 0 });
@@ -306,6 +308,7 @@ export function FloatingGenerateBox({
   const floating = layout === 'floating';
   const expanded = !floating || isExpanded;
   const engine = form.watch('engine');
+  const modelSize = form.watch('modelSize');
   const script = form.watch('text') || '';
   const triggerClass = 'h-9 w-full rounded-lg text-sm';
 
@@ -390,7 +393,16 @@ export function FloatingGenerateBox({
                 render={() => (
                   <FormItem className="min-w-0 space-y-2">
                     <FormLabel className="text-xs">Engine</FormLabel>
-                    <EngineModelSelector form={form} />
+                    <EngineModelSelector
+                      form={form}
+                      selectedProfile={
+                        profileApplied &&
+                        draftProfileId === selectedProfileId &&
+                        selectedProfile?.id === selectedProfileId
+                          ? selectedProfile
+                          : null
+                      }
+                    />
                   </FormItem>
                 )}
               />
@@ -407,7 +419,7 @@ export function FloatingGenerateBox({
                         </SelectTrigger>
                       </FormControl>
                       <SelectContent side={floating ? 'top' : undefined}>
-                        {getLanguageOptionsForEngine(engine || 'qwen').map((lang) => (
+                        {getLanguageOptionsForEngine(engine || 'qwen', modelSize).map((lang) => (
                           <SelectItem key={lang.value} value={lang.value}>
                             {lang.label}
                           </SelectItem>

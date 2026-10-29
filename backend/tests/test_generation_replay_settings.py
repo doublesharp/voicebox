@@ -1,6 +1,7 @@
 import json
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import Session
 
@@ -119,3 +120,60 @@ async def test_invalid_snapshot_does_not_mark_the_generation_running(replay):
     assert error.value.status_code == 400
     assert db.get(Generation, "invalid").status == "failed"
     assert calls == []
+
+
+@pytest.mark.parametrize("action", ["generate", "retry", "regenerate"])
+async def test_enqueue_failure_does_not_leave_generation_active(replay, monkeypatch, action):
+    from backend.utils.tasks import TaskManager
+
+    db, _ = replay
+    task_manager = TaskManager()
+    monkeypatch.setattr(generations, "get_task_manager", lambda: task_manager)
+    def reject(_generation_id, coro):
+        coro.close()
+        raise RuntimeError("queue unavailable")
+    monkeypatch.setattr(generations, "enqueue_generation", reject)
+
+    if action == "generate":
+        call = generations.generate_speech(models.GenerationRequest(profile_id="voice", text="Hello"), db)
+    else:
+        status = "failed" if action == "retry" else "completed"
+        db.add(Generation(id="gen", profile_id="voice", text="Hello", status=status,
+                          error="old failure" if action == "retry" else None,
+                          audio_path="preserved.wav", duration=1.25))
+        db.commit()
+        call = getattr(generations, f"{action}_generation")("gen", db)
+
+    with pytest.raises(HTTPException) as error:
+        await call
+    assert error.value.status_code == 503
+    assert task_manager.get_active_generations() == []
+    db.expire_all()
+    row = db.query(Generation).one()
+    if action == "generate":
+        assert row.status == "failed"
+        assert row.error
+    else:
+        assert row.status == ("failed" if action == "retry" else "completed")
+        assert row.audio_path == "preserved.wav"
+        assert row.duration == 1.25
+        assert row.error == ("old failure" if action == "retry" else None)
+
+
+async def test_rejected_retry_does_not_remove_existing_task_tracking(replay, monkeypatch):
+    from backend.utils.tasks import TaskManager
+
+    db, _ = replay
+    db.add(Generation(id="gen", profile_id="voice", text="Hello", status="failed"))
+    db.commit()
+    task_manager = TaskManager()
+    task_manager.start_generation("gen", "voice", "already running")
+    monkeypatch.setattr(generations, "get_task_manager", lambda: task_manager)
+    def reject(_generation_id, coro):
+        coro.close()
+        raise ValueError("already queued or running")
+    monkeypatch.setattr(generations, "enqueue_generation", reject)
+    with pytest.raises(HTTPException):
+        await generations.retry_generation("gen", db)
+    assert task_manager.is_generation_active("gen")
+    assert task_manager.get_active_generations()[0].text_preview == "already running"

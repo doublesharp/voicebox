@@ -9,6 +9,7 @@ interface UseModelDownloadToastOptions {
   modelName: string;
   displayName: string;
   enabled?: boolean;
+  includeTerminalSnapshot?: boolean;
   onComplete?: () => void;
   onError?: (error: string) => void;
 }
@@ -21,6 +22,7 @@ export function useModelDownloadToast({
   modelName,
   displayName,
   enabled = false,
+  includeTerminalSnapshot = false,
   onComplete,
   onError,
 }: UseModelDownloadToastOptions) {
@@ -69,15 +71,17 @@ export function useModelDownloadToast({
     toastUpdateRef.current = toastResult.update;
 
     // Subscribe to progress updates via Server-Sent Events
-    const eventSourceUrl = `${serverUrl}/models/progress/${modelName}`;
+    const eventSourceUrl = `${serverUrl}/models/progress/${modelName}${includeTerminalSnapshot ? '?include_terminal=true' : ''}`;
     console.log('[useModelDownloadToast] Creating EventSource to:', eventSourceUrl);
     const eventSource = new EventSource(eventSourceUrl);
+    let active = true;
 
     eventSource.onopen = () => {
       console.log('[useModelDownloadToast] EventSource connection opened for:', modelName);
     };
 
     eventSource.onmessage = (event) => {
+      if (!active) return;
       console.log('[useModelDownloadToast] Received SSE message:', event.data);
       try {
         const progress = JSON.parse(event.data) as ModelProgress;
@@ -135,9 +139,8 @@ export function useModelDownloadToast({
               progress.status === 'complete' || progress.status === 'error' ? 5000 : Infinity,
           });
 
-          // Close connection and dismiss toast on completion or error
-          // Also treat progress >= 100% as complete
-          const isComplete = progress.status === 'complete' || progress.progress >= 100;
+          // Byte transfer can reach 100% before extraction or model loading.
+          const isComplete = progress.status === 'complete';
           const isError = progress.status === 'error';
 
           if (isComplete || isError) {
@@ -146,8 +149,9 @@ export function useModelDownloadToast({
               isError,
               progress: progress.progress,
             });
+            active = false;
             eventSource.close();
-            eventSourceRef.current = null;
+            if (eventSourceRef.current === eventSource) eventSourceRef.current = null;
 
             // Update toast to show completion state before callbacks
             if (isComplete && toastUpdateRef.current) {
@@ -179,10 +183,12 @@ export function useModelDownloadToast({
     };
 
     eventSource.onerror = (error) => {
+      if (!active) return;
+      active = false;
       console.error('[useModelDownloadToast] SSE error for:', modelName, error);
       console.log('[useModelDownloadToast] EventSource readyState:', eventSource.readyState);
       eventSource.close();
-      eventSourceRef.current = null;
+      if (eventSourceRef.current === eventSource) eventSourceRef.current = null;
 
       // Show error toast
       if (toastIdRef.current && toastUpdateRef.current) {
@@ -202,13 +208,24 @@ export function useModelDownloadToast({
     // Cleanup on unmount or when disabled
     return () => {
       console.log('[useModelDownloadToast] Cleanup - closing EventSource for:', modelName);
-      if (eventSourceRef.current) {
-        eventSourceRef.current.close();
+      active = false;
+      eventSource.close();
+      if (eventSourceRef.current === eventSource) {
         eventSourceRef.current = null;
       }
       // Note: We don't dismiss the toast here as it might still be showing completion state
     };
-  }, [enabled, serverUrl, modelName, displayName, toast, formatBytes, onComplete, onError]);
+  }, [
+    enabled,
+    serverUrl,
+    modelName,
+    displayName,
+    toast,
+    formatBytes,
+    onComplete,
+    onError,
+    includeTerminalSnapshot,
+  ]);
 
   return {
     isTracking: enabled && eventSourceRef.current !== null,
