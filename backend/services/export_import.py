@@ -412,11 +412,11 @@ async def import_generation_from_zip(file_bytes: bytes, db: Session) -> dict:
                     raise ValueError("No voice profiles found. Please create a profile before importing generations.")
             
             # Extract audio file to temporary location
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                tmp.write(zip_file.read(audio_file_path))
-                tmp_path = tmp.name
-            
+            tmp_path = None
             try:
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                    tmp_path = tmp.name
+                    tmp.write(zip_file.read(audio_file_path))
                 # Create generations directory
                 generations_dir = config.get_generations_dir()
                 generations_dir.mkdir(parents=True, exist_ok=True)
@@ -426,23 +426,25 @@ async def import_generation_from_zip(file_bytes: bytes, db: Session) -> dict:
                 
                 # Copy audio to generations directory
                 audio_dest = generations_dir / f"{new_generation_id}.wav"
-                shutil.copy(tmp_path, audio_dest)
-                
-                # Create generation record
-                db_generation = DBGeneration(
-                    id=new_generation_id,
-                    profile_id=profile_id,
-                    text=generation_data["text"],
-                    language=generation_data["language"],
-                    audio_path=config.to_storage_path(audio_dest),
-                    duration=generation_data["duration"],
-                    seed=generation_data.get("seed"),
-                    instruct=generation_data.get("instruct"),
-                    created_at=datetime.now(UTC),
-                )
-                
-                db.add(db_generation)
-                db.commit()
+                try:
+                    shutil.copy(tmp_path, audio_dest)
+                    db_generation = DBGeneration(
+                        id=new_generation_id,
+                        profile_id=profile_id,
+                        text=generation_data["text"],
+                        language=generation_data["language"],
+                        audio_path=config.to_storage_path(audio_dest),
+                        duration=generation_data["duration"],
+                        seed=generation_data.get("seed"),
+                        instruct=generation_data.get("instruct"),
+                        created_at=datetime.now(UTC),
+                    )
+                    db.add(db_generation)
+                    db.commit()
+                except BaseException:
+                    db.rollback()
+                    audio_dest.unlink(missing_ok=True)
+                    raise
                 db.refresh(db_generation)
                 
                 return {
@@ -455,7 +457,8 @@ async def import_generation_from_zip(file_bytes: bytes, db: Session) -> dict:
                 
             finally:
                 # Clean up temp file
-                Path(tmp_path).unlink(missing_ok=True)
+                if tmp_path is not None:
+                    Path(tmp_path).unlink(missing_ok=True)
             
     except zipfile.BadZipFile:
         raise ValueError("Invalid ZIP file")

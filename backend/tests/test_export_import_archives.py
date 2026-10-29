@@ -183,6 +183,25 @@ async def test_generation_import_rejects_missing_default_take(db, monkeypatch, t
     assert db.query(Generation).count() == 0
 
 
+@pytest.mark.asyncio
+async def test_generation_import_removes_audio_when_database_commit_fails(db, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "_data_dir", tmp_path)
+    db.add(VoiceProfile(id="p", name="Voice"))
+    db.commit()
+    data = io.BytesIO()
+    with zipfile.ZipFile(data, "w") as z:
+        z.writestr("manifest.json", json.dumps({"version": "1.0", "profile": {"name": "Voice"},
+                                               "generation": {"text": "Hi", "language": "en", "duration": 1}}))
+        z.writestr("audio/legacy.wav", b"audio")
+    def fail_commit():
+        raise RuntimeError("database unavailable")
+    monkeypatch.setattr(db, "commit", fail_commit)
+    with pytest.raises(ValueError, match="database unavailable"):
+        await export_import.import_generation_from_zip(data.getvalue(), db)
+    assert db.query(Generation).count() == 0
+    assert list(config.get_generations_dir().iterdir()) == []
+
+
 @pytest.mark.parametrize("path", [None, "missing.wav"])
 def test_generation_export_rejects_missing_legacy_audio(db, monkeypatch, tmp_path, path):
     monkeypatch.setattr(config, "_data_dir", tmp_path)
