@@ -381,7 +381,7 @@ async def _unload_models() -> None:
     except Exception:
         logger.exception("Failed to unload TTS model")
     try:
-        transcribe.unload_whisper_model()
+        await transcribe.unload_whisper_model_async()
     except Exception:
         logger.exception("Failed to unload Whisper model")
     try:

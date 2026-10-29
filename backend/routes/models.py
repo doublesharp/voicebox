@@ -106,11 +106,15 @@ async def _run_model_work(configuration, operation):
 
 
 async def _unload_model_work(configuration):
-    """Wait for an active local LLM operation before unloading its model."""
+    """Wait for an active speech or LLM operation before unloading its model."""
     from ..backends import get_llm_backend_for_engine, unload_model_by_config
 
-    if configuration.engine == "qwen_llm":
-        backend = get_llm_backend_for_engine("qwen_llm")
+    if configuration.engine in ("qwen_llm", "whisper"):
+        if configuration.engine == "qwen_llm":
+            backend = get_llm_backend_for_engine("qwen_llm")
+        else:
+            from ..services.transcribe import get_whisper_model
+            backend = get_whisper_model()
         lock = getattr(backend, "_op_lock", None)
         if lock is not None:
             async with lock:
@@ -572,8 +576,12 @@ async def delete_model(model_name: str):
 
     try:
         async with AsyncExitStack() as stack:
-            if config.engine == "qwen_llm":
-                backend = get_llm_backend_for_engine("qwen_llm")
+            if config.engine in ("qwen_llm", "whisper"):
+                if config.engine == "qwen_llm":
+                    backend = get_llm_backend_for_engine("qwen_llm")
+                else:
+                    from ..services.transcribe import get_whisper_model
+                    backend = get_whisper_model()
                 lock = getattr(backend, "_op_lock", None)
                 if lock is not None:
                     await stack.enter_async_context(lock)

@@ -40,6 +40,7 @@ from .base import (  # noqa: E402
     empty_mlx_cache,
 )
 from ..utils.cache import get_cache_key, get_cached_voice_prompt, cache_voice_prompt  # noqa: E402
+from ..utils.async_work import run_owned  # noqa: E402
 
 
 class VoiceCloningError(RuntimeError):
@@ -364,11 +365,10 @@ class MLXSTTBackend:
         if model_size is None:
             model_size = self.model_size
 
-        if self.model is not None and self.model_size == model_size:
-            return
-
-        # Run blocking load in thread pool
-        await _run_on_mlx_thread(self._load_model_sync, model_size)
+        async with self._op_lock:
+            if self.model is not None and self.model_size == model_size:
+                return
+            await run_owned(_run_on_mlx_thread(self._load_model_sync, model_size))
 
     # Alias for compatibility
     load_model = load_model_async
@@ -466,4 +466,4 @@ class MLXSTTBackend:
                     empty_mlx_cache()
 
         async with self._op_lock:
-            return await _run_on_mlx_thread(_reload_and_transcribe_sync)
+            return await run_owned(_run_on_mlx_thread(_reload_and_transcribe_sync))
