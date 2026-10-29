@@ -70,7 +70,7 @@ export function AudioSampleUpload({
               }
             }}
             onKeyDown={(e) => {
-              if (e.key === 'Enter' || e.key === ' ') {
+              if (e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) {
                 e.preventDefault();
                 fileInputRef.current?.click();
               }
