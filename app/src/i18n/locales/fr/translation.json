@@ -917,6 +917,8 @@
           "change": "Modifier"
         },
         "chordPicker": {
+          "conflictTitle": "Raccourci déjà utilisé",
+          "conflictDescription": "Choisissez des raccourcis différents pour parler en maintenant et pour l’enregistrement continu.",
           "pttTitle": "Définir le raccourci push-to-talk",
           "pttDescription": "Maintenez les touches souhaitées, puis relâchez et cliquez sur Enregistrer. Le badge de modification droite/gauche indique de quel côté est une touche.",
           "toggleTitle": "Définir le raccourci bascule",

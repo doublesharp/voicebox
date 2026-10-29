@@ -32,7 +32,7 @@ import { useProfiles } from '@/lib/hooks/useProfiles';
 import { usePlatform } from '@/platform/PlatformContext';
 import { useServerStore } from '@/stores/serverStore';
 import { cn } from '@/lib/utils/cn';
-import { defaultChordKeys, displayLabelForKey, modifierSideHint } from '@/lib/utils/keyCodes';
+import { chordKeysEqual, defaultChordKeys, displayLabelForKey, modifierSideHint } from '@/lib/utils/keyCodes';
 import type { Qwen3ModelSize, VoiceProfileResponse, WhisperModelSize } from '@/lib/api/types';
 import { SettingRow, SettingSection } from './SettingRow';
 
@@ -337,6 +337,14 @@ export function CapturesPage() {
           initialKeys={pushToTalkKeys}
           onCancel={() => setChordEditor(null)}
           onSave={(keys) => {
+            if (chordKeysEqual(keys, toggleToTalkKeys)) {
+              toast({
+                title: t('settings.captures.dictation.chordPicker.conflictTitle'),
+                description: t('settings.captures.dictation.chordPicker.conflictDescription'),
+                variant: 'destructive',
+              });
+              return;
+            }
             update({ chord_push_to_talk_keys: keys });
             setChordEditor(null);
           }}
@@ -349,6 +357,14 @@ export function CapturesPage() {
           initialKeys={toggleToTalkKeys}
           onCancel={() => setChordEditor(null)}
           onSave={(keys) => {
+            if (chordKeysEqual(keys, pushToTalkKeys)) {
+              toast({
+                title: t('settings.captures.dictation.chordPicker.conflictTitle'),
+                description: t('settings.captures.dictation.chordPicker.conflictDescription'),
+                variant: 'destructive',
+              });
+              return;
+            }
             update({ chord_toggle_to_talk_keys: keys });
             setChordEditor(null);
           }}

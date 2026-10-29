@@ -917,6 +917,8 @@
           "change": "Cambia"
         },
         "chordPicker": {
+          "conflictTitle": "Scorciatoia già in uso",
+          "conflictDescription": "Scegli scorciatoie diverse per parlare tenendo premuto e per la registrazione continua.",
           "pttTitle": "Imposta la scorciatoia push-to-talk",
           "pttDescription": "Tieni premuti i tasti che desideri utilizzare, quindi rilasciali e clicca su Salva. L'indicatore del tasto modificatore sul lato destro mostra se si tratta della variante sinistra o destra.",
           "toggleTitle": "Imposta la scorciatoia di attivazione/disattivazione",

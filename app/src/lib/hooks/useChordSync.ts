@@ -1,5 +1,8 @@
 import { invoke } from '@tauri-apps/api/core';
 import { useEffect } from 'react';
+import { useTranslation } from 'react-i18next';
+import { toast } from '@/components/ui/use-toast';
+import { chordKeysEqual } from '@/lib/utils/keyCodes';
 import { useDictationReadiness } from '@/lib/hooks/useDictationReadiness';
 import { useCaptureSettings } from '@/lib/hooks/useSettings';
 import { usePlatform } from '@/platform/PlatformContext';
@@ -27,6 +30,7 @@ import { usePlatform } from '@/platform/PlatformContext';
  */
 export function useChordSync() {
   const platform = usePlatform();
+  const { t } = useTranslation();
   const { settings } = useCaptureSettings();
   const { canRecord } = useDictationReadiness();
   const enabled = settings?.hotkey_enabled;
@@ -36,7 +40,15 @@ export function useChordSync() {
   useEffect(() => {
     if (!platform.metadata.isTauri) return;
     if (enabled === undefined || !pushKeys || !toggleKeys) return;
-    const shouldArm = enabled && canRecord;
+    const conflict = chordKeysEqual(pushKeys, toggleKeys);
+    const shouldArm = enabled && canRecord && !conflict;
+    if (enabled && conflict) {
+      toast({
+        title: t('settings.captures.dictation.chordPicker.conflictTitle'),
+        description: t('settings.captures.dictation.chordPicker.conflictDescription'),
+        variant: 'destructive',
+      });
+    }
     const command = shouldArm ? 'enable_hotkey' : 'disable_hotkey';
     const args = shouldArm ? { pushToTalk: pushKeys, toggleToTalk: toggleKeys } : {};
     invoke(command, args).catch((err) => {
@@ -46,6 +58,7 @@ export function useChordSync() {
     platform.metadata.isTauri,
     enabled,
     canRecord,
+    t,
     // Stringify so a referentially-new array with the same content
     // doesn't fire a redundant invoke on every settings refetch.
     pushKeys?.join(','),

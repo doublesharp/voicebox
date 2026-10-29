@@ -166,3 +166,20 @@ export function sortChordKeys(keys: string[]): string[] {
     return a.localeCompare(b);
   });
 }
+
+/** Normalize historical aliases before comparing physical chord keys. */
+export function chordKeysEqual(left: string[], right: string[]): boolean {
+  const aliases: Record<string, string> = {
+    Alt: 'AltLeft', AltGr: 'AltRight', Return: 'Enter',
+    UpArrow: 'ArrowUp', DownArrow: 'ArrowDown', LeftArrow: 'ArrowLeft', RightArrow: 'ArrowRight',
+    BackQuote: 'Backquote', LeftBracket: 'BracketLeft', RightBracket: 'BracketRight',
+    SemiColon: 'Semicolon', BackSlash: 'Backslash', Dot: 'Period',
+  };
+  const normalize = (keys: string[]) => new Set(keys.map((key) => {
+    const digit = /^Num([0-9])$/.exec(key);
+    return digit ? `Digit${digit[1]}` : (aliases[key] ?? key);
+  }));
+  const a = normalize(left);
+  const b = normalize(right);
+  return a.size === b.size && [...a].every((key) => b.has(key));
+}
