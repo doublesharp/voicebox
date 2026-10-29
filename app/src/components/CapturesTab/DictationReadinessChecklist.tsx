@@ -55,9 +55,11 @@ function ChecklistRow({ icon, title, description, ready, action }: RowProps) {
 
 function progressPercent(task: ActiveDownloadTask | undefined): number | null {
   if (!task) return null;
-  if (typeof task.progress === 'number')
+  if (typeof task.progress === 'number' && Number.isFinite(task.progress))
     return Math.round(Math.max(0, Math.min(100, task.progress)));
-  if (task.current && task.total) return Math.round((task.current / task.total) * 100);
+  if (typeof task.current === 'number' && Number.isFinite(task.current) &&
+      typeof task.total === 'number' && Number.isFinite(task.total) && task.total > 0)
+    return Math.round(Math.max(0, Math.min(100, (task.current / task.total) * 100)));
   return null;
 }
 
@@ -98,7 +100,7 @@ export function DictationReadinessChecklist({
     // 5s otherwise. Keeps progress feeling live without hammering when idle.
     refetchInterval: (query) => {
       const data = query.state.data;
-      const hasActive = data?.downloads.some((d) => d.status === 'downloading');
+      const hasActive = data?.downloads.some((d) => (d.status === 'downloading' || d.status === 'extracting'));
       return hasActive ? 1000 : 5000;
     },
   });
@@ -109,7 +111,7 @@ export function DictationReadinessChecklist({
   const downloadByModel = useMemo(() => {
     const m = new Map<string, ActiveDownloadTask>();
     for (const dl of activeTasks?.downloads ?? []) {
-      if (dl.status === 'downloading') m.set(dl.model_name, dl);
+      if ((dl.status === 'downloading' || dl.status === 'extracting')) m.set(dl.model_name, dl);
     }
     return m;
   }, [activeTasks]);
