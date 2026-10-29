@@ -18,6 +18,14 @@ import {
 } from '@/lib/utils/keyCodes';
 import { cn } from '@/lib/utils/cn';
 
+function isInteractiveTarget(target: EventTarget | null): boolean {
+  return Boolean(
+    (target as Element | null)?.closest?.(
+      'button, input, select, textarea, [contenteditable="true"]',
+    ),
+  );
+}
+
 interface ChordPickerProps {
   open: boolean;
   /** Title shown in the modal — caller picks "push-to-talk" vs "toggle". */
@@ -56,64 +64,65 @@ export function ChordPicker({
   const [captured, setCaptured] = useState<string[]>(initialKeys);
   const [unsupportedAttempt, setUnsupportedAttempt] = useState<string | null>(null);
   const captureRef = useRef<HTMLDivElement>(null);
+  const initialKeysRef = useRef(initialKeys);
+  initialKeysRef.current = initialKeys;
 
   // Reset every time the modal re-opens — otherwise the previous picker
   // session's peak set leaks into the next open and confuses the user.
   useEffect(() => {
     if (open) {
       setPressed(new Set());
-      setCaptured(initialKeys);
+      setCaptured(initialKeysRef.current);
       setUnsupportedAttempt(null);
       // Defer focus to the next paint so the dialog is mounted.
       const timeoutId = window.setTimeout(() => captureRef.current?.focus(), 50);
       return () => window.clearTimeout(timeoutId);
     }
     return;
-  }, [open, initialKeys]);
+  }, [open]);
 
-  const handleKeyDown = useCallback(
-    (event: KeyboardEvent) => {
-      // Esc reaches the dialog's onOpenChange and closes the modal — let
-      // it pass through unmodified.
-      if (event.key === 'Escape') return;
-      // Tab cycles focus inside the dialog; capturing it would trap the
-      // user. Same for the dialog's own keyboard interactions.
-      if (event.key === 'Tab') return;
+  const handleKeyDown = useCallback((event: KeyboardEvent) => {
+    // Esc reaches the dialog's onOpenChange and closes the modal — let
+    // it pass through unmodified.
+    if (event.key === 'Escape') return;
+    // Tab cycles focus inside the dialog; capturing it would trap the
+    // user. Same for the dialog's own keyboard interactions.
+    if (event.key === 'Tab') return;
+    // Let focused dialog controls handle activation and editing keys.
+    if (isInteractiveTarget(event.target)) return;
 
-      const canonical = canonicalKeyFromEvent(event);
-      if (!canonical) {
-        setUnsupportedAttempt(event.code || event.key || 'unknown');
-        event.preventDefault();
-        return;
-      }
-
+    const canonical = canonicalKeyFromEvent(event);
+    if (!canonical) {
+      setUnsupportedAttempt(event.code || event.key || 'unknown');
       event.preventDefault();
-      event.stopPropagation();
-      setUnsupportedAttempt(null);
+      return;
+    }
 
-      setPressed((prev) => {
-        if (prev.has(canonical)) return prev;
-        const next = new Set(prev);
-        next.add(canonical);
-        setCaptured((prevCaptured) => {
-          const candidate = sortChordKeys(Array.from(next));
-          // First key in a fresh sequence replaces the peak — otherwise a
-          // user trying to swap a longer saved chord for a shorter one is
-          // stuck because their candidate never beats the seed length.
-          if (prev.size === 0) return candidate;
-          return candidate.length >= prevCaptured.length ? candidate : prevCaptured;
-        });
-        return next;
+    event.preventDefault();
+    event.stopPropagation();
+    setUnsupportedAttempt(null);
+
+    setPressed((prev) => {
+      if (prev.has(canonical)) return prev;
+      const next = new Set(prev);
+      next.add(canonical);
+      setCaptured((prevCaptured) => {
+        const candidate = sortChordKeys(Array.from(next));
+        // First key in a fresh sequence replaces the peak — otherwise a
+        // user trying to swap a longer saved chord for a shorter one is
+        // stuck because their candidate never beats the seed length.
+        if (prev.size === 0) return candidate;
+        return candidate.length >= prevCaptured.length ? candidate : prevCaptured;
       });
-    },
-    [],
-  );
+      return next;
+    });
+  }, []);
 
   const handleKeyUp = useCallback((event: KeyboardEvent) => {
     if (event.key === 'Escape' || event.key === 'Tab') return;
     const canonical = canonicalKeyFromEvent(event);
     if (!canonical) return;
-    event.preventDefault();
+    if (!isInteractiveTarget(event.target)) event.preventDefault();
     setPressed((prev) => {
       if (!prev.has(canonical)) return prev;
       const next = new Set(prev);
@@ -128,20 +137,26 @@ export function ChordPicker({
     if (!open) return;
     window.addEventListener('keydown', handleKeyDown, true);
     window.addEventListener('keyup', handleKeyUp, true);
+    const handleBlur = () => setPressed(new Set());
+    window.addEventListener('blur', handleBlur);
     return () => {
       window.removeEventListener('keydown', handleKeyDown, true);
       window.removeEventListener('keyup', handleKeyUp, true);
+      window.removeEventListener('blur', handleBlur);
     };
   }, [open, handleKeyDown, handleKeyUp]);
 
-  const displayKeys = pressed.size > 0
-    ? sortChordKeys(Array.from(pressed))
-    : captured;
+  const displayKeys = pressed.size > 0 ? sortChordKeys(Array.from(pressed)) : captured;
 
   const canSave = captured.length > 0;
 
   return (
-    <Dialog open={open} onOpenChange={(next) => { if (!next) onCancel(); }}>
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        if (!next) onCancel();
+      }}
+    >
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>{title}</DialogTitle>
