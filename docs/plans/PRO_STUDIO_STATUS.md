@@ -1,48 +1,48 @@
 # Voicebox DS implementation status
 
-Local Coordinate is the authoritative task and evidence record. Project: `project_14a676bd-5cff-4ffe-ad9c-9aa08abc554e`; effort: `effort_efc6c236-4604-4cb2-95ee-f1e66c8e6320`. This is a short working view of the 2026-10-28 implementation.
+S1 feature implementation is complete for testing. Full runtime acceptance remains open. Local Coordinate is authoritative: project `project_14a676bd-5cff-4ffe-ad9c-9aa08abc554e`, effort `effort_efc6c236-4604-4cb2-95ee-f1e66c8e6320`, integration work `work_1e51884b-8640-4e14-9b21-a13b5a54efe1`.
 
-| Feature | Implementation state |
+The testing branch is `doublesharp`. Verified code merge: `c79bbeda6611df534cb6322725ea87aa7fbb9b19`; subsequent status-only commits do not change the tested application source.
+
+| Feature | Implementation |
 | --- | --- |
-| DoubleSharp identity and theme | Implemented; supplied logo, edition attribution, splash/settings/sidebar and display titles |
-| Projects, scripts and cast | Implemented; owned SQLite/audio, ordered passages and frozen voice/model variants |
-| Database and owned audio | Implemented; numbered transactional upgrades, verified pre-upgrade backups, newer-schema refusal, shared staged/hash-verified publication and quarantined orphan recovery |
-| Recovery and history | Implemented; revision checks, operation identity, independent window journals, undo/redo and immutable checkpoints |
-| Generation | Implemented; per-passage capability checks, frozen known adapter/runtime identity, durable phase/attempt history, commercial-only policy, retry identity, cancellation, stale-adoption protection and shared model ownership |
-| Retained takes and comparison | Implemented; undoable names/notes with durable recovery, temporary sampled-level A/B attenuation, frozen snapshots and explicit short-take replacement choices |
-| Arrangement | Implemented; selected-take and raw music/SFX insertion, voice tracks, sample placement, trims, split, gain, fades and mute/solo |
-| Review and delivery | Persistent checkpoint notes/checklists and local approval are merged; narration coverage, earlier-recording acknowledgement, mix/dry stems, WAV/MP3 and actual-file audition remain available |
-| Archives and imports | Implemented; copied Story/audio ownership, validated portable graph, hashes and clean-profile reopening |
-| Playback and visuals | Implemented; bounded preview ranges, awaited native ownership, cached waveforms, live sample-peak meters and reduced-motion styling |
+| DoubleSharp identity | Supplied logo, edition attribution, splash/settings/sidebar, display titles and restrained motion |
+| Projects, scripts and cast | Owned SQLite/audio, ordered passages, frozen voice/model configuration and capability-aware direction |
+| Persistence and recovery | Numbered migrations through version 5, verified backups, newer-schema refusal, staged audio publication, independent window journals, revision checks, undo/redo and checkpoints |
+| Generation | Per-passage capability validation, commercial-only policy, durable request/attempt/phase history, retry/cancellation, adoption protection and one physical inference owner |
+| Takes | Recoverable names/notes, retained alternatives, frozen provenance, temporary sampled-level A/B comparison and explicit short-take replacement choices |
+| Arrangement and visuals | Raw audio and selected-take insertion, keyboard/drop import, voice routing, sample placement/trims/split/gain/fades/mute/solo, bounded preview, cached waveforms and live sample-peak meters |
+| Mixing and mastering | Stateful bounded track effects, dry/processed output, aligned stems, master gain, editable loudness/peak targets and oversampled limiting; actual-file audition and frozen render provenance |
+| Local review | Persistent checkpoint-specific notes/checklists, independent CAS/replay, durable recovery and frozen local approval snapshots |
+| Delivery | Complete narration preflight, explicit earlier-recording consent, WAV24/MP3 preflight, render phases/attempts, preserved output through uncertain commits and truthful save receipts |
+| Story copying | Create studio copy from Stories, durable retry identity, independently owned pinned audio, preserved placement/trims/gain/overlap and conservative pinned-source stem routing |
+| Portable archives | Explicit all/used-take and reference inclusion scope, checkpoint/review preservation, validated graph/hashes/paths, missing optional-reference recovery and clean-profile reopening |
+| Recoverable storage cleanup | Protected-reference preview, stale-preview checks, explicit selection/confirmation, verified trash publication, exact retry and restore |
 
-The testing branch is `doublesharp` at `aedb3d5`. Persistent reviews and native staged publication are merged. Root is reviewing the remaining mixing and Story-copy changes separately; uncommitted implementation is not included in that testing revision.
+Studio supports the existing effects that preserve block shape. Enabled pitch shifting is rejected with a legacy Effects alternative until its variable output can be aligned. Dry output bypasses effects and master processing; processed stems omit master normalization/limiting and preserve relative track levels. The oversampled limiter is not certified for final true-peak compliance after resampling or encoding. Unmeasurable audio stays unavailable.
 
-## Remaining S1 implementation
+Archives explicitly exclude model weights, disposable caches and undo history; recorded jobs are provenance only. Missing optional voice references preserve included playback and re-export, while regeneration requires voice reassignment. Required audio and present corrupt assets still fail validation. Track identity is rebound during omission/remapping so retained-take replacement and empty-track reuse preserve mix settings.
 
-The current core is a foundation slice, not full S1 acceptance. The user has requested that these gaps be completed in feature branches and merged into `doublesharp` as each slice passes its checks:
+Cleanup retains audio reachable from drafts, checkpoints, history, takes, jobs, render inputs and retained metadata. It verifies a trash copy before committing source registration removal, and checks durable state before removing an original. Restore preserves recoverable bytes through uncertain acknowledgements. No automatic or permanent purge is offered: recoverable trash does not reduce total disk usage. Conservative historical receipts can retain otherwise unused audio.
 
-- Mixing/mastering: track effects, master gain, oversampled limiting, dry/processed output and stems are implemented. Independent review found uncertain-commit cleanup and unsupported pitch-processing faults; root repaired both and a fresh scoped recheck is pending. Legacy Effects remains available.
-- Persistent revision-bound notes/checklists are merged with durable recovery and frozen local approvals. The exact-replay field-order defect was repaired and independently rechecked.
-- Explicit archive scope and missing optional-regeneration-reference handling are being integrated. Native staged destination publication is merged; dialogs, Windows replacement/ACL behavior and packaged runtime remain unqualified.
-- Story Create studio copy, durable retry identity and an accessible empty-arrangement import target are implemented. A copied-Story stem identity repair is undergoing independent recheck.
-- Explicit recoverable storage cleanup with a complete retained-reference preview (P4.7) is being implemented. Automatic deletion remains disabled.
-- Applicable integration and runtime acceptance in the spec, with unrun environments tracked separately from missing feature code.
+## Verified source and fixtures
 
-Verification for the integrated testing branch: 317 backend checks, 223 frontend checks across 26 isolated test files, and seven device-independent native PCM/control tests pass. App and web no-emit typechecks pass. Independent scoped source reviews accepted shared inference/playback ownership and the capability/take integration repairs. The web production build also passes. Frontend files run in separate processes because existing module mocks contaminate a combined invocation.
+The exact clean code merge passed **386 backend tests**, **244 frontend checks in 31 isolated test files**, app/web no-emit typechecks and the web production build. Frontend files run in separate processes because existing mocks contaminate combined runs. The existing Scratch Python and dependency caches were reused; no models or packages were installed for these checks.
 
-The existing complete Scratch Python environment supplies the compatibility dependencies. The native macOS source/test bridge compiles with `cargo check --locked --offline --release --tests` using the existing Scratch cache. Existing real sidecars satisfy compile-time resource presence; this does not qualify their freshness or packaged launch. A standalone Tauri TypeScript check also reports window/virtual-module declarations and a missing workspace dependency link; it is not a passing gate. The original checkout's uncommitted playback helper and four failing fixtures are preserved outside these merges.
+The native macOS source/test bridge passes `cargo check --locked --offline --release --tests` at the earlier native/review merge; native Rust source is unchanged in the final code merge. Existing real sidecars satisfied compile-time resource presence, which does not qualify their freshness or packaged launch. Pure filesystem fixtures cover replacement, stream/rename failure and private Unix permissions; simulated write/flush/sync errors are not actual OS fault injection.
 
-A real offline renderer check against the final renderer/timing source used a 30-minute source split into 200 clips and produced the expected 48 kHz stereo WAV24 sample count. It completed in about 72 seconds with about 195 MiB process peak RSS. This measures that renderer fixture, excluding model inference, browser memory, UI timing and native audio. Raw evidence stays on Scratch and is referenced in Coordinate.
+Independent source reviews accepted the integrated inference/playback ownership and the completed feature slices. Reproduced repairs include recovery identity, review replay key order, uncertain render publication, unsupported pitch processing, imported Story stem identity, disabled slider gestures, portable track recipe preservation and malformed frozen archive snapshots. Logs, exact hashes, review reports and command receipts remain on Scratch and are referenced in Coordinate.
 
-Open qualification includes real preset/cloned/directed engines, GPU cancellation/contention, packaged lifecycle and output routing, listening and independent metering, rendered 800×600/200% zoom/accessibility checks, and native destination publication. Later S2 video automation, S3 collaboration and S4 calling/advanced capabilities remain separate phases.
+An earlier renderer baseline produced a 30-minute/200-clip WAV fixture in about 72 seconds with about 195 MiB process peak RSS. That receipt predates the new effects pipeline and is not a current application performance qualification.
 
+## Qualification still open
 
-## Testing branch integration
+- Real preset/cloned/directed models, GPU cancellation/contention and platform-specific model execution.
+- Actual browser layout, keyboard/accessibility and recovery/navigation journeys at 800×600 and 200% zoom.
+- Packaged lifecycle, native output routing/save dialogs, HTTP failure journeys and Windows replacement/ACL behavior.
+- Listening, independent metering, final encoded true-peak/loudness compliance and long-project UI/effects performance.
+- Actual disk-full, power-loss and OS write/flush failure behavior; current failure fixtures are bounded/injected.
 
-Previously committed feature, fix, improvement and test branch tips are included in the integrated history; the remaining uncommitted S1 slices are tracked above. This includes the audio-quality aggregate, TTS pipeline, native playback sessions, Story scheduling, pause preservation, clean reference capture and offline quality tools. Historical upstream branches are outside this integration.
+A standalone Tauri TypeScript check previously reported existing window/virtual-module declarations and workspace dependency resolution errors; it is not a passing gate. The original checkout's three unrelated playback edits and four known failing playback-output fixtures remain preserved outside these merges. Other owners' worktrees and packaging outputs remain untouched.
 
-Merge repairs retain one shared TTS lifecycle owner, queue pending native starts before Studio handover, preserve output-clock/version-edit safeguards, and consolidate the earlier reference preference into microphone settings. Reference recording retains the recorder's actual fallback container type. This integration makes the accumulated work available for testing; the S1 feature and runtime gaps above remain open.
-
-Persistence integration: Story/archive imports now use the same verified staged publisher as uploads. Real file/SQLite fixtures cover interrupted and corrupted copies, later-asset registration rollback, uncertain successful commits, migration failure, backup preservation and concurrent recovery/publication. Independent source reviews accepted the migration, publication and schema ownership changes; native/cross-platform qualification remains separate.
-
-Direction/take integration: registry/runtime identity now follows the actual engine adapter and relevant package versions; unresolved model terms stay excluded from commercial-only generation. Inactive direction is preserved, ordinary bracketed prose is not treated as an emotion token, and project polling exposes generation phases. Both new review findings (runtime identity and unjournaled take notes) were reproduced and repaired with scoped independent rechecks. Annotation keystrokes use journal version 2 with legacy recovery support. Sampled A/B levels are listening estimates, not integrated loudness or true-peak qualification.
+S2 video automation, S3 collaboration and S4 calling/advanced capabilities remain later phases. No release, signing, notarization, deployment or updater-channel change is claimed by this testing integration.
