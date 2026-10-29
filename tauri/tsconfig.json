@@ -18,9 +18,10 @@
     "types": ["vite/client"],
     "baseUrl": ".",
     "paths": {
-      "@/*": ["../app/src/*"]
+      "@/*": ["../app/src/*"],
+      "@tanstack/react-query": ["../app/node_modules/@tanstack/react-query"]
     }
   },
-  "include": ["src"],
+  "include": ["src", "../app/src/global.d.ts"],
   "references": [{ "path": "./tsconfig.node.json" }]
 }
