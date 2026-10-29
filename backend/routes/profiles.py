@@ -21,6 +21,20 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+PROFILE_IMPORT_MAX_BYTES = 100 * 1024 * 1024
+PROFILE_AVATAR_MAX_BYTES = 5 * 1024 * 1024
+PROFILE_UPLOAD_CHUNK_BYTES = 1024 * 1024
+
+
+async def _copy_bounded_upload(file: UploadFile, destination, limit: int, *, status: int, detail: str):
+    """Copy without reading unbounded input or writing bytes past the limit."""
+    total = 0
+    while chunk := await file.read(min(PROFILE_UPLOAD_CHUNK_BYTES, limit - total + 1)):
+        total += len(chunk)
+        if total > limit:
+            raise HTTPException(status_code=status, detail=detail)
+        destination.write(chunk)
+
 
 @router.post("/profiles", response_model=models.VoiceProfileResponse)
 async def create_profile(
@@ -48,17 +62,14 @@ async def import_profile(
     db: Session = Depends(get_db),
 ):
     """Import a voice profile from a ZIP archive."""
-    MAX_FILE_SIZE = 100 * 1024 * 1024
-
-    content = await file.read()
-
-    if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=400, detail=f"File too large. Maximum size is {MAX_FILE_SIZE / (1024 * 1024)}MB"
-        )
+    content = io.BytesIO()
+    await _copy_bounded_upload(
+        file, content, PROFILE_IMPORT_MAX_BYTES, status=400,
+        detail=f"File too large. Maximum size is {PROFILE_IMPORT_MAX_BYTES / (1024 * 1024)}MB",
+    )
 
     try:
-        profile = await export_import.import_profile_from_zip(content, db)
+        profile = await export_import.import_profile_from_zip(content.getvalue(), db)
         return profile
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -231,8 +242,10 @@ async def upload_profile_avatar(
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename or "").suffix) as tmp:
             tmp_path = tmp.name
-            content = await file.read()
-            tmp.write(content)
+            await _copy_bounded_upload(
+                file, tmp, PROFILE_AVATAR_MAX_BYTES, status=413,
+                detail=f"File too large (max {PROFILE_AVATAR_MAX_BYTES // (1024 * 1024)} MB)",
+            )
         try:
             return await profiles.upload_avatar(profile_id, tmp_path, db)
         except ValueError as e:
