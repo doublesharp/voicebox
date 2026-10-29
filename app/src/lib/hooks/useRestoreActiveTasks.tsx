@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { apiClient } from '@/lib/api/client';
 import type { ActiveDownloadTask } from '@/lib/api/types';
 import { useGenerationStore } from '@/stores/generationStore';
+import { useServerStore } from '@/stores/serverStore';
 
 // Polling interval in milliseconds
 const POLL_INTERVAL = 30000;
@@ -15,6 +16,8 @@ const POLL_INTERVAL = 30000;
  */
 export function useRestoreActiveTasks() {
   const [activeDownloads, setActiveDownloads] = useState<ActiveDownloadTask[]>([]);
+  const serverUrl = useServerStore((state) => state.serverUrl);
+  const serverRevision = useServerStore((state) => state.serverRevision);
   const setActiveGenerationId = useGenerationStore((state) => state.setActiveGenerationId);
   const addPendingGeneration = useGenerationStore((state) => state.addPendingGeneration);
 
@@ -27,7 +30,11 @@ export function useRestoreActiveTasks() {
     const activeIdAtStart = useGenerationStore.getState().activeGenerationId;
     try {
       const tasks = await apiClient.getActiveTasks();
-      if (requestVersion.current !== version) return;
+      if (
+        requestVersion.current !== version ||
+        useServerStore.getState().serverUrl !== serverUrl ||
+        useServerStore.getState().serverRevision !== serverRevision
+      ) return;
       const activeIdUnchanged = useGenerationStore.getState().activeGenerationId === activeIdAtStart;
 
       // Restore pending generations (e.g., after page refresh)
@@ -64,10 +71,12 @@ export function useRestoreActiveTasks() {
       // Silently fail - server might be temporarily unavailable
       console.debug('Failed to fetch active tasks:', error);
     }
-  }, [setActiveGenerationId, addPendingGeneration]);
+  }, [setActiveGenerationId, addPendingGeneration, serverUrl, serverRevision]);
 
   useEffect(() => {
-    // Fetch immediately on mount
+    // Clear the previous server's downloads and fetch the new server immediately.
+    seenDownloadsRef.current.clear();
+    setActiveDownloads([]);
     fetchActiveTasks();
 
     // Poll for active tasks

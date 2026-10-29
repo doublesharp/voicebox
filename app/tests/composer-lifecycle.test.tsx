@@ -61,6 +61,12 @@ mock.module('../src/lib/audio/useSpeechPreview', () => ({
     },
   }),
 }));
+const mockServerStore = Object.assign(
+  (selector: (state: { serverUrl: string; serverRevision: number }) => unknown) =>
+    selector({ serverUrl: 'http://server-a', serverRevision: 0 }),
+  { getState: () => ({ serverUrl: 'http://server-a', serverRevision: 0 }) },
+);
+mock.module('../src/stores/serverStore', () => ({ useServerStore: mockServerStore }));
 mock.module('../src/lib/api/client', () => ({
   apiClient: {
     composeWithPersonality: (id: string) => compose(id),

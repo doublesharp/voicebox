@@ -5,6 +5,7 @@ let request: () => Promise<any> = async () => ({ downloads: [], generations: [] 
 mock.module('../src/lib/api/client', () => ({ apiClient: { getActiveTasks: () => request() } }));
 const { useRestoreActiveTasks } = await import('../src/lib/hooks/useRestoreActiveTasks');
 const { useGenerationStore } = await import('../src/stores/generationStore');
+const { useServerStore } = await import('../src/stores/serverStore');
 const originalSetInterval = globalThis.setInterval;
 const originalClearInterval = globalThis.clearInterval;
 let tick: () => void;
@@ -17,7 +18,8 @@ async function flush() { await act(async () => { await new Promise((resolve) => 
 const task = (id: string) => ({ task_id: id });
 const dl = (name: string) => ({ model_name: name, status: 'downloading' });
 beforeEach(() => {
-  useGenerationStore.setState({ pendingGenerationIds: new Set(), isGenerating: false, activeGenerationId: null });
+  useServerStore.setState({ serverUrl: 'http://server-a', serverUrlSource: 'auto' });
+  useGenerationStore.setState({ pendingGenerationIds: new Set(), pendingStoryAdds: new Map(), isGenerating: false, activeGenerationId: null });
   request = async () => ({ downloads: [], generations: [] });
   cleared = 0;
   globalThis.setInterval = ((fn: () => void) => { tick = fn; return 42; }) as any;
@@ -80,4 +82,78 @@ test('old active response cannot replace a generation started after the request'
   await mount(); act(() => useGenerationStore.getState().setActiveGenerationId('newly-started'));
   await act(async () => finish({ generations: [task('older')], downloads: [] })); await flush();
   expect(useGenerationStore.getState().activeGenerationId).toBe('newly-started');
+});
+
+
+test('switching servers clears old downloads and immediately restores new tasks', async () => {
+  let finishNew!: (value: any) => void;
+  request = () => useServerStore.getState().serverUrl === 'http://server-a'
+    ? Promise.resolve({ generations: [task('old')], downloads: [dl('old-model')] })
+    : new Promise((resolve) => { finishNew = resolve; });
+  await mount(); await flush();
+  useGenerationStore.getState().addPendingStoryAdd('old', 'old-story');
+  expect(downloads.map((x) => x.model_name)).toEqual(['old-model']);
+  act(() => useServerStore.getState().setServerUrl('http://server-b'));
+  expect(downloads).toEqual([]);
+  expect(useGenerationStore.getState().pendingGenerationIds.size).toBe(0);
+  expect(useGenerationStore.getState().pendingStoryAdds.size).toBe(0);
+  expect(useGenerationStore.getState().activeGenerationId).toBeNull();
+  expect(typeof finishNew).toBe('function');
+  await act(async () => finishNew({ generations: [task('new')], downloads: [dl('new-model')] }));
+  expect(downloads.map((x) => x.model_name)).toEqual(['new-model']);
+  expect(useGenerationStore.getState().activeGenerationId).toBe('new');
+});
+
+test('an old-server response cannot restore tasks after a server switch', async () => {
+  let finishOld!: (value: any) => void;
+  request = () => useServerStore.getState().serverUrl === 'http://server-a'
+    ? new Promise((resolve) => { finishOld = resolve; })
+    : Promise.resolve({ generations: [task('new')], downloads: [dl('new-model')] });
+  await mount();
+  act(() => useServerStore.getState().setServerUrl('http://server-b'));
+  await flush();
+  await act(async () => finishOld({ generations: [task('old')], downloads: [dl('old-model')] }));
+  expect(useGenerationStore.getState().activeGenerationId).toBe('new');
+  expect([...useGenerationStore.getState().pendingGenerationIds]).toEqual(['new']);
+  expect(downloads.map((x) => x.model_name)).toEqual(['new-model']);
+});
+
+test('setting the same server retains active task state', async () => {
+  request = async () => ({ generations: [task('running')], downloads: [dl('model')] });
+  await mount(); await flush();
+  act(() => useServerStore.getState().setServerUrl('http://server-a'));
+  expect([...useGenerationStore.getState().pendingGenerationIds]).toEqual(['running']);
+  expect(downloads.map((x) => x.model_name)).toEqual(['model']);
+});
+
+
+test('automatic server discovery also resets old tasks and polls immediately', async () => {
+  request = async () => useServerStore.getState().serverUrl === 'http://server-a'
+    ? { generations: [task('old')], downloads: [dl('old')] }
+    : { generations: [task('new')], downloads: [dl('new')] };
+  await mount(); await flush();
+  act(() => useServerStore.getState().setDiscoveredServerUrl('http://server-b'));
+  await flush();
+  expect([...useGenerationStore.getState().pendingGenerationIds]).toEqual(['new']);
+  expect(downloads.map((x) => x.model_name)).toEqual(['new']);
+});
+
+
+test('switching away and back cannot restore the first server request', async () => {
+  let finishOld!: (value: any) => void;
+  let calls = 0;
+  request = () => {
+    calls++;
+    return calls === 1 ? new Promise((resolve) => { finishOld = resolve; })
+      : Promise.resolve({ generations: [task('current')], downloads: [dl('current')] });
+  };
+  await mount();
+  act(() => {
+    useServerStore.getState().setServerUrl('http://server-b');
+    useServerStore.getState().setServerUrl('http://server-a');
+  });
+  await flush();
+  await act(async () => finishOld({ generations: [task('stale')], downloads: [dl('stale')] }));
+  expect([...useGenerationStore.getState().pendingGenerationIds]).toEqual(['current']);
+  expect(downloads.map((x) => x.model_name)).toEqual(['current']);
 });
