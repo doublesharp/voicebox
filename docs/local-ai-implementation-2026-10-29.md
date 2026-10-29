@@ -83,8 +83,8 @@ line tracing covered **975 / 986 changed executable source lines (98.88%)**
 against the `doublesharp` baseline `a563267`. All changed native-stream bridge,
 style adapter, MLX backend, endpoint closure and audio-joining lines executed.
 The remaining 11 lines are defensive reference-cache paths (9), Turbo’s
-non-Tensor audio conversion fallback (1), and the benchmark CLI’s outer refusal
-exception return (1). This is changed-source line coverage, not a claim about
+non-Tensor audio conversion fallback (1), and the benchmark CLI’s `__main__`
+entry point (1), exercised in subprocess checks outside this tracer. This is changed-source line coverage, not a claim about
 whole-backend coverage, branch coverage or native hardware qualification.
 Exact command: the existing Python environment ran the retained
 `merge-coverage/verify-merge.py` harness with `timid=True` and thread tracing,
