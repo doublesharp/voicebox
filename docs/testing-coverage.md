@@ -41,11 +41,16 @@ raw percentage directly with Istanbul or claim it is whole-app coverage.
 
 ## Measured scope, 29 October 2026
 
-The final consolidated candidate passes **760 tests in 116 isolated files** and
+The consolidated candidate `bac3af1` passed **760 tests in 116 isolated files** and
 the application TypeScript check, with no failed checks or missing coverage files.
 All 117 checks completed and production source remained stable during the run.
 This includes local AI preview, model management, speech review, shortcut-conflict
 handling and existing Studio/upstream regressions.
+
+Subsequent published model-download UI changes passed 31 affected integration
+tests, TypeScript and production bundling after merging. That focused run does
+not establish a new whole-frontend coverage percentage; the table below belongs
+to the consolidated source snapshot above.
 
 | Scope | Lines | Statements | Functions | Branches |
 | --- | ---: | ---: | ---: | ---: |

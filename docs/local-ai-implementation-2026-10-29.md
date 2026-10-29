@@ -48,7 +48,7 @@ frozen-build qualification are separate evidence domains.
 
 A real CustomVoice 0.6B request reached the native CPAL output callback before
 HTTP generation finished. This establishes the production HTTP/native queue
-path, not first audible output, physical hotplug or the packaged Tauri journey.
+path; it does not measure first audible output or physical hotplug.
 Cached Whisper Base produced ten word intervals from explicitly synthetic speech;
 its number formatting and punctuation artifacts reinforce the advisory label.
 The audited mlx-audio 0.4.1 word-timing head-name mismatch is handled by a scoped
@@ -63,6 +63,13 @@ an initially empty MOSS download and real Qwen 4-bit synthesis. The final backen
 was refreshed through PyInstaller using the audited dependency analysis, with
 the new watchdog module explicitly included and complete code closure checked.
 Packaged desktop interaction is recorded separately from backend inference.
+A task-isolated desktop bundle from `8692fbc` also passed the real webview
+Preview/Stop journey using Ryan and CustomVoice 0.6B. Native keyboard input
+preserved the exact draft, the real incremental endpoint received the request,
+and CoreAudio observed the app producing output until Stop. All nine existing
+saved-history IDs remained unchanged. Subsequent profile and model-download UI
+fixes were checked separately through affected tests, TypeScript and production
+bundling; the packaged interaction receipt applies to its named source snapshot.
 Windows/Linux devices, signing/notarization, blind listening and CUDA remain
 separate gates. See the [remaining work](plans/LOCAL_AI_FOLLOWUPS.md).
 
@@ -76,9 +83,11 @@ published lifecycle baseline `01c9778`. Whole app-owned backend coverage was
 not branch, subprocess or native-model coverage; real inference was checked
 separately. Production and test sources remained stable during the run.
 
-The final frontend suite passed **760 tests in 116 isolated files** plus
-TypeScript, with **74.81% whole-frontend line coverage**. The native suite passed
-**56 tests**, with two intentional host-only skips. Scoped independent review
+A consolidated frontend run at `bac3af1` passed **760 tests in 116 isolated
+files** plus TypeScript, with **74.81% whole-frontend line coverage**. Later
+published model-download UI fixes passed 31 affected integration tests,
+TypeScript and a fresh production frontend build after merging. The native suite
+passed **56 tests**, with two intentional host-only skips. Scoped independent review
 accepted the preview ownership, portable speech-review and pinned-readiness
 fixes, including their backend merge interactions. The tracked-source audit
 found no developer home paths, fixed build-volume paths or private tracker IDs.
