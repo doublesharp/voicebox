@@ -126,9 +126,16 @@ export function CapturesPage() {
   const { t } = useTranslation();
   const platform = usePlatform();
   const serverUrl = useServerStore((state) => state.serverUrl);
-  const { settings, update } = useCaptureSettings();
-  const { data: profiles } = useProfiles();
   const { toast } = useToast();
+  const onSettingsError = useCallback(() => {
+    toast({
+      title: t('settings.captures.saveError.title'),
+      description: t('settings.captures.saveError.description'),
+      variant: 'destructive',
+    });
+  }, [t, toast]);
+  const { settings, update } = useCaptureSettings({ onError: onSettingsError });
+  const { data: profiles } = useProfiles();
   const readiness = useDictationReadiness();
   const sttModel = settings?.stt_model ?? 'turbo';
   const language = settings?.language ?? 'auto';
@@ -158,7 +165,7 @@ export function CapturesPage() {
   const [customLlmEndpointDraft, setCustomLlmEndpointDraft] = useState(customLlmEndpointSaved);
   const [customLlmModelDraft, setCustomLlmModelDraft] = useState(customLlmModelSaved);
   // Write-only field: the input is blank on load even when a key is stored,
-  // and clears itself after a successful save so the raw value never lingers
+  // and clears itself when submitted so the raw value never lingers
   // in React state where a browser cache or dev-tools inspection could grab it.
   const [customLlmApiKeyDraft, setCustomLlmApiKeyDraft] = useState('');
 
@@ -198,15 +205,26 @@ export function CapturesPage() {
   }, [update]);
 
   useEffect(() => {
-    fetch(`${serverUrl}/health/filesystem`)
-      .then((res) => res.json())
+    let active = true;
+    const controller = new AbortController();
+    setCapturesPath(null);
+    if (!serverUrl) return () => { active = false; controller.abort(); };
+    fetch(`${serverUrl}/health/filesystem`, { signal: controller.signal })
+      .then((res) => {
+        if (!res.ok) throw new Error('Unable to load capture folder');
+        return res.json();
+      })
       .then((data) => {
         const dir = data.directories?.find((d: { path: string }) =>
-          d.path.includes('captures'),
+          d.path.replace(/[\\/]+$/, '').split(/[\\/]/).pop()?.toLowerCase() === 'captures',
         );
-        if (dir?.path) setCapturesPath(dir.path);
+        if (active && dir?.path) setCapturesPath(dir.path);
       })
       .catch(() => {});
+    return () => {
+      active = false;
+      controller.abort();
+    };
   }, [serverUrl]);
 
   const openCapturesFolder = useCallback(async () => {

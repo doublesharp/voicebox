@@ -37,7 +37,7 @@ function renderCaptureWrites(client: QueryClient, writes: CaptureWrites) {
  * updates with optimistic cache mutation so toggles stay snappy while the
  * PUT round-trip settles.
  */
-export function useCaptureSettings() {
+export function useCaptureSettings(options?: { onError?: () => void }) {
   const queryClient = useQueryClient();
 
   const query = useQuery({
@@ -76,6 +76,7 @@ export function useCaptureSettings() {
       renderCaptureWrites(queryClient, writes);
       return { writes, pending };
     },
+    onError: () => options?.onError?.(),
     onSettled: (data, _err, { patch, secretId }, context) => {
       if (secretId !== undefined) captureSecrets.get(queryClient)?.delete(secretId);
       if (context) {
