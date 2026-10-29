@@ -18,14 +18,14 @@ class GenerationJob:
 
     generation_id: str
     coro: Coroutine
+    cancelled: bool = False
 
 
 # Generation queue — serializes TTS inference to avoid GPU contention
 _generation_queue: asyncio.Queue = None  # type: ignore  # initialized at startup
 _generation_worker_task: asyncio.Task | None = None
-_queued_generation_ids: set[str] = set()
+_queued_generation_jobs: dict[str, GenerationJob] = {}
 _running_generation_tasks: dict[str, asyncio.Task] = {}
-_cancelled_generation_ids: set[str] = set()
 
 
 def create_background_task(coro) -> asyncio.Task:
@@ -36,23 +36,23 @@ def create_background_task(coro) -> asyncio.Task:
     return task
 
 
-async def _generation_worker():
+async def _generation_worker(queue: asyncio.Queue, queued: dict[str, GenerationJob], running: dict[str, asyncio.Task]):
     """Worker that processes generation tasks one at a time."""
     while True:
-        job = await _generation_queue.get()
+        job = await queue.get()
         try:
-            if job.generation_id in _cancelled_generation_ids:
-                _cancelled_generation_ids.discard(job.generation_id)
+            if job.cancelled:
                 job.coro.close()
                 continue
 
             task = asyncio.create_task(job.coro)
-            _running_generation_tasks[job.generation_id] = task
-            _queued_generation_ids.discard(job.generation_id)
+            running[job.generation_id] = task
+            if queued.get(job.generation_id) is job:
+                queued.pop(job.generation_id)
             try:
                 await task
             except asyncio.CancelledError:
-                if not task.cancelled():
+                if asyncio.current_task().cancelling() or not task.cancelled():
                     raise
         except Exception:
             traceback.print_exc()
@@ -61,9 +61,10 @@ async def _generation_worker():
                 "Worker exited without writing terminal status",
             )
         finally:
-            _running_generation_tasks.pop(job.generation_id, None)
-            _queued_generation_ids.discard(job.generation_id)
-            _generation_queue.task_done()
+            running.pop(job.generation_id, None)
+            if queued.get(job.generation_id) is job:
+                queued.pop(job.generation_id)
+            queue.task_done()
 
 
 async def _force_fail_if_active(generation_id: str, error: str) -> None:
@@ -96,10 +97,15 @@ async def _force_fail_if_active(generation_id: str, error: str) -> None:
 def enqueue_generation(generation_id: str, coro):
     """Add a generation coroutine to the serial queue."""
     if _generation_queue is None:
+        coro.close()
         raise RuntimeError("Generation queue has not been initialized")
+    if generation_id in _queued_generation_jobs or generation_id in _running_generation_tasks:
+        coro.close()
+        raise ValueError(f"Generation {generation_id} is already queued or running")
 
-    _queued_generation_ids.add(generation_id)
-    _generation_queue.put_nowait(GenerationJob(generation_id=generation_id, coro=coro))
+    job = GenerationJob(generation_id=generation_id, coro=coro)
+    _queued_generation_jobs[generation_id] = job
+    _generation_queue.put_nowait(job)
 
 
 def cancel_generation(generation_id: str) -> Literal["queued", "running"] | None:
@@ -109,9 +115,9 @@ def cancel_generation(generation_id: str) -> Literal["queued", "running"] | None
         running_task.cancel()
         return "running"
 
-    if generation_id in _queued_generation_ids:
-        _queued_generation_ids.discard(generation_id)
-        _cancelled_generation_ids.add(generation_id)
+    job = _queued_generation_jobs.pop(generation_id, None)
+    if job is not None:
+        job.cancelled = True
         return "queued"
 
     return None
@@ -123,7 +129,7 @@ def init_queue(force: bool = False):
     Must be called once during application startup (inside a running event loop).
     """
     global _generation_queue, _generation_worker_task
-    global _queued_generation_ids, _running_generation_tasks, _cancelled_generation_ids
+    global _queued_generation_jobs, _running_generation_tasks
 
     if _generation_worker_task is not None and not _generation_worker_task.done():
         if not force:
@@ -131,9 +137,17 @@ def init_queue(force: bool = False):
         _generation_worker_task.cancel()
         for task in list(_running_generation_tasks.values()):
             task.cancel()
+        while True:
+            try:
+                job = _generation_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            job.coro.close()
+            _generation_queue.task_done()
 
     _generation_queue = asyncio.Queue()
-    _queued_generation_ids = set()
+    _queued_generation_jobs = {}
     _running_generation_tasks = {}
-    _cancelled_generation_ids = set()
-    _generation_worker_task = create_background_task(_generation_worker())
+    _generation_worker_task = create_background_task(
+        _generation_worker(_generation_queue, _queued_generation_jobs, _running_generation_tasks)
+    )
