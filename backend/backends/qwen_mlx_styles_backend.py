@@ -164,6 +164,44 @@ class _QwenMLXStylesBackend:
 
         return await self._run_owned(generate_sync)
 
+    async def generate_stream(self, text, voice_prompt, language="en", seed=None, instruct=None):
+        """Yield incremental codec audio while holding this adapter's physical owner."""
+        from contextlib import aclosing
+
+        from ..utils.native_stream import audio_frame, iter_native_worker
+
+        self._validate_prompt(voice_prompt)
+        kwargs = self._generation_kwargs(voice_prompt, instruct)
+        kwargs.update(
+            text=text,
+            language=LANGUAGE_CODE_TO_NAME.get(language, "auto"),
+            stream=True,
+            streaming_interval=0.32,
+        )
+
+        def frames():
+            model = self._model_for_size_sync(self.model_size)
+            try:
+                if seed is not None:
+                    import mlx.core as mx
+
+                    mx.random.seed(seed)
+                rate = None
+                for result in getattr(model, self.generation_method)(**kwargs):
+                    frame = audio_frame(result.audio, result.sample_rate)
+                    if rate is not None and frame[1] != rate:
+                        raise ValueError("Qwen returned inconsistent audio sample rates")
+                    rate = frame[1]
+                    yield frame
+            finally:
+                del model
+                if self.model is None:
+                    empty_mlx_cache()
+
+        async with self._op_lock, aclosing(iter_native_worker(frames, _run_on_mlx_thread)) as stream:
+            async for frame in stream:
+                yield frame
+
 
 class QwenMLXCustomVoiceBackend(_QwenMLXStylesBackend):
     engine = "qwen_custom_voice"

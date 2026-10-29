@@ -33,8 +33,15 @@ Normal preset/designed profile prompts retain their existing defaults. Empty
 audio result streams and inconsistent sample rates are errors.
 
 `backend/tests/test_qwen_mlx_styles.py` exercises these application contracts with
-offline CPU fakes, local cache fixtures, and the actual shared executor. Those
-checks do not qualify synthesis quality, performance, or a loaded style model.
-Real CustomVoice 1.7B/0.6B and VoiceDesign 1.7B inference, repeated-seed audio,
-native cancellation/memory recovery, and packaged macOS behavior remain separate
-gates requiring cached matching weights. Existing PyTorch adapters are unchanged.
+offline CPU fakes, local cache fixtures, and the actual shared executor.
+On 2026-10-29, real offline synthesis also passed for CustomVoice 0.6B and
+VoiceDesign 1.7B on Apple M2 Max, using mlx-audio 0.4.1 and BF16 checkpoints.
+Both produced finite 24 kHz native audio frames. CustomVoice 1.7B, listening
+quality, cross-backend/repeated-seed waveform equality, packaged macOS, and real
+non-Mac PyTorch synthesis remain separate gates. See
+[local AI implementation](local-ai-implementation-2026-10-29.md).
+
+The optional `generate_stream` adapter method emits model-native frames through a
+bounded worker bridge. Use it through incremental preview when no whole-output
+trim or runaway validation is required. It does not change the buffered export
+or mastering contract. Model-frame arrival is not device playback latency.

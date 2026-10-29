@@ -337,6 +337,50 @@ class MLXTTSBackend:
         return audio, sample_rate
 
 
+    async def generate_stream(self, text, voice_prompt, language="en", seed=None, instruct=None):
+        """Yield model-native audio; callers needing full-output checks use generate()."""
+        from contextlib import aclosing
+
+        from ..utils.native_stream import audio_frame, iter_native_worker
+
+        def frames():
+            if self.model is None or self._current_model_size != self.model_size:
+                self._reload_sync(self.model_size)
+            model = self.model
+            reference = voice_prompt.get("ref_audio") or voice_prompt.get("ref_audio_path")
+            try:
+                if reference and not Path(reference).is_file():
+                    raise VoiceCloningError("Voice reference audio is missing. Re-add the sample before generating speech.")
+                if seed is not None:
+                    import mlx.core as mx
+
+                    np.random.seed(seed)
+                    mx.random.seed(seed)
+                kwargs = dict(lang_code=LANGUAGE_CODE_TO_NAME.get(language, "auto"), stream=True, streaming_interval=0.32)
+                if reference:
+                    kwargs.update(ref_audio=reference, ref_text=voice_prompt.get("ref_text", ""))
+                rate = None
+                try:
+                    for result in model.generate(text, **kwargs):
+                        frame = audio_frame(result.audio, result.sample_rate)
+                        if rate is not None and frame[1] != rate:
+                            raise ValueError("Qwen returned inconsistent audio sample rates")
+                        rate = frame[1]
+                        yield frame
+                except Exception as error:
+                    if reference and not isinstance(error, VoiceCloningError):
+                        raise VoiceCloningError(f"Voice cloning failed; no replacement voice was generated: {error}") from error
+                    raise
+            finally:
+                del model
+                if self.model is None:
+                    empty_mlx_cache()
+
+        async with self._op_lock, aclosing(iter_native_worker(frames, _run_on_mlx_thread)) as stream:
+            async for frame in stream:
+                yield frame
+
+
 class MLXSTTBackend:
     """MLX-based STT backend using mlx-audio Whisper."""
 
