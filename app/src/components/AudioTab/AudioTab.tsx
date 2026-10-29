@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Check, CheckCircle2, Edit, Plus, Speaker, Trash2 } from 'lucide-react';
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -39,11 +39,19 @@ export function AudioTab() {
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [editingChannel, setEditingChannel] = useState<string | null>(null);
   const [selectedChannelId, setSelectedChannelId] = useState<string | null>(null);
+  const [deviceUpdatePending, setDeviceUpdatePending] = useState(false);
+  const deviceUpdateRef = useRef(false);
   const queryClient = useQueryClient();
   const audioUrl = usePlayerStore((state) => state.audioUrl);
   const isPlayerVisible = !!audioUrl;
 
-  const { data: channels, isLoading: channelsLoading } = useQuery({
+  const {
+    data: channels,
+    isLoading: channelsLoading,
+    isError: channelsError,
+    isFetching: channelsFetching,
+    refetch: refetchChannels,
+  } = useQuery({
     queryKey: ['channels'],
     queryFn: () => apiClient.listChannels(),
   });
@@ -85,10 +93,11 @@ export function AudioTab() {
       channelId: string;
       data: { name?: string; device_ids?: string[] };
     }) => apiClient.updateChannel(channelId, data),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['channels'] });
-      queryClient.invalidateQueries({ queryKey: ['profile-channels'] });
-      setEditingChannel(null);
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['channels'] }),
+        queryClient.invalidateQueries({ queryKey: ['profile-channels'] }),
+      ]);
     },
   });
 
@@ -100,7 +109,7 @@ export function AudioTab() {
     },
   });
 
-  const { data: channelVoices } = useQuery({
+  const { data: channelVoices, isError: channelVoicesError } = useQuery({
     queryKey: ['channel-voices', editingChannel],
     queryFn: async () => {
       if (!editingChannel) return { profile_ids: [] };
@@ -277,6 +286,22 @@ export function AudioTab() {
                   : t('audioChannels.devices.toggleHint')
                 : t('audioChannels.devices.selectHint')}
             </p>
+            {channelsError && (
+              <div role="alert" className="mt-2 text-sm text-destructive">
+                {t('audioChannels.devices.refreshFailed', {
+                  defaultValue:
+                    'Could not refresh channel assignments. Retry before changing devices.',
+                })}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={channelsFetching}
+                  onClick={() => void refetchChannels()}
+                >
+                  {t('common.retry')}
+                </Button>
+              </div>
+            )}
           </div>
           {allDevices.length > 0 ? (
             <div className="space-y-2">
@@ -288,20 +313,32 @@ export function AudioTab() {
                     ? device.is_default
                     : selectedChannel.device_ids.includes(device.id));
                 const canToggle =
-                  selectedChannelId && selectedChannel && !selectedChannel.is_default;
+                  selectedChannelId &&
+                  selectedChannel &&
+                  !selectedChannel.is_default &&
+                  !deviceUpdatePending &&
+                  !updateChannel.isPending &&
+                  !channelsError;
 
                 const handleDeviceClick = () => {
-                  if (!canToggle || !selectedChannel) return;
+                  if (!canToggle || !selectedChannel || deviceUpdateRef.current) return;
 
                   const currentDeviceIds = selectedChannel.device_ids;
                   const newDeviceIds = isConnected
                     ? currentDeviceIds.filter((id) => id !== device.id)
                     : [...currentDeviceIds, device.id];
 
-                  updateChannel.mutate({
-                    channelId: selectedChannelId,
-                    data: { device_ids: newDeviceIds },
-                  });
+                  deviceUpdateRef.current = true;
+                  setDeviceUpdatePending(true);
+                  updateChannel.mutate(
+                    { channelId: selectedChannelId, data: { device_ids: newDeviceIds } },
+                    {
+                      onSettled: () => {
+                        deviceUpdateRef.current = false;
+                        setDeviceUpdatePending(false);
+                      },
+                    },
+                  );
                 };
 
                 return (
@@ -365,27 +402,44 @@ export function AudioTab() {
       {editingChannel &&
         (() => {
           const channel = channels?.find((c) => c.id === editingChannel);
-          return channel ? (
+          return channel && channelVoices ? (
             <EditChannelDialog
               open={!!editingChannel}
               onOpenChange={(open) => !open && setEditingChannel(null)}
               channel={channel}
               devices={devices || []}
               profiles={profiles || []}
-              channelVoices={channelVoices?.profile_ids || []}
-              onUpdate={(name, deviceIds) => {
-                updateChannel.mutate({
-                  channelId: editingChannel,
+              channelVoices={channelVoices.profile_ids}
+              onSave={async (name, deviceIds, profileIds) => {
+                const channelId = editingChannel;
+                await updateChannel.mutateAsync({
+                  channelId,
                   data: { name, device_ids: deviceIds },
                 });
-              }}
-              onSetVoices={(profileIds) => {
-                setChannelVoices.mutate({
-                  channelId: editingChannel,
-                  profileIds,
-                });
+                await setChannelVoices.mutateAsync({ channelId, profileIds });
+                setEditingChannel((current) => (current === channelId ? null : current));
               }}
             />
+          ) : channel ? (
+            <Dialog open onOpenChange={(open) => !open && setEditingChannel(null)}>
+              <DialogContent>
+                <DialogHeader>
+                  <DialogTitle>{t('audioChannels.editDialog.title')}</DialogTitle>
+                  <DialogDescription>
+                    {channelVoicesError
+                      ? t('audioChannels.editDialog.voicesLoadFailed', {
+                          defaultValue: 'Could not load voice assignments. Close and try again.',
+                        })
+                      : t('audioChannels.loading')}
+                  </DialogDescription>
+                </DialogHeader>
+                <DialogFooter>
+                  <Button variant="outline" onClick={() => setEditingChannel(null)}>
+                    {t('common.close')}
+                  </Button>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
           ) : null;
         })()}
     </div>
@@ -530,8 +584,7 @@ interface EditChannelDialogProps {
   devices: AudioDevice[];
   profiles: Array<{ id: string; name: string }>;
   channelVoices: string[];
-  onUpdate: (name: string, deviceIds: string[]) => void;
-  onSetVoices: (profileIds: string[]) => void;
+  onSave: (name: string, deviceIds: string[], profileIds: string[]) => Promise<void>;
 }
 
 function EditChannelDialog({
@@ -541,23 +594,33 @@ function EditChannelDialog({
   devices,
   profiles,
   channelVoices,
-  onUpdate,
-  onSetVoices,
+  onSave,
 }: EditChannelDialogProps) {
   const { t } = useTranslation();
   const [name, setName] = useState(channel.name);
   const [selectedDevices, setSelectedDevices] = useState<string[]>(channel.device_ids);
   const [selectedVoices, setSelectedVoices] = useState<string[]>(channelVoices);
+  const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
+  const [saveFailed, setSaveFailed] = useState(false);
 
-  const handleSubmit = () => {
-    if (name.trim()) {
-      onUpdate(name.trim(), selectedDevices);
-      onSetVoices(selectedVoices);
+  const handleSubmit = async () => {
+    if (!name.trim() || savingRef.current) return;
+    savingRef.current = true;
+    setSaving(true);
+    setSaveFailed(false);
+    try {
+      await onSave(name.trim(), selectedDevices, selectedVoices);
+    } catch {
+      setSaveFailed(true);
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
     }
   };
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={(next) => !savingRef.current && onOpenChange(next)}>
       <DialogContent className="max-w-2xl">
         <DialogHeader>
           <DialogTitle>{t('audioChannels.editDialog.title')}</DialogTitle>
@@ -566,12 +629,18 @@ function EditChannelDialog({
         <div className="space-y-4">
           <div>
             <Label htmlFor="edit-channel-name">{t('audioChannels.fields.name')}</Label>
-            <Input id="edit-channel-name" value={name} onChange={(e) => setName(e.target.value)} />
+            <Input
+              id="edit-channel-name"
+              value={name}
+              disabled={saving}
+              onChange={(e) => setName(e.target.value)}
+            />
           </div>
           <div>
             <Label>{t('audioChannels.labels.outputDevices')}</Label>
             <Select
               value=""
+              disabled={saving}
               onValueChange={(value) => {
                 if (value && !selectedDevices.includes(value)) {
                   setSelectedDevices([...selectedDevices, value]);
@@ -602,6 +671,7 @@ function EditChannelDialog({
                       <Button
                         variant="ghost"
                         size="sm"
+                        disabled={saving}
                         onClick={() =>
                           setSelectedDevices(selectedDevices.filter((id) => id !== deviceId))
                         }
@@ -618,6 +688,7 @@ function EditChannelDialog({
             <Label>{t('audioChannels.labels.assignedVoices')}</Label>
             <Select
               value=""
+              disabled={saving}
               onValueChange={(value) => {
                 if (value && !selectedVoices.includes(value)) {
                   setSelectedVoices([...selectedVoices, value]);
@@ -648,6 +719,7 @@ function EditChannelDialog({
                       <Button
                         variant="ghost"
                         size="sm"
+                        disabled={saving}
                         onClick={() =>
                           setSelectedVoices(selectedVoices.filter((id) => id !== profileId))
                         }
@@ -661,11 +733,19 @@ function EditChannelDialog({
             )}
           </div>
         </div>
+        {saveFailed && (
+          <p role="alert" className="text-sm text-destructive">
+            {t('audioChannels.editDialog.saveFailed', {
+              defaultValue:
+                'Some changes may have been saved. Review your selections and try again.',
+            })}
+          </p>
+        )}
         <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)}>
+          <Button variant="outline" disabled={saving} onClick={() => onOpenChange(false)}>
             {t('common.cancel')}
           </Button>
-          <Button onClick={handleSubmit} disabled={!name.trim()}>
+          <Button onClick={handleSubmit} disabled={!name.trim() || saving}>
             {t('common.save')}
           </Button>
         </DialogFooter>
