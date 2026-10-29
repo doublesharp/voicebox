@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import math
 import uuid
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from ..services.generation import release_generation_memory, run_generation
 from ..services.task_queue import cancel_generation as cancel_generation_job, enqueue_generation
 from ..utils.audio import load_audio
 from ..utils.tasks import get_task_manager
+from ..utils.async_work import run_blocking
 
 logger = logging.getLogger(__name__)
 
@@ -587,54 +589,73 @@ async def import_audio(
             detail=f"Unsupported audio format '{suffix}'. Allowed: {sorted(IMPORT_AUDIO_EXTENSIONS)}",
         )
 
-    chunks: list[bytes] = []
-    total = 0
-    while True:
-        chunk = await file.read(1024 * 1024)
-        if not chunk:
-            break
-        total += len(chunk)
-        if total > IMPORT_AUDIO_MAX_BYTES:
-            raise HTTPException(
-                status_code=413,
-                detail=f"File exceeds {IMPORT_AUDIO_MAX_BYTES // (1024 * 1024)} MB limit.",
-            )
-        chunks.append(chunk)
-    audio_bytes = b"".join(chunks)
-    if not audio_bytes:
-        raise HTTPException(status_code=400, detail="Empty audio file.")
-
     generation_id = str(uuid.uuid4())
     target = config.get_generations_dir() / f"{generation_id}{suffix}"
-    target.write_bytes(audio_bytes)
-
+    owned_file = False
+    history_started = False
     try:
-        audio, sr = load_audio(str(target))
-        duration = float(len(audio) / sr) if sr else 0.0
-    except Exception as decode_err:
+        # Never overwrite an existing generation, and stream the upload so
+        # the size limit does not require buffering the whole file in RAM.
+        with target.open("xb") as output:
+            owned_file = True
+            total = 0
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > IMPORT_AUDIO_MAX_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File exceeds {IMPORT_AUDIO_MAX_BYTES // (1024 * 1024)} MB limit.",
+                    )
+                output.write(chunk)
+        if not total:
+            raise HTTPException(status_code=400, detail="Empty audio file.")
+
         try:
-            target.unlink()
-        except OSError:
-            pass
-        raise HTTPException(
-            status_code=400,
-            detail=f"Could not decode audio: {decode_err}",
-        ) from decode_err
+            audio, sr = await run_blocking(load_audio, str(target))
+            duration = float(len(audio) / sr) if sr else 0.0
+            if not math.isfinite(duration) or duration <= 0:
+                raise ValueError("Audio has no playable duration")
+        except Exception as decode_err:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Could not decode audio: {decode_err}",
+            ) from decode_err
 
-    profile = _get_or_create_import_profile(db)
-    display_name = Path(file.filename or "Imported audio").stem or "Imported audio"
-
-    return await history.create_generation(
-        profile_id=profile.id,
-        text=display_name,
-        language="en",
-        audio_path=config.to_storage_path(target),
-        duration=duration,
-        seed=None,
-        db=db,
-        generation_id=generation_id,
-        status="completed",
-        engine="import",
-        model_size=None,
-        source="import",
-    )
+        profile = _get_or_create_import_profile(db)
+        display_name = Path(file.filename or "Imported audio").stem or "Imported audio"
+        history_started = True
+        return await history.create_generation(
+            profile_id=profile.id,
+            text=display_name,
+            language="en",
+            audio_path=config.to_storage_path(target),
+            duration=duration,
+            seed=None,
+            db=db,
+            generation_id=generation_id,
+            status="completed",
+            engine="import",
+            model_size=None,
+            source="import",
+        )
+    except BaseException:
+        if owned_file:
+            # A failure can happen after history committed. Only remove audio
+            # when a fresh read confirms that no generation references it.
+            remove_file = not history_started
+            if history_started:
+                try:
+                    db.rollback()
+                    with Session(bind=db.get_bind()) as check_db:
+                        remove_file = check_db.query(DBGeneration).filter_by(id=generation_id).first() is None
+                except Exception:
+                    logger.exception("Could not verify imported audio ownership after failure")
+            if remove_file:
+                try:
+                    target.unlink(missing_ok=True)
+                except OSError:
+                    logger.exception("Could not remove failed audio import %s", target)
+        raise
