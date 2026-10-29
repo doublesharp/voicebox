@@ -41,16 +41,16 @@ raw percentage directly with Istanbul or claim it is whole-app coverage.
 
 ## Measured scope, 29 October 2026
 
-The final consolidated candidate passes **728 tests in 115 isolated files** and
+The final consolidated candidate passes **750 tests in 116 isolated files** and
 the application TypeScript check, with no failed checks or missing coverage files.
-All 116 checks completed and production source remained stable during the run.
-This includes local AI preview, model management, speech review and existing
-Studio/upstream regressions.
+All 117 checks completed and production source remained stable during the run.
+This includes local AI preview, model management, speech review, shortcut-conflict
+handling and existing Studio/upstream regressions.
 
 | Scope | Lines | Statements | Functions | Branches |
 | --- | ---: | ---: | ---: | ---: |
-| Whole frontend, all 248 source files | 74.52% | 72.76% | 66.27% | 65.65% |
-| The 156 modules imported by tests | 80.31% | 78.35% | 73.31% | 70.36% |
+| Whole frontend, all 248 source files | 74.72% | 72.95% | 66.49% | 65.82% |
+| The 157 modules imported by tests | 80.41% | 78.44% | 73.47% | 70.43% |
 
 Using the same Istanbul setup, the earlier 333-test suite covered 38.69% of
 whole-frontend lines; the later 414-test/62-file integration covered 45.85%.
