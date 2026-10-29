@@ -57,9 +57,6 @@ async def watchdog_disable():
 @router.get("/health", response_model=models.HealthResponse)
 async def health():
     """Health check endpoint."""
-    from huggingface_hub import constants as hf_constants
-    from pathlib import Path
-
     tts_model = tts.get_tts_model()
     backend_type = get_backend_type()
 
@@ -141,30 +138,15 @@ async def health():
     model_downloaded = None
     try:
         from ..backends import get_model_config
+        from ..backends.base import is_model_cached
 
         default_config = get_model_config("qwen-tts-1.7B")
         default_model_id = default_config.hf_repo_id if default_config else "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 
-        try:
-            from huggingface_hub import scan_cache_dir
-
-            cache_info = scan_cache_dir()
-            for repo in cache_info.repos:
-                if repo.repo_id == default_model_id:
-                    model_downloaded = True
-                    break
-        except (ImportError, Exception):
-            cache_dir = hf_constants.HF_HUB_CACHE
-            repo_cache = Path(cache_dir) / ("models--" + default_model_id.replace("/", "--"))
-            if repo_cache.exists():
-                has_model_files = (
-                    any(repo_cache.rglob("*.bin"))
-                    or any(repo_cache.rglob("*.safetensors"))
-                    or any(repo_cache.rglob("*.pt"))
-                    or any(repo_cache.rglob("*.pth"))
-                    or any(repo_cache.rglob("*.npz"))
-                )
-                model_downloaded = has_model_files
+        model_downloaded = is_model_cached(
+            default_model_id,
+            weight_extensions=(".safetensors", ".bin", ".pt", ".pth", ".npz"),
+        )
     except Exception:
         pass
 

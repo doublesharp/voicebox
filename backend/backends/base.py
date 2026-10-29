@@ -78,13 +78,13 @@ def is_model_cached(
         if required_files:
             # Check that every required filename exists somewhere in snapshots
             for fname in required_files:
-                if not any(snapshots_dir.rglob(fname)):
+                if not any(path.is_file() for path in snapshots_dir.rglob(fname)):
                     return False
             return True
 
         # Check that at least one weight file exists
         for ext in weight_extensions:
-            if any(snapshots_dir.rglob(f"*{ext}")):
+            if any(path.is_file() for path in snapshots_dir.rglob(f"*{ext}")):
                 return True
 
         logger.debug(f"No model weights found for {hf_repo}")

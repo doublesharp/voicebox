@@ -359,7 +359,10 @@ async def get_model_status():
                         for rev in repo.revisions:
                             for f in rev.files:
                                 fname = f.file_name.lower()
-                                if fname.endswith((".safetensors", ".bin", ".pt", ".pth", ".npz")):
+                                if (
+                                    fname.endswith((".safetensors", ".bin", ".pt", ".pth", ".npz"))
+                                    and f.file_path.is_file()
+                                ):
                                     has_model_weights = True
                                     break
                             if has_model_weights:
@@ -396,11 +399,11 @@ async def get_model_status():
                             has_model_files = False
                             if snapshots_dir.exists():
                                 has_model_files = (
-                                    any(snapshots_dir.rglob("*.bin"))
-                                    or any(snapshots_dir.rglob("*.safetensors"))
-                                    or any(snapshots_dir.rglob("*.pt"))
-                                    or any(snapshots_dir.rglob("*.pth"))
-                                    or any(snapshots_dir.rglob("*.npz"))
+                                    any(path.is_file() for path in snapshots_dir.rglob("*.bin"))
+                                    or any(path.is_file() for path in snapshots_dir.rglob("*.safetensors"))
+                                    or any(path.is_file() for path in snapshots_dir.rglob("*.pt"))
+                                    or any(path.is_file() for path in snapshots_dir.rglob("*.pth"))
+                                    or any(path.is_file() for path in snapshots_dir.rglob("*.npz"))
                                 )
 
                             if has_model_files:

@@ -72,3 +72,14 @@ def test_genuinely_in_progress_download_is_not_cached(tmp_path, monkeypatch):
     (snapshots_dir / "config.json").write_text("{}")
 
     assert is_model_cached(repo) is False
+
+
+def test_missing_weight_target_is_not_cached(tmp_path, monkeypatch):
+    import huggingface_hub.constants as hf_constants
+
+    monkeypatch.setattr(hf_constants, "HF_HUB_CACHE", str(tmp_path))
+    _, blobs, snapshot = _make_repo_cache(tmp_path)
+    (snapshot / "model.safetensors").symlink_to(blobs / "missing")
+
+    assert is_model_cached("org/model") is False
+    assert is_model_cached("org/model", required_files=["model.safetensors"]) is False
