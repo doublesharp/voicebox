@@ -9,9 +9,11 @@ Short text (≤ max_chunk_chars) uses the single-shot fast path with zero
 overhead.
 """
 
+from bisect import bisect_right
 import inspect
 import logging
 import re
+from numbers import Integral
 from typing import List, Tuple
 
 import numpy as np
@@ -73,6 +75,9 @@ def split_text_into_chunks(text: str, max_chars: int = DEFAULT_MAX_CHUNK_CHARS) 
     Paralinguistic tags like ``[laugh]`` are treated as atomic and will not
     be split across chunks.
     """
+    if not isinstance(max_chars, Integral) or isinstance(max_chars, bool) or max_chars <= 0:
+        raise ValueError("max_chars must be a positive integer")
+    max_chars = int(max_chars)
     text = text.strip()
     if not text:
         return []
@@ -80,98 +85,122 @@ def split_text_into_chunks(text: str, max_chars: int = DEFAULT_MAX_CHUNK_CHARS) 
         return [text]
 
     chunks: List[str] = []
-    remaining = text
+    all_tags = [(m.start(), m.end()) for m in _PARA_TAG_RE.finditer(text)]
+    cursor = 0
 
-    while remaining:
-        remaining = remaining.lstrip()
-        if not remaining:
+    while cursor < len(text):
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+        if cursor >= len(text):
             break
+        remaining = text[cursor:]
         if len(remaining) <= max_chars:
             chunks.append(remaining)
             break
 
         segment = remaining[:max_chars]
+        index = bisect_right(all_tags, (cursor, len(text) + 1)) - 1
+        if index < 0 or all_tags[index][1] <= cursor:
+            index += 1
+        tag_ranges = []
+        while index < len(all_tags) and all_tags[index][0] < cursor + max_chars:
+            start, end = all_tags[index]
+            tag_ranges.append((start - cursor, end - cursor))
+            index += 1
 
         # Try to split at the last real sentence ending
-        split_pos = _find_last_sentence_end(segment)
+        split_pos = _find_last_sentence_end(segment, remaining, tag_ranges)
         if split_pos == -1:
-            split_pos = _find_last_clause_boundary(segment)
+            split_pos = _find_last_clause_boundary(segment, remaining, tag_ranges)
         if split_pos == -1:
-            split_pos = segment.rfind(" ")
+            split_pos = next(
+                (pos for pos in range(len(segment) - 1, -1, -1)
+                 if segment[pos].isspace() and not _inside_bracket_tag(remaining, pos, tag_ranges)),
+                -1,
+            )
         if split_pos == -1:
-            # Absolute fallback: hard cut but avoid splitting inside a tag
-            split_pos = _safe_hard_cut(segment, max_chars)
+            # Inspect the full remaining text: a tag may end beyond this segment.
+            split_pos = _safe_hard_cut(remaining, max_chars, tag_ranges)
 
         chunk = remaining[: split_pos + 1].strip()
         if chunk:
             chunks.append(chunk)
-        remaining = remaining[split_pos + 1 :]
+        cursor += split_pos + 1
 
     return chunks
 
 
-def _find_last_sentence_end(text: str) -> int:
+def _find_last_sentence_end(
+    text: str, context: str | None = None, tag_ranges: list[tuple[int, int]] | None = None
+) -> int:
     """Return the index of the last sentence-ending punctuation in *text*.
 
     Skips periods that follow common abbreviations (``Dr.``, ``Mr.``, etc.)
     and periods inside bracket tags (``[laugh]``).  Also handles CJK
     sentence-ending punctuation (``。！？``).
     """
+    context = text if context is None else context
     best = -1
     # ASCII sentence ends
     for m in re.finditer(r"[.!?](?:\s|$)", text):
         pos = m.start()
         char = text[pos]
-        # Skip periods after abbreviations
+        # A truncated segment is not a sentence boundary if the next character
+        # in the original text is not whitespace.
+        if pos + 1 == len(text) and len(context) > len(text) and not context[pos + 1].isspace():
+            continue
         if char == ".":
-            # Walk backwards to find the preceding word
-            word_start = pos - 1
-            while word_start >= 0 and text[word_start].isalpha():
-                word_start -= 1
-            word = text[word_start + 1 : pos].lower()
-            if word in _ABBREVIATIONS:
+            word = re.search(r"([A-Za-z]+(?:\.[A-Za-z]+)*)$", text[:pos])
+            if word and word.group(1).lower() in _ABBREVIATIONS:
                 continue
-            # Skip decimal numbers (digit immediately before the period)
-            if word_start >= 0 and text[word_start].isdigit():
-                continue
-        # Skip if we're inside a bracket tag
-        if _inside_bracket_tag(text, pos):
+        if _inside_bracket_tag(context, pos, tag_ranges):
             continue
         best = pos
     # CJK sentence-ending punctuation
     for m in re.finditer(r"[\u3002\uff01\uff1f]", text):
-        if m.start() > best:
+        if m.start() > best and not _inside_bracket_tag(context, m.start(), tag_ranges):
             best = m.start()
     return best
 
 
-def _find_last_clause_boundary(text: str) -> int:
+def _find_last_clause_boundary(
+    text: str, context: str | None = None, tag_ranges: list[tuple[int, int]] | None = None
+) -> int:
     """Return the index of the last clause-boundary punctuation."""
+    context = text if context is None else context
     best = -1
     for m in re.finditer(r"[;:,\u2014](?:\s|$)", text):
         pos = m.start()
-        # Skip if inside a bracket tag
-        if _inside_bracket_tag(text, pos):
+        if pos + 1 == len(text) and len(context) > len(text) and not context[pos + 1].isspace():
+            continue
+        if _inside_bracket_tag(context, pos, tag_ranges):
             continue
         best = pos
     return best
 
 
-def _inside_bracket_tag(text: str, pos: int) -> bool:
-    """Return True if *pos* falls inside a ``[...]`` tag."""
-    for m in _PARA_TAG_RE.finditer(text):
-        if m.start() < pos < m.end():
-            return True
-    return False
+def _inside_bracket_tag(
+    text: str, pos: int, tag_ranges: list[tuple[int, int]] | None = None
+) -> bool:
+    """Return True if *pos* falls inside a complete ``[...]`` tag."""
+    if tag_ranges is None:
+        tag_ranges = [(m.start(), m.end()) for m in _PARA_TAG_RE.finditer(text)]
+    index = bisect_right(tag_ranges, (pos, len(text) + 1)) - 1
+    return index >= 0 and tag_ranges[index][0] < pos < tag_ranges[index][1]
 
 
-def _safe_hard_cut(segment: str, max_chars: int) -> int:
-    """Find a hard-cut position that doesn't split a ``[tag]``."""
+def _safe_hard_cut(
+    text: str, max_chars: int, tag_ranges: list[tuple[int, int]] | None = None
+) -> int:
+    """Find a hard-cut position that doesn't split a complete ``[tag]``."""
     cut = max_chars - 1
-    # Check if the cut falls inside a bracket tag; if so, move before it
-    for m in _PARA_TAG_RE.finditer(segment):
-        if m.start() < cut < m.end():
-            return m.start() - 1 if m.start() > 0 else cut
+    if tag_ranges is None:
+        tag_ranges = [(m.start(), m.end()) for m in _PARA_TAG_RE.finditer(text)]
+    for start, end in tag_ranges:
+        if start <= cut < end - 1:
+            if start == 0:
+                raise ValueError("A speech tag exceeds the maximum chunk size")
+            return start - 1
     return cut
 
 
@@ -311,6 +340,9 @@ async def _generate_chunked(
         )
 
         check_inference_cancelled()
+        if not isinstance(chunk_sr, Integral) or isinstance(chunk_sr, bool) or chunk_sr <= 0:
+            raise ValueError("The audio sample rate is invalid during generation")
+        chunk_sr = int(chunk_sr)
         if runaway_detector is not None and runaway_detector(chunk_audio, chunk_sr):
             if retry_depth >= MAX_RUNAWAY_RETRIES or len(chunk_text) <= MIN_RUNAWAY_RETRY_CHARS:
                 if trim_fn is not None:
@@ -337,6 +369,7 @@ async def _generate_chunked(
                 len(retry_chunks),
             )
             retry_audio: list[np.ndarray] = []
+            retry_sample_rate = None
             for i, retry_text in enumerate(retry_chunks):
                 retry_seed = (
                     chunk_seed + ((retry_depth + 1) * 1000) + i
@@ -348,6 +381,9 @@ async def _generate_chunked(
                     retry_seed,
                     retry_depth + 1,
                 )
+                if retry_sample_rate is not None and sample_rate != retry_sample_rate:
+                    raise ValueError("The audio sample rate changed during generation")
+                retry_sample_rate = sample_rate
                 retry_audio.append(np.asarray(audio, dtype=np.float32))
 
             return (
@@ -399,6 +435,8 @@ async def _generate_chunked(
         audio_chunks.append(chunk_audio)
         if sample_rate is None:
             sample_rate = chunk_sr
+        elif sample_rate != chunk_sr:
+            raise ValueError("The audio sample rate changed during generation")
 
     audio = concatenate_audio_chunks(audio_chunks, sample_rate, crossfade_ms=crossfade_ms)
     return audio, sample_rate
