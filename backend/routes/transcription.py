@@ -1,6 +1,5 @@
 """Transcription endpoints."""
 
-import asyncio
 import tempfile
 from pathlib import Path
 
@@ -9,7 +8,9 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from .. import models
 from ..services import transcribe
 from ..services.task_queue import create_background_task
+from ..utils.progress import get_progress_manager
 from ..utils.tasks import get_task_manager
+from ..utils.async_work import run_blocking, run_owned
 
 router = APIRouter()
 
@@ -30,17 +31,19 @@ async def transcribe_audio(
     uploaded_ext = Path(file.filename or "").suffix.lower()
     file_suffix = uploaded_ext if uploaded_ext in ALLOWED_AUDIO_EXTS else ".wav"
 
-    with tempfile.NamedTemporaryFile(suffix=file_suffix, delete=False) as tmp:
-        while chunk := await file.read(UPLOAD_CHUNK_SIZE):
-            tmp.write(chunk)
-        tmp_path = tmp.name
-
-    stt_path = tmp_path
+    tmp_path = None
+    stt_path = None
     try:
+        with tempfile.NamedTemporaryFile(suffix=file_suffix, delete=False) as tmp:
+            tmp_path = tmp.name
+            while chunk := await file.read(UPLOAD_CHUNK_SIZE):
+                tmp.write(chunk)
+
+        stt_path = tmp_path
         from ..utils.audio import load_audio, save_audio
         from ..backends import WHISPER_HF_REPOS
 
-        audio, sr = await asyncio.to_thread(load_audio, tmp_path)
+        audio, sr = await run_blocking(load_audio, tmp_path)
         duration = len(audio) / sr
 
         # The STT backend (mlx_audio.stt -> miniaudio) only decodes
@@ -52,7 +55,7 @@ async def transcribe_audio(
         # unchanged.
         if file_suffix != ".wav":
             stt_path = f"{tmp_path}.stt.wav"
-            await asyncio.to_thread(save_audio, audio, stt_path, sr)
+            await run_blocking(save_audio, audio, stt_path, sr)
 
         whisper_model = transcribe.get_whisper_model()
         model_size = model if model else whisper_model.model_size
@@ -71,13 +74,38 @@ async def transcribe_audio(
 
             async def download_whisper_background():
                 try:
-                    await whisper_model.load_model_async(model_size)
+                    await run_owned(whisper_model.load_model_async(model_size))
                     task_manager.complete_download(progress_model_name)
                 except Exception as e:
                     task_manager.error_download(progress_model_name, str(e))
 
-            task_manager.start_download(progress_model_name)
-            create_background_task(download_whisper_background())
+            # A previous request may already own this download. Checking and
+            # reserving are synchronous on the event loop, before scheduling.
+            existing = next(
+                (task for task in task_manager.get_active_downloads() if task.model_name == progress_model_name),
+                None,
+            )
+            progress = get_progress_manager().get_progress(progress_model_name)
+            pending = (
+                existing is not None and existing.status in ("downloading", "extracting")
+            ) or (
+                existing is None and progress and progress.get("status") in ("downloading", "extracting")
+            )
+            if not pending:
+                task_manager.start_download(progress_model_name)
+                owned = next(task for task in task_manager.get_active_downloads() if task.model_name == progress_model_name)
+                work = download_whisper_background()
+                try:
+                    task = create_background_task(work)
+                    def mark_cancelled(done):
+                        # Do not change a replacement task that has already started.
+                        if done.cancelled() and any(item is owned for item in task_manager.get_active_downloads()):
+                            task_manager.error_download(progress_model_name, "Download cancelled")
+                    task.add_done_callback(mark_cancelled)
+                except Exception as e:
+                    work.close()
+                    task_manager.error_download(progress_model_name, str(e))
+                    raise
 
             raise HTTPException(
                 status_code=202,
@@ -88,7 +116,7 @@ async def transcribe_audio(
                 },
             )
 
-        text = await whisper_model.transcribe(stt_path, language, model_size)
+        text = await run_owned(whisper_model.transcribe(stt_path, language, model_size))
 
         return models.TranscriptionResponse(
             text=text,
@@ -100,6 +128,7 @@ async def transcribe_audio(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        Path(tmp_path).unlink(missing_ok=True)
-        if stt_path != tmp_path:
+        if tmp_path is not None:
+            Path(tmp_path).unlink(missing_ok=True)
+        if stt_path is not None and stt_path != tmp_path:
             Path(stt_path).unlink(missing_ok=True)
