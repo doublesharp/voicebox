@@ -306,8 +306,10 @@ def validate_effects_chain(effects_chain: List[Dict[str, Any]]) -> Optional[str]
                 return f"Effect '{effect_type}' at index {i}: unknown param '{param_name}'"
 
             pdef = registry["params"][param_name]
-            if not isinstance(value, (int, float)):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
                 return f"Effect '{effect_type}' at index {i}: param '{param_name}' must be a number"
+            if isinstance(value, float) and not math.isfinite(value):
+                return f"Effect '{effect_type}' at index {i}: param '{param_name}' must be finite"
             if value < pdef["min"] or value > pdef["max"]:
                 return (
                     f"Effect '{effect_type}' at index {i}: param '{param_name}' "

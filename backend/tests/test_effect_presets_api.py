@@ -11,6 +11,7 @@ from backend.database import Base, EffectPreset, get_db
 from backend.models import EffectConfig, EffectPresetUpdate
 from backend.routes import effects as routes
 from backend.services import effects as service
+from backend.utils.effects import validate_effects_chain
 
 
 @pytest.fixture
@@ -89,3 +90,37 @@ def test_duplicate_rename_race_rolls_back_and_reports_conflict(database, monkeyp
             service.update_preset("one", EffectPresetUpdate(name="Taken"), db)
         assert db.get(EffectPreset, "one").name == "Original"
         assert db.get(EffectPreset, "two").name == "Taken"
+
+
+@pytest.mark.parametrize("value", ["NaN", "true"])
+def test_invalid_numeric_parameters_do_not_create_preset(client, value):
+    response = client.post(
+        "/effects/presets",
+        content='{"name":"Bad","effects_chain":[{"type":"gain","params":{"gain_db":' + value + "}}]}",
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 400
+    assert client.get("/effects/presets").json() == []
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), True, False, 10**400])
+def test_invalid_effect_numbers_are_rejected_at_shared_validation_boundary(value):
+    assert validate_effects_chain([{"type": "gain", "params": {"gain_db": value}}]) is not None
+
+
+@pytest.mark.parametrize("value", [-40, 0, 40.0])
+def test_finite_effect_numbers_within_bounds_are_allowed(value):
+    assert validate_effects_chain([{"type": "gain", "params": {"gain_db": value}}]) is None
+
+
+def test_invalid_number_does_not_replace_existing_preset(client):
+    created = client.post("/effects/presets", json={"name": "Original", "effects_chain": []}).json()
+    response = client.put(
+        f"/effects/presets/{created['id']}",
+        content='{"name":"Changed","effects_chain":[{"type":"gain","params":{"gain_db":NaN}}]}',
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 400
+    saved = client.get(f"/effects/presets/{created['id']}").json()
+    assert saved["name"] == "Original"
+    assert saved["effects_chain"] == []
