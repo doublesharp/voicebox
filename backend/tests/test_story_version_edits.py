@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from backend import config
 from backend.database import Base, Generation, Story, StoryItem, VoiceProfile
-from backend.models import StoryItemCreate, StoryItemSplit, StoryItemTrim
+from backend.models import StoryItemCreate, StoryItemSplit, StoryItemTrim, StoryItemVersionUpdate
 from backend.services import stories, versions
 
 
@@ -69,3 +69,35 @@ async def test_reorder_uses_selected_version_duration(pinned_story):
     await stories.add_item_to_story("story", StoryItemCreate(generation_id="next", start_time_ms=1000), pinned_story)
     ordered = await stories.reorder_story_items("story", ["gen", "next"], pinned_story)
     assert ordered[1].start_time_ms == 300
+
+
+async def test_cannot_select_version_shorter_than_existing_trims(pinned_story):
+    item = pinned_story.get(StoryItem, "pinned")
+    short_version = item.version_id
+    item.version_id = None
+    item.trim_start_ms = 100
+    item.trim_end_ms = 50
+    pinned_story.commit()
+    result = await stories.set_story_item_version(
+        "story", "pinned", StoryItemVersionUpdate(version_id=short_version), pinned_story
+    )
+    assert result is None
+    assert pinned_story.get(StoryItem, "pinned").version_id is None
+
+
+async def test_can_switch_version_when_existing_trims_fit(pinned_story):
+    item = pinned_story.get(StoryItem, "pinned")
+    short_version = item.version_id
+    item.version_id = None
+    item.trim_start_ms = 20
+    item.trim_end_ms = 30
+    pinned_story.commit()
+    result = await stories.set_story_item_version(
+        "story", "pinned", StoryItemVersionUpdate(version_id=short_version), pinned_story
+    )
+    assert result.version_id == short_version
+    assert (result.trim_start_ms, result.trim_end_ms) == (20, 30)
+    assert await stories.set_story_item_version(
+        "story", "pinned", StoryItemVersionUpdate(version_id="missing"), pinned_story
+    ) is None
+    assert pinned_story.get(StoryItem, "pinned").version_id == short_version

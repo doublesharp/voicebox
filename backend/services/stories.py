@@ -715,12 +715,23 @@ async def update_story_item_times(
 
     # Get all items for this story
     items = db.query(DBStoryItem).filter_by(story_id=story_id).all()
-    item_map = {item.generation_id: item for item in items}
+    item_map = {}
+    ambiguous_ids = set()
+    for item in items:
+        if item.generation_id in item_map:
+            ambiguous_ids.add(item.generation_id)
+        item_map[item.generation_id] = item
 
-    # Verify all generation IDs belong to this story and update timecodes
+    # Validate the entire request before changing any item. Generation IDs
+    # cannot identify one clip after a split or duplication.
+    seen = set()
     for update in data.updates:
-        if update.generation_id not in item_map:
+        if (update.generation_id not in item_map or update.generation_id in ambiguous_ids
+                or update.generation_id in seen):
             return False
+        seen.add(update.generation_id)
+
+    for update in data.updates:
         item_map[update.generation_id].start_time_ms = update.start_time_ms
 
     # Update story updated_at
@@ -765,7 +776,9 @@ async def reorder_story_items(
     item_map = {item.generation_id: (item, gen, profile_name) for item, gen, profile_name in items_with_gen}
 
     # Verify all generation IDs belong to this story
-    if set(generation_ids) != set(item_map.keys()):
+    if (len(items_with_gen) != len(item_map)
+            or len(generation_ids) != len(item_map)
+            or set(generation_ids) != set(item_map.keys())):
         return None
 
     version_info = _get_versions_for_generations(list(item_map), db)
@@ -829,6 +842,7 @@ async def set_story_item_version(
         return None
 
     # Validate version_id belongs to this generation if provided
+    selected_audio_path = generation.audio_path
     if data.version_id:
         from ..database import GenerationVersion as DBGenerationVersion
 
@@ -842,6 +856,12 @@ async def set_story_item_version(
         )
         if not version:
             return None
+        selected_audio_path = version.audio_path
+
+    selected_duration = audio_duration(selected_audio_path, fallback=generation.duration)
+    trim_ms = item.trim_start_ms + item.trim_end_ms
+    if trim_ms and trim_ms >= int((selected_duration or 0.0) * 1000):
+        return None
 
     item.version_id = data.version_id
 
