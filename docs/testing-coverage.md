@@ -80,3 +80,38 @@ where possible. Network, waveform, recording, filesystem, and native boundaries
 are mocked in component tests. Passing tests do not qualify live model quality,
 OS permissions, physical devices, real database mutations, or native rendering;
 those require separate runtime checks.
+
+## Rust desktop production coverage
+
+LLVM coverage of Rust unit tests includes the executable lines in inline test
+modules. Use `scripts/rust-production-coverage.py` to summarize LCOV after
+excluding syntax explicitly gated by `#[cfg(test)]` or `#[cfg(all(test, ...))]`.
+The helper uses `syn` to find Rust item spans instead of cutting off a file at
+its first test module; production code can occur after those modules. Build the
+helper and the desktop test target with Scratch output paths:
+
+```sh
+export CARGO_TARGET_DIR=/Volumes/Scratch/voicebox/build/rust-coverage-helper
+cargo build --locked --manifest-path scripts/rust-test-spans/Cargo.toml
+# Set the desktop build's own Scratch CARGO_TARGET_DIR before this run.
+export CARGO_TARGET_DIR=/Volumes/Scratch/voicebox/cargo/desktop-coverage
+export TMPDIR=/Volumes/Scratch/voicebox/tmp/desktop-coverage
+mkdir -p "$TMPDIR" /Volumes/Scratch/voicebox/reports/desktop-coverage
+TAURI_CONFIG='{"bundle":{"externalBin":[]}}' cargo llvm-cov \
+  --manifest-path tauri/src-tauri/Cargo.toml --lib --bin voicebox --lcov \
+  --output-path /Volumes/Scratch/voicebox/reports/desktop-coverage/desktop.lcov
+python3 scripts/rust-production-coverage.py \
+  --lcov /Volumes/Scratch/voicebox/reports/desktop-coverage/desktop.lcov \
+  --root "$PWD" \
+  --span-tool /Volumes/Scratch/voicebox/build/rust-coverage-helper/debug/rust-test-spans \
+  > /Volumes/Scratch/voicebox/reports/desktop-coverage/production.json
+```
+
+The source tree must match the one used for the LCOV run; LCOV does not record
+source hashes, so the reporter cannot verify that itself. LCOV and LLVM JSON
+can count different mapped lines and should not be compared as identical
+metrics. The result covers only source files and executable lines mapped by the
+selected build, OS, and targets. It does not include uncompiled Windows/Linux
+code, live device tests, or unmapped code. It excludes only syntax directly
+marked by the supported test-only `cfg` forms; review other conditional and
+macro-generated test code before treating the figure as complete.

@@ -138,6 +138,9 @@ impl PlaybackControls {
             .store(seconds.max(0.0).to_bits(), Ordering::Release);
         self.seek_revision.fetch_add(1, Ordering::AcqRel);
     }
+    pub fn volume(&self) -> f32 {
+        f32::from_bits(self.volume.load(Ordering::Acquire))
+    }
     pub fn set_volume(&self, volume: f32) {
         self.volume
             .store(volume.clamp(0.0, 1.0).to_bits(), Ordering::Release);

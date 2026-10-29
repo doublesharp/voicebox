@@ -122,7 +122,10 @@ class SpeechRequest(BaseModel):
 def _available_formats() -> list[str]:
     """Formats this server can actually produce, given its libsndfile build and PATH."""
     formats = ["pcm"]
-    formats.extend(f for f, (fmt, _, _) in _SOUNDFILE_FORMATS.items() if fmt in sf.available_formats())
+    formats.extend(
+        f for f, (fmt, subtype, _) in _SOUNDFILE_FORMATS.items()
+        if fmt in sf.available_formats() and sf.check_format(fmt, subtype)
+    )
     if shutil.which("ffmpeg"):
         formats.extend(_FFMPEG_FORMATS)
     return formats
@@ -214,7 +217,7 @@ def encode_audio(audio: np.ndarray, sample_rate: int, response_format: str) -> t
 
     if response_format in _SOUNDFILE_FORMATS:
         fmt, subtype, media_type = _SOUNDFILE_FORMATS[response_format]
-        if fmt not in sf.available_formats():
+        if fmt not in sf.available_formats() or not sf.check_format(fmt, subtype):
             raise OpenAIError(
                 400,
                 f"response_format '{response_format}' is not supported by this server's libsndfile build.",

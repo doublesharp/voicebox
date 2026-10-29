@@ -469,6 +469,52 @@ fn emit(
     );
 }
 
+/// Reject partial PCM frames that a permissive WAV decoder would silently drop.
+fn validate_wave_frame_alignment(data: &[u8]) -> Result<(), String> {
+    let mut offset = 12usize;
+    let mut pcm_block_align = None;
+    while let Some(header) = data.get(offset..offset.saturating_add(8)) {
+        let size = u32::from_le_bytes(header[4..8].try_into().unwrap());
+        let body = offset + 8;
+        if &header[..4] == b"data" {
+            if let Some(align) = pcm_block_align {
+                if size != u32::MAX && size % align != 0 {
+                    return Err("WAV data ends in an incomplete audio frame".into());
+                }
+            }
+            break;
+        }
+        let Some(end) = body.checked_add(size as usize) else {
+            break;
+        };
+        let Some(chunk) = data.get(body..end) else {
+            break;
+        };
+        if &header[..4] == b"fmt " && chunk.len() >= 16 {
+            let format = u16::from_le_bytes([chunk[0], chunk[1]]);
+            let align = u16::from_le_bytes([chunk[12], chunk[13]]);
+            // WAVE_FORMAT_EXTENSIBLE stores the real format in a standard GUID.
+            let subtype = if format == 0xfffe
+                && chunk.len() >= 40
+                && chunk[26..40] == [0, 0, 0, 0, 16, 0, 128, 0, 0, 170, 0, 56, 155, 113]
+                && u16::from_le_bytes([chunk[16], chunk[17]]) >= 22
+            {
+                u16::from_le_bytes([chunk[24], chunk[25]])
+            } else {
+                format
+            };
+            if matches!(subtype, 1 | 3) && align != 0 {
+                pcm_block_align = Some(u32::from(align));
+            }
+        }
+        let Some(next) = end.checked_add((size & 1) as usize) else {
+            break;
+        };
+        offset = next;
+    }
+    Ok(())
+}
+
 fn decode_audio(data: Vec<u8>) -> Result<(Vec<f32>, u32, usize), String> {
     use symphonia::core::audio::SampleBuffer;
     use symphonia::core::errors::Error;
@@ -483,6 +529,7 @@ fn decode_audio(data: Vec<u8>) -> Result<(Vec<f32>, u32, usize), String> {
         if declared != u32::MAX && u64::from(declared) + 8 > data.len() as u64 {
             return Err("Audio file is truncated".into());
         }
+        validate_wave_frame_alignment(&data)?;
     }
     let input = MediaSourceStream::new(Box::new(std::io::Cursor::new(data)), Default::default());
     let mut format = symphonia::default::get_probe()
@@ -734,6 +781,25 @@ fn run_session(
     Ok(())
 }
 
+// Render one preview callback independently of the physical output device.
+fn render_preview<T: Copy>(
+    output: &mut [T],
+    rate: u32,
+    channels: usize,
+    queue: &mut crate::audio_stream::PcmQueue,
+    controls: &PlaybackControls,
+    convert: impl Fn(f32) -> T,
+) {
+    output.fill(convert(0.0));
+    if controls.stopped.load(Ordering::Acquire) || controls.paused.load(Ordering::Acquire) {
+        return;
+    }
+    let volume = controls.volume();
+    queue.render(output, rate, channels, |sample| {
+        convert((sample * volume).clamp(-1.0, 1.0))
+    });
+}
+
 fn build_pcm_stream<T>(
     device: &Device,
     config: &StreamConfig,
@@ -757,7 +823,14 @@ where
                     return;
                 }
                 if let Ok(mut queue) = queue.try_lock() {
-                    queue.render(output, rate, channels, T::from_sample);
+                    render_preview(
+                        output,
+                        rate,
+                        channels,
+                        &mut queue,
+                        &controls,
+                        T::from_sample,
+                    );
                 }
             },
             move |error| {
@@ -924,6 +997,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn preview_volume_applies_to_each_channel_and_can_be_changed() {
+        let controls = PlaybackControls::new(0.0, 1.0);
+        controls.paused.store(false, Ordering::Release);
+        let mut queue = crate::audio_stream::PcmQueue::new(8000).unwrap();
+        queue.append(&[0.8, -0.4, 0.6, -0.2]).unwrap();
+        queue.finished = true;
+        let mut out = [0.0; 4];
+        controls.set_volume(0.5);
+        render_preview(&mut out, 8000, 2, &mut queue, &controls, |s| s);
+        assert_eq!(out, [0.4, 0.4, -0.2, -0.2]);
+        controls.set_volume(0.0);
+        render_preview(&mut out, 8000, 2, &mut queue, &controls, |s| s);
+        assert_eq!(out, [0.0; 4]);
+        assert!(queue.ended());
+    }
+
+    #[test]
+    fn paused_preview_is_silent_without_consuming_audio() {
+        let controls = PlaybackControls::new(0.0, 1.0);
+        let mut queue = crate::audio_stream::PcmQueue::new(8000).unwrap();
+        queue.append(&[0.25, 0.5]).unwrap();
+        queue.finished = true;
+        let mut out = [1.0; 2];
+        render_preview(&mut out, 8000, 1, &mut queue, &controls, |s| s);
+        assert_eq!(out, [0.0; 2]);
+        assert!(!queue.ended());
+        controls.paused.store(false, Ordering::Release);
+        render_preview(&mut out, 8000, 1, &mut queue, &controls, |s| s);
+        assert_eq!(out, [0.25, 0.5]);
+        assert!(queue.ended());
+    }
+
+    #[test]
     fn binary_playback_preserves_bytes_and_routing_metadata() {
         let body = tauri::ipc::InvokeBody::Raw(vec![0, 127, 255]);
         let (data, devices, options) = read_playback_request(
@@ -989,6 +1095,83 @@ mod tests {
         let size = (audio.len() - 8) as u32;
         audio[4..8].copy_from_slice(&size.to_le_bytes());
         assert!(decode_audio(audio).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_wav_with_incomplete_stereo_frame_even_when_lengths_match() {
+        let mut audio = wav(&[100, 200, 300, 400], 2, 24000);
+        let data = audio.windows(4).position(|bytes| bytes == b"data").unwrap();
+        audio.truncate(audio.len() - 2);
+        let riff_size = (audio.len() - 8) as u32;
+        audio[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        audio[data + 4..data + 8].copy_from_slice(&6_u32.to_le_bytes());
+        assert!(decode_audio(audio).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_partial_extensible_pcm_frame() {
+        let mut audio = wav(&[100, 200, 300, 400], 2, 24000);
+        let fmt = audio.windows(4).position(|bytes| bytes == b"fmt ").unwrap();
+        assert_eq!(&audio[fmt + 4..fmt + 8], &16_u32.to_le_bytes());
+        audio[fmt + 4..fmt + 8].copy_from_slice(&40_u32.to_le_bytes());
+        audio[fmt + 8..fmt + 10].copy_from_slice(&0xfffe_u16.to_le_bytes());
+        let extension = [
+            22, 0, 16, 0, 3, 0, 0, 0, 1, 0, 0, 0, 0, 0, 16, 0, 128, 0, 0, 170, 0, 56, 155, 113,
+        ];
+        audio.splice(fmt + 24..fmt + 24, extension);
+        let riff_size = (audio.len() - 8) as u32;
+        audio[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        assert_eq!(decode_audio(audio.clone()).unwrap().0.len(), 4);
+        audio.truncate(audio.len() - 2);
+        let data = audio.windows(4).position(|bytes| bytes == b"data").unwrap();
+        audio[data + 4..data + 8].copy_from_slice(&6_u32.to_le_bytes());
+        let riff_size = (audio.len() - 8) as u32;
+        audio[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        assert!(decode_audio(audio).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_a_partial_mono_sample_with_a_valid_padding_byte() {
+        let mut audio = wav(&[100, 200], 1, 24000);
+        let data = audio.windows(4).position(|bytes| bytes == b"data").unwrap();
+        audio.truncate(audio.len() - 1);
+        audio.push(0); // RIFF pads odd-size chunks, but padding is not audio.
+        let riff_size = (audio.len() - 8) as u32;
+        audio[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        audio[data + 4..data + 8].copy_from_slice(&3_u32.to_le_bytes());
+        assert!(decode_audio(audio).is_err());
+    }
+
+    #[test]
+    fn decode_accepts_odd_metadata_chunk_with_padding() {
+        let mut audio = wav(&[100, 200], 1, 24000);
+        let data = audio.windows(4).position(|bytes| bytes == b"data").unwrap();
+        audio.splice(data..data, b"JUNK\x03\x00\x00\x00abc\x00".iter().copied());
+        let riff_size = (audio.len() - 8) as u32;
+        audio[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        assert_eq!(decode_audio(audio).unwrap().0.len(), 2);
+    }
+
+    #[test]
+    fn wave_alignment_check_defers_streaming_and_non_pcm_formats() {
+        let mut audio = wav(&[100, 200], 1, 24000);
+        let data = audio.windows(4).position(|bytes| bytes == b"data").unwrap();
+        audio[data + 4..data + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(validate_wave_frame_alignment(&audio).is_ok());
+        audio[data + 4..data + 8].copy_from_slice(&3_u32.to_le_bytes());
+        let fmt = audio.windows(4).position(|bytes| bytes == b"fmt ").unwrap();
+        audio[fmt + 8..fmt + 10].copy_from_slice(&6_u16.to_le_bytes());
+        assert!(validate_wave_frame_alignment(&audio).is_ok());
+    }
+
+    #[test]
+    fn decode_accepts_wav_with_unknown_chunk_before_audio_data() {
+        let mut audio = wav(&[100, 200, 300, 400], 2, 24000);
+        let data = audio.windows(4).position(|bytes| bytes == b"data").unwrap();
+        audio.splice(data..data, b"JUNK\x04\x00\x00\x00test".iter().copied());
+        let riff_size = (audio.len() - 8) as u32;
+        audio[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        assert_eq!(decode_audio(audio).unwrap().0.len(), 4);
     }
 
     #[test]
