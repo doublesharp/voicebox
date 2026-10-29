@@ -3,17 +3,18 @@
 import json
 import math
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 import time
 import uuid
+from pathlib import Path
 
 import numpy as np
 import soundfile as sf
 from scipy.signal import resample_poly
 
+from .processing import make_board, tail_frames, validate_chain
 from .timing import resampled_frames
 
 
@@ -24,7 +25,7 @@ def _integer(value, name):
 
 
 def _gain(value):
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value < 0:
         raise ValueError("gain must be finite and nonnegative")
     return float(value)
 
@@ -64,6 +65,7 @@ def _measure(path, cancelled=None):
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         return {"status": "unavailable", "integrated_lufs": None, "true_peak_dbtp": None}
+
     _check_cancel(cancelled)
     try:
         stderr = _process(
@@ -91,6 +93,35 @@ def _measure(path, cancelled=None):
         return {"status": "unavailable", "integrated_lufs": None, "true_peak_dbtp": None}
 
 
+def preflight_mp3():
+    """Encode a short silent signal to verify the actual configured MP3 encoder."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise ValueError("MP3 encoder unavailable")
+    try:
+        _process(
+            [
+                ffmpeg,
+                "-nostdin",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=48000:cl=stereo",
+                "-t",
+                "0.01",
+                "-c:a",
+                "libmp3lame",
+                "-f",
+                "mp3",
+                "-",
+            ]
+        )
+    except (OSError, ValueError) as exc:
+        raise ValueError("MP3 encoder unavailable") from exc
+
+
 def _source_range(path, info, rate, start, end):
     """Read only a working-sample range, retaining the resampler's global phase."""
     with sf.SoundFile(str(path)) as source:
@@ -115,10 +146,29 @@ def _source_range(path, info, rate, start, end):
 
 
 def render_project(
-    document, assets, resolve_asset, output_path, *, kind="mix", format="wav", cancelled=None, progress=None
+    document,
+    assets,
+    resolve_asset,
+    output_path,
+    *,
+    kind="mix",
+    format="wav",  # noqa: A002 - public renderer keyword retained for compatibility.
+    processing=None,
+    cancelled=None,
+    progress=None,
+    phase=None,
 ):
     if kind not in ("mix", "stems") or format not in ("wav", "mp3"):
         raise ValueError("unsupported render kind or format")
+    if processing is None:
+        processing = "processed" if kind == "mix" else "dry"
+    if processing not in ("dry", "processed"):
+        raise ValueError("unsupported processing")
+    mix_settings = document.get("mix", {})
+    master_gain = _gain(mix_settings.get("master_gain", 1))
+    limiter = mix_settings.get("limiter", False)
+    if master_gain > 16 or type(limiter) is not bool:
+        raise ValueError("Invalid master processing")
     rate = _integer(document["sample_rate"], "sample rate")
     channels = document["channels"]
     if not 8000 <= rate <= 192000 or type(channels) is not int or channels not in (1, 2):
@@ -129,6 +179,16 @@ def render_project(
     by_id = {t["id"]: t for t in tracks}
     if len(by_id) != len(tracks):
         raise ValueError("duplicate track")
+    for track in tracks:
+        validate_chain(track.get("effects_chain", []))
+        effect_gain_db = track.get("effect_gain_db", 0)
+        if (
+            isinstance(effect_gain_db, bool)
+            or not isinstance(effect_gain_db, int | float)
+            or not math.isfinite(effect_gain_db)
+            or not -40 <= effect_gain_db <= 40
+        ):
+            raise ValueError("Invalid track gain effect")
     solo = any(t.get("solo", False) and not t.get("mute", False) for t in tracks)
     active = {t["id"] for t in tracks if not t.get("mute", False) and (not solo or t.get("solo", False))}
     parts = []
@@ -145,6 +205,8 @@ def render_project(
         fade_in = _integer(clip["fade_in_samples"], "fade in")
         fade_out = _integer(clip["fade_out_samples"], "fade out")
         gain = _gain(clip["gain"]) * _gain(by_id[track_id].get("gain", 1))
+        if processing == "processed":
+            gain *= 10 ** (by_id[track_id].get("effect_gain_db", 0) / 20)
         if not math.isfinite(gain):
             raise ValueError("Invalid combined gain")
         if asset_id not in sources:
@@ -165,9 +227,23 @@ def render_project(
         if track_id in active:
             parts.append((track_id, start, duration, left, gain, fade_in, fade_out, path, info))
             length = max(length, start + duration)
+    arrangement_length = length
+    tail_truncated = False
+    if processing == "processed":
+        tail = max((tail_frames(by_id[tid].get("effects_chain", []), rate) for tid in active), default=0)
+        length = min(rate * MAX_DURATION_SECONDS, length + tail)
+        tail_truncated = length < arrangement_length + tail
     output = Path(output_path)
     output.mkdir(parents=True, exist_ok=True)
     warnings = []
+    if tail_truncated:
+        warnings.append("Effect tail truncated at the two-hour output limit")
+    if processing == "processed" and any(
+        effect.get("type") == "pitch_shift" and effect.get("enabled", True)
+        for tid in active
+        for effect in by_id[tid].get("effects_chain", [])
+    ):
+        warnings.append("Pitch shifting may introduce plugin latency; clip placement is not latency compensated")
     files = []
     measurements = {}
     # Unique names make each publication independent of earlier deliverables.
@@ -176,7 +252,15 @@ def render_project(
     try:
         targets = [(None, "mix")] if kind == "mix" else [(t["id"], "stem") for t in tracks if t["id"] in active]
         for target_index, (track_id, file_kind) in enumerate(targets):
+            if phase:
+                phase("mixing")
             peak = 0.0
+            target_tracks = [t["id"] for t in tracks if t["id"] in active and (track_id is None or t["id"] == track_id)]
+            boards = (
+                {tid: make_board(by_id[tid].get("effects_chain", [])) for tid in target_tracks}
+                if processing == "processed"
+                else {}
+            )
             intermediate = staging / f"{uuid.uuid4().hex}.wav"
             # Block mixing keeps memory independent of project/source duration.
             with sf.SoundFile(str(intermediate), "w", samplerate=rate, channels=channels, subtype="FLOAT") as stream:
@@ -184,39 +268,57 @@ def render_project(
                     _check_cancel(cancelled)
                     end = min(offset + BLOCK_FRAMES, max(length, 1))
                     mixed = np.zeros((end - offset, channels), dtype=np.float64)
-                    for tid, start, duration, left, gain, fade_in, fade_out, path, info in parts:
-                        if track_id is not None and tid != track_id:
-                            continue
-                        lo, hi = max(offset, start), min(end, start + duration)
-                        if lo >= hi:
-                            continue
-                        local = lo - start
-                        data = _source_range(path, info, rate, left + local, left + hi - start)
-                        if channels == 2 and info.channels == 1:
-                            data = np.repeat(data, 2, axis=1)
-                        elif channels == 1 and info.channels == 2:
-                            data = data.mean(axis=1, keepdims=True)
-                        scale = np.full(hi - lo, gain)
-                        positions = np.arange(local, local + hi - lo)
-                        if fade_in:
-                            scale *= np.minimum(positions / fade_in, 1.0)
-                        if fade_out:
-                            scale *= np.minimum((duration - positions) / fade_out, 1.0)
-                        mixed[lo - offset : hi - offset] += data * scale[:, None]
+                    for target_tid in target_tracks:
+                        track_block = np.zeros_like(mixed)
+                        for tid, start, duration, left, gain, fade_in, fade_out, path, info in parts:
+                            if tid != target_tid:
+                                continue
+                            lo, hi = max(offset, start), min(end, start + duration)
+                            if lo >= hi:
+                                continue
+                            local = lo - start
+                            data = _source_range(path, info, rate, left + local, left + hi - start)
+                            if channels == 2 and info.channels == 1:
+                                data = np.repeat(data, 2, axis=1)
+                            elif channels == 1 and info.channels == 2:
+                                data = data.mean(axis=1, keepdims=True)
+                            scale = np.full(hi - lo, gain)
+                            positions = np.arange(local, local + hi - lo)
+                            if fade_in:
+                                scale *= np.minimum(positions / fade_in, 1.0)
+                            if fade_out:
+                                scale *= np.minimum((duration - positions) / fade_out, 1.0)
+                            track_block[lo - offset : hi - offset] += data * scale[:, None]
+                        board = boards.get(target_tid)
+                        if board is not None:
+                            track_block = board(track_block.T.astype(np.float32), rate, reset=False).T
+                        mixed += track_block
                     if not np.isfinite(mixed).all():
                         raise ValueError("Invalid mixed samples")
+                    if kind == "mix" and processing == "processed":
+                        mixed *= master_gain
+                    if length > arrangement_length:
+                        # Fixed tail budget, with a short fade only in the appended tail.
+                        positions = np.arange(offset, end)
+                        fade = min(int(rate * 0.02), length - arrangement_length)
+                        if fade:
+                            mixed *= np.minimum(1, np.maximum(0, (length - positions) / fade))[:, None]
                     peak = max(peak, float(np.max(np.abs(mixed))))
                     stream.write(mixed)
                     if progress:
                         progress(target_index * max(length, 1) + end, len(targets) * max(length, 1))
-            normalize = kind == "mix" and document.get("mix", {}).get("normalize", False)
-            if peak > 1:
+            normalize = kind == "mix" and processing == "processed" and document.get("mix", {}).get("normalize", False)
+            limit_enabled = kind == "mix" and processing == "processed" and limiter
+            if peak > 1 and not limit_enabled:
                 warnings.append(
                     f"{file_kind} exceeds full scale before encoding" + ("; output clips" if not normalize else "")
                 )
             mix = document.get("mix", {})
             ffmpeg = shutil.which("ffmpeg")
             encoded = staging / f"{uuid.uuid4().hex}.{format}"
+            if phase:
+                phase("encoding")
+            filters = []
             if normalize:
                 if not ffmpeg:
                     raise ValueError("normalization requires ffmpeg loudnorm")
@@ -224,10 +326,25 @@ def render_project(
                 tp = float(mix.get("max_true_peak_dbtp", -1.5))
                 if not math.isfinite(target) or not math.isfinite(tp) or not -70 <= target <= -5 or not -9 <= tp <= 0:
                     raise ValueError("unsupported loudness target")
-                filter_arg = f"loudnorm=I={target}:TP={tp}:LRA=11"
-            else:
-                filter_arg = "anull"
-            if format == "mp3" or normalize:
+                filters.append(f"loudnorm=I={target}:TP={tp}:LRA=11")
+            if limit_enabled:
+                tp = mix.get("max_true_peak_dbtp", -1.5)
+                if (
+                    isinstance(tp, bool)
+                    or not isinstance(tp, int | float)
+                    or not math.isfinite(tp)
+                    or not -9 <= tp <= 0
+                ):
+                    raise ValueError("unsupported limiter target")
+                ceiling = 10 ** (tp / 20)
+                filters.extend(
+                    [f"aresample={rate * 4}", f"alimiter=limit={ceiling:.9f}:level=0:latency=1", f"aresample={rate}"]
+                )
+                warnings.append(
+                    "Oversampled limiter uses the peak target; final true-peak compliance is not guaranteed"
+                )
+            filter_arg = ",".join(filters) or "anull"
+            if format == "mp3" or normalize or limit_enabled:
                 if not ffmpeg:
                     raise ValueError("ffmpeg encoder unavailable")
                 codec = ["-c:a", "libmp3lame"] if format == "mp3" else ["-c:a", "pcm_s24le"]
@@ -262,6 +379,8 @@ def render_project(
                         if not len(block):
                             break
                         target.write(block)
+            if phase:
+                phase("metering")
             measurement = _measure(encoded, cancelled)
             measurement["pre_encode_sample_peak"] = peak
             if measurement["status"] != "measured":
@@ -280,7 +399,7 @@ def render_project(
                     "track_id": track_id,
                     "sample_rate": rate,
                     "channels": channels,
-                    "processing": "master" if kind == "mix" else "dry",
+                    "processing": processing,
                 }
             )
             measurements[name] = measurement

@@ -4,36 +4,26 @@ import hashlib
 import json
 import math
 import os
-from pathlib import Path, PurePosixPath
 import re
 import shutil
 import stat
 import tempfile
 import zipfile
+from pathlib import Path, PurePosixPath
 
 import soundfile as sf
 
+from .archive_scope import (
+    asset_references as _references,  # noqa: F401 - retain the prior private collector alias.
+    mark_missing_references,
+    prepare_export,
+    required_references,
+    unavailable_references,
+    validate_reference_markers,
+    validate_scope,
+    voice_snapshots,
+)
 from .timing import resampled_frames
-
-
-def _references(value):
-    found = set()
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if (key == "asset_id" or key.endswith("_asset_id")) and item is not None:
-                if not isinstance(item, str) or not item:
-                    raise ValueError("invalid asset reference")
-                found.add(item)
-            elif (key in ("asset_ids", "reference_assets") or key.endswith("_asset_ids")) and item is not None:
-                if not isinstance(item, list) or any(not isinstance(x, str) or not x for x in item):
-                    raise ValueError("invalid asset references")
-                found.update(item)
-            else:
-                found.update(_references(item))
-    elif isinstance(value, list):
-        for item in value:
-            found.update(_references(item))
-    return found
 
 
 def _records(items, label):
@@ -56,7 +46,7 @@ def _nonnegative_integer(value, label):
 def _finite(value, label, minimum=None, maximum=None):
     if type(value) not in (int, float) or not math.isfinite(value):
         raise ValueError(f"invalid {label}")
-    if minimum is not None and value < minimum or maximum is not None and value > maximum:
+    if (minimum is not None and value < minimum) or (maximum is not None and value > maximum):
         raise ValueError(f"invalid {label}")
     return value
 
@@ -71,7 +61,7 @@ def _validate_generation(passage, assets):
     direction = passage.get("direction")
     if not isinstance(direction, dict) or not isinstance(direction.get("instruct"), str):
         raise ValueError("invalid passage direction")
-    if "seed" not in direction or direction["seed"] is not None and type(direction["seed"]) is not int:
+    if "seed" not in direction or (direction["seed"] is not None and type(direction["seed"]) is not int):
         raise ValueError("invalid generation seed")
     if not 1 <= _nonnegative_integer(direction.get("max_chunk_chars"), "chunk size") <= 100000:
         raise ValueError("invalid generation chunk size")
@@ -92,6 +82,7 @@ def _validate_generation(passage, assets):
     elif kind == "designed":
         _string(voice.get("design_prompt"), "voice design")
     elif kind == "cloned":
+        missing = unavailable_references(voice)
         samples = voice.get("samples")
         if not isinstance(samples, list) or not samples:
             raise ValueError("missing voice samples")
@@ -99,7 +90,7 @@ def _validate_generation(passage, assets):
             if (
                 not isinstance(sample, dict)
                 or not isinstance(sample.get("asset_id"), str)
-                or sample["asset_id"] not in assets
+                or (sample["asset_id"] not in assets and sample["asset_id"] not in missing)
                 or not isinstance(sample.get("reference_text"), str)
             ):
                 raise ValueError("invalid voice sample")
@@ -157,8 +148,7 @@ def _validate_document(doc, assets, takes):
         if take_id is not None and (
             take_id not in takes
             or takes[take_id].get("asset_id") != asset_id
-            or passage_id is not None
-            and takes[take_id].get("passage_id") != passage_id
+            or (passage_id is not None and takes[take_id].get("passage_id") != passage_id)
         ):
             raise ValueError("clip take does not match its audio or passage")
         values = {
@@ -171,11 +161,19 @@ def _validate_document(doc, assets, takes):
         if length <= 0 or values["fade_in_samples"] > length or values["fade_out_samples"] > length:
             raise ValueError("invalid clip source range")
         _finite(clip.get("gain"), "clip gain", 0)
+    for track in tracks.values():
+        _finite(track.get("effect_gain_db", 0), "track gain effect", -40, 40)
+        from .processing import validate_chain
+
+        validate_chain(track.get("effects_chain", []))
     mix = doc.get("mix")
     if not isinstance(mix, dict) or type(mix.get("normalize")) is not bool:
         raise ValueError("invalid mix settings")
     _finite(mix.get("target_lufs"), "loudness target", -70, -5)
     _finite(mix.get("max_true_peak_dbtp"), "true peak target", -9, 0)
+    _finite(mix.get("master_gain", 1), "master gain", 0, 16)
+    if type(mix.get("limiter", False)) is not bool:
+        raise ValueError("invalid sample peak limiter")
 
 
 def _validate_project(project, assets):
@@ -229,7 +227,8 @@ def _validate_project(project, assets):
                 or recording.get("text") != takes[recording["take_id"]]["text"]
             ):
                 raise ValueError("invalid acknowledged recording")
-    if not _references(project).issubset(assets):
+    validate_reference_markers(project, assets)
+    if not required_references(project).issubset(assets):
         raise ValueError("missing referenced asset")
 
 
@@ -287,7 +286,12 @@ def _validate_audio(path, metadata):
         raise ValueError("invalid audio asset") from exc
 
 
-def write_archive(project_payload, assets, resolve_asset, output_path):
+def write_archive(
+    project_payload, assets, resolve_asset, output_path, *, take_scope="all", include_regeneration_references=True
+):
+    project_payload, assets, scope = prepare_export(
+        project_payload, assets, take_scope=take_scope, include_regeneration_references=include_regeneration_references
+    )
     ids = _metadata(assets)
     _validate_project(project_payload, ids)
     output = Path(output_path)
@@ -309,7 +313,7 @@ def write_archive(project_payload, assets, resolve_asset, output_path):
                 metadata["archive_path"] = entry
                 manifest_assets.append(metadata)
                 archive.write(source, entry)
-            manifest = {"schema_version": 1, "project": project_payload, "assets": manifest_assets}
+            manifest = {"schema_version": 1, "project": project_payload, "assets": manifest_assets, "scope": scope}
             archive.writestr("manifest.json", json.dumps(manifest, allow_nan=False, separators=(",", ":")))
         with zipfile.ZipFile(name, "r") as check:
             for asset in manifest_assets:
@@ -375,6 +379,7 @@ def read_archive(archive_path, destination, *, max_total_bytes=1073741824, max_f
                 or manifest["schema_version"] != 1
             ):
                 raise ValueError("unsupported archive schema")
+            scope = validate_scope(manifest.get("scope"))
             assets = manifest.get("assets")
             ids = _metadata(assets)
             _validate_project(manifest.get("project"), ids)
@@ -382,11 +387,22 @@ def read_archive(archive_path, destination, *, max_total_bytes=1073741824, max_f
             if (
                 any(not isinstance(p, str) or not re.fullmatch(r"assets/[0-9]{8}", p) for p in paths)
                 or len(set(paths)) != len(paths)
-                or names != {"manifest.json", *paths}
+                or names - {"manifest.json", *paths}
             ):
                 raise ValueError("invalid asset entries")
+            missing = {asset["id"] for asset in assets if asset["archive_path"] not in names}
+            if missing:
+                mark_missing_references(manifest["project"], missing)
+                assets = [asset for asset in assets if asset["id"] not in missing]
+                ids = _metadata(assets)
+                _validate_project(manifest["project"], ids)
+                paths = [asset["archive_path"] for asset in assets]
+                if scope is not None:
+                    scope["missing_reference_count"] = len(
+                        set().union(*(unavailable_references(v) for v in voice_snapshots(manifest["project"])))
+                    )
             staged = []
-            for asset, entry in zip(assets, paths):
+            for asset, entry in zip(assets, paths, strict=False):
                 info = archive.getinfo(entry)
                 if info.file_size != asset["size_bytes"]:
                     raise ValueError("asset size mismatch")
@@ -404,7 +420,7 @@ def read_archive(archive_path, destination, *, max_total_bytes=1073741824, max_f
                     raise ValueError("asset integrity mismatch")
                 _validate_audio(target, asset)
                 staged.append({**{k: v for k, v in asset.items() if k != "archive_path"}, "path": str(target)})
-            return {"project": manifest["project"], "assets": staged}
+            return {"project": manifest["project"], "assets": staged, "scope": scope}
     except Exception:
         shutil.rmtree(stage, ignore_errors=True)
         raise

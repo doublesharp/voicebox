@@ -1,6 +1,7 @@
 """Render frozen checkpoints into managed, immutable deliverables."""
 
 import asyncio
+import hashlib
 import json
 import shutil
 import threading
@@ -21,16 +22,31 @@ class StudioDelivery:
         self.directory = store.root / "deliverables"
         self.directory.mkdir(exist_ok=True)
 
-    def submit(self, project_id, idempotency_key, revision_id, kind, format, allow_stale_audio=False):
+    def _discard_unregistered(self, paths):
+        # A successful COMMIT can lose its acknowledgement. Re-read durable
+        # publication before deleting; an unavailable readback preserves files.
+        try:
+            with self.store.connect() as db:
+                registered = {row[0] for row in db.execute("SELECT path FROM deliverables")}
+        except Exception:
+            return
+        for path in paths:
+            if path.name not in registered:
+                path.unlink(missing_ok=True)
+
+    def submit(self, project_id, idempotency_key, revision_id, kind, format, allow_stale_audio=False, processing=None):  # noqa: A002 - public API keyword
         if (
             not isinstance(idempotency_key, str)
             or not idempotency_key.strip()
             or kind not in ("mix", "stems")
             or format not in ("wav", "mp3")
             or type(allow_stale_audio) is not bool
+            or processing not in (None, "dry", "processed")
         ):
             raise ValueError("Invalid render request")
         request = dict(revision_id=revision_id, kind=kind, format=format, allow_stale_audio=allow_stale_audio)
+        if processing is not None:
+            request["processing"] = processing
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             old = db.execute(
@@ -64,6 +80,7 @@ class StudioDelivery:
                 ):
                     raise ValueError("Incomplete narration: insert every passage on an audible track")
             recordings = []
+            stem_voices = {}
             for clip in doc["clips"]:
                 self.store._validate_clip(db, project_id, doc, clip)
                 asset = assets.get(clip["asset_id"])
@@ -74,6 +91,13 @@ class StudioDelivery:
                     take = takes.get(clip.get("take_id"))
                     if not p or not take or take["passage_id"] != p["id"] or take["asset_id"] != clip["asset_id"]:
                         raise ValueError("Invalid clip source")
+                    if kind == "stems":
+                        from .voice_identity import frozen_identity
+
+                        identity = encode(frozen_identity(take, lambda ident: assets.get(ident, {}).get("hash")))
+                        previous = stem_voices.setdefault(clip["track_id"], identity)
+                        if previous != identity:
+                            raise ValueError("A stem track contains multiple frozen voice identities")
                     frozen_passage = take.get("request", {}).get("passage")
                     stale = take["text"] != p["text"] or (
                         frozen_passage is not None and frozen_passage.get("input_revision") != p["input_revision"]
@@ -91,9 +115,15 @@ class StudioDelivery:
                     )
             if not doc["clips"]:
                 raise ValueError("Nothing to render")
-            if format == "mp3" or doc["mix"]["normalize"]:
-                if not shutil.which("ffmpeg"):
-                    raise ValueError("Requested encoder or normalization is unavailable")
+            if format == "mp3":
+                from .rendering import preflight_mp3
+
+                preflight_mp3()
+            needs_ffmpeg = format == "mp3" or (
+                (doc["mix"]["normalize"] or doc["mix"].get("limiter", False)) and kind == "mix" and processing != "dry"
+            )
+            if needs_ffmpeg and not shutil.which("ffmpeg"):
+                raise ValueError("Requested encoder or normalization is unavailable")
             job_id = uid()
             stamp = now()
             frozen = {
@@ -122,6 +152,7 @@ class StudioDelivery:
         return result
 
     async def run(self, job_id):
+        from .job_state import phase, start_attempt
         from .rendering import render_project
 
         with self.store.connect() as db:
@@ -130,10 +161,11 @@ class StudioDelivery:
             if not row or row["status"] != "queued":
                 return
             db.execute("UPDATE jobs SET status='running',updated_at=? WHERE id=?", (now(), job_id))
+            attempt = start_attempt(db, job_id)
+            phase(db, job_id, attempt, "mixing")
             project_id = row["project_id"]
             frozen = json.loads(row["request"])
         work = self.directory / (".render-" + job_id)
-        work.mkdir()
         published = []
         stop = threading.Event()
         last_progress = [0.0]
@@ -155,8 +187,17 @@ class StudioDelivery:
                     (encode({"progress": 0.9 * done / max(total, 1)}), now(), job_id),
                 )
 
+        def render_phase(value):
+            with self.store.connect() as db:
+                row = db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+                if row and row["status"] == "running":
+                    phase(db, job_id, attempt, value)
+
         operation = None
+        created_work = False
         try:
+            work.mkdir()
+            created_work = True
             operation = asyncio.create_task(
                 asyncio.to_thread(
                     render_project,
@@ -166,16 +207,31 @@ class StudioDelivery:
                     work,
                     kind=frozen["kind"],
                     format=frozen["format"],
+                    processing=frozen.get("processing"),
                     cancelled=cancelled,
                     progress=progress,
+                    phase=render_phase,
                 )
             )
             result = await asyncio.shield(operation)
+            hashes = {}
+            for output in result["files"]:
+                source = Path(output["path"]).resolve()
+                if source.parent != work.resolve() or not source.is_file():
+                    raise ValueError("Invalid rendered output")
+                digest = hashlib.sha256()
+                with source.open("rb") as rendered:
+                    for block in iter(lambda: rendered.read(1024 * 1024), b""):
+                        if cancelled():
+                            raise ValueError("Render cancelled")
+                        digest.update(block)
+                hashes[str(source)] = digest.hexdigest()
             with self.store.connect() as db:
                 db.execute("BEGIN IMMEDIATE")
                 row = db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
                 if not row or row["status"] != "running":
                     return
+                phase(db, job_id, attempt, "publishing")
                 items = []
                 for output in result["files"]:
                     source = Path(output["path"]).resolve()
@@ -207,7 +263,16 @@ class StudioDelivery:
                         measurements=measurement,
                         recordings=frozen["recordings"],
                         allow_stale_audio=frozen["allow_stale_audio"],
+                        recipe={
+                            "document": frozen["document"],
+                            "kind": frozen["kind"],
+                            "format": frozen["format"],
+                            "processing": frozen.get("processing")
+                            or ("processed" if frozen["kind"] == "mix" else "dry"),
+                            "source_hashes": {key: asset.get("hash") for key, asset in frozen["assets"].items()},
+                        },
                     )
+                    data["sha256"] = hashes[str(source)]
                     db.execute("INSERT INTO deliverables VALUES (?,?,?,?)", (ident, project_id, encode(data), ident))
                     items.append({"id": ident, **data})
                 db.execute(
@@ -224,6 +289,7 @@ class StudioDelivery:
                         job_id,
                     ),
                 )
+                phase(db, job_id, attempt, "completed")
         except asyncio.CancelledError:
             stop.set()
             # to_thread cancellation does not stop its native worker. Reap it
@@ -237,29 +303,35 @@ class StudioDelivery:
                     break
             if operation is not None and not operation.cancelled():
                 operation.exception()
-            for path in published:
-                path.unlink(missing_ok=True)
+            self._discard_unregistered(published)
             with self.store.connect() as db:
                 db.execute(
                     "UPDATE jobs SET status='interrupted',error='Render interrupted',updated_at=? WHERE id=? AND status='running'",
                     (now(), job_id),
                 )
+                phase(db, job_id, attempt, "interrupted", "Render interrupted")
             raise
         except Exception as exc:
-            for path in published:
-                path.unlink(missing_ok=True)
+            self._discard_unregistered(published)
             with self.store.connect() as db:
                 db.execute(
                     "UPDATE jobs SET status='failed',error=?,updated_at=? WHERE id=? AND status='running'",
                     (str(exc), now(), job_id),
                 )
+                row = db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+                if row and row["status"] == "failed":
+                    phase(db, job_id, attempt, "failed", str(exc))
         finally:
-            shutil.rmtree(work, ignore_errors=True)
+            if created_work:
+                shutil.rmtree(work, ignore_errors=True)
             with self.store.connect() as db:
                 db.execute(
                     "UPDATE jobs SET status='cancelled',updated_at=? WHERE id=? AND status='cancelling'",
                     (now(), job_id),
                 )
+                row = db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+                if row and row["status"] == "cancelled":
+                    phase(db, job_id, attempt, "cancelled")
 
     def path(self, ident):
         with self.store.connect() as db:

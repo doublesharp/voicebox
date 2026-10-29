@@ -126,6 +126,7 @@ export class StudioClient implements StudioTransport {
       revision_id: string;
       kind: 'mix' | 'stems';
       format: 'wav' | 'mp3';
+      processing?: 'dry' | 'processed';
       allow_stale_audio?: boolean;
     },
   ) {

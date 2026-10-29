@@ -2,6 +2,10 @@ import { Sparkles } from 'lucide-react';
 import { useState } from 'react';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
+import {
+  hasMissingRegenerationReferences,
+  RegenerationReferenceNotice,
+} from './ArchiveScopeControls';
 import { useStudio } from './context';
 import { engineForPassage } from './domain';
 import { operationId } from './session';
@@ -92,6 +96,10 @@ export function Director() {
   const selectedIds = studio.checkedPassages.length
     ? studio.checkedPassages.filter((id) => project.document.passages.some((p) => p.id === id))
     : [passage.id];
+  const missingReferences = project.document.passages.some(
+    (item) =>
+      selectedIds.includes(item.id) && hasMissingRegenerationReferences(item.voice_snapshot),
+  );
   const direction = save.drafts[passage.id]?.direction ?? passage.direction;
   const currentText = save.drafts[passage.id]?.text ?? passage.text;
   const disabled = !studio.canMutate || passage.locked;
@@ -144,6 +152,7 @@ export function Director() {
         </div>
         <span className="studio-status-chip">{passage.locked ? 'Locked' : 'Passage'}</span>
       </div>
+      {missingReferences && <RegenerationReferenceNotice />}
       <Field
         label="Voice / cast"
         hint="Assignments snapshot this profile. Global profile changes do not silently update the project."
@@ -396,6 +405,7 @@ export function Director() {
             studio.actionBusy ||
             (!request &&
               (disabled ||
+                missingReferences ||
                 !engine?.ready ||
                 !passage.profile_id ||
                 !currentText.trim() ||

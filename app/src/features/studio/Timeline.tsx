@@ -1,5 +1,6 @@
 import { Copy, Plus, Scissors, Trash2 } from 'lucide-react';
 import { useRef, useState } from 'react';
+import { EffectsChainEditor } from '@/components/Effects/EffectsChainEditor';
 import { Input } from '@/components/ui/input';
 import { useStudio } from './context';
 import { clipFrames, formatTime, timelineEnd, toSamples } from './domain';
@@ -30,6 +31,18 @@ export function Timeline({ compact = false }: { compact?: boolean }) {
       gap_ms: gap,
       ...(atPlayhead ? { start_sample: toSamples(studio.playhead, doc.sample_rate) } : {}),
     });
+  const importAudio = (file: File) => {
+    if (!canMutate || studio.actionBusy) return;
+    void studio.runAction(async () => {
+      const asset = await studio.client.uploadAsset(project.id, file);
+      await session.command('insert_asset', {
+        asset_id: asset.id,
+        start_sample: toSamples(studio.playhead, doc.sample_rate),
+        kind: mediaKind,
+        name: file.name,
+      });
+    });
+  };
   return (
     <section
       className={`studio-timeline ${compact ? 'is-compact' : ''}`}
@@ -52,15 +65,7 @@ export function Timeline({ compact = false }: { compact?: boolean }) {
               const file = event.target.files?.[0];
               event.target.value = '';
               if (!file) return;
-              void studio.runAction(async () => {
-                const asset = await studio.client.uploadAsset(project.id, file);
-                await session.command('insert_asset', {
-                  asset_id: asset.id,
-                  start_sample: toSamples(studio.playhead, doc.sample_rate),
-                  kind: mediaKind,
-                  name: file.name,
-                });
-              });
+              importAudio(file);
             }}
           />
           <select
@@ -94,6 +99,23 @@ export function Timeline({ compact = false }: { compact?: boolean }) {
       </div>
       {unresolved && (
         <p className="studio-note">Choose a take for every selected passage before insertion.</p>
+      )}
+      {!doc.clips.length && (
+        <button
+          type="button"
+          disabled={!canMutate || studio.actionBusy}
+          aria-label="Import audio into the empty arrangement"
+          aria-disabled={!canMutate || studio.actionBusy}
+          onClick={() => importInput.current?.click()}
+          onDragOver={(event) => event.preventDefault()}
+          onDrop={(event) => {
+            event.preventDefault();
+            const file = event.dataTransfer.files[0];
+            if (file) importAudio(file);
+          }}
+        >
+          <span>Drop audio here, or choose an audio file.</span>
+        </button>
       )}
       <div className="studio-timeline-scroll">
         <div className="studio-ruler">
@@ -343,13 +365,51 @@ export function Mixer() {
                 void session.command('update_track', { track_id: track.id, gain });
             }}
           />
+          <details>
+            <summary>Track effects</summary>
+            <fieldset disabled={!canMutate}>
+              <EffectsChainEditor
+                value={track.effects_chain ?? []}
+                compact
+                showPresets={false}
+                excludedTypes={['pitch_shift']}
+                commitParametersOnRelease
+                disabled={!canMutate}
+                onChange={(effects_chain) =>
+                  canMutate &&
+                  void session.command('update_track', { track_id: track.id, effects_chain })
+                }
+              />
+            </fieldset>
+            <p className="studio-note">Pitch shifting is available in legacy Effects.</p>
+          </details>
         </div>
       ))}
       <div className="studio-divider" />
       <h3>Delivery mastering</h3>
+      <NumberField
+        label="Master gain (linear)"
+        min={0}
+        max={16}
+        value={mix.master_gain ?? 1}
+        disabled={!canMutate}
+        onCommit={(master_gain) => void session.command('update_mix', { master_gain })}
+      />
+      <label className="studio-check">
+        <input
+          type="checkbox"
+          checked={mix.limiter ?? false}
+          disabled={!canMutate}
+          onChange={(event) =>
+            void session.command('update_mix', { limiter: event.target.checked })
+          }
+        />{' '}
+        Oversampled peak limiter (final true-peak compliance is not guaranteed)
+      </label>
       <p className="studio-note">
         Targets are saved with the checkpoint. Final-file measurements come from the renderer;
-        timeline playback is a source preview.
+        timeline playback bypasses effects and master processing. Processed renders include up to
+        ten seconds of effect tail, limited by the two-hour output boundary.
       </p>
       <label className="studio-check">
         <input
@@ -374,7 +434,7 @@ export function Mixer() {
       />
       <NumberField
         label="Maximum true peak (dBTP)"
-        min={-12}
+        min={-9}
         max={0}
         value={mix.max_true_peak_dbtp}
         disabled={!canMutate}

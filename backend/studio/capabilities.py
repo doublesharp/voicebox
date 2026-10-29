@@ -151,6 +151,13 @@ def resolve_voice(voice):
 
 def freeze_passage(passage, resolver=resolve_voice):
     voice = passage.get("voice_snapshot")
+    from .archive_scope import unavailable_references
+
+    if voice and unavailable_references(voice):
+        raise ValueError(
+            f"Passage {passage['id']}: regeneration references are unavailable. "
+            "Existing audio can still play; reassign a voice with reference audio before generating."
+        )
     current = resolver(voice)
     snapshot = (voice or {}).get("capabilities")
     if snapshot is not None and snapshot != current:
