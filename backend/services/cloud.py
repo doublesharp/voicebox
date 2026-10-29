@@ -99,8 +99,9 @@ async def handle_callback(db: Session, code: str, state: str) -> tuple[bool, str
                 logger.warning("cloud exchange returned a non-JSON payload")
                 return False, "Voicebox Cloud returned an unexpected response."
             api_key = payload.get("key")
-            device_name = payload.get("label")
-            if not api_key:
+            label = payload.get("label")
+            device_name = label if isinstance(label, str) else None
+            if not isinstance(api_key, str) or not api_key or any(not 33 <= ord(c) <= 126 for c in api_key):
                 return False, "Voicebox Cloud did not return a key."
 
             # Confirm the freshly minted key actually authenticates the API.
@@ -113,7 +114,8 @@ async def handle_callback(db: Session, code: str, state: str) -> tuple[bool, str
                 return False, "Sign-in succeeded but the key could not be verified."
             # The 200 above proves the key works; the user id is best-effort.
             data = (_json_dict(me) or {}).get("data")
-            account_user_id = data.get("userId") if isinstance(data, dict) else None
+            user_id = data.get("userId") if isinstance(data, dict) else None
+            account_user_id = user_id if isinstance(user_id, str) else None
     except httpx.HTTPError:
         logger.exception("network error during cloud exchange")
         return False, "Could not reach Voicebox Cloud. Check your connection and try again."
