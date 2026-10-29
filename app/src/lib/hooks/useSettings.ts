@@ -1,4 +1,5 @@
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
+import { useCallback } from 'react';
 import { apiClient } from '@/lib/api/client';
 import type {
   CaptureSettings,
@@ -9,6 +10,27 @@ import type {
 
 const CAPTURE_SETTINGS_KEY = ['settings', 'captures'] as const;
 const GENERATION_SETTINGS_KEY = ['settings', 'generation'] as const;
+
+type CapturePending = { patch: Partial<CaptureSettings> };
+type CaptureWrites = { confirmed: CaptureSettings | undefined; pending: CapturePending[] };
+const captureWrites = new WeakMap<QueryClient, CaptureWrites>();
+type CaptureMutation = {
+  patch: Omit<CaptureSettingsUpdate, 'custom_llm_api_key'>;
+  secretId?: number;
+};
+const captureSecrets = new WeakMap<QueryClient, Map<number, string | null>>();
+let nextCaptureSecretId = 0;
+
+function renderCaptureWrites(client: QueryClient, writes: CaptureWrites) {
+  if (!writes.confirmed) return;
+  client.setQueryData<CaptureSettings>(
+    CAPTURE_SETTINGS_KEY,
+    writes.pending.reduce(
+      (settings, pending) => ({ ...settings, ...pending.patch }),
+      writes.confirmed,
+    ),
+  );
+}
 
 /**
  * Hook for capture/refine defaults. Reads from the server and writes partial
@@ -25,25 +47,43 @@ export function useCaptureSettings() {
   });
 
   const mutation = useMutation({
-    mutationFn: (patch: CaptureSettingsUpdate) => apiClient.updateCaptureSettings(patch),
-    onMutate: async (patch) => {
+    scope: { id: 'capture-settings' },
+    mutationFn: async ({ patch, secretId }: CaptureMutation) => {
+      const secrets = captureSecrets.get(queryClient);
+      try {
+        if (secretId !== undefined && !secrets?.has(secretId)) {
+          throw new Error('The pending API key is unavailable');
+        }
+        return await apiClient.updateCaptureSettings(
+          secretId === undefined ? patch : { ...patch, custom_llm_api_key: secrets?.get(secretId) },
+        );
+      } finally {
+        if (secretId !== undefined) secrets?.delete(secretId);
+      }
+    },
+    onMutate: async ({ patch }: CaptureMutation) => {
       await queryClient.cancelQueries({ queryKey: CAPTURE_SETTINGS_KEY });
-      const previous = queryClient.getQueryData<CaptureSettings>(CAPTURE_SETTINGS_KEY);
-      if (previous) {
-        queryClient.setQueryData<CaptureSettings>(CAPTURE_SETTINGS_KEY, {
-          ...previous,
-          ...patch,
-        });
+      let writes = captureWrites.get(queryClient);
+      if (!writes) {
+        writes = {
+          confirmed: queryClient.getQueryData<CaptureSettings>(CAPTURE_SETTINGS_KEY),
+          pending: [],
+        };
+        captureWrites.set(queryClient, writes);
       }
-      return { previous };
+      const pending: CapturePending = { patch };
+      writes.pending.push(pending);
+      renderCaptureWrites(queryClient, writes);
+      return { writes, pending };
     },
-    onError: (_err, _patch, ctx) => {
-      if (ctx?.previous) {
-        queryClient.setQueryData(CAPTURE_SETTINGS_KEY, ctx.previous);
+    onSettled: (data, _err, { patch, secretId }, context) => {
+      if (secretId !== undefined) captureSecrets.get(queryClient)?.delete(secretId);
+      if (context) {
+        if (data) context.writes.confirmed = data;
+        context.writes.pending = context.writes.pending.filter((item) => item !== context.pending);
+        renderCaptureWrites(queryClient, context.writes);
+        if (context.writes.pending.length === 0) captureWrites.delete(queryClient);
       }
-    },
-    onSettled: (data, _err, patch) => {
-      if (data) queryClient.setQueryData(CAPTURE_SETTINGS_KEY, data);
       // /capture/readiness resolves stt_model / llm_model live on each
       // call, but its cached response keeps serving the previous
       // model's state until the next 5 s poll. Invalidate on model
@@ -60,10 +100,28 @@ export function useCaptureSettings() {
     },
   });
 
+  const update = useCallback(
+    (patch: CaptureSettingsUpdate) => {
+      const { custom_llm_api_key: secret, ...safePatch } = patch;
+      let secretId: number | undefined;
+      if (secret !== undefined) {
+        let secrets = captureSecrets.get(queryClient);
+        if (!secrets) {
+          secrets = new Map();
+          captureSecrets.set(queryClient, secrets);
+        }
+        secretId = ++nextCaptureSecretId;
+        secrets.set(secretId, secret);
+      }
+      mutation.mutate({ patch: safePatch, secretId });
+    },
+    [mutation.mutate, queryClient],
+  );
+
   return {
     settings: query.data,
     isLoading: query.isLoading,
-    update: mutation.mutate,
+    update,
   };
 }
 
@@ -81,8 +139,7 @@ export function useGenerationSettings() {
   });
 
   const mutation = useMutation({
-    mutationFn: (patch: GenerationSettingsUpdate) =>
-      apiClient.updateGenerationSettings(patch),
+    mutationFn: (patch: GenerationSettingsUpdate) => apiClient.updateGenerationSettings(patch),
     onMutate: async (patch) => {
       await queryClient.cancelQueries({ queryKey: GENERATION_SETTINGS_KEY });
       const previous = queryClient.getQueryData<GenerationSettings>(GENERATION_SETTINGS_KEY);
