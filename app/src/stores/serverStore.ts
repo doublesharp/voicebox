@@ -4,7 +4,9 @@ import { queryClient } from '@/lib/queryClient';
 
 interface ServerStore {
   serverUrl: string;
+  serverUrlSource: 'auto' | 'custom';
   setServerUrl: (url: string) => void;
+  setDiscoveredServerUrl: (url: string) => void;
 
   isConnected: boolean;
   setIsConnected: (connected: boolean) => void;
@@ -35,37 +37,29 @@ export function getDefaultServerUrl(): string {
   }
 
   const { protocol, origin, hostname } = window.location;
-  if (
-    (protocol === 'http:' || protocol === 'https:') &&
-    origin &&
-    hostname !== 'tauri.localhost'
-  ) {
+  if ((protocol === 'http:' || protocol === 'https:') && origin && hostname !== 'tauri.localhost') {
     return origin;
   }
 
   return fallback;
 }
 
-export function isLoopbackVoiceboxServerUrl(url: string): boolean {
-  try {
-    const parsed = new URL(url);
-    return (
-      parsed.port === '17493' &&
-      (parsed.hostname === '127.0.0.1' ||
-        parsed.hostname === 'localhost' ||
-        parsed.hostname === '[::1]' ||
-        parsed.hostname === '::1')
-    );
-  } catch {
-    return false;
-  }
-}
-
 export const useServerStore = create<ServerStore>()(
   persist(
     (set, get) => ({
       serverUrl: getDefaultServerUrl(),
+      serverUrlSource: 'auto',
       setServerUrl: (url) => {
+        const prev = get().serverUrl;
+        set({ serverUrl: url, serverUrlSource: 'custom' });
+        if (url !== prev) {
+          invalidateAllServerData();
+        }
+      },
+
+      setDiscoveredServerUrl: (url) => {
+        // Read the latest selection: a user may save while startup is pending.
+        if (get().serverUrlSource === 'custom') return;
         const prev = get().serverUrl;
         set({ serverUrl: url });
         if (url !== prev) {
@@ -87,6 +81,21 @@ export const useServerStore = create<ServerStore>()(
     }),
     {
       name: 'voicebox-server',
+      version: 1,
+      migrate: (persistedState) => {
+        const state = persistedState as Partial<ServerStore>;
+        // Older versions did not record whether a URL was saved by the user.
+        // Only exact known defaults are safe to treat as automatic. Preserve
+        // all other URLs, including custom loopback ports, paths and protocols.
+        const isDefault =
+          !state.serverUrl ||
+          state.serverUrl === 'http://127.0.0.1:17493' ||
+          state.serverUrl === getDefaultServerUrl() ||
+          // Desktop upgrades retire this old bundled port. Preserve it only
+          // when the user explicitly selected remote-server mode.
+          (state.serverUrl === 'http://127.0.0.1:8000' && state.mode !== 'remote');
+        return { ...state, serverUrlSource: isDefault ? 'auto' : 'custom' };
+      },
     },
   ),
 );

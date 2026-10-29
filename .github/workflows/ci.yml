@@ -19,6 +19,12 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Upstream integration regressions
+        run: bun run test:upstream
+
+      - name: Playback lifecycle regressions
+        run: bun run test:playback
+
       - name: Typecheck app + web
         run: bun run typecheck
 

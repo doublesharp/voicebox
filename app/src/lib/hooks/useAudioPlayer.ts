@@ -1,61 +1,104 @@
-import { useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useToast } from '@/components/ui/use-toast';
+import { createPlaybackOutput, type PlaybackOutput } from '@/lib/audio/playbackOutput';
+
+interface PreviewSession {
+  file: File;
+  url: string;
+  output: PlaybackOutput;
+  removeListeners: () => void;
+  generation: number;
+}
 
 export function useAudioPlayer() {
   const [isPlaying, setIsPlaying] = useState(false);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const sessionRef = useRef<PreviewSession | null>(null);
   const { toast } = useToast();
+
+  const release = useCallback((session: PreviewSession) => {
+    if (sessionRef.current !== session) return;
+    sessionRef.current = null;
+    session.removeListeners();
+    session.output.dispose();
+    URL.revokeObjectURL(session.url);
+  }, []);
+
+  const cleanup = useCallback(() => {
+    if (sessionRef.current) release(sessionRef.current);
+    setIsPlaying(false);
+  }, [release]);
+
+  useEffect(
+    () => () => {
+      if (sessionRef.current) release(sessionRef.current);
+    },
+    [release],
+  );
 
   const playPause = (file: File | null | undefined) => {
     if (!file) return;
-
-    if (audioRef.current) {
-      if (isPlaying) {
-        audioRef.current.pause();
+    let session = sessionRef.current;
+    if (session && session.file !== file) {
+      release(session);
+      session = null;
+    }
+    if (!session) {
+      const output = createPlaybackOutput();
+      const url = URL.createObjectURL(file);
+      const audio = output.audio;
+      audio.src = url;
+      const created: PreviewSession = {
+        file,
+        url,
+        output,
+        removeListeners: () => {},
+        generation: 0,
+      };
+      const ended = () => {
+        if (sessionRef.current !== created) return;
+        release(created);
         setIsPlaying(false);
-      } else {
-        audioRef.current.play();
-        setIsPlaying(true);
-      }
-    } else {
-      const audio = new Audio(URL.createObjectURL(file));
-      audioRef.current = audio;
-
-      audio.addEventListener('ended', () => {
-        setIsPlaying(false);
-        if (audioRef.current) {
-          URL.revokeObjectURL(audioRef.current.src);
-        }
-        audioRef.current = null;
-      });
-
-      audio.addEventListener('error', () => {
+      };
+      const failed = () => {
+        if (sessionRef.current !== created) return;
+        release(created);
         setIsPlaying(false);
         toast({
           title: 'Playback error',
           description: 'Failed to play audio file',
           variant: 'destructive',
         });
-        if (audioRef.current) {
-          URL.revokeObjectURL(audioRef.current.src);
-        }
-        audioRef.current = null;
+      };
+      audio.addEventListener('ended', ended);
+      audio.addEventListener('error', failed);
+      created.removeListeners = () => {
+        audio.removeEventListener('ended', ended);
+        audio.removeEventListener('error', failed);
+      };
+      sessionRef.current = created;
+      session = created;
+    }
+
+    const current = session;
+    const audio = current.output.audio;
+    const request = ++current.generation;
+    if (!audio.paused || current.output.isStarting()) {
+      audio.pause();
+      setIsPlaying(false);
+      return;
+    }
+    setIsPlaying(true);
+    void audio.play().catch(() => {
+      // A rejected start from an old preview must not stop its replacement.
+      if (sessionRef.current !== current || current.generation !== request) return;
+      release(current);
+      setIsPlaying(false);
+      toast({
+        title: 'Playback error',
+        description: 'Failed to play audio file',
+        variant: 'destructive',
       });
-
-      audio.play();
-      setIsPlaying(true);
-    }
-  };
-
-  const cleanup = () => {
-    if (audioRef.current) {
-      audioRef.current.pause();
-      if (audioRef.current.src.startsWith('blob:')) {
-        URL.revokeObjectURL(audioRef.current.src);
-      }
-      audioRef.current = null;
-    }
-    setIsPlaying(false);
+    });
   };
 
   return {
