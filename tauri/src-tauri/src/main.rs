@@ -1945,3 +1945,26 @@ mod server_health_tests {
         assert!(!healthy);
     }
 }
+
+#[cfg(test)]
+mod backend_override_tests {
+    use super::{read_persisted_backend_override, write_persisted_backend_override};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn backend_override_survives_restart_and_can_be_cleared() {
+        let dir = std::env::temp_dir().join(format!("voicebox-override-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        assert_eq!(read_persisted_backend_override(&dir), None);
+        write_persisted_backend_override(&dir, Some("cuda"));
+        assert_eq!(read_persisted_backend_override(&dir).as_deref(), Some("cuda"));
+        write_persisted_backend_override(&dir, Some("  rocm\n"));
+        assert_eq!(read_persisted_backend_override(&dir).as_deref(), Some("rocm"));
+        write_persisted_backend_override(&dir, Some(" \n"));
+        assert_eq!(read_persisted_backend_override(&dir), None);
+        write_persisted_backend_override(&dir, None);
+        assert_eq!(read_persisted_backend_override(&dir), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}

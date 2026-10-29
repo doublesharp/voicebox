@@ -1373,6 +1373,54 @@ mod tests {
         assert!(state.finish_pcm_stream("current-preview").is_err());
     }
 
+    #[tokio::test]
+    async fn multi_output_preview_waits_until_every_queue_can_accept_a_block() {
+        let state = Arc::new(AudioOutputState::new());
+        let controls = Arc::new(PlaybackControls::new(0.0, 1.0));
+        let fast = Arc::new(Mutex::new(crate::audio_stream::PcmQueue::new(8000).unwrap()));
+        let slow = Arc::new(Mutex::new(crate::audio_stream::PcmQueue::new(8000).unwrap()));
+        slow.lock().unwrap().append(&vec![0.5; 16000]).unwrap();
+        let (wake, _receiver) = mpsc::channel();
+        *state.active.lock().unwrap() = Some(SessionHandle {
+            id: "multi".into(), controls, wake,
+            streaming: Some(Arc::new(Mutex::new(vec![fast.clone(), slow.clone()]))),
+        });
+        let pending_state = state.clone();
+        let pending = tokio::spawn(async move { pending_state.append_pcm_stream("multi", vec![0, 64, 0, 192]).await });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!pending.is_finished());
+        assert_eq!(fast.lock().unwrap().samples_len_for_test(), 0);
+        let mut output = [0.0_f32; 4];
+        slow.lock().unwrap().render(&mut output, 8000, 1, |sample| sample);
+        pending.await.unwrap().unwrap();
+        assert_eq!(fast.lock().unwrap().samples_len_for_test(), 2);
+        assert_eq!(slow.lock().unwrap().samples_len_for_test(), 15998);
+        state.finish_pcm_stream("multi").unwrap();
+        assert!(fast.lock().unwrap().finished && slow.lock().unwrap().finished);
+        assert!(state.append_pcm_stream("multi", vec![0, 0]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn finishing_a_backpressured_multi_output_rejects_the_block_everywhere() {
+        let state = Arc::new(AudioOutputState::new());
+        let fast = Arc::new(Mutex::new(crate::audio_stream::PcmQueue::new(8000).unwrap()));
+        let slow = Arc::new(Mutex::new(crate::audio_stream::PcmQueue::new(8000).unwrap()));
+        slow.lock().unwrap().append(&vec![0.5; 16000]).unwrap();
+        let (wake, _receiver) = mpsc::channel();
+        *state.active.lock().unwrap() = Some(SessionHandle {
+            id: "multi".into(), controls: Arc::new(PlaybackControls::new(0.0, 1.0)), wake,
+            streaming: Some(Arc::new(Mutex::new(vec![fast.clone(), slow.clone()]))),
+        });
+        let pending_state = state.clone();
+        let pending = tokio::spawn(async move { pending_state.append_pcm_stream("multi", vec![0, 0]).await });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!pending.is_finished());
+        state.finish_pcm_stream("multi").unwrap();
+        assert!(pending.await.unwrap().is_err());
+        assert_eq!(fast.lock().unwrap().samples_len_for_test(), 0);
+        assert_eq!(slow.lock().unwrap().samples_len_for_test(), 16000);
+    }
+
     /// Opt-in host proof: uses the production CPAL callback, no webview/mock device.
     #[test]
     #[ignore = "plays sound on the host; run explicitly for native qualification"]
