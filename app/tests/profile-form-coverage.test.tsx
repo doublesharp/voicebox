@@ -14,6 +14,7 @@ const calls: Record<string, any[]> = {
 let fail = '',
   duration = 5,
   profile: any;
+let durationHandler: (file: File) => Promise<number> = async () => duration;
 const voices = [{ voice_id: 'v1', name: 'Voice One', gender: 'female', language: 'en' }];
 const mutation = (key: string, result?: unknown) => ({
   isPending: false,
@@ -49,7 +50,7 @@ mock.module('../src/lib/hooks/useTranscription', () => ({
   useTranscription: () => ({ mutateAsync: async () => ({ text: 'transcribed' }) }),
 }));
 mock.module('../src/lib/utils/audio', () => ({
-  getAudioDuration: async () => duration,
+  getAudioDuration: (file: File) => durationHandler(file),
   formatAudioDuration: String,
   convertToWav: async () => new Blob(['wav'], { type: 'audio/wav' }),
 }));
@@ -137,6 +138,7 @@ afterEach(() => {
   for (const arr of Object.values(calls)) arr.length = 0;
   fail = '';
   duration = 5;
+  durationHandler = async () => duration;
   profile = undefined;
   useUIStore.setState({ profileDialogOpen: false, editingProfileId: null, profileFormDraft: null });
 });
@@ -288,4 +290,90 @@ test('personality-only draft survives closing and reopening', async () => {
     useUIStore.getState().setProfileDialogOpen(true);
   });
   expect(input('profileForm.fields.personalityPlaceholder').props.value).toBe('Gentle');
+});
+
+
+test('replacing a sample ignores an older duration result while the new file is validating', async () => {
+  const pending = new Map<string, (value: number) => void>();
+  durationHandler = (file) => new Promise((resolve) => pending.set(file.name, resolve));
+  await mount();
+  await upload(new File(['a'], 'first.wav', { type: 'audio/wav' }));
+  await upload(new File(['b'], 'second.wav', { type: 'audio/wav' }));
+  await act(async () => { pending.get('first.wav')!(31); await Promise.resolve(); });
+  const field = view.root.findByType('audio-upload' as never);
+  expect(field.props.isValidating).toBe(true);
+  expect(field.props.isDisabled).toBe(false);
+  await act(async () => { pending.get('second.wav')!(5); await Promise.resolve(); });
+  expect(field.props.isValidating).toBe(false);
+  expect(field.props.isDisabled).toBe(false);
+});
+
+test('a stale duration failure cannot invalidate a replacement sample', async () => {
+  const pending = new Map<string, { resolve: (value: number) => void; reject: (error: Error) => void }>();
+  durationHandler = (file) => new Promise((resolve, reject) => pending.set(file.name, { resolve, reject }));
+  await mount();
+  await upload(new File(['a'], 'first.wav', { type: 'audio/wav' }));
+  await upload(new File(['b'], 'second.wav', { type: 'audio/wav' }));
+  await act(async () => { pending.get('second.wav')!.resolve(5); await Promise.resolve(); });
+  await act(async () => { pending.get('first.wav')!.reject(new Error('old file failed')); await Promise.resolve(); });
+  await name('Clone');
+  await type('profileForm.fields.referenceTextPlaceholder', 'referenceText', 'Hello');
+  durationHandler = async () => 5;
+  await submit();
+  expect(calls.create).toHaveLength(1);
+  expect(calls.add[0].file.name).toBe('second.wav');
+});
+
+test('duplicate submits while duration validation is pending create only one profile', async () => {
+  await mount();
+  await name('Clone');
+  await upload(new File(['audio'], 'voice.wav', { type: 'audio/wav' }));
+  await type('profileForm.fields.referenceTextPlaceholder', 'referenceText', 'Hello');
+  const resolvers: ((value: number) => void)[] = [];
+  durationHandler = () => new Promise((resolve) => resolvers.push(resolve));
+  let first: Promise<unknown>;
+  let second: Promise<unknown>;
+  await act(async () => {
+    const form = view.root.findByType('form');
+    first = form.props.onSubmit({ preventDefault() {}, persist() {} });
+    second = form.props.onSubmit({ preventDefault() {}, persist() {} });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+  expect(resolvers.length).toBeGreaterThan(0);
+  await act(async () => {
+    for (const resolve of resolvers) resolve(5);
+    await Promise.all([first!, second!]);
+  });
+  expect(calls.create).toHaveLength(1);
+  expect(calls.add).toHaveLength(1);
+});
+
+test('clearing a sample ends validation and ignores its late result', async () => {
+  let finish = (_value: number) => {};
+  durationHandler = () => new Promise((resolve) => { finish = resolve; });
+  await mount();
+  await upload(new File(['audio'], 'old.wav', { type: 'audio/wav' }));
+  await act(async () => { view.root.findByType('audio-upload' as never).props.onFileChange(undefined); });
+  expect(view.root.findByType('audio-upload' as never).props.isValidating).toBe(false);
+  await act(async () => { finish(31); await Promise.resolve(); });
+  expect(view.root.findByType('audio-upload' as never).props.isDisabled).toBe(false);
+});
+
+test('changing the sample during submit does not create a profile from the old file', async () => {
+  await mount();
+  await name('Clone');
+  await upload(new File(['a'], 'first.wav', { type: 'audio/wav' }));
+  await type('profileForm.fields.referenceTextPlaceholder', 'referenceText', 'Hello');
+  let finishOld = (_value: number) => {};
+  durationHandler = (file) => file.name === 'first.wav' ? new Promise((resolve) => { finishOld = resolve; }) : Promise.resolve(5);
+  let submitting: Promise<unknown>;
+  await act(async () => {
+    submitting = view.root.findByType('form').props.onSubmit({ preventDefault() {}, persist() {} });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+  await upload(new File(['b'], 'second.wav', { type: 'audio/wav' }));
+  await act(async () => { finishOld(5); await submitting!; });
+  expect(calls.create).toHaveLength(0);
+  expect(calls.add).toHaveLength(0);
+  expect(useUIStore.getState().profileDialogOpen).toBe(true);
 });
