@@ -869,18 +869,12 @@ export function ModelManagement() {
                             </>
                           );
                         })()}
+                        <p className="text-xs text-muted-foreground">
+                          {t('models.progress.cannotCancel', {
+                            defaultValue: 'Downloads cannot be cancelled once started.',
+                          })}
+                        </p>
                       </div>
-                      <Button
-                        size="sm"
-                        onClick={() => handleCancel(freshSelectedModel.model_name)}
-                        variant="ghost"
-                        disabled={
-                          cancelMutation.isPending &&
-                          cancelMutation.variables === freshSelectedModel.model_name
-                        }
-                      >
-                        <X className="h-4 w-4" />
-                      </Button>
                     </>
                   ) : freshSelectedModel.downloaded ? (
                     <div className="flex gap-2 flex-1">

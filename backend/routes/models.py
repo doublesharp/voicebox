@@ -519,6 +519,13 @@ async def cancel_model_download(request: models.ModelDownloadRequest):
     task_manager = get_task_manager()
     progress_manager = get_progress_manager()
 
+    task = next((task for task in task_manager.get_active_downloads()
+                 if task.model_name == request.model_name), None)
+    progress = progress_manager.get_progress(request.model_name)
+    if ((task is not None and task.status in ("downloading", "extracting"))
+            or (task is None and progress and progress.get("status") in ("downloading", "extracting"))):
+        raise HTTPException(status_code=409, detail="A running download cannot be dismissed")
+
     removed = task_manager.cancel_download(request.model_name)
 
     progress_removed = False

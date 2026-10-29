@@ -101,3 +101,33 @@ async def test_progress_only_download_blocks_duplicate_request(monkeypatch):
     with pytest.raises(HTTPException) as error:
         await model_routes.trigger_model_download(models.ModelDownloadRequest(model_name="model"))
     assert error.value.status_code == 409
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tracking", ["task", "progress"])
+async def test_dismiss_does_not_hide_a_running_download(monkeypatch, tracking):
+    manager, progress = TaskManager(), ProgressManager()
+    if tracking == "task":
+        manager.start_download("model")
+    progress.update_progress("model", 25, 100)
+    monkeypatch.setattr(model_routes, "get_task_manager", lambda: manager)
+    monkeypatch.setattr(model_routes, "get_progress_manager", lambda: progress)
+    with pytest.raises(HTTPException) as error:
+        await model_routes.cancel_model_download(models.ModelDownloadRequest(model_name="model"))
+    assert error.value.status_code == 409
+    assert progress.get_progress("model")["status"] == "downloading"
+    if tracking == "task":
+        assert manager.is_download_active("model")
+
+
+@pytest.mark.asyncio
+async def test_dismiss_removes_errored_download(monkeypatch):
+    manager, progress = TaskManager(), ProgressManager()
+    manager.start_download("model")
+    manager.error_download("model", "failed")
+    progress.mark_error("model", "failed")
+    monkeypatch.setattr(model_routes, "get_task_manager", lambda: manager)
+    monkeypatch.setattr(model_routes, "get_progress_manager", lambda: progress)
+    await model_routes.cancel_model_download(models.ModelDownloadRequest(model_name="model"))
+    assert manager.get_active_downloads() == []
+    assert progress.get_progress("model") is None

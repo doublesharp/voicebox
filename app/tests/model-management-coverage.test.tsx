@@ -101,7 +101,7 @@ async function setup(models = [model()], downloads: any[] = []) {
   return { client, view, button, open, finish };
 }
 
-test('shows active progress in list and selected detail, then cancels the correct model', async () => {
+test('shows active progress without offering a cancellation that cannot stop the download', async () => {
   const s = await setup(
     [model({ downloading: true })],
     [
@@ -119,17 +119,16 @@ test('shows active progress in list and selected detail, then cancels the correc
   s.open();
   expect(s.view.root.findAllByType('progress').map((n) => n.props.value)).toEqual([50, 50]);
   expect(JSON.stringify(s.view.toJSON())).toContain('512.0 B / 1.0 KB (50.0%)');
-  const cancelButton = s.view.root
+  const cancelButtons = s.view.root
     .findAllByType('button')
-    .find(
+    .filter(
       (n) =>
         n.props.onClick &&
         n.findAllByType('svg').some((svg) => svg.props.className?.includes('lucide-x')),
-    )!;
-  await act(async () => {
-    cancelButton.props.onClick();
-  });
-  expect(cancel).toHaveBeenCalledWith('whisper-small');
+    );
+  expect(cancelButtons).toHaveLength(0);
+  expect(cancel).not.toHaveBeenCalled();
+  expect(JSON.stringify(s.view.toJSON())).toContain('models.progress.cannotCancel');
   s.finish();
 });
 
@@ -197,19 +196,17 @@ test('a rejected start reports the error and leaves download available', async (
   s.finish();
 });
 
-test('cancel failure restores the active progress and reports the failure', async () => {
+test('dismiss failure restores the error and reports the failure', async () => {
   cancel.mockImplementationOnce(async () => {
     throw new Error('cancel failed');
   });
   const s = await setup(
-    [model({ downloading: true })],
+    [model()],
     [
       {
         model_name: 'whisper-small',
-        status: 'downloading',
-        current: 512,
-        total: 1024,
-        progress: 50,
+        status: 'error',
+        error: 'download failed',
         started_at: '2026-01-01',
       },
     ],
@@ -229,6 +226,6 @@ test('cancel failure restores the active progress and reports the failure', asyn
   expect(toast).toHaveBeenCalledWith(
     expect.objectContaining({ title: 'models.toast.cancelFailed', variant: 'destructive' }),
   );
-  expect(s.view.root.findAllByType('progress').map((n) => n.props.value)).toEqual([50, 50]);
+  expect(JSON.stringify(s.view.toJSON())).toContain('download failed');
   s.finish();
 });
