@@ -15,6 +15,7 @@ let fail = '',
   duration = 5,
   profile: any;
 let durationHandler: (file: File) => Promise<number> = async () => duration;
+let transcribeHandler: (arg: any) => Promise<{ text: string }> = async () => ({ text: 'transcribed' });
 const voices = [{ voice_id: 'v1', name: 'Voice One', gender: 'female', language: 'en' }];
 const mutation = (key: string, result?: unknown) => ({
   isPending: false,
@@ -47,7 +48,7 @@ mock.module('../src/lib/hooks/useSystemAudioCapture', () => ({
   useSystemAudioCapture: () => ({ startRecording() {}, stopRecording() {}, cancelRecording() {} }),
 }));
 mock.module('../src/lib/hooks/useTranscription', () => ({
-  useTranscription: () => ({ mutateAsync: async () => ({ text: 'transcribed' }) }),
+  useTranscription: () => ({ mutateAsync: (arg: any) => transcribeHandler(arg) }),
 }));
 mock.module('../src/lib/utils/audio', () => ({
   getAudioDuration: (file: File) => durationHandler(file),
@@ -139,6 +140,7 @@ afterEach(() => {
   fail = '';
   duration = 5;
   durationHandler = async () => duration;
+  transcribeHandler = async () => ({ text: 'transcribed' });
   profile = undefined;
   useUIStore.setState({ profileDialogOpen: false, editingProfileId: null, profileFormDraft: null });
 });
@@ -376,4 +378,73 @@ test('changing the sample during submit does not create a profile from the old f
   expect(calls.create).toHaveLength(0);
   expect(calls.add).toHaveLength(0);
   expect(useUIStore.getState().profileDialogOpen).toBe(true);
+});
+
+
+test('a late transcript cannot replace reference text for a newer sample', async () => {
+  let resolveTranscript!: (value: { text: string }) => void;
+  transcribeHandler = () => new Promise((resolve) => { resolveTranscript = resolve; });
+  await mount();
+  await upload(new File(['first'], 'first.wav', { type: 'audio/wav' }));
+  await act(async () => { view.root.findByType('audio-upload' as never).props.onTranscribe(); });
+  await upload(new File(['second'], 'second.wav', { type: 'audio/wav' }));
+  await type('profileForm.fields.referenceTextPlaceholder', 'referenceText', 'Second sample');
+  await act(async () => { resolveTranscript({ text: 'First sample transcript' }); });
+  expect(input('profileForm.fields.referenceTextPlaceholder').props.value).toBe('Second sample');
+});
+
+test('transcription fills reference text for the selected sample', async () => {
+  await mount();
+  const sample = new File(['voice'], 'voice.wav', { type: 'audio/wav' });
+  await upload(sample);
+  let received: any;
+  transcribeHandler = async (arg) => { received = arg; return { text: 'Recognized speech' }; };
+  await act(async () => { await view.root.findByType('audio-upload' as never).props.onTranscribe(); });
+  expect(received.file).toBe(sample);
+  expect(input('profileForm.fields.referenceTextPlaceholder').props.value).toBe('Recognized speech');
+});
+
+
+test('transcription does not overwrite reference text edited while it is pending', async () => {
+  let resolveTranscript!: (value: { text: string }) => void;
+  transcribeHandler = () => new Promise((resolve) => { resolveTranscript = resolve; });
+  await mount();
+  await upload(new File(['voice'], 'voice.wav', { type: 'audio/wav' }));
+  await act(async () => { view.root.findByType('audio-upload' as never).props.onTranscribe(); });
+  await type('profileForm.fields.referenceTextPlaceholder', 'referenceText', 'My correction');
+  await act(async () => { resolveTranscript({ text: 'Old result' }); });
+  expect(input('profileForm.fields.referenceTextPlaceholder').props.value).toBe('My correction');
+});
+
+test('only the newest overlapping transcription can update reference text', async () => {
+  const pending: Array<(value: { text: string }) => void> = [];
+  transcribeHandler = () => new Promise((resolve) => { pending.push(resolve); });
+  await mount();
+  await upload(new File(['voice'], 'voice.wav', { type: 'audio/wav' }));
+  await act(async () => { view.root.findByType('audio-upload' as never).props.onTranscribe(); });
+  await act(async () => { view.root.findByType('audio-upload' as never).props.onTranscribe(); });
+  await act(async () => { pending[0]({ text: 'Older' }); });
+  expect(input('profileForm.fields.referenceTextPlaceholder').props.value).toBe('');
+  await act(async () => { pending[1]({ text: 'Newer' }); });
+  expect(input('profileForm.fields.referenceTextPlaceholder').props.value).toBe('Newer');
+});
+
+
+test('a stale transcription failure does not show an error for a replacement sample', async () => {
+  let rejectTranscript!: (reason: Error) => void;
+  transcribeHandler = () => new Promise((_resolve, reject) => { rejectTranscript = reject; });
+  await mount();
+  await upload(new File(['first'], 'first.wav', { type: 'audio/wav' }));
+  await act(async () => { view.root.findByType('audio-upload' as never).props.onTranscribe(); });
+  await upload(new File(['second'], 'second.wav', { type: 'audio/wav' }));
+  await act(async () => { rejectTranscript(new Error('old request failed')); });
+  expect(calls.toast.some((v) => v.title === 'profileForm.toast.transcribeFailed')).toBe(false);
+});
+
+test('a current transcription failure is reported', async () => {
+  transcribeHandler = async () => { throw new Error('transcription unavailable'); };
+  await mount();
+  await upload(new File(['voice'], 'voice.wav', { type: 'audio/wav' }));
+  await act(async () => { await view.root.findByType('audio-upload' as never).props.onTranscribe(); });
+  expect(calls.toast.at(-1)).toEqual(expect.objectContaining({ title: 'profileForm.toast.transcribeFailed', description: 'transcription unavailable' }));
 });

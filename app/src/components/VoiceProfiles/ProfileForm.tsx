@@ -168,6 +168,10 @@ export function ProfileForm() {
   const [isValidatingAudio, setIsValidatingAudio] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const savingRef = useRef(false);
+  const transcriptionRequestRef = useRef(0);
+  useEffect(() => () => {
+    transcriptionRequestRef.current += 1;
+  }, [open, editingProfileId]);
   const [avatarPreview, setAvatarPreview] = useState<string | null>(null);
   const [selectedPresetEngine, setSelectedPresetEngine] = useState<string>('kokoro');
   const [selectedPresetVoiceId, setSelectedPresetVoiceId] = useState<string>('');
@@ -443,12 +447,22 @@ export function ProfileForm() {
       return;
     }
 
-    try {
-      const language = form.getValues('language');
-      const result = await transcribe.mutateAsync({ file, language });
+    const request = ++transcriptionRequestRef.current;
+    const language = form.getValues('language');
+    const referenceText = form.getValues('referenceText');
+    const isCurrent = () =>
+      request === transcriptionRequestRef.current &&
+      useUIStore.getState().profileDialogOpen &&
+      form.getValues('sampleFile') === file &&
+      form.getValues('language') === language &&
+      form.getValues('referenceText') === referenceText;
 
+    try {
+      const result = await transcribe.mutateAsync({ file, language });
+      if (!isCurrent()) return;
       form.setValue('referenceText', result.text, { shouldValidate: true });
     } catch (error) {
+      if (!isCurrent()) return;
       toast({
         title: t('profileForm.toast.transcribeFailed'),
         description:
