@@ -2,7 +2,7 @@
 
 S1 feature implementation is complete for testing. Full runtime acceptance remains open. Local Coordinate is authoritative: project `project_14a676bd-5cff-4ffe-ad9c-9aa08abc554e`, effort `effort_efc6c236-4604-4cb2-95ee-f1e66c8e6320`, integration work `work_1e51884b-8640-4e14-9b21-a13b5a54efe1`.
 
-The testing branch is `doublesharp`. Verified code merge: `c79bbeda6611df534cb6322725ea87aa7fbb9b19`; subsequent status-only commits do not change the tested application source.
+The testing branch is `doublesharp`. Verified code merge: `c79bbeda6611df534cb6322725ea87aa7fbb9b19`; Subsequent changes add desktop TypeScript declaration/alias configuration and remove one obsolete suppression; application runtime behavior is unchanged. Desktop types and the desktop UI build pass independently.
 
 | Feature | Implementation |
 | --- | --- |
@@ -27,7 +27,7 @@ Cleanup retains audio reachable from drafts, checkpoints, history, takes, jobs, 
 
 ## Verified source and fixtures
 
-The exact clean code merge passed **386 backend tests**, **244 frontend checks in 31 isolated test files**, app/web no-emit typechecks and the web production build. Frontend files run in separate processes because existing mocks contaminate combined runs. The existing Scratch Python and dependency caches were reused; no models or packages were installed for these checks.
+The exact clean code merge passed **386 backend tests**, **244 frontend checks in 31 isolated test files**, app/web no-emit typechecks and the web production build. The desktop TypeScript target and desktop UI build also pass after aligning its configuration with the existing shared declarations and Vite alias. Frontend files run in separate processes because existing mocks contaminate combined runs. The existing Scratch Python and dependency caches were reused; no models or packages were installed for these checks.
 
 The native macOS source/test bridge passes `cargo check --locked --offline --release --tests` at the earlier native/review merge; native Rust source is unchanged in the final code merge. Existing real sidecars satisfied compile-time resource presence, which does not qualify their freshness or packaged launch. Pure filesystem fixtures cover replacement, stream/rename failure and private Unix permissions; simulated write/flush/sync errors are not actual OS fault injection.
 
@@ -43,6 +43,6 @@ An earlier renderer baseline produced a 30-minute/200-clip WAV fixture in about 
 - Listening, independent metering, final encoded true-peak/loudness compliance and long-project UI/effects performance.
 - Actual disk-full, power-loss and OS write/flush failure behavior; current failure fixtures are bounded/injected.
 
-A standalone Tauri TypeScript check previously reported existing window/virtual-module declarations and workspace dependency resolution errors; it is not a passing gate. The original checkout's three unrelated playback edits and four known failing playback-output fixtures remain preserved outside these merges. Other owners' worktrees and packaging outputs remain untouched.
+The earlier desktop TypeScript declaration and resolution errors were repaired without installing dependencies. The original checkout's three unrelated playback edits and four known failing playback-output fixtures remain preserved outside these merges. Other owners' worktrees and packaging outputs remain untouched.
 
 S2 video automation, S3 collaboration and S4 calling/advanced capabilities remain later phases. No release, signing, notarization, deployment or updater-channel change is claimed by this testing integration.
