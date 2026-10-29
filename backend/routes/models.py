@@ -1,6 +1,7 @@
 """Model management endpoints."""
 
 import asyncio
+import os
 import shutil
 from pathlib import Path
 
@@ -21,7 +22,7 @@ def _get_dir_size(path: Path) -> int:
     """Get total size of a directory in bytes."""
     total = 0
     for f in path.rglob("*"):
-        if f.is_file():
+        if not f.is_symlink() and f.is_file():
             total += f.stat().st_size
     return total
 
@@ -31,7 +32,9 @@ def _copy_with_progress(src: Path, dst: Path, progress_manager, copied_so_far: i
     dst.mkdir(parents=True, exist_ok=True)
     for item in src.iterdir():
         dest_item = dst / item.name
-        if item.is_dir():
+        if item.is_symlink():
+            dest_item.symlink_to(os.readlink(item))
+        elif item.is_dir():
             copied_so_far = _copy_with_progress(item, dest_item, progress_manager, copied_so_far, total_bytes)
         else:
             size = item.stat().st_size
@@ -45,6 +48,13 @@ def _copy_with_progress(src: Path, dst: Path, progress_manager, copied_so_far: i
                 status="downloading",
             )
     return copied_so_far
+
+
+def _same_filesystem(source: Path, destination: Path) -> bool:
+    try:
+        return source.stat().st_dev == destination.stat().st_dev
+    except OSError:
+        return False
 
 
 DEFAULT_QWEN_MODEL_SIZE = "1.7B"
@@ -213,72 +223,101 @@ async def migrate_models(request: models.ModelMigrateRequest):
         raise HTTPException(status_code=400, detail="Destination cannot be inside the current cache directory")
 
     progress_manager = get_progress_manager()
+    active = progress_manager.get_progress("migration")
+    if active and active.get("status") in ("downloading", "extracting"):
+        raise HTTPException(status_code=409, detail="A model migration is already in progress")
     model_dirs = [d for d in source.iterdir() if d.name.startswith("models--") and d.is_dir()]
     if not model_dirs:
         progress_manager.update_progress("migration", 1, 1, status="complete")
         progress_manager.mark_complete("migration")
         return {"moved": 0, "errors": [], "source": str(source), "destination": str(destination)}
 
-    destination.mkdir(parents=True, exist_ok=True)
+    conflicts = [item.name for item in model_dirs if os.path.lexists(destination / item.name)]
+    if conflicts:
+        raise HTTPException(status_code=409, detail=f"Destination already contains models: {', '.join(sorted(conflicts))}")
 
-    same_fs = False
-    try:
-        same_fs = source.stat().st_dev == destination.stat().st_dev
-    except OSError:
-        pass
+    destination.mkdir(parents=True, exist_ok=True)
+    # Clear any terminal state before returning, so late SSE subscribers
+    # cannot mistake the previous migration for this one.
+    progress_manager.update_progress("migration", 0, 1, status="downloading")
+
+    same_fs = _same_filesystem(source, destination)
 
     async def migrate_background():
-        moved = 0
-        errors = []
+        moved = []
+        copied = []
+        deletion_started = False
         try:
             if same_fs:
                 total = len(model_dirs)
                 for i, item in enumerate(model_dirs):
                     dest_item = destination / item.name
-                    try:
-                        if dest_item.exists():
-                            shutil.rmtree(dest_item)
-                        shutil.move(str(item), str(dest_item))
-                        moved += 1
-                        progress_manager.update_progress(
-                            "migration",
-                            i + 1,
-                            total,
-                            filename=item.name,
-                            status="downloading",
-                        )
-                    except Exception as e:
-                        errors.append(f"{item.name}: {str(e)}")
+                    if os.path.lexists(dest_item):
+                        raise FileExistsError(f"Destination already exists: {dest_item}")
+                    shutil.move(str(item), str(dest_item))
+                    moved.append((item, dest_item))
+                    progress_manager.update_progress(
+                        "migration", i + 1, total, filename=item.name, status="downloading"
+                    )
             else:
                 total_bytes = sum(_get_dir_size(d) for d in model_dirs)
                 progress_manager.update_progress(
                     "migration", 0, total_bytes, filename="Calculating...", status="downloading"
                 )
-
-                copied = 0
+                copied_bytes = 0
                 for item in model_dirs:
                     dest_item = destination / item.name
-                    try:
-                        if dest_item.exists():
-                            shutil.rmtree(dest_item)
-                        copied = await asyncio.to_thread(
-                            _copy_with_progress, item, dest_item, progress_manager, copied, total_bytes
-                        )
-                        await asyncio.to_thread(shutil.rmtree, str(item))
-                        moved += 1
-                    except Exception as e:
-                        errors.append(f"{item.name}: {str(e)}")
+                    if os.path.lexists(dest_item):
+                        raise FileExistsError(f"Destination already exists: {dest_item}")
+                    # Claim the new directory exclusively before copying.
+                    dest_item.mkdir()
+                    copied.append(dest_item)
+                    copied_bytes = await asyncio.to_thread(
+                        _copy_with_progress, item, dest_item, progress_manager, copied_bytes, total_bytes
+                    )
+                # Keep every original until every copy has finished, so a
+                # copy error can be rolled back without losing source files.
+                deletion_started = True
+                for item in model_dirs:
+                    await asyncio.to_thread(shutil.rmtree, str(item))
 
             progress_manager.update_progress("migration", 1, 1, status="complete")
             progress_manager.mark_complete("migration")
         except Exception as e:
-            progress_manager.update_progress("migration", 0, 0, status="error")
-            progress_manager.mark_error("migration", str(e))
+            rollback_errors = []
+            if same_fs:
+                for original, target in reversed(moved):
+                    try:
+                        if os.path.lexists(original):
+                            raise FileExistsError(f"Cannot restore over existing source: {original}")
+                        shutil.move(str(target), str(original))
+                    except Exception as rollback_error:
+                        rollback_errors.append(str(rollback_error))
+            elif not deletion_started:
+                for target in copied:
+                    try:
+                        shutil.rmtree(target)
+                    except FileNotFoundError:
+                        pass
+                    except Exception as rollback_error:
+                        rollback_errors.append(str(rollback_error))
+            message = str(e)
+            if deletion_started and not same_fs:
+                message += "; copied models remain in the destination; source cleanup was incomplete"
+            if rollback_errors:
+                message += "; rollback incomplete: " + "; ".join(rollback_errors)
+            progress_manager.mark_error("migration", message)
         finally:
             model_inventory.invalidate()
 
     model_inventory.invalidate()
-    create_background_task(migrate_background())
+    work = migrate_background()
+    try:
+        create_background_task(work)
+    except Exception as e:
+        work.close()
+        progress_manager.mark_error("migration", str(e))
+        raise
 
     return {"source": str(source), "destination": str(destination)}
 
@@ -289,7 +328,7 @@ async def get_migration_progress():
     progress_manager = get_progress_manager()
 
     async def event_generator():
-        async for event in progress_manager.subscribe("migration"):
+        async for event in progress_manager.subscribe("migration", include_terminal=True):
             yield event
 
     return StreamingResponse(
