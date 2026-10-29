@@ -1,4 +1,5 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from 'bun:test';
+import { createPlaybackOutput } from '../src/lib/audio/playbackOutput';
 
 let releaseOutput: () => void = () => {};
 let rejectOutput: (error: Error) => void = () => {};
@@ -59,11 +60,8 @@ class AudioElement extends EventTarget {
 Object.defineProperty(globalThis, 'AudioContext', { configurable: true, value: Context });
 Object.defineProperty(globalThis, 'Audio', { configurable: true, value: AudioElement });
 
-let moduleId = 0;
-async function freshOutput() {
-  return import(`../src/lib/audio/playbackOutput.ts?case=${++moduleId}`);
-}
 beforeEach(() => {
+  for (const context of contexts) context.state = 'closed';
   contexts.length = 0;
   disconnects.length = 0;
   start.mockClear();
@@ -78,7 +76,6 @@ afterAll(() => {
 
 describe('audio output startup', () => {
   test('does not advance the clip before the output context has resumed', async () => {
-    const { createPlaybackOutput } = await freshOutput();
     const output = createPlaybackOutput();
     const pending = output.audio.play();
     await Promise.resolve();
@@ -90,7 +87,6 @@ describe('audio output startup', () => {
   });
 
   test('shares a device-rate context with a playback buffer between clips', async () => {
-    const { createPlaybackOutput } = await freshOutput();
     const first = createPlaybackOutput();
     const second = createPlaybackOutput();
     expect(contexts).toHaveLength(1);
@@ -100,7 +96,6 @@ describe('audio output startup', () => {
   });
 
   test('canceling while output wakes does not play the canceled clip', async () => {
-    const { createPlaybackOutput } = await freshOutput();
     const output = createPlaybackOutput();
     const pending = output.audio.play();
     output.audio.pause();
@@ -111,7 +106,6 @@ describe('audio output startup', () => {
   });
 
   test('disposing a player during startup releases it without starting audio', async () => {
-    const { createPlaybackOutput } = await freshOutput();
     const output = createPlaybackOutput();
     const pending = output.audio.play();
     output.dispose();
@@ -121,7 +115,6 @@ describe('audio output startup', () => {
   });
 
   test('concurrent clips share one resume and cancel independently', async () => {
-    const { createPlaybackOutput } = await freshOutput();
     const first = createPlaybackOutput();
     const second = createPlaybackOutput();
     const pending = [first.audio.play(), second.audio.play()];
@@ -137,7 +130,6 @@ describe('audio output startup', () => {
   });
 
   test('a later start on the same clip supersedes its canceled start', async () => {
-    const { createPlaybackOutput } = await freshOutput();
     const output = createPlaybackOutput();
     const first = output.audio.play();
     output.audio.pause();
@@ -150,7 +142,6 @@ describe('audio output startup', () => {
   });
 
   test('resume rejection is reported and a later gesture can retry', async () => {
-    const { createPlaybackOutput } = await freshOutput();
     const output = createPlaybackOutput();
     const pending = output.audio.play();
     rejectOutput(new Error('Resume denied'));
@@ -165,7 +156,6 @@ describe('audio output startup', () => {
   });
 
   test('a disposed clip ignores a late resume rejection and disconnects once', async () => {
-    const { createPlaybackOutput } = await freshOutput();
     const output = createPlaybackOutput();
     const pending = output.audio.play();
     output.dispose();
@@ -179,7 +169,6 @@ describe('audio output startup', () => {
   });
 
   test('an already running context starts media within the current gesture', async () => {
-    const { createPlaybackOutput } = await freshOutput();
     const output = createPlaybackOutput();
     contexts[0].state = 'running';
     const pending = output.audio.play();
@@ -191,7 +180,6 @@ describe('audio output startup', () => {
 
   test('falls back to native media when Web Audio is unavailable', async () => {
     Reflect.deleteProperty(globalThis, 'AudioContext');
-    const { createPlaybackOutput } = await freshOutput();
     const output = createPlaybackOutput();
     await output.audio.play();
     expect(start).toHaveBeenCalledTimes(1);
