@@ -28,7 +28,7 @@ def health_client(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "torch_directml", None)
     # Hugging Face's cache scan lists repositories even when no weights exist.
     monkeypatch.setattr(
-        huggingface_hub, "scan_cache_dir", lambda: SimpleNamespace(repos=[SimpleNamespace(repo_id=repo)])
+        huggingface_hub, "scan_cache_dir", lambda cache_dir=None: SimpleNamespace(repos=[SimpleNamespace(repo_id=repo)])
     )
     app = FastAPI()
     app.include_router(health.router)
@@ -110,7 +110,7 @@ def test_model_status_validates_weight_links(health_client, monkeypatch, scan_fi
     revision = SimpleNamespace(files=[file], size_on_disk=7)
     cached_repo = SimpleNamespace(repo_id="test/model", revisions=[revision])
     monkeypatch.setattr(
-        huggingface_hub, "scan_cache_dir", lambda: SimpleNamespace(repos=[cached_repo] if scan_finds_repo else [])
+        huggingface_hub, "scan_cache_dir", lambda cache_dir=None: SimpleNamespace(repos=[cached_repo] if scan_finds_repo else [])
     )
     monkeypatch.setattr(model_routes, "get_task_manager", lambda: SimpleNamespace(get_pending_downloads=list))
     app = FastAPI()
