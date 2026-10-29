@@ -280,23 +280,27 @@ async def add_profile_sample(
     profile_dir.mkdir(parents=True, exist_ok=True)
 
     dest_path = profile_dir / f"{sample_id}.wav"
-    await asyncio.to_thread(save_audio, audio, str(dest_path), sr)
+    try:
+        await asyncio.to_thread(save_audio, audio, str(dest_path), sr)
 
-    db_sample = DBProfileSample(
-        id=sample_id,
-        profile_id=profile_id,
-        audio_path=config.to_storage_path(dest_path),
-        reference_text=reference_text,
-    )
+        db_sample = DBProfileSample(
+            id=sample_id,
+            profile_id=profile_id,
+            audio_path=config.to_storage_path(dest_path),
+            reference_text=reference_text,
+        )
+        db.add(db_sample)
+        profile.updated_at = datetime.now(UTC)
 
-    db.add(db_sample)
-
-    profile.updated_at = datetime.now(UTC)
-
-    if commit:
-        db.commit()
-    else:
-        db.flush()
+        if commit:
+            db.commit()
+        else:
+            db.flush()
+    except Exception:
+        if commit:
+            db.rollback()
+        dest_path.unlink(missing_ok=True)
+        raise
     db.refresh(db_sample)
 
     # Invalidate combined audio cache for this profile
@@ -538,11 +542,20 @@ async def delete_profile_sample(
     profile_id = sample.profile_id
 
     audio_path = config.resolve_storage_path(sample.audio_path)
-    if audio_path is not None and audio_path.exists():
-        audio_path.unlink()
-
     db.delete(sample)
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    if audio_path is not None:
+        try:
+            audio_path.unlink(missing_ok=True)
+        except OSError:
+            # The deletion is already committed; report success rather than
+            # inviting a retry of a mutation that has completed.
+            logger.warning("Could not remove deleted profile sample audio %s", audio_path, exc_info=True)
 
     # Invalidate combined audio cache for this profile
     # Since the sample set changed, any cached combined audio is now stale
