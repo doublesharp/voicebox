@@ -584,8 +584,13 @@ class MLXSTTBackend:
                 options = {"word_timestamps": True}
                 if language:
                     options["language"] = language
+                # Studio assets have opaque, extensionless names. Decode by
+                # audio content before handing 16 kHz mono samples to Whisper.
+                from ..utils.audio import load_audio
+
+                audio, _ = load_audio(str(audio_path), sample_rate=16000, mono=True)
                 with recognized_word_timing(model):
-                    result = model.generate(str(audio_path), **options)
+                    result = model.generate(audio, **options)
                 # Return plain CPU metadata, never lazy arrays/native model state.
                 return {"text": result.get("text", "") if isinstance(result, dict) else result.text,
                         "segments": result.get("segments", []) if isinstance(result, dict) else result.segments}
