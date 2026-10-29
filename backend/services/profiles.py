@@ -174,6 +174,8 @@ def validate_profile_engine(profile, engine: str) -> None:
 async def create_profile(
     data: VoiceProfileCreate,
     db: Session,
+    *,
+    commit: bool = True,
 ) -> VoiceProfileResponse:
     """
     Create a new voice profile.
@@ -228,7 +230,10 @@ async def create_profile(
     )
 
     db.add(db_profile)
-    db.commit()
+    if commit:
+        db.commit()
+    else:
+        db.flush()
     db.refresh(db_profile)
 
     profile_dir = config.get_profiles_dir() / db_profile.id
@@ -242,6 +247,8 @@ async def add_profile_sample(
     audio_path: str,
     reference_text: str,
     db: Session,
+    *,
+    commit: bool = True,
 ) -> ProfileSampleResponse:
     """
     Add a sample to a voice profile.
@@ -286,7 +293,10 @@ async def add_profile_sample(
 
     profile.updated_at = datetime.now(UTC)
 
-    db.commit()
+    if commit:
+        db.commit()
+    else:
+        db.flush()
     db.refresh(db_sample)
 
     # Invalidate combined audio cache for this profile

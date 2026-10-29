@@ -2,6 +2,9 @@
 
 import io
 import json
+import math
+import struct
+import wave
 import zipfile
 from datetime import datetime, timezone
 
@@ -10,7 +13,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from backend import config
-from backend.database import Base, Generation, GenerationVersion, VoiceProfile
+from backend.database import Base, Generation, GenerationVersion, ProfileSample, VoiceProfile
 from backend.services import export_import
 
 
@@ -31,6 +34,71 @@ def archive(manifest, samples=None):
         if samples is not None:
             z.writestr("samples.json", json.dumps(samples))
     return out.getvalue()
+
+
+def reference_wav():
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(b"".join(struct.pack("<h", int(8000 * math.sin(2 * math.pi * 220 * i / 16000)))
+                                 for i in range(48000)))
+    return output.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_failed_profile_sample_import_removes_partial_profile_and_files(db, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "_data_dir", tmp_path)
+    db.add(VoiceProfile(id="existing", name="Existing"))
+    db.commit()
+    data = io.BytesIO()
+    with zipfile.ZipFile(data, "w") as z:
+        z.writestr("manifest.json", json.dumps({"version": "1.0", "profile": {"name": "Imported"}}))
+        z.writestr("samples.json", json.dumps({"valid.wav": "first", "broken.wav": "second"}))
+        z.writestr("samples/valid.wav", reference_wav())
+        z.writestr("samples/broken.wav", b"not audio")
+    with pytest.raises(ValueError, match="Invalid reference audio"):
+        await export_import.import_profile_from_zip(data.getvalue(), db)
+    assert [p.name for p in db.query(VoiceProfile).all()] == ["Existing"]
+    assert db.query(ProfileSample).count() == 0
+    assert list(config.get_profiles_dir().iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_profile_import_commits_all_samples(db, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "_data_dir", tmp_path)
+    db.add(VoiceProfile(id="existing", name="Voice"))
+    db.commit()
+    data = io.BytesIO()
+    with zipfile.ZipFile(data, "w") as z:
+        z.writestr("manifest.json", json.dumps({"version": "1.0", "profile": {"name": "Voice"}}))
+        z.writestr("samples.json", json.dumps({"a.wav": "first", "b.wav": "second"}))
+        z.writestr("samples/a.wav", reference_wav())
+        z.writestr("samples/b.wav", reference_wav())
+    result = await export_import.import_profile_from_zip(data.getvalue(), db)
+    assert result.name == "Voice (1)"
+    samples = db.query(ProfileSample).filter_by(profile_id=result.id).all()
+    assert {sample.reference_text for sample in samples} == {"first", "second"}
+    assert all(config.resolve_storage_path(sample.audio_path).is_file() for sample in samples)
+
+
+@pytest.mark.asyncio
+async def test_profile_import_cleans_up_if_commit_fails(db, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "_data_dir", tmp_path)
+    data = io.BytesIO()
+    with zipfile.ZipFile(data, "w") as z:
+        z.writestr("manifest.json", json.dumps({"version": "1.0", "profile": {"name": "Voice"}}))
+        z.writestr("samples.json", json.dumps({"a.wav": "first"}))
+        z.writestr("samples/a.wav", reference_wav())
+    def fail_commit():
+        raise RuntimeError("database unavailable")
+    monkeypatch.setattr(db, "commit", fail_commit)
+    with pytest.raises(ValueError, match="database unavailable"):
+        await export_import.import_profile_from_zip(data.getvalue(), db)
+    assert db.query(VoiceProfile).count() == 0
+    assert db.query(ProfileSample).count() == 0
+    assert list(config.get_profiles_dir().iterdir()) == []
 
 
 @pytest.mark.asyncio

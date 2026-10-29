@@ -8,6 +8,7 @@ Also handles exporting individual generations.
 import json
 import zipfile
 import io
+import shutil
 from pathlib import Path
 from typing import Optional
 from sqlalchemy.orm import Session
@@ -183,61 +184,47 @@ async def import_profile_from_zip(file_bytes: bytes, db: Session) -> VoiceProfil
                 language=profile_data.get("language", "en"),
             )
             
-            profile = await create_profile(profile_create, db)
+            profile_dir = None
+            try:
+                profile = await create_profile(profile_create, db, commit=False)
+                profile_dir = config.get_profiles_dir() / profile.id
+                for filename, reference_text in samples_data.items():
+                    import tempfile
+                    tmp_path = None
+                    try:
+                        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                            tmp_path = tmp.name
+                            tmp.write(zip_file.read(f"samples/{filename}"))
+                        await add_profile_sample(
+                            profile.id, tmp_path, reference_text, db, commit=False,
+                        )
+                    finally:
+                        if tmp_path is not None:
+                            Path(tmp_path).unlink(missing_ok=True)
+                db.commit()
+            except BaseException:
+                db.rollback()
+                if profile_dir is not None:
+                    shutil.rmtree(profile_dir, ignore_errors=True)
+                raise
 
-            # Extract and add samples
-            profile_dir = config.get_profiles_dir() / profile.id
-            profile_dir.mkdir(parents=True, exist_ok=True)
-
-            # Handle avatar if present
+            # Avatar import is optional and happens after the profile is committed.
             avatar_files = [f for f in namelist if f.startswith("avatar.")]
             if avatar_files:
                 try:
-                    avatar_file = avatar_files[0]
-                    # Extract to temporary file
                     import tempfile
+                    avatar_file = avatar_files[0]
                     with tempfile.NamedTemporaryFile(suffix=Path(avatar_file).suffix, delete=False) as tmp:
                         tmp.write(zip_file.read(avatar_file))
                         tmp_path = tmp.name
-
                     try:
                         from .profiles import upload_avatar
                         await upload_avatar(profile.id, tmp_path, db)
                     finally:
                         Path(tmp_path).unlink(missing_ok=True)
-                except Exception as e:
-                    # Avatar import is optional - continue even if it fails
+                except Exception:
                     pass
 
-            for filename, reference_text in samples_data.items():
-                # Validate filename
-                if not filename.endswith('.wav'):
-                    raise ValueError(f"Invalid sample filename: {filename} (must be .wav)")
-                
-                # Extract audio file to temp location
-                zip_path = f"samples/{filename}"
-                
-                if zip_path not in namelist:
-                    raise ValueError(f"Sample file not found in ZIP: {zip_path}")
-                
-                # Extract to temporary file
-                import tempfile
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                    tmp.write(zip_file.read(zip_path))
-                    tmp_path = tmp.name
-                
-                try:
-                    # Add sample to profile
-                    await add_profile_sample(
-                        profile.id,
-                        tmp_path,
-                        reference_text,
-                        db,
-                    )
-                finally:
-                    # Clean up temp file
-                    Path(tmp_path).unlink(missing_ok=True)
-            
             return profile
             
     except zipfile.BadZipFile:
