@@ -360,41 +360,40 @@ async def generate_audio_sync(
     bg_db = next(get_db())
     tts_model = None
     try:
-        tts_model = get_tts_backend_for_engine(engine)
-        await load_engine_model(engine, model_size)
-        check_inference_cancelled()
+        try:
+            tts_model = get_tts_backend_for_engine(engine)
+            await load_engine_model(engine, model_size)
+            check_inference_cancelled()
 
-        voice_prompt = await profiles.create_voice_prompt_for_profile(
-            profile_id,
-            bg_db,
-            use_cache=True,
-            engine=engine,
+            voice_prompt = await profiles.create_voice_prompt_for_profile(
+                profile_id,
+                bg_db,
+                use_cache=True,
+                engine=engine,
+            )
+            check_inference_cancelled()
+            if effects_chain is None:
+                profile = await profiles.get_profile(profile_id, bg_db)
+                effects_chain = effects_chain_from_config(profile.effects_chain if profile else None)
+        finally:
+            bg_db.close()
+        trim_fn = trim_tts_output if engine_needs_trim(engine) else None
+        runaway_detector = has_tts_runaway if engine_retries_runaway(engine) else None
+
+        gen_kwargs: dict = dict(
+            language=language,
+            seed=seed,
+            instruct=instruct,
+            trim_fn=trim_fn,
+            runaway_detector=runaway_detector,
         )
-        check_inference_cancelled()
-        if effects_chain is None:
-            profile = await profiles.get_profile(profile_id, bg_db)
-            effects_chain = effects_chain_from_config(profile.effects_chain if profile else None)
-    finally:
-        bg_db.close()
+        if generation_options:
+            gen_kwargs["generation_options"] = generation_options
+        if max_chunk_chars is not None:
+            gen_kwargs["max_chunk_chars"] = max_chunk_chars
+        if crossfade_ms is not None:
+            gen_kwargs["crossfade_ms"] = crossfade_ms
 
-    trim_fn = trim_tts_output if engine_needs_trim(engine) else None
-    runaway_detector = has_tts_runaway if engine_retries_runaway(engine) else None
-
-    gen_kwargs: dict = dict(
-        language=language,
-        seed=seed,
-        instruct=instruct,
-        trim_fn=trim_fn,
-        runaway_detector=runaway_detector,
-    )
-    if generation_options:
-        gen_kwargs["generation_options"] = generation_options
-    if max_chunk_chars is not None:
-        gen_kwargs["max_chunk_chars"] = max_chunk_chars
-    if crossfade_ms is not None:
-        gen_kwargs["crossfade_ms"] = crossfade_ms
-
-    try:
         audio, sample_rate = await generate_chunked(
             tts_model, text, voice_prompt, **gen_kwargs
         )
@@ -407,7 +406,8 @@ async def generate_audio_sync(
         check_inference_cancelled()
         return wav_bytes
     finally:
-        release_generation_memory(tts_model)
+        if tts_model is not None:
+            release_generation_memory(tts_model)
 
 
 def _save_regenerate(

@@ -502,29 +502,29 @@ async def _buffered_speech(
     model_size = data.model_size or "1.7B"
 
     await ensure_model_cached_or_raise(engine, model_size)
-    await load_engine_model(engine, model_size)
-    check_inference_cancelled()
-
-    voice_prompt = await profiles.create_voice_prompt_for_profile(
-        data.profile_id,
-        db,
-        engine=engine,
-    )
-
-    from ..utils.chunked_tts import generate_chunked
-
-    trim_fn = None
-    runaway_detector = None
-    if engine_needs_trim(engine):
-        from ..utils.audio import trim_tts_output
-
-        trim_fn = trim_tts_output
-    if engine_retries_runaway(engine):
-        from ..utils.audio import has_tts_runaway
-
-        runaway_detector = has_tts_runaway
-
     try:
+        await load_engine_model(engine, model_size)
+        check_inference_cancelled()
+
+        voice_prompt = await profiles.create_voice_prompt_for_profile(
+            data.profile_id,
+            db,
+            engine=engine,
+        )
+
+        from ..utils.chunked_tts import generate_chunked
+
+        trim_fn = None
+        runaway_detector = None
+        if engine_needs_trim(engine):
+            from ..utils.audio import trim_tts_output
+
+            trim_fn = trim_tts_output
+        if engine_retries_runaway(engine):
+            from ..utils.audio import has_tts_runaway
+
+            runaway_detector = has_tts_runaway
+
         audio, sample_rate = await generate_chunked(
             tts_model,
             data.text,
