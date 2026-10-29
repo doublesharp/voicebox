@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiClient } from '@/lib/api/client';
-import type { VoiceProfileCreate } from '@/lib/api/types';
+import type { EffectConfig, VoiceProfileCreate, VoiceProfileResponse } from '@/lib/api/types';
 import { usePlatform } from '@/platform/PlatformContext';
 
 export function useProfiles() {
@@ -55,6 +55,28 @@ export function useDeleteProfile() {
       // reference — both caches still hold rows that no longer exist.
       queryClient.invalidateQueries({ queryKey: ['history'] });
       queryClient.invalidateQueries({ queryKey: ['stories'] });
+    },
+  });
+}
+
+export function useUpdateProfileEffects() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      profileId,
+      effectsChain,
+    }: {
+      profileId: string;
+      effectsChain: EffectConfig[] | null;
+    }) => apiClient.updateProfileEffects(profileId, effectsChain),
+    onSuccess: async (profile) => {
+      // A metadata save may already have refetched the old effects. Cancel older
+      // requests before publishing the effects acknowledgement to both views.
+      await queryClient.cancelQueries({ queryKey: ['profiles'] });
+      queryClient.setQueryData(['profiles', profile.id], profile);
+      queryClient.setQueryData<VoiceProfileResponse[]>(['profiles'], (previous) =>
+        previous?.map((item) => (item.id === profile.id ? profile : item)),
+      );
     },
   });
 }

@@ -29,9 +29,7 @@ interface ListPaneHeaderProps {
 }
 
 export function ListPaneHeader({ className, children }: ListPaneHeaderProps) {
-  return (
-    <div className={cn('absolute top-0 left-0 right-0 z-20 px-4', className)}>{children}</div>
-  );
+  return <div className={cn('absolute top-0 left-0 right-0 z-20 px-4', className)}>{children}</div>;
 }
 
 interface ListPaneTitleRowProps {
@@ -49,7 +47,11 @@ interface ListPaneTitleProps {
 }
 
 export function ListPaneTitle({ className, children }: ListPaneTitleProps) {
-  return <h2 className={cn('text-2xl px-4 font-bold truncate', className)}>{children}</h2>;
+  return (
+    <h2 className={cn('text-xl px-4 font-semibold tracking-tight truncate', className)}>
+      {children}
+    </h2>
+  );
 }
 
 interface ListPaneActionsProps {
@@ -89,10 +91,7 @@ interface ListPaneScrollProps {
 
 export function ListPaneScroll({ className, style, children }: ListPaneScrollProps) {
   return (
-    <div
-      className={cn('flex-1 overflow-y-auto overflow-x-hidden pt-24', className)}
-      style={style}
-    >
+    <div className={cn('flex-1 overflow-y-auto overflow-x-hidden pt-24', className)} style={style}>
       {children}
     </div>
   );

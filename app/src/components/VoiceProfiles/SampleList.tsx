@@ -183,6 +183,29 @@ export function SampleList({ profileId }: SampleListProps) {
   const [editedText, setEditedText] = useState<string>('');
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [sampleToDelete, setSampleToDelete] = useState<string | null>(null);
+  const editEpoch = useRef(0);
+  const currentProfile = useRef(profileId);
+  const mounted = useRef(true);
+  if (currentProfile.current !== profileId) {
+    currentProfile.current = profileId;
+    editEpoch.current++;
+  }
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      editEpoch.current++;
+    };
+  }, []);
+  // Reset profile-scoped dialogs and drafts on navigation.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: profileId is the reset trigger.
+  useEffect(() => {
+    setEditingSampleId(null);
+    setEditedText('');
+    setUploadOpen(false);
+    setDeleteDialogOpen(false);
+    setSampleToDelete(null);
+  }, [profileId]);
 
   const handleDeleteClick = (sampleId: string) => {
     setSampleToDelete(sampleId);
@@ -198,11 +221,13 @@ export function SampleList({ profileId }: SampleListProps) {
   };
 
   const handleStartEdit = (sampleId: string, currentText: string) => {
+    editEpoch.current++;
     setEditingSampleId(sampleId);
     setEditedText(currentText);
   };
 
   const handleCancelEdit = () => {
+    editEpoch.current++;
     setEditingSampleId(null);
     setEditedText('');
   };
@@ -217,8 +242,10 @@ export function SampleList({ profileId }: SampleListProps) {
       return;
     }
 
+    const epoch = editEpoch.current;
     try {
       await updateSample.mutateAsync({ sampleId, referenceText: editedText.trim() });
+      if (!mounted.current || editEpoch.current !== epoch) return;
       toast({
         title: t('sampleList.toast.updated'),
         description: t('sampleList.toast.updatedDescription'),
@@ -226,6 +253,7 @@ export function SampleList({ profileId }: SampleListProps) {
       setEditingSampleId(null);
       setEditedText('');
     } catch (error) {
+      if (!mounted.current) return;
       toast({
         title: t('sampleList.toast.updateFailed'),
         description:
@@ -269,7 +297,10 @@ export function SampleList({ profileId }: SampleListProps) {
                     </div>
                     <Textarea
                       value={editedText}
-                      onChange={(e) => setEditedText(e.target.value)}
+                      onChange={(e) => {
+                        editEpoch.current++;
+                        setEditedText(e.target.value);
+                      }}
                       className="min-h-[100px] text-sm resize-none"
                       placeholder={t('sampleList.placeholder')}
                       autoFocus
@@ -308,7 +339,7 @@ export function SampleList({ profileId }: SampleListProps) {
                       </div>
 
                       {/* Action Buttons */}
-                      <div className="shrink-0 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                      <div className="shrink-0 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity">
                         <CircleButton
                           icon={Edit}
                           title={t('sampleList.editTranscription')}

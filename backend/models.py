@@ -76,7 +76,31 @@ class ProfileSampleResponse(BaseModel):
         from_attributes = True
 
 
-class GenerationRequest(BaseModel):
+SPEECH_DELIVERY_FIELDS = (
+    "speed", "chatterbox_temperature", "chatterbox_cfg_weight", "chatterbox_exaggeration",
+)
+
+
+class SpeechDeliverySettings(BaseModel):
+    """Application-owned rate plus optional Chatterbox sampling overrides."""
+
+    speed: float = Field(default=1.0, ge=0.5, le=2.0)
+    chatterbox_temperature: Optional[float] = Field(default=None, ge=0.1, le=1.5)
+    chatterbox_cfg_weight: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    chatterbox_exaggeration: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+
+    def chatterbox_options(self, engine: str) -> Optional[dict[str, float]]:
+        options = {
+            name.removeprefix("chatterbox_"): getattr(self, name)
+            for name in SPEECH_DELIVERY_FIELDS[1:]
+            if getattr(self, name) is not None
+        }
+        if options and engine != "chatterbox":
+            raise ValueError("Chatterbox delivery controls require the Chatterbox engine")
+        return options or None
+
+
+class GenerationRequest(SpeechDeliverySettings):
     """Request model for voice generation."""
 
     profile_id: str
@@ -100,6 +124,12 @@ class GenerationRequest(BaseModel):
     effects_chain: Optional[List["EffectConfig"]] = Field(
         None, description="Effects chain to apply after generation (overrides profile default)"
     )
+
+    @model_validator(mode="after")
+    def validate_delivery_engine(self):
+        if self.engine is not None:
+            self.chatterbox_options(self.engine)
+        return self
 
 
 class GenerationResponse(BaseModel):

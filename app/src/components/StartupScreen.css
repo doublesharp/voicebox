@@ -1,0 +1,44 @@
+.startup-waveform {
+  display: flex;
+  height: 24px;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+}
+
+.startup-waveform > span {
+  width: 3px;
+  height: 12px;
+  border-radius: 999px;
+  background: hsl(var(--primary));
+  animation: startup-wave 1.2s ease-in-out infinite;
+}
+
+.startup-waveform > span:nth-child(2),
+.startup-waveform > span:nth-child(4) {
+  height: 18px;
+  animation-delay: 0.15s;
+}
+
+.startup-waveform > span:nth-child(3) {
+  height: 24px;
+  animation-delay: 0.3s;
+}
+
+@keyframes startup-wave {
+  0%,
+  100% {
+    transform: scaleY(0.45);
+    opacity: 0.45;
+  }
+  50% {
+    transform: scaleY(1);
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .startup-waveform > span {
+    animation: none;
+  }
+}

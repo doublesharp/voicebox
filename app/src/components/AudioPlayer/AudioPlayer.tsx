@@ -1,6 +1,6 @@
 import { useQuery } from '@tanstack/react-query';
 import { Pause, Play, Repeat, Volume2, VolumeX, X } from 'lucide-react';
-import { useEffect, useId, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import WaveSurfer from 'wavesurfer.js';
 import { Button } from '@/components/ui/button';
 import { Slider } from '@/components/ui/slider';
@@ -13,11 +13,24 @@ import { usePlatform } from '@/platform/PlatformContext';
 import { usePlayerStore } from '@/stores/playerStore';
 
 export function AudioPlayer() {
+  const audioUrl = usePlayerStore((state) => state.audioUrl);
+  const audioId = usePlayerStore((state) => state.audioId);
+  const sourceGeneration = usePlayerStore((state) => state.sourceGeneration);
+  // WaveSurfer's fetch cancellation cannot cancel an already-running decode.
+  // Give each source its own media graph so a late decode cannot replace the
+  // newly selected clip's sound or waveform.
+  return audioUrl ? (
+    <AudioPlayerSession key={JSON.stringify([audioId, audioUrl, sourceGeneration])} />
+  ) : null;
+}
+
+function AudioPlayerSession() {
   const platform = usePlatform();
   const volumeLabelId = useId();
   const {
     audioUrl,
     audioId,
+    sourceGeneration,
     profileId,
     isPlaying,
     currentTime,
@@ -101,6 +114,14 @@ export function AudioPlayer() {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [wsReady, setWsReady] = useState(false);
+  const sourceIsCurrent = useCallback(() => {
+    const selected = usePlayerStore.getState();
+    return (
+      selected.audioId === audioId &&
+      selected.audioUrl === audioUrl &&
+      selected.sourceGeneration === sourceGeneration
+    );
+  }, [audioId, audioUrl, sourceGeneration]);
 
   useEffect(() => {
     const controller = new NativePlaybackController(platform.audio, (event) =>
@@ -113,16 +134,18 @@ export function AudioPlayer() {
     };
   }, [platform.audio]);
 
-  // Create WaveSurfer once when the player becomes visible (audioUrl is set).
-  // This instance is reused for all subsequent audio loads - never destroyed until unmount.
+  // Create one WaveSurfer for this source; source replacement unmounts it.
   useEffect(() => {
     if (!audioUrl) return;
     if (wavesurferRef.current) return; // already created
 
+    let disposed = false;
+    let retry: ReturnType<typeof setTimeout> | undefined;
     const initWaveSurfer = () => {
+      if (disposed || !sourceIsCurrent() || wavesurferRef.current) return;
       const container = waveformRef.current;
       if (!container) {
-        setTimeout(initWaveSurfer, 50);
+        retry = setTimeout(initWaveSurfer, 50);
         return;
       }
 
@@ -135,7 +158,7 @@ export function AudioPlayer() {
         style.visibility !== 'hidden';
 
       if (!isVisible) {
-        setTimeout(initWaveSurfer, 50);
+        retry = setTimeout(initWaveSurfer, 50);
         return;
       }
 
@@ -166,15 +189,19 @@ export function AudioPlayer() {
           mediaControls: false,
           backend: 'WebAudio',
         });
+        wavesurferRef.current = wavesurfer;
+        const ownsSource = () =>
+          !disposed && sourceIsCurrent() && wavesurferRef.current === wavesurfer;
 
         const presentation = bindPlaybackPresentation(
           wavesurfer,
           setCurrentTime,
-          () => !isUsingNativePlaybackRef.current,
+          () => ownsSource() && !isUsingNativePlaybackRef.current,
         );
 
         // Wire up event handlers (these persist for the lifetime of the instance)
         wavesurfer.on('timeupdate', (time) => {
+          if (!ownsSource()) return;
           if (isUsingNativePlaybackRef.current) return;
           const dur = usePlayerStore.getState().duration;
           if (dur > 0 && time >= dur) {
@@ -193,6 +220,7 @@ export function AudioPlayer() {
         });
 
         wavesurfer.on('ready', () => {
+          if (!ownsSource()) return;
           const dur = wavesurfer.getDuration();
           setDuration(dur);
           loadingRef.current = false;
@@ -205,15 +233,18 @@ export function AudioPlayer() {
         });
 
         wavesurfer.on('play', () => {
+          if (!ownsSource()) return;
           if (!isUsingNativePlaybackRef.current) setIsPlaying(true);
         });
         wavesurfer.on('pause', () => {
+          if (!ownsSource()) return;
           if (isUsingNativePlaybackRef.current) return;
           setIsPlaying(false);
           presentation.update();
         });
 
         wavesurfer.on('seeking', (time) => {
+          if (!ownsSource()) return;
           if (isUsingNativePlaybackRef.current) {
             setCurrentTime(time);
             if (!syncingNativePositionRef.current) {
@@ -245,6 +276,7 @@ export function AudioPlayer() {
           });
         }
         wavesurfer.on('finish', () => {
+          if (!ownsSource()) return;
           if (isUsingNativePlaybackRef.current) return;
           const loop = usePlayerStore.getState().isLooping;
           if (loop) {
@@ -258,12 +290,14 @@ export function AudioPlayer() {
         });
 
         wavesurfer.on('error', (err) => {
+          if (!ownsSource()) return;
           debug.error('WaveSurfer error:', err);
           setIsLoading(false);
           setError(`Audio error: ${err instanceof Error ? err.message : String(err)}`);
         });
 
         wavesurfer.on('loading', (percent) => {
+          if (!ownsSource()) return;
           setIsLoading(true);
           if (percent === 100) setIsLoading(false);
         });
@@ -285,12 +319,14 @@ export function AudioPlayer() {
     });
 
     return () => {
+      disposed = true;
+      clearTimeout(retry);
       cancelAnimationFrame(rafId);
     };
     // Only run on mount-like conditions. audioUrl is here so we create the instance
     // when the player first appears, but we guard against re-creation above.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [audioUrl, setIsPlaying, setDuration, setCurrentTime]);
+  }, [audioUrl, sourceIsCurrent, setIsPlaying, setDuration, setCurrentTime]);
 
   // Destroy WaveSurfer only on unmount
   useEffect(() => {
@@ -298,7 +334,22 @@ export function AudioPlayer() {
       if (wavesurferRef.current) {
         debug.log('Destroying WaveSurfer instance (unmount)');
         try {
-          wavesurferRef.current.destroy();
+          const wavesurfer = wavesurferRef.current;
+          wavesurferRef.current = null;
+          wavesurfer.pause();
+          const media = wavesurfer.getMediaElement() as HTMLMediaElement & {
+            getGainNode?: () => GainNode;
+          };
+          media.removeAttribute?.('src');
+          wavesurfer.destroy();
+          // WaveSurfer's WebAudio media is treated as externally supplied and
+          // its destroy() does not release this context. We own it here.
+          const context = media.getGainNode?.().context as AudioContext | undefined;
+          if (context && context.state !== 'closed') {
+            void context
+              .close?.()
+              .catch((error) => debug.error('Audio context close failed:', error));
+          }
         } catch (err) {
           debug.error('Error destroying WaveSurfer:', err);
         }
@@ -359,42 +410,48 @@ export function AudioPlayer() {
     wavesurfer
       .load(audioUrl)
       .then(() => {
+        if (!sourceIsCurrent() || wavesurferRef.current !== wavesurfer) return;
         debug.log('Audio loaded into WaveSurfer');
         loadingRef.current = false;
       })
       .catch((err) => {
+        if (!sourceIsCurrent() || wavesurferRef.current !== wavesurfer) return;
         debug.error('Failed to load audio:', err);
         loadingRef.current = false;
         setIsLoading(false);
         setError(`Failed to load audio: ${err instanceof Error ? err.message : String(err)}`);
       });
-  }, [audioUrl, wsReady, setCurrentTime, setDuration]);
+  }, [audioUrl, wsReady, sourceIsCurrent, setCurrentTime, setDuration]);
 
   // Sync play/pause state (only when user clicks play/pause button, not auto-sync)
   // This effect is kept for external state changes but should be minimal
+  // biome-ignore lint/correctness/useExhaustiveDependencies: isPlaying triggers synchronization; the current store value prevents an older effect from pausing newer playback.
   useEffect(() => {
-    if (!wavesurferRef.current || duration === 0) return;
+    if (!sourceIsCurrent() || !wavesurferRef.current || duration === 0) return;
+    const playing = usePlayerStore.getState().isPlaying;
     if (nativeRoutingRef.current) {
       const controller = nativeControllerRef.current;
       if (controller?.isStarting) return;
       if (controller?.hasSession) {
-        void controller.control({ paused: !isPlaying }).catch((error) => setError(String(error)));
-      } else if (isPlaying) {
+        void controller.control({ paused: !playing }).catch((error) => setError(String(error)));
+      } else if (playing) {
         void playbackActionsRef.current.playFrom(usePlayerStore.getState().currentTime);
       }
       return;
     }
 
-    if (isPlaying && wavesurferRef.current.isPlaying() === false) {
-      wavesurferRef.current.play().catch((error) => {
+    const wavesurfer = wavesurferRef.current;
+    if (playing && wavesurfer.isPlaying() === false) {
+      wavesurfer.play().catch((error) => {
+        if (!sourceIsCurrent() || wavesurferRef.current !== wavesurfer) return;
         debug.error('Failed to play:', error);
         setIsPlaying(false);
         setError(`Playback error: ${error instanceof Error ? error.message : String(error)}`);
       });
-    } else if (!isPlaying && wavesurferRef.current.isPlaying()) {
-      wavesurferRef.current.pause();
+    } else if (!playing && wavesurfer.isPlaying()) {
+      wavesurfer.pause();
     }
-  }, [isPlaying, setIsPlaying, duration]);
+  }, [isPlaying, sourceIsCurrent, setIsPlaying, duration]);
 
   // Sync volume
   useEffect(() => {
@@ -449,18 +506,24 @@ export function AudioPlayer() {
   // Wait for both decoded media and routing before autoplay, so a slow channel
   // query cannot send a custom-device profile to the default output first.
   useEffect(() => {
-    if (!shouldAutoPlay || !routingReady || duration === 0 || isLoading) return;
+    if (!sourceIsCurrent() || !shouldAutoPlay || !routingReady || duration === 0 || isLoading)
+      return;
     usePlayerStore.getState().clearAutoPlayFlag();
     void playbackActionsRef.current.playFrom(0);
-  }, [shouldAutoPlay, routingReady, duration, isLoading]);
+  }, [shouldAutoPlay, sourceIsCurrent, routingReady, duration, isLoading]);
 
   // Spacebar to play/pause (capture phase so it fires before focused elements)
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.code !== 'Space') return;
-      // Ignore if user is typing in an input/textarea
-      const tag = (e.target as HTMLElement)?.tagName;
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement)?.isContentEditable) {
+      // Let focused controls handle Space, including history cards and sliders.
+      const target = e.target as HTMLElement | null;
+      if (
+        target?.isContentEditable ||
+        target?.closest?.(
+          'button, input, textarea, select, a[href], [role="button"], [role="slider"], [role="menuitem"], [role="checkbox"], [role="radio"], [role="switch"], [role="tab"], [role="option"], [role="combobox"], [role="textbox"]',
+        )
+      ) {
         return;
       }
       if (audioUrl && duration > 0 && wavesurferRef.current) {
@@ -497,12 +560,14 @@ export function AudioPlayer() {
     try {
       await wavesurfer.play();
     } catch (error) {
+      if (!sourceIsCurrent() || wavesurferRef.current !== wavesurfer) return;
       setIsPlaying(false);
       setError(`Playback error: ${String(error)}`);
     }
   };
 
   onNativeUpdateRef.current = (event) => {
+    if (!sourceIsCurrent()) return;
     setIsStarting(event.state === 'starting');
     if (event.state === 'starting') return;
     if (event.state === 'error') {
@@ -537,6 +602,7 @@ export function AudioPlayer() {
       if (controller.hasSession) {
         try {
           await controller.control({ paused: playing });
+          if (!sourceIsCurrent()) return;
           setIsPlaying(!playing);
         } catch (error) {
           setError(String(error));
@@ -580,7 +646,7 @@ export function AudioPlayer() {
   }
 
   return (
-    <div className="fixed bottom-0 left-0 right-0 border-t bg-background/95 backdrop-blur supports-backdrop-filter:bg-background/60 z-50">
+    <div className="app-global-player fixed bottom-0 left-[var(--app-rail-width)] right-0 border-t bg-background/95 backdrop-blur supports-backdrop-filter:bg-background/60 z-50">
       <div className="container mx-auto px-4 py-3 max-w-7xl">
         <div className="flex items-center gap-4">
           {/* Play/Pause Button */}

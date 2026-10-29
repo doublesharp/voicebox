@@ -52,9 +52,9 @@ export function EffectsList() {
 
   return (
     <ListPane>
-      <ListPaneHeader>
-        <ListPaneTitleRow>
-          <ListPaneTitle>{t('effects.title')}</ListPaneTitle>
+      <ListPaneHeader className="relative shrink-0 pb-4">
+        <ListPaneTitleRow className="flex-wrap gap-2 mb-0">
+          <ListPaneTitle className="px-0 text-lg shrink-0">{t('effects.title')}</ListPaneTitle>
           <ListPaneActions>
             <Button onClick={handleCreateNew} size="sm">
               <Plus className="mr-2 h-4 w-4" />
@@ -64,7 +64,7 @@ export function EffectsList() {
         </ListPaneTitleRow>
       </ListPaneHeader>
 
-      <ListPaneScroll className="pt-16">
+      <ListPaneScroll className="pt-0">
         <div className="px-4 pb-6 space-y-4">
           {builtIn.length > 0 && (
             <div>
@@ -168,10 +168,10 @@ function PresetCard({
         {description || t('effects.noDescription')}
       </p>
       <div className="flex items-center gap-2 mt-1.5 pl-6">
-        <span className="text-[10px] text-muted-foreground">
+        <span className="shrink-0 whitespace-nowrap text-[10px] text-muted-foreground">
           {t('effects.effectCount', { count: effectCount })}
         </span>
-        <span className="text-[10px] text-muted-foreground/50">
+        <span className="min-w-0 truncate text-[10px] text-muted-foreground/50">
           {preset.effects_chain
             .filter((e) => e.enabled)
             .map((e) => e.type)

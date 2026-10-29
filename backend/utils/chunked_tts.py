@@ -210,7 +210,8 @@ def concatenate_audio_chunks(
 @serialized_inference
 async def generate_chunked(backend, text, voice_prompt, language='en', seed=None,
                            instruct=None, max_chunk_chars=DEFAULT_MAX_CHUNK_CHARS,
-                           crossfade_ms=50, trim_fn=None, runaway_detector=None):
+                           crossfade_ms=50, trim_fn=None, runaway_detector=None,
+                           generation_options=None):
     """Serialize TTS across callers, including after caller cancellation.
 
     The shielded operation owns the slot until its backend coroutine returns;
@@ -218,7 +219,7 @@ async def generate_chunked(backend, text, voice_prompt, language='en', seed=None
     """
     return await _generate_chunked(backend, text, voice_prompt, language, seed,
                                    instruct, max_chunk_chars, crossfade_ms,
-                                   trim_fn, runaway_detector)
+                                   trim_fn, runaway_detector, generation_options)
 
 
 async def _generate_chunked(
@@ -232,6 +233,7 @@ async def _generate_chunked(
     crossfade_ms: int = 50,
     trim_fn=None,
     runaway_detector=None,
+    generation_options: dict[str, float] | None = None,
 ) -> Tuple[np.ndarray, int]:
     """Generate audio with automatic chunking for long text.
 
@@ -295,6 +297,7 @@ async def _generate_chunked(
             language,
             chunk_seed,
             instruct,
+            **({"generation_options": generation_options} if generation_options else {}),
         )
 
         check_inference_cancelled()

@@ -143,6 +143,8 @@ class ChatterboxMLXTTSBackend:
         language: str = "en",
         seed: int | None = None,
         instruct: str | None = None,
+        *,
+        generation_options: dict[str, float] | None = None,
     ) -> tuple[np.ndarray, int]:
         """
         Generate audio using Chatterbox Multilingual TTS on MLX.
@@ -158,6 +160,7 @@ class ChatterboxMLXTTSBackend:
             Tuple of (audio_array, sample_rate)
         """
         ref_audio = voice_prompt.get("ref_audio")
+        sampling = {**self._DEFAULTS, **(generation_options or {})}
         if ref_audio and not Path(ref_audio).exists():
             logger.warning(f"Reference audio not found: {ref_audio}")
             ref_audio = None
@@ -185,7 +188,7 @@ class ChatterboxMLXTTSBackend:
                     ref_audio=ref_audio,
                     lang_code=language,
                     verbose=False,
-                    **self._DEFAULTS,
+                    **sampling,
                 )
             ]
             audio = np.concatenate(chunks).astype(np.float32) if chunks else np.zeros(0, dtype=np.float32)

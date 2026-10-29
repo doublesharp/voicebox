@@ -49,6 +49,7 @@ from sqlalchemy.orm import Session
 
 from ..services.inference_scheduler import check_inference_cancelled, serialized_inference
 from ..database import get_db
+from ..utils.speech_delivery import apply_speed
 
 logger = logging.getLogger(__name__)
 
@@ -251,14 +252,6 @@ def encode_audio(audio: np.ndarray, sample_rate: int, response_format: str) -> t
     return result.stdout, media_type
 
 
-def apply_speed(audio: np.ndarray, sample_rate: int, speed: float) -> np.ndarray:
-    """Time-stretch without changing pitch. ``speed`` > 1 shortens the clip."""
-    if abs(speed - 1.0) < 1e-3 or audio.size == 0:
-        return audio
-    import librosa
-
-    stretched = librosa.effects.time_stretch(audio.astype(np.float32), rate=speed)
-    return stretched.astype(audio.dtype, copy=False)
 
 
 @router.get("/v1/models")

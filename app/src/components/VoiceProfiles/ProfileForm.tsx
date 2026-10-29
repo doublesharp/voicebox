@@ -1,7 +1,7 @@
 import { zodResolver } from '@hookform/resolvers/zod';
 import { useQuery } from '@tanstack/react-query';
 import { Edit2, Mic, Monitor, Music, Sparkles, Upload, X } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { useForm } from 'react-hook-form';
 import { useTranslation } from 'react-i18next';
 import * as z from 'zod';
@@ -24,7 +24,9 @@ import {
   FormLabel,
   FormMessage,
 } from '@/components/ui/form';
+import { FormSection } from '@/components/ui/form-section';
 import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
 import {
   Select,
   SelectContent,
@@ -47,6 +49,7 @@ import {
   useDeleteProfile,
   useProfile,
   useUpdateProfile,
+  useUpdateProfileEffects,
   useUploadAvatar,
 } from '@/lib/hooks/useProfiles';
 import { useSystemAudioCapture } from '@/lib/hooks/useSystemAudioCapture';
@@ -137,6 +140,7 @@ function base64ToFile(base64: string, fileName: string, fileType: string): File 
 }
 
 export function ProfileForm() {
+  const defaultEngineFieldId = useId();
   const { t } = useTranslation();
   const platform = usePlatform();
   const open = useUIStore((state) => state.profileDialogOpen);
@@ -148,6 +152,7 @@ export function ProfileForm() {
   const { data: editingProfile } = useProfile(editingProfileId || '');
   const createProfile = useCreateProfile();
   const updateProfile = useUpdateProfile();
+  const updateEffects = useUpdateProfileEffects();
   const addSample = useAddSample();
   const deleteProfile = useDeleteProfile();
   const uploadAvatar = useUploadAvatar();
@@ -542,10 +547,10 @@ export function ProfileForm() {
         // Save effects chain if changed
         if (effectsDirty) {
           try {
-            await apiClient.updateProfileEffects(
-              editingProfileId,
-              profileEffectsChain.length > 0 ? profileEffectsChain : null,
-            );
+            await updateEffects.mutateAsync({
+              profileId: editingProfileId,
+              effectsChain: profileEffectsChain.length > 0 ? profileEffectsChain : null,
+            });
           } catch (fxError) {
             toast({
               title: t('profileForm.toast.effectsUpdateFailed'),
@@ -870,10 +875,10 @@ export function ProfileForm() {
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogContent className="max-w-none w-screen h-screen left-0 top-0 translate-x-0 translate-y-0 rounded-none p-6 overflow-hidden">
-        <div className="max-w-5xl h-[85vh] mx-auto my-auto w-full flex flex-col overflow-hidden">
-          <DialogHeader>
-            <DialogTitle className="text-2xl">
+      <DialogContent className="flex w-[calc(100vw-3rem)] max-w-6xl h-[calc(100dvh-3rem)] max-h-[920px] flex-col gap-0 overflow-hidden p-0">
+        <div className="h-full min-h-0 w-full flex flex-col overflow-hidden">
+          <DialogHeader className="shrink-0 border-b border-border/60 px-6 py-5">
+            <DialogTitle className="text-xl">
               {editingProfileId ? t('profileForm.editTitle') : t('profileForm.createTitle')}
             </DialogTitle>
             <DialogDescription>
@@ -915,14 +920,17 @@ export function ProfileForm() {
 
           <Form {...form}>
             <form onSubmit={form.handleSubmit(onSubmit)} className="flex-1 min-h-0 flex flex-col">
-              <div className="grid gap-6 grid-cols-2 flex-1 min-h-0 overflow-hidden">
+              <div className="flex flex-col gap-6 min-[1100px]:grid min-[1100px]:grid-cols-2 flex-1 min-h-0 overflow-y-auto min-[1100px]:overflow-hidden p-6">
                 {/* Left column: Sample management */}
-                <div className="space-y-4 border-r pr-6 overflow-y-auto min-h-0">
+                <div className="shrink-0 space-y-4 min-[1100px]:border-r min-[1100px]:border-border/60 min-[1100px]:pr-6 min-[1100px]:overflow-y-auto min-[1100px]:min-h-0">
+                  <h3 className="text-[13px] font-semibold">
+                    {t('profileForm.sections.reference', { defaultValue: '1 · Reference audio' })}
+                  </h3>
                   {isCreating ? (
                     <>
                       {/* Voice source selector */}
-                      <div className="flex pt-4 pb-2">
-                        <div className="inline-flex rounded-lg border border-border p-0.5 bg-muted/50">
+                      <div className="flex pb-2">
+                        <div className="inline-flex flex-wrap gap-1 rounded-xl border border-border/70 p-1 bg-muted/30">
                           <button
                             type="button"
                             onClick={() => setVoiceSource('clone')}
@@ -1236,175 +1244,209 @@ export function ProfileForm() {
                 </div>
 
                 {/* Right column: Profile info */}
-                <div className="space-y-4 overflow-y-auto min-h-0">
-                  {/* Avatar Upload */}
-                  <FormField
-                    control={form.control}
-                    name="avatarFile"
-                    render={() => (
-                      <FormItem>
-                        <FormControl>
-                          <div className="flex justify-center pt-4 pb-2">
-                            <div className="relative group">
-                              <div className="h-24 w-24 rounded-full bg-muted flex items-center justify-center shrink-0 overflow-hidden border-2 border-border">
-                                {avatarPreview ? (
-                                  <img
-                                    src={avatarPreview}
-                                    alt={t('profileForm.avatar.alt')}
-                                    className="h-full w-full object-cover"
-                                  />
-                                ) : (
-                                  <Mic className="h-10 w-10 text-muted-foreground" />
-                                )}
-                              </div>
-                              <button
-                                type="button"
-                                onClick={() => avatarInputRef.current?.click()}
-                                className="absolute inset-0 rounded-full bg-accent/60 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center cursor-pointer"
-                              >
-                                <Edit2 className="h-6 w-6 text-accent-foreground" />
-                              </button>
-                              {(avatarPreview || editingProfile?.avatar_path) && (
+                <div className="shrink-0 space-y-6 rounded-xl border border-border/60 bg-card/50 p-5 min-[1100px]:overflow-y-auto min-[1100px]:min-h-0">
+                  <FormSection
+                    title={t('profileForm.sections.voiceDetails', {
+                      defaultValue: '2 · Voice details',
+                    })}
+                  >
+                    {/* Avatar Upload */}
+                    <FormField
+                      control={form.control}
+                      name="avatarFile"
+                      render={() => (
+                        <FormItem>
+                          <FormControl>
+                            <div className="flex items-center gap-3 pb-1">
+                              <div className="relative group">
+                                <div className="h-14 w-14 rounded-xl bg-accent/10 flex items-center justify-center shrink-0 overflow-hidden border border-accent/20">
+                                  {avatarPreview ? (
+                                    <img
+                                      src={avatarPreview}
+                                      alt={t('profileForm.avatar.alt')}
+                                      className="h-full w-full object-cover"
+                                    />
+                                  ) : (
+                                    <Mic className="h-6 w-6 text-accent" />
+                                  )}
+                                </div>
                                 <button
                                   type="button"
-                                  onClick={handleRemoveAvatar}
-                                  disabled={deleteAvatar.isPending}
-                                  className="absolute bottom-0 right-0 h-6 w-6 rounded-full bg-background/60 backdrop-blur-sm text-muted-foreground flex items-center justify-center hover:bg-background/80 hover:text-foreground transition-colors shadow-sm border border-border/50"
+                                  aria-label={t('profileForm.avatar.change', {
+                                    defaultValue: 'Change voice image',
+                                  })}
+                                  onClick={() => avatarInputRef.current?.click()}
+                                  className="absolute inset-0 rounded-xl bg-accent/60 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent transition-opacity flex items-center justify-center cursor-pointer"
                                 >
-                                  <X className="h-3.5 w-3.5" />
+                                  <Edit2 className="h-6 w-6 text-accent-foreground" />
                                 </button>
-                              )}
+                                {(avatarPreview || editingProfile?.avatar_path) && (
+                                  <button
+                                    type="button"
+                                    aria-label={t('profileForm.avatar.remove', {
+                                      defaultValue: 'Remove voice image',
+                                    })}
+                                    onClick={handleRemoveAvatar}
+                                    disabled={deleteAvatar.isPending}
+                                    className="absolute bottom-0 right-0 h-6 w-6 rounded-full bg-background/60 backdrop-blur-sm text-muted-foreground flex items-center justify-center hover:bg-background/80 hover:text-foreground transition-colors shadow-sm border border-border/50"
+                                  >
+                                    <X className="h-3.5 w-3.5" />
+                                  </button>
+                                )}
+                              </div>
+                              <div className="space-y-0.5">
+                                <p className="text-xs font-medium">
+                                  {t('profileForm.avatar.title', { defaultValue: 'Voice image' })}
+                                </p>
+                                <p className="text-xs text-muted-foreground">
+                                  {t('profileForm.avatar.hint', {
+                                    defaultValue: 'Optional · PNG, JPG or WebP',
+                                  })}
+                                </p>
+                              </div>
+                              <input
+                                ref={avatarInputRef}
+                                type="file"
+                                accept="image/png,image/jpeg,image/webp"
+                                onChange={handleAvatarFileChange}
+                                className="hidden"
+                              />
                             </div>
-                            <input
-                              ref={avatarInputRef}
-                              type="file"
-                              accept="image/png,image/jpeg,image/webp"
-                              onChange={handleAvatarFileChange}
-                              className="hidden"
-                            />
-                          </div>
-                        </FormControl>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-
-                  <FormField
-                    control={form.control}
-                    name="name"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>{t('profileForm.fields.name')}</FormLabel>
-                        <FormControl>
-                          <Input placeholder={t('profileForm.fields.namePlaceholder')} {...field} />
-                        </FormControl>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-
-                  <FormField
-                    control={form.control}
-                    name="description"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>{t('profileForm.fields.descriptionLabel')}</FormLabel>
-                        <FormControl>
-                          <Textarea
-                            placeholder={t('profileForm.fields.descriptionPlaceholder')}
-                            {...field}
-                          />
-                        </FormControl>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-
-                  <FormField
-                    control={form.control}
-                    name="personality"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>{t('profileForm.fields.personalityLabel')}</FormLabel>
-                        <FormControl>
-                          <Textarea
-                            placeholder={t('profileForm.fields.personalityPlaceholder')}
-                            className="min-h-[96px]"
-                            {...field}
-                          />
-                        </FormControl>
-                        <FormDescription>{t('profileForm.fields.personalityHint')}</FormDescription>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-
-                  <FormField
-                    control={form.control}
-                    name="language"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>{t('profileForm.fields.language')}</FormLabel>
-                        <Select onValueChange={field.onChange} defaultValue={field.value}>
-                          <FormControl>
-                            <SelectTrigger>
-                              <SelectValue />
-                            </SelectTrigger>
                           </FormControl>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+
+                    <FormField
+                      control={form.control}
+                      name="name"
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>{t('profileForm.fields.name')}</FormLabel>
+                          <FormControl>
+                            <Input
+                              placeholder={t('profileForm.fields.namePlaceholder')}
+                              {...field}
+                            />
+                          </FormControl>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+
+                    <FormField
+                      control={form.control}
+                      name="description"
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>{t('profileForm.fields.descriptionLabel')}</FormLabel>
+                          <FormControl>
+                            <Textarea
+                              placeholder={t('profileForm.fields.descriptionPlaceholder')}
+                              rows={2}
+                              {...field}
+                            />
+                          </FormControl>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                  </FormSection>
+                  <FormSection
+                    title={t('profileForm.sections.delivery', { defaultValue: 'Voice & delivery' })}
+                    className="border-t border-border/60 pt-5"
+                  >
+                    <FormField
+                      control={form.control}
+                      name="personality"
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>{t('profileForm.fields.personalityLabel')}</FormLabel>
+                          <FormControl>
+                            <Textarea
+                              placeholder={t('profileForm.fields.personalityPlaceholder')}
+                              className="min-h-[96px]"
+                              {...field}
+                            />
+                          </FormControl>
+                          <FormDescription>
+                            {t('profileForm.fields.personalityHint')}
+                          </FormDescription>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                      <FormField
+                        control={form.control}
+                        name="language"
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel>{t('profileForm.fields.language')}</FormLabel>
+                            <Select onValueChange={field.onChange} value={field.value}>
+                              <FormControl>
+                                <SelectTrigger>
+                                  <SelectValue />
+                                </SelectTrigger>
+                              </FormControl>
+                              <SelectContent>
+                                {LANGUAGE_OPTIONS.map((lang) => (
+                                  <SelectItem key={lang.value} value={lang.value}>
+                                    {lang.label}
+                                  </SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+
+                      <FormItem>
+                        <Label htmlFor={defaultEngineFieldId}>
+                          {t('profileForm.fields.defaultEngine')}
+                        </Label>
+                        <Select
+                          value={defaultEngine || '_none'}
+                          onValueChange={(v) => {
+                            setDefaultEngine(v === '_none' ? '' : v);
+                          }}
+                          disabled={
+                            voiceSource === 'builtin' ||
+                            voiceSource === 'design' ||
+                            editingProfile?.voice_type === 'preset' ||
+                            editingProfile?.voice_type === 'designed'
+                          }
+                        >
+                          <SelectTrigger id={defaultEngineFieldId}>
+                            <SelectValue placeholder={t('profileForm.fields.noPreference')} />
+                          </SelectTrigger>
                           <SelectContent>
-                            {LANGUAGE_OPTIONS.map((lang) => (
-                              <SelectItem key={lang.value} value={lang.value}>
-                                {lang.label}
+                            <SelectItem value="_none">
+                              {t('profileForm.fields.noPreference')}
+                            </SelectItem>
+                            {availableDefaultEngines.map((option) => (
+                              <SelectItem key={option.value} value={option.value}>
+                                {option.label}
                               </SelectItem>
                             ))}
                           </SelectContent>
                         </Select>
-                        <FormMessage />
+                        <p className="text-xs text-muted-foreground">
+                          {t('profileForm.fields.defaultEngineHint')}
+                        </p>
                       </FormItem>
-                    )}
-                  />
-
-                  <FormItem>
-                    <FormLabel>{t('profileForm.fields.defaultEngine')}</FormLabel>
-                    <Select
-                      value={defaultEngine || '_none'}
-                      onValueChange={(v) => {
-                        setDefaultEngine(v === '_none' ? '' : v);
-                      }}
-                      disabled={
-                        voiceSource === 'builtin' ||
-                        voiceSource === 'design' ||
-                        editingProfile?.voice_type === 'preset' ||
-                        editingProfile?.voice_type === 'designed'
-                      }
-                    >
-                      <FormControl>
-                        <SelectTrigger>
-                          <SelectValue placeholder={t('profileForm.fields.noPreference')} />
-                        </SelectTrigger>
-                      </FormControl>
-                      <SelectContent>
-                        <SelectItem value="_none">
-                          {t('profileForm.fields.noPreference')}
-                        </SelectItem>
-                        {availableDefaultEngines.map((option) => (
-                          <SelectItem key={option.value} value={option.value}>
-                            {option.label}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                    <p className="text-xs text-muted-foreground">
-                      {t('profileForm.fields.defaultEngineHint')}
-                    </p>
-                  </FormItem>
+                    </div>
+                  </FormSection>
 
                   {editingProfileId && (
-                    <div className="space-y-2">
-                      <FormLabel>{t('profileForm.fields.defaultEffects')}</FormLabel>
-                      <p className="text-xs text-muted-foreground">
-                        {t('profileForm.fields.defaultEffectsHint')}
-                      </p>
+                    <FormSection
+                      title={t('profileForm.fields.defaultEffects')}
+                      description={t('profileForm.fields.defaultEffectsHint')}
+                      className="border-t border-border/60 pt-5"
+                    >
                       <EffectsChainEditor
                         value={profileEffectsChain}
                         onChange={(chain) => {
@@ -1413,12 +1455,12 @@ export function ProfileForm() {
                         }}
                         compact
                       />
-                    </div>
+                    </FormSection>
                   )}
                 </div>
               </div>
 
-              <div className="flex gap-2 justify-end mt-6 pt-4 border-t">
+              <div className="flex shrink-0 items-center gap-2 justify-end border-t border-border/60 bg-card/50 px-6 py-4">
                 <Button type="button" variant="outline" onClick={() => handleOpenChange(false)}>
                   {t('common.cancel')}
                 </Button>

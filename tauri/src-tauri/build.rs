@@ -82,7 +82,9 @@ fn main() {
                             for line in &detail {
                                 eprintln!("actool: {}", line);
                             }
-                            panic!("actool failed to compile icon (release build requires full Xcode)");
+                            panic!(
+                                "actool failed to compile icon (release build requires full Xcode)"
+                            );
                         }
                         println!(
                             "cargo:warning=actool failed (requires full Xcode, not just CLT) — \
@@ -108,70 +110,12 @@ fn main() {
                 }
             }
 
-            // Generate voicebox.icns from the source PNG via sips + iconutil
-            let icns_path = format!("{}/voicebox.icns", gen_dir);
-            if !std::path::Path::new(&icns_path).exists() {
-                let source_png = format!("{}/Assets/Voicebox.png", icon_source);
-                if std::path::Path::new(&source_png).exists() {
-                    let iconset_dir = format!("{}/voicebox.iconset", gen_dir);
-                    std::fs::create_dir_all(&iconset_dir).ok();
-
-                    let sizes: &[(u32, &str)] = &[
-                        (16, "icon_16x16.png"),
-                        (32, "icon_16x16@2x.png"),
-                        (32, "icon_32x32.png"),
-                        (64, "icon_32x32@2x.png"),
-                        (128, "icon_128x128.png"),
-                        (256, "icon_128x128@2x.png"),
-                        (256, "icon_256x256.png"),
-                        (512, "icon_256x256@2x.png"),
-                        (512, "icon_512x512.png"),
-                        (1024, "icon_512x512@2x.png"),
-                    ];
-
-                    for (size, name) in sizes {
-                        let dest = format!("{}/{}", iconset_dir, name);
-                        let status = Command::new("sips")
-                            .args([
-                                "-z",
-                                &size.to_string(),
-                                &size.to_string(),
-                                &source_png,
-                                "--out",
-                                &dest,
-                            ])
-                            .output();
-                        if let Ok(out) = status {
-                            if !out.status.success() {
-                                eprintln!(
-                                    "sips failed for {}: {}",
-                                    name,
-                                    String::from_utf8_lossy(&out.stderr)
-                                );
-                            }
-                        }
-                    }
-
-                    let iconutil_output = Command::new("iconutil")
-                        .args(["-c", "icns", "-o", &icns_path, &iconset_dir])
-                        .output();
-
-                    match iconutil_output {
-                        Ok(out) if out.status.success() => {
-                            println!("Generated voicebox.icns");
-                        }
-                        Ok(out) => {
-                            eprintln!("iconutil failed: {}", String::from_utf8_lossy(&out.stderr));
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to run iconutil: {}", e);
-                        }
-                    }
-
-                    // Clean up iconset directory
-                    std::fs::remove_dir_all(&iconset_dir).ok();
-                }
-            }
+            // Always refresh the legacy icon from the maintained desktop asset.
+            // An existing gen/voicebox.icns must not retain an older brand.
+            let fallback_icon = format!("{}/icons/icon.icns", project_root);
+            println!("cargo:rerun-if-changed={}", fallback_icon);
+            std::fs::copy(&fallback_icon, format!("{}/voicebox.icns", gen_dir))
+                .expect("Failed to refresh the macOS fallback icon");
         } else {
             println!(
                 "cargo:warning=Icon source not found at {}, skipping icon compilation",
