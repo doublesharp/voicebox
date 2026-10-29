@@ -75,6 +75,8 @@ export function useGenerationProgress() {
       const source = new EventSource(url);
 
       source.onmessage = (event) => {
+        // Ignore queued callbacks from a connection that has been replaced or closed.
+        if (currentSources.get(id) !== source) return;
         try {
           const data: GenerationStatusEvent = JSON.parse(event.data);
 
@@ -176,11 +178,13 @@ export function useGenerationProgress() {
       };
 
       source.onerror = () => {
+        if (currentSources.get(id) !== source) return;
         // SSE connection dropped — clean up and refresh history so any
         // completed/failed generation still appears in the list
         source.close();
         currentSources.delete(id);
         removePendingGeneration(id);
+        removePendingStoryAdd(id);
         queryClient.refetchQueries({ queryKey: ['history'] });
       };
 
