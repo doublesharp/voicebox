@@ -181,6 +181,9 @@ export function ProfileForm() {
   const cleanReferenceAudio = useMicrophoneStore((state) => state.cleanReferenceAudio);
   const isCreating = !editingProfileId;
   const serverUrl = useServerStore((state) => state.serverUrl);
+  const serverRevision = useServerStore((state) => state.serverRevision);
+  const avatarEpoch = useRef(0);
+  useEffect(() => () => { avatarEpoch.current += 1; }, [open, editingProfileId, serverUrl, serverRevision]);
   const [profileEffectsChain, setProfileEffectsChain] = useState<EffectConfig[]>([]);
   const [effectsDirty, setEffectsDirty] = useState(false);
   const [defaultEngine, setDefaultEngine] = useState<string>('');
@@ -509,24 +512,31 @@ export function ProfileForm() {
         });
         return;
       }
+      avatarEpoch.current += 1;
       form.setValue('avatarFile', file);
     }
   }
 
   async function handleRemoveAvatar() {
+    const epoch = ++avatarEpoch.current;
+    const scope = currentServerScope();
+    const isCurrent = () => avatarEpoch.current === epoch && isCurrentServer(scope);
     if (editingProfileId && editingProfile?.avatar_path) {
       try {
-        await deleteAvatar.mutateAsync(editingProfileId);
+        await deleteAvatar.mutateAsync({ profileId: editingProfileId, _serverScope: scope });
+        if (!isCurrent()) return;
         toast({
           title: t('profileForm.toast.avatarRemoved'),
           description: t('profileForm.toast.avatarRemovedDescription'),
         });
       } catch (error) {
+        if (!isCurrent()) return;
         toast({
           title: t('profileForm.toast.avatarRemoveFailed'),
           description: error instanceof Error ? error.message : t('common.unknownError'),
           variant: 'destructive',
         });
+        return;
       }
     }
     form.setValue('avatarFile', undefined);

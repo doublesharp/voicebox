@@ -19,6 +19,7 @@ let transcribeHandler: (arg: any) => Promise<{ text: string }> = async () => ({ 
 let addHandler: (arg: any) => Promise<void> = async () => {};
 let createHandler: (arg: any) => Promise<any> = async () => ({ id: 'new' });
 let updateHandler: (arg: any) => Promise<void> = async () => {};
+let avatarHandler: (arg: any) => Promise<void> = async () => {};
 const voices = [{ voice_id: 'v1', name: 'Voice One', gender: 'female', language: 'en' }];
 const mutation = (key: string, result?: unknown) => ({
   isPending: false,
@@ -32,6 +33,7 @@ const mutation = (key: string, result?: unknown) => ({
     if (key === 'add') await addHandler(arg);
     if (key === 'create') return createHandler(arg);
     if (key === 'update') await updateHandler(arg);
+    if (key === 'avatar') await avatarHandler(arg);
     return result;
   },
 });
@@ -155,6 +157,7 @@ afterEach(() => {
   addHandler = async () => {};
   createHandler = async () => ({ id: 'new' });
   updateHandler = async () => {};
+  avatarHandler = async () => {};
   useServerStore.setState({ serverUrl: 'http://server-a', serverRevision: 0 });
   profile = undefined;
   useUIStore.setState({ profileDialogOpen: false, editingProfileId: null, profileFormDraft: null });
@@ -772,4 +775,63 @@ test('editing a voice never sends follow-up effects to a different server', asyn
   await act(async () => { resolve(); });
   expect(calls.effects).toHaveLength(0);
   expect(useUIStore.getState().profileDialogOpen).toBe(true);
+});
+
+test('a failed avatar deletion keeps the existing image visible', async () => {
+  profile = { id: 'p', name: 'Voice', language: 'en', avatar_path: 'avatar.png' };
+  fail = 'avatar';
+  await mount('p');
+  const image = () => view.root.findByProps({ alt: 'profileForm.avatar.alt' });
+  expect(image().props.src).toContain('/profiles/p/avatar');
+  await act(async () => { await view.root.findByProps({ 'aria-label': 'profileForm.avatar.remove' }).props.onClick(); });
+  expect(calls.toast.at(-1).title).toBe('profileForm.toast.avatarRemoveFailed');
+  expect(image().props.src).toContain('/profiles/p/avatar');
+});
+
+test('an old avatar deletion cannot clear a newly selected image', async () => {
+  let resolve!: () => void;
+  avatarHandler = () => new Promise((r) => { resolve = r; });
+  profile = { id: 'p', name: 'Voice', language: 'en', avatar_path: 'avatar.png' };
+  await mount('p');
+  await act(async () => { view.root.findByProps({ 'aria-label': 'profileForm.avatar.remove' }).props.onClick(); });
+  const replacement = new File(['image'], 'new.png', { type: 'image/png' });
+  await act(async () => { view.root.findByProps({ accept: 'image/png,image/jpeg,image/webp' }).props.onChange({ target: { files: [replacement] } }); });
+  const preview = view.root.findByProps({ alt: 'profileForm.avatar.alt' }).props.src;
+  expect(preview).toStartWith('blob:');
+  await act(async () => { resolve(); });
+  expect(view.root.findByProps({ alt: 'profileForm.avatar.alt' }).props.src).toBe(preview);
+});
+
+test('a stale avatar deletion failure does not report an error on another server', async () => {
+  let reject!: (error: Error) => void;
+  avatarHandler = () => new Promise((_resolve, r) => { reject = r; });
+  profile = { id: 'p', name: 'Voice', language: 'en', avatar_path: 'avatar.png' };
+  await mount('p');
+  await act(async () => { view.root.findByProps({ 'aria-label': 'profileForm.avatar.remove' }).props.onClick(); });
+  switchVoiceServer();
+  await act(async () => { reject(new Error('old server failed')); });
+  expect(calls.toast.some((item) => item.description === 'old server failed')).toBe(false);
+});
+
+for (const [file, title] of [
+  [new File(['not an image'], 'note.txt', { type: 'text/plain' }), 'profileForm.toast.invalidFile'],
+  [new File([new Uint8Array(5 * 1024 * 1024 + 1)], 'large.png', { type: 'image/png' }), 'profileForm.toast.fileTooLarge'],
+] as const) {
+  test(`rejects ${file.name} as a voice image without losing the existing image`, async () => {
+    profile = { id: 'p', name: 'Voice', language: 'en', avatar_path: 'avatar.png' };
+    await mount('p');
+    await act(async () => { view.root.findByProps({ accept: 'image/png,image/jpeg,image/webp' }).props.onChange({ target: { files: [file] } }); });
+    expect(calls.toast.at(-1).title).toBe(title);
+    expect(view.root.findByProps({ alt: 'profileForm.avatar.alt' }).props.src).toContain('/profiles/p/avatar');
+    expect(calls.avatar).toHaveLength(0);
+  });
+}
+
+test('a successful avatar deletion removes the image and reports success', async () => {
+  profile = { id: 'p', name: 'Voice', language: 'en', avatar_path: 'avatar.png' };
+  await mount('p');
+  await act(async () => { await view.root.findByProps({ 'aria-label': 'profileForm.avatar.remove' }).props.onClick(); });
+  expect(calls.avatar).toEqual([{ profileId: 'p' }]);
+  expect(calls.toast.at(-1).title).toBe('profileForm.toast.avatarRemoved');
+  expect(view.root.findAllByProps({ alt: 'profileForm.avatar.alt' })).toHaveLength(0);
 });

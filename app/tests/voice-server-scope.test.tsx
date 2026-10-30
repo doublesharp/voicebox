@@ -3,7 +3,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 
 const calls: string[] = [];
-const apiClient = Object.fromEntries(['createProfile', 'updateProfile', 'deleteProfile', 'addProfileSample', 'uploadAvatar', 'updateProfileEffects', 'transcribeAudio', 'deleteProfileSample', 'updateProfileSample', 'exportSampleAudio'].map((name) => [name, mock(async (..._args: any[]) => { calls.push(name); return { id: 'voice', text: 'words' }; })]));
+const apiClient = Object.fromEntries(['createProfile', 'updateProfile', 'deleteProfile', 'addProfileSample', 'uploadAvatar', 'deleteAvatar', 'updateProfileEffects', 'transcribeAudio', 'deleteProfileSample', 'updateProfileSample', 'exportSampleAudio'].map((name) => [name, mock(async (..._args: any[]) => { calls.push(name); return { id: 'voice', text: 'words' }; })]));
 mock.module('../src/lib/api/client', () => ({ apiClient }));
 mock.module('../src/platform/PlatformContext', () => ({ usePlatform: () => ({ filesystem: { saveFile: async () => {} } }) }));
 const { useServerStore } = await import('../src/stores/serverStore');
@@ -19,6 +19,7 @@ function Probe() {
     add: profiles.useAddSample(), avatar: profiles.useUploadAvatar(), effects: profiles.useUpdateProfileEffects(),
     transcribe: useTranscription(), deleteSample: profiles.useDeleteSample(),
     updateSample: profiles.useUpdateSample(), exportSample: profiles.useExportSampleAudio(),
+    deleteAvatar: profiles.useDeleteAvatar(),
   };
   return null;
 }
@@ -30,7 +31,7 @@ async function mount() {
 afterEach(() => { if (view) act(() => view.unmount()); client?.clear(); calls.length = 0; });
 afterAll(() => mock.restore());
 
-for (const kind of ['create', 'update', 'delete', 'add', 'avatar', 'effects', 'transcribe', 'deleteSample', 'updateSample', 'exportSample'] as const) {
+for (const kind of ['create', 'update', 'delete', 'add', 'avatar', 'deleteAvatar', 'effects', 'transcribe', 'deleteSample', 'updateSample', 'exportSample'] as const) {
   test(`queued ${kind} cannot dispatch to a different server`, async () => {
     await mount();
     const scope = currentServerScope();
@@ -41,6 +42,7 @@ for (const kind of ['create', 'update', 'delete', 'add', 'avatar', 'effects', 't
       delete: { profileId: 'voice', _serverScope: scope },
       add: { profileId: 'voice', file, referenceText: 'words', _serverScope: scope },
       avatar: { profileId: 'voice', file, _serverScope: scope },
+      deleteAvatar: { profileId: 'voice', _serverScope: scope },
       effects: { profileId: 'voice', effectsChain: [], _serverScope: scope },
       transcribe: { file, _serverScope: scope },
       deleteSample: { sampleId: 'sample', _serverScope: scope },

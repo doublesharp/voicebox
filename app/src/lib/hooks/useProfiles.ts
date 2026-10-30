@@ -278,8 +278,13 @@ export function useDeleteAvatar() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: (profileId: string) => apiClient.deleteAvatar(profileId),
-    onSuccess: (_, profileId) => {
+    mutationFn: (value: string | { profileId: string; _serverScope: ServerScope }) => {
+      if (typeof value === 'string') return apiClient.deleteAvatar(value);
+      requireCurrentServer(value._serverScope);
+      return apiClient.deleteAvatar(value.profileId);
+    },
+    onSuccess: (_, value) => {
+      const profileId = typeof value === 'string' ? value : value.profileId;
       queryClient.invalidateQueries({ queryKey: ['profiles'] });
       queryClient.invalidateQueries({
         queryKey: ['profiles', profileId],
