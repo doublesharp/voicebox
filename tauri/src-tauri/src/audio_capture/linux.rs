@@ -1,9 +1,8 @@
 use crate::audio_capture::AudioCaptureState;
+use super::wav::samples_to_wav;
 use base64::{engine::general_purpose, Engine as _};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
-use hound::{WavSpec, WavWriter};
-use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -349,34 +348,4 @@ pub fn is_supported() -> bool {
         }
     }
     host.default_input_device().is_some()
-}
-
-fn samples_to_wav(samples: &[f32], sample_rate: u32, channels: u16) -> Result<Vec<u8>, String> {
-    let mut buffer = Vec::new();
-    let cursor = Cursor::new(&mut buffer);
-
-    let spec = WavSpec {
-        channels,
-        sample_rate,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-
-    let mut writer =
-        WavWriter::new(cursor, spec).map_err(|e| format!("Failed to create WAV writer: {}", e))?;
-
-    // Convert f32 samples to i16
-    for sample in samples {
-        let clamped = sample.clamp(-1.0, 1.0);
-        let i16_sample = (clamped * 32767.0) as i16;
-        writer
-            .write_sample(i16_sample)
-            .map_err(|e| format!("Failed to write sample: {}", e))?;
-    }
-
-    writer
-        .finalize()
-        .map_err(|e| format!("Failed to finalize WAV: {}", e))?;
-
-    Ok(buffer)
 }
