@@ -393,10 +393,7 @@ fn read_persisted_backend_override(data_dir: &std::path::Path) -> Option<String>
 fn write_persisted_backend_override(data_dir: &std::path::Path, value: Option<&str>) -> std::io::Result<()> {
     let path = backend_override_file(data_dir);
     match value {
-        Some(value) => {
-            std::fs::create_dir_all(data_dir)?;
-            std::fs::write(path, value)
-        }
+        Some(value) => write_backend_override_from(data_dir, value.as_bytes()),
         None => match std::fs::remove_file(path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             result => result,
@@ -404,7 +401,15 @@ fn write_persisted_backend_override(data_dir: &std::path::Path, value: Option<&s
     }
 }
 
+fn write_backend_override_from(data_dir: &std::path::Path, input: impl std::io::Read) -> std::io::Result<()> {
+    std::fs::create_dir_all(data_dir)?;
+    publication::publish(&backend_override_file(data_dir), input)
+}
+
 fn save_backend_override(data_dir: &std::path::Path, state: &Mutex<Option<String>>, value: Option<String>) -> Result<(), String> {
+    if value.as_deref().is_some_and(|choice| !matches!(choice, "cpu" | "cuda" | "rocm")) {
+        return Err("Invalid backend override".into());
+    }
     // Serialize disk and memory updates so concurrent commands cannot disagree.
     let mut current = state.lock().map_err(|_| "Backend override state unavailable")?;
     write_persisted_backend_override(data_dir, value.as_deref())
@@ -4268,5 +4273,108 @@ mod dictate_position_tests {
             PhysicalSize::new(u32::MAX, 0),
         );
         assert_eq!((actual.x, actual.y), (i32::MIN, 0));
+    }
+}
+
+#[cfg(test)]
+mod backend_override_integrity_tests {
+    use super::*;
+    use std::io::{self, Read};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    struct Fixture(std::path::PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "voicebox-backend-integrity-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct InterruptedWrite(bool);
+    impl Read for InterruptedWrite {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if !self.0 {
+                self.0 = true;
+                output[..2].copy_from_slice(b"cp");
+                Ok(2)
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "simulated read failure",
+                ))
+            }
+        }
+    }
+
+    #[test]
+    fn failed_update_preserves_previous_backend_choice() {
+        let fixture = Fixture::new();
+        write_persisted_backend_override(&fixture.0, Some("cuda")).unwrap();
+        assert!(write_backend_override_from(&fixture.0, InterruptedWrite(false)).is_err());
+        assert_eq!(
+            read_persisted_backend_override(&fixture.0).as_deref(),
+            Some("cuda")
+        );
+        assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn failed_first_write_does_not_leave_partial_choice() {
+        let fixture = Fixture::new();
+        assert!(write_backend_override_from(&fixture.0, InterruptedWrite(false)).is_err());
+        assert!(!backend_override_file(&fixture.0).exists());
+        assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn invalid_choices_cannot_change_memory_or_disk() {
+        let fixture = Fixture::new();
+        let state = Mutex::new(None);
+        save_backend_override(&fixture.0, &state, Some("cuda".into())).unwrap();
+        for invalid in ["", "auto", "GPU", "cuda\nrocm", " cpu ", "../../cpu"] {
+            assert!(
+                save_backend_override(&fixture.0, &state, Some(invalid.into())).is_err(),
+                "invalid choice {invalid:?}"
+            );
+            assert_eq!(state.lock().unwrap().as_deref(), Some("cuda"));
+            assert_eq!(
+                read_persisted_backend_override(&fixture.0).as_deref(),
+                Some("cuda")
+            );
+        }
+    }
+
+    #[test]
+    fn failed_update_can_be_retried_and_then_reset() {
+        let fixture = Fixture::new();
+        let state = Mutex::new(None);
+        save_backend_override(&fixture.0, &state, Some("cuda".into())).unwrap();
+        assert!(write_backend_override_from(&fixture.0, InterruptedWrite(false)).is_err());
+        assert_eq!(state.lock().unwrap().as_deref(), Some("cuda"));
+        assert_eq!(
+            read_persisted_backend_override(&fixture.0).as_deref(),
+            Some("cuda")
+        );
+        save_backend_override(&fixture.0, &state, Some("cpu".into())).unwrap();
+        assert_eq!(state.lock().unwrap().as_deref(), Some("cpu"));
+        assert_eq!(
+            read_persisted_backend_override(&fixture.0).as_deref(),
+            Some("cpu")
+        );
+        save_backend_override(&fixture.0, &state, None).unwrap();
+        assert!(state.lock().unwrap().is_none());
+        assert!(!backend_override_file(&fixture.0).exists());
+        assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 0);
     }
 }
