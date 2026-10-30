@@ -120,3 +120,80 @@ async def test_profile_listing_closes_database_and_filters_personality(mcp, monk
     result = await mcp.call_tool('voicebox_list_profiles', {})
     assert result.structured_content == {'profiles': [{'id': 'p', 'name': 'Voice', 'voice_type': 'cloned', 'language': 'en', 'has_personality': True}]}
     assert closed == [True]
+
+
+@pytest.mark.asyncio
+async def test_base64_audio_with_empty_optional_path_is_transcribed(mcp, monkeypatch):
+    received = []
+    async def transcribe(path, language, model):
+        received.append(path.read_bytes())
+        return {'text': 'hello'}
+    monkeypatch.setattr(tools, '_transcribe_file', transcribe)
+    await mcp.call_tool('voicebox_transcribe', {'audio_base64': 'YXVkaW8=', 'audio_path': ''})
+    assert received == [b'audio']
+
+
+@pytest.mark.asyncio
+async def test_temporary_audio_is_removed_when_write_fails(mcp, monkeypatch):
+    original = tools.tempfile.NamedTemporaryFile
+    created = []
+    class FailingFile:
+        def __init__(self, *args, **kwargs):
+            self.inner = original(*args, **kwargs)
+            self.name = self.inner.name
+            created.append(self.name)
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            self.inner.close()
+        def write(self, _data):
+            raise OSError('disk full')
+    monkeypatch.setattr(tools.tempfile, 'NamedTemporaryFile', FailingFile)
+    with pytest.raises(Exception, match='disk full'):
+        await mcp.call_tool('voicebox_transcribe', {'audio_base64': 'YXVkaW8='})
+    from pathlib import Path
+    assert len(created) == 1 and not Path(created[0]).exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('loaded,cached,selected,current,expected', [
+    (True, False, 'base', 'base', True),
+    (False, True, 'small', 'base', True),
+    (False, False, 'small', 'base', False),
+    (True, False, 'small', 'base', False),
+])
+async def test_transcribe_helper_requires_selected_model_to_be_available(monkeypatch, tmp_path, loaded, cached, selected, current, expected):
+    from backend.services import transcribe as service
+    from backend.utils import audio
+    calls = []
+    class Whisper:
+        model_size = current
+        def is_loaded(self):
+            return loaded
+        def _is_model_cached(self, model):
+            calls.append(('cache', model))
+            return cached
+        async def transcribe(self, path, language, model):
+            calls.append(('transcribe', path, language, model))
+            return 'words'
+    monkeypatch.setattr(service, 'get_whisper_model', lambda: Whisper())
+    monkeypatch.setattr(audio, 'load_audio', lambda _path: ([0.0] * 8000, 16000))
+    path = tmp_path / 'clip.wav'
+    if expected:
+        result = await tools._transcribe_file(path, 'en', selected)
+        assert result == {'text': 'words', 'duration': 0.5, 'language': 'en', 'model': selected}
+        assert ('transcribe', str(path), 'en', selected) in calls
+    else:
+        with pytest.raises(ValueError, match='not yet downloaded'):
+            await tools._transcribe_file(path, 'en', selected)
+        assert not any(call[0] == 'transcribe' for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_transcribe_helper_rejects_unknown_model_before_reading_audio(monkeypatch, tmp_path):
+    from backend.services import transcribe as service
+    from backend.utils import audio
+    monkeypatch.setattr(service, 'get_whisper_model', lambda: SimpleNamespace(model_size='base'))
+    monkeypatch.setattr(audio, 'load_audio', lambda *_args: pytest.fail('invalid model read audio'))
+    with pytest.raises(ValueError, match='Invalid STT model'):
+        await tools._transcribe_file(tmp_path / 'clip.wav', None, 'bogus')

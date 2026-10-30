@@ -135,7 +135,7 @@ def register_tools(mcp: FastMCP) -> None:
         # Absolute-path mode: validate and transcribe in place. Restricted
         # to loopback callers so a Voicebox bound on 0.0.0.0 doesn't double
         # as an unauthenticated arbitrary-local-file read primitive.
-        if audio_path is not None:
+        if audio_path:
             if not request_is_loopback():
                 raise ValueError(
                     "`audio_path` is only available to loopback callers — "
@@ -169,15 +169,15 @@ def register_tools(mcp: FastMCP) -> None:
             raise ValueError(
                 f"Audio exceeds {MAX_TRANSCRIBE_BYTES // (1024 * 1024)} MB limit."
             )
-        with tempfile.NamedTemporaryFile(
-            suffix=".wav", delete=False
-        ) as tmp:
-            tmp.write(raw)
-            tmp_path = Path(tmp.name)
+        tmp_path = None
         try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                tmp_path = Path(tmp.name)
+                tmp.write(raw)
             return await _transcribe_file(tmp_path, language, model)
         finally:
-            tmp_path.unlink(missing_ok=True)
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
 
     @mcp.tool(
         name="voicebox_list_captures",
