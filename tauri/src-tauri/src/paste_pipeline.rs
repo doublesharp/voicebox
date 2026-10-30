@@ -13,7 +13,11 @@ trait PasteBackend {
     fn trusted(&self) -> bool;
     fn activate(&self, pid: i32) -> Result<(), String>;
     fn save(&self) -> Result<Self::Snapshot, String>;
-    fn write(&self, text: &str) -> Result<i64, clipboard::ClipboardWriteFailure>;
+    fn write(
+        &self,
+        text: &str,
+        snapshot: &Self::Snapshot,
+    ) -> Result<i64, clipboard::ClipboardWriteFailure>;
     fn send(&self) -> Result<(), String>;
     fn change_count(&self) -> Result<i64, String>;
     fn restore(&self, snapshot: &Self::Snapshot) -> Result<(), String>;
@@ -64,8 +68,12 @@ impl PasteBackend for NativePaste {
     fn save(&self) -> Result<Self::Snapshot, String> {
         clipboard::save_clipboard()
     }
-    fn write(&self, text: &str) -> Result<i64, clipboard::ClipboardWriteFailure> {
-        clipboard::write_text_tracked(text)
+    fn write(
+        &self,
+        text: &str,
+        snapshot: &Self::Snapshot,
+    ) -> Result<i64, clipboard::ClipboardWriteFailure> {
+        clipboard::write_text_tracked_if_unchanged(text, snapshot.change_count())
     }
     fn send(&self) -> Result<(), String> {
         synthetic_keys::send_paste()
@@ -104,7 +112,7 @@ async fn paste_with<B: PasteBackend, F: Future<Output = ()>>(
     backend.activate(focus.pid)?;
     sleep(Duration::from_millis(crate::POST_ACTIVATE_SETTLE_MS)).await;
     let snapshot = backend.save()?;
-    let after_write = match backend.write(text) {
+    let after_write = match backend.write(text, &snapshot) {
         Ok(count) => count,
         Err(failure) => {
             if let Some(count) = failure.owned_change_count {
@@ -171,7 +179,7 @@ async fn diagnostic_with<B: PasteBackend, F: Future<Output = ()>>(
 ) -> Result<DiagnosticResult<B::Snapshot>, String> {
     let _paste_guard = PASTE_LOCK.lock().await;
     let snapshot = backend.save()?;
-    let after_write = match backend.write(text) {
+    let after_write = match backend.write(text, &snapshot) {
         Ok(count) => count,
         Err(failure) => {
             if let Some(count) = failure.owned_change_count {
@@ -270,7 +278,11 @@ mod tests {
             self.call("save")?;
             Ok("original")
         }
-        fn write(&self, text: &str) -> Result<i64, clipboard::ClipboardWriteFailure> {
+        fn write(
+            &self,
+            text: &str,
+            _snapshot: &Self::Snapshot,
+        ) -> Result<i64, clipboard::ClipboardWriteFailure> {
             assert_eq!(text, "hello");
             self.call("write")
                 .map_err(|message| clipboard::ClipboardWriteFailure {
@@ -433,7 +445,11 @@ mod concurrent_paste_tests {
         fn save(&self) -> Result<String, String> {
             Ok(self.0.borrow().text.clone())
         }
-        fn write(&self, text: &str) -> Result<i64, clipboard::ClipboardWriteFailure> {
+        fn write(
+            &self,
+            text: &str,
+            _snapshot: &Self::Snapshot,
+        ) -> Result<i64, clipboard::ClipboardWriteFailure> {
             let mut clipboard = self.0.borrow_mut();
             clipboard.text = text.into();
             clipboard.revision += 1;
@@ -828,7 +844,11 @@ mod staging_failure_regression_tests {
         fn save(&self) -> Result<String, String> {
             Ok(self.state.borrow().value.clone())
         }
-        fn write(&self, _: &str) -> Result<i64, clipboard::ClipboardWriteFailure> {
+        fn write(
+            &self,
+            _: &str,
+            _snapshot: &Self::Snapshot,
+        ) -> Result<i64, clipboard::ClipboardWriteFailure> {
             let mut state = self.state.borrow_mut();
             if !matches!(self.failure, Failure::BeforeClear) {
                 state.value.clear();
@@ -967,6 +987,7 @@ mod private_pasteboard_transaction_tests {
         fail_write: bool,
         fail_send: bool,
         change_during_capture: bool,
+        change_after_capture: bool,
         sends: Cell<usize>,
     }
     impl Backend {
@@ -978,6 +999,7 @@ mod private_pasteboard_transaction_tests {
                 fail_write: false,
                 fail_send: false,
                 change_during_capture: false,
+                change_after_capture: false,
                 sends: Cell::new(0),
             }
         }
@@ -994,11 +1016,20 @@ mod private_pasteboard_transaction_tests {
             if self.change_during_capture {
                 self.board.save_with_change()
             } else {
-                Ok(self.board.save())
+                let snapshot = self.board.save();
+                if self.change_after_capture {
+                    self.board.write("newer");
+                }
+                Ok(snapshot)
             }
         }
-        fn write(&self, text: &str) -> Result<i64, clipboard::ClipboardWriteFailure> {
-            self.board.write_tracked(text, self.fail_write)
+        fn write(
+            &self,
+            text: &str,
+            snapshot: &Self::Snapshot,
+        ) -> Result<i64, clipboard::ClipboardWriteFailure> {
+            self.board
+                .write_if_unchanged(text, snapshot.change_count(), self.fail_write)
         }
         fn send(&self) -> Result<(), String> {
             self.sends.set(self.sends.get() + 1);
@@ -1015,6 +1046,45 @@ mod private_pasteboard_transaction_tests {
             self.board.restore(snapshot);
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn native_private_dictation_preserves_change_after_capture() {
+        let mut backend = Backend::new();
+        backend.change_after_capture = true;
+        let focus = focus_capture::FocusSnapshot {
+            pid: 42,
+            bundle_id: None,
+            role: None,
+        };
+        let result = paste_with("dictation", &focus, &backend, |_| async {}).await;
+        assert!(
+            result.is_err(),
+            "staging should abort after the pasteboard changes"
+        );
+        assert_eq!(backend.board.text().as_deref(), Some("newer"));
+        assert_eq!(backend.sends.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn native_private_diagnostic_preserves_change_after_capture() {
+        let mut backend = Backend::new();
+        backend.change_after_capture = true;
+        let result = diagnostic_with(
+            "dictation",
+            Duration::ZERO,
+            Duration::ZERO,
+            true,
+            &backend,
+            |_| async {},
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "staging should abort after the pasteboard changes"
+        );
+        assert_eq!(backend.board.text().as_deref(), Some("newer"));
+        assert_eq!(backend.sends.get(), 0);
     }
 
     #[tokio::test]

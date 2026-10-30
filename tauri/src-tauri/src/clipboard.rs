@@ -111,13 +111,14 @@ pub(crate) mod private_pasteboard_tests {
         pub(crate) fn restore(&self, snapshot: &ClipboardSnapshot) {
             unsafe { restore_clipboard_to(self.board, snapshot).unwrap() }
         }
-        pub(crate) fn write_tracked(
+        pub(crate) fn write_if_unchanged(
             &self,
             text: &str,
+            expected: i64,
             fail: bool,
         ) -> Result<i64, ClipboardWriteFailure> {
             unsafe {
-                write_text_to_with(self.board, text, |board, value, kind| {
+                write_text_to_if_unchanged(self.board, text, expected, |board, value, kind| {
                     if fail {
                         false
                     } else {
@@ -536,6 +537,39 @@ pub(crate) fn write_text_tracked(text: &str) -> Result<i64, ClipboardWriteFailur
             |pb, value, kind| msg_send![pb, setString: value forType: kind],
         )
     }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn write_text_tracked_if_unchanged(
+    text: &str,
+    expected: i64,
+) -> Result<i64, ClipboardWriteFailure> {
+    unsafe {
+        let _pool = AutoreleasePool::new();
+        let board = general_pasteboard().map_err(ClipboardWriteFailure::before_mutation)?;
+        write_text_to_if_unchanged(
+            board,
+            text,
+            expected,
+            |pb, value, kind| msg_send![pb, setString: value forType: kind],
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn write_text_to_if_unchanged(
+    pb: Id,
+    text: &str,
+    expected: i64,
+    write: impl FnOnce(Id, Id, Id) -> bool,
+) -> Result<i64, ClipboardWriteFailure> {
+    let current: i64 = msg_send![pb, changeCount];
+    if current != expected {
+        return Err(ClipboardWriteFailure::before_mutation(
+            "Clipboard changed before staging; try again".into(),
+        ));
+    }
+    write_text_to_with(pb, text, write)
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -971,8 +1005,8 @@ pub fn current_change_count() -> Result<i64, String> {
 
 #[cfg(target_os = "windows")]
 pub fn save_clipboard() -> Result<ClipboardSnapshot, String> {
-    let change_count = win::sequence_number() as i64;
     let _guard = win::ClipboardGuard::open()?;
+    let change_count = win::sequence_number() as i64;
 
     let formats = win::enumerate_formats();
     let mut pairs: Vec<(String, Vec<u8>)> = Vec::with_capacity(formats.len());
@@ -1031,6 +1065,26 @@ pub(crate) fn write_text_tracked(text: &str) -> Result<i64, ClipboardWriteFailur
 }
 
 #[cfg(target_os = "windows")]
+pub(crate) fn write_text_tracked_if_unchanged(
+    text: &str,
+    expected: i64,
+) -> Result<i64, ClipboardWriteFailure> {
+    let _guard = win::ClipboardGuard::open().map_err(ClipboardWriteFailure::before_mutation)?;
+    if win::sequence_number() as i64 != expected {
+        return Err(ClipboardWriteFailure::before_mutation(
+            "Clipboard changed before staging; try again".into(),
+        ));
+    }
+    win::empty().map_err(ClipboardWriteFailure::before_mutation)?;
+    let after_clear = win::sequence_number() as i64;
+    win::put_unicode_text(text).map_err(|message| ClipboardWriteFailure {
+        message,
+        owned_change_count: Some(after_clear),
+    })?;
+    Ok(win::sequence_number() as i64)
+}
+
+#[cfg(target_os = "windows")]
 pub fn restore_clipboard(snapshot: &ClipboardSnapshot) -> Result<(), String> {
     let _guard = win::ClipboardGuard::open()?;
     win::empty()?;
@@ -1067,6 +1121,16 @@ pub fn write_text(_text: &str) -> Result<i64, String> {
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub(crate) fn write_text_tracked(_text: &str) -> Result<i64, ClipboardWriteFailure> {
+    Err(ClipboardWriteFailure::before_mutation(
+        "clipboard snapshot is not yet implemented on this platform".into(),
+    ))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub(crate) fn write_text_tracked_if_unchanged(
+    _text: &str,
+    _expected: i64,
+) -> Result<i64, ClipboardWriteFailure> {
     Err(ClipboardWriteFailure::before_mutation(
         "clipboard snapshot is not yet implemented on this platform".into(),
     ))
