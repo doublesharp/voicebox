@@ -418,17 +418,21 @@ async fn start_server<R: tauri::Runtime>(
 
 struct ServerStartupConfig {
     port: u16,
+    discover_listener: bool,
     legacy_port: Option<u16>,
     data_dir: Option<std::path::PathBuf>,
     cpu_executable: Option<std::path::PathBuf>,
+    startup_timeout: std::time::Duration,
 }
 impl Default for ServerStartupConfig {
     fn default() -> Self {
         Self {
             port: SERVER_PORT,
+            discover_listener: true,
             legacy_port: Some(LEGACY_PORT),
             data_dir: None,
             cpu_executable: None,
+            startup_timeout: std::time::Duration::from_secs(120),
         }
     }
 }
@@ -458,7 +462,7 @@ async fn start_server_with<R: tauri::Runtime>(
     // Check if a voicebox server is already running on our port (from previous session with keep_running=true,
     // or an externally started server e.g. via `python`, `uvicorn`, Docker, etc.)
     #[cfg(unix)]
-    {
+    if config.discover_listener {
         use std::process::Command;
         if let Ok(output) = Command::new("lsof")
             .args(["+c", "0", "-i", &format!(":{}", config.port), "-sTCP:LISTEN"])
@@ -498,7 +502,7 @@ async fn start_server_with<R: tauri::Runtime>(
     }
     
     #[cfg(windows)]
-    {
+    if config.discover_listener {
         use std::net::TcpStream;
         if TcpStream::connect_timeout(
             &format!("127.0.0.1:{}", config.port).parse().unwrap(),
@@ -770,7 +774,7 @@ async fn start_server_with<R: tauri::Runtime>(
     println!("Server process spawned, waiting for ready signal...");
     println!("=================================================================");
 
-    let startup = _start_permit.until_cancelled(server_startup::wait_for_startup(&mut rx, std::time::Duration::from_secs(120), |stream, line| {
+    let startup = _start_permit.until_cancelled(server_startup::wait_for_startup(&mut rx, config.startup_timeout, |stream, line| {
         if stream == "stderr" { eprintln!("Server: {line}"); } else { println!("Server output: {line}"); }
         let _ = app.emit("server-log", serde_json::json!({ "stream": stream, "line": line }));
     })).await.ok_or("Server startup cancelled")?;
@@ -2903,17 +2907,20 @@ mod server_start_flow_tests {
             let exe = dir.join("fake-sidecar");
             std::fs::write(&exe, format!("#!/bin/sh\n{script}\n")).unwrap();
             std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let port = listener.local_addr().unwrap().port();
-            drop(listener);
+            // Stand-in sidecars never bind a socket; port zero avoids racing
+            // other processes for a released ephemeral port. Listener tests
+            // supply the actual port held by their own bound socket.
+            let port = 0;
             Self { dir, port, exe }
         }
         fn config(&self) -> ServerStartupConfig {
             ServerStartupConfig {
                 port: self.port,
+                discover_listener: false,
                 legacy_port: None,
                 data_dir: Some(self.dir.join("data")),
                 cpu_executable: Some(self.exe.clone()),
+                startup_timeout: Duration::from_secs(120),
             }
         }
     }
@@ -2944,9 +2951,11 @@ mod server_start_flow_tests {
     fn production_defaults_keep_fixed_ports_and_packaged_paths() {
         let config = ServerStartupConfig::default();
         assert_eq!(config.port, SERVER_PORT);
+        assert!(config.discover_listener);
         assert_eq!(config.legacy_port, Some(LEGACY_PORT));
         assert!(config.data_dir.is_none());
         assert!(config.cpu_executable.is_none());
+        assert_eq!(config.startup_timeout, Duration::from_secs(120));
     }
 
     #[tokio::test]
@@ -3127,6 +3136,7 @@ mod server_start_flow_tests {
             let fixture = Fixture::new("exit 42");
             let mut config = fixture.config();
             config.port = port;
+            config.discover_listener = true;
             let app = app();
             let result = tokio::time::timeout(
                 Duration::from_secs(5),
@@ -3272,6 +3282,7 @@ mod server_start_flow_tests {
                 config.legacy_port = Some(port);
             } else {
                 config.port = port;
+                config.discover_listener = true;
             }
             let app = app();
             let handle = app.handle().clone();
@@ -3302,5 +3313,82 @@ mod server_start_flow_tests {
                 .unwrap()
                 .is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn timed_out_sidecar_is_stopped_and_ownership_is_cleared() {
+        let fixture = Fixture::new("printf 'ERROR: still starting\\n' >&2\nexec /bin/sleep 5");
+        let app = app();
+        let mut config = fixture.config();
+        config.startup_timeout = Duration::from_millis(1500);
+        let logs = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observed = logs.clone();
+        app.listen("server-log", move |event| {
+            observed.lock().unwrap().push(event.payload().into())
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            start_server_with(app.handle().clone(), app.state(), None, None, config),
+        )
+        .await
+        .unwrap();
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(logs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.contains("still starting")));
+        assert!(app
+            .state::<ServerState>()
+            .server_pid
+            .lock()
+            .unwrap()
+            .is_none());
+        assert!(app.state::<ServerState>().child.lock().unwrap().is_none());
+        assert!(app.state::<ServerState>().start_gate.try_begin().is_some());
+    }
+
+    #[tokio::test]
+    async fn ready_sidecar_exit_is_forwarded_and_releases_ownership() {
+        let fixture = Fixture::new("printf 'INFO: Uvicorn running on http://127.0.0.1:1\\nINFO: after readiness\\n' >&2\nexec /bin/sleep 1");
+        let app = app();
+        let logs = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observed = logs.clone();
+        app.listen("server-log", move |event| {
+            observed.lock().unwrap().push(event.payload().into())
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            start_server_with(
+                app.handle().clone(),
+                app.state(),
+                None,
+                None,
+                fixture.config(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result, format!("http://127.0.0.1:{}", fixture.port));
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while app
+                .state::<ServerState>()
+                .server_pid
+                .lock()
+                .unwrap()
+                .is_some()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("exited sidecar ownership was not released");
+        assert!(app.state::<ServerState>().child.lock().unwrap().is_none());
+        assert!(logs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.contains("after readiness")));
     }
 }
