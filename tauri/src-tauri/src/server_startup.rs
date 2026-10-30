@@ -3,25 +3,58 @@ use std::time::Duration;
 use tauri::async_runtime::Receiver;
 use tauri_plugin_shell::process::CommandEvent;
 
-/// Prevent overlapping attempts before a spawned child is registered.
+/// Serialize startup attempts and coordinate stop with child registration.
 #[derive(Default)]
-pub(crate) struct StartGate(std::sync::atomic::AtomicBool);
+pub(crate) struct StartGate(std::sync::Mutex<StartState>);
 
-pub(crate) struct StartPermit<'a>(&'a std::sync::atomic::AtomicBool);
+#[derive(Default)]
+struct StartState {
+    starting: bool,
+    generation: u64,
+}
+
+pub(crate) struct StartPermit<'a> {
+    gate: &'a StartGate,
+    generation: u64,
+}
 
 impl StartGate {
     pub(crate) fn try_begin(&self) -> Option<StartPermit<'_>> {
-        use std::sync::atomic::Ordering;
-        self.0
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .ok()?;
-        Some(StartPermit(&self.0))
+        let mut state = self.0.lock().unwrap();
+        if state.starting {
+            return None;
+        }
+        state.starting = true;
+        Some(StartPermit {
+            gate: self,
+            generation: state.generation,
+        })
+    }
+
+    pub(crate) fn cancel_and<T>(&self, action: impl FnOnce() -> T) -> T {
+        let mut state = self.0.lock().unwrap();
+        state.generation = state.generation.wrapping_add(1);
+        let result = action();
+        drop(state);
+        result
+    }
+}
+
+impl StartPermit<'_> {
+    pub(crate) fn commit<T>(&self, action: impl FnOnce() -> T) -> Option<T> {
+        let state = self.gate.0.lock().unwrap();
+        if state.generation != self.generation {
+            return None;
+        }
+        let result = action();
+        drop(state);
+        Some(result)
     }
 }
 
 impl Drop for StartPermit<'_> {
     fn drop(&mut self) {
-        self.0.store(false, std::sync::atomic::Ordering::Release);
+        self.gate.0.lock().unwrap().starting = false;
     }
 }
 
@@ -478,5 +511,108 @@ mod start_gate_tests {
         let second = StartGate::default();
         let _permit = first.try_begin().unwrap();
         assert!(second.try_begin().is_some());
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::StartGate;
+    use std::sync::{mpsc, Arc, Mutex};
+
+    #[test]
+    fn stopping_during_preflight_prevents_late_spawn() {
+        let gate = StartGate::default();
+        let permit = gate.try_begin().unwrap();
+        gate.cancel_and(|| ());
+        let mut spawned = false;
+        assert!(permit.commit(|| spawned = true).is_none());
+        assert!(!spawned);
+        assert!(gate.try_begin().is_none());
+        drop(permit);
+        assert!(gate.try_begin().is_some());
+    }
+
+    #[test]
+    fn stop_after_registration_takes_the_registered_child() {
+        let gate = StartGate::default();
+        let child = Mutex::new(None);
+        let permit = gate.try_begin().unwrap();
+        assert!(permit
+            .commit(|| *child.lock().unwrap() = Some(42))
+            .is_some());
+        let stopped = gate.cancel_and(|| child.lock().unwrap().take());
+        assert_eq!(stopped, Some(42));
+        assert!(permit.commit(|| ()).is_none());
+    }
+
+    #[test]
+    fn cancellation_before_a_new_attempt_does_not_cancel_the_new_attempt() {
+        let gate = StartGate::default();
+        gate.cancel_and(|| ());
+        let permit = gate.try_begin().unwrap();
+        assert_eq!(permit.commit(|| 7), Some(7));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registered_real_child_can_be_taken_and_stopped() {
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let gate = StartGate::default();
+        let child = Mutex::new(None);
+        let permit = gate.try_begin().unwrap();
+        permit
+            .commit(|| {
+                *child.lock().unwrap() = Some(Child(
+                    std::process::Command::new("/bin/sleep")
+                        .arg("30")
+                        .spawn()
+                        .unwrap(),
+                ));
+            })
+            .unwrap();
+        let mut owned = gate.cancel_and(|| child.lock().unwrap().take()).unwrap();
+        owned.0.kill().unwrap();
+        let status = owned.0.wait().unwrap();
+        assert!(!status.success());
+        assert!(permit.commit(|| ()).is_none());
+    }
+
+    #[test]
+    fn concurrent_stop_waits_for_registration_then_sees_the_child() {
+        let gate = Arc::new(StartGate::default());
+        let child = Arc::new(Mutex::new(None));
+        let (inside_tx, inside_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let worker_gate = gate.clone();
+        let worker_child = child.clone();
+        let worker = std::thread::spawn(move || {
+            let permit = worker_gate.try_begin().unwrap();
+            permit
+                .commit(|| {
+                    inside_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                    *worker_child.lock().unwrap() = Some(99);
+                })
+                .unwrap();
+        });
+        inside_rx.recv().unwrap();
+        let stop_gate = gate.clone();
+        let stop_child = child.clone();
+        let stopper = std::thread::spawn(move || {
+            let stopped = stop_gate.cancel_and(|| stop_child.lock().unwrap().take());
+            stop_tx.send(stopped).unwrap();
+        });
+        assert!(stop_rx.try_recv().is_err());
+        resume_tx.send(()).unwrap();
+        assert_eq!(stop_rx.recv().unwrap(), Some(99));
+        worker.join().unwrap();
+        stopper.join().unwrap();
     }
 }

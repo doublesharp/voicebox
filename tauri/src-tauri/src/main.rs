@@ -371,6 +371,7 @@ async fn start_server(
             .await
             .unwrap_or(false);
         if ready {
+            _start_permit.commit(|| ()).ok_or("Server startup cancelled")?;
             return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
         }
         return Err("The bundled server is still starting. Please try again shortly.".to_string());
@@ -394,14 +395,17 @@ async fn start_server(
                     #[cfg(target_os = "linux")]
                     if !server_process::linux_server_executable(pid) {
                         println!("Healthy server has an unverified executable; reusing it as external");
+                        _start_permit.commit(|| ()).ok_or("Server startup cancelled")?;
                         return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
                     }
                     println!("Found healthy voicebox-server on port {} (PID: {}), reusing it", SERVER_PORT, pid);
-                    *state.server_pid.lock().unwrap() = Some(pid);
+                    _start_permit.commit(|| *state.server_pid.lock().unwrap() = Some(pid))
+                        .ok_or("Server startup cancelled")?;
                     return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
                 }
                 server_process::ListenerDecision::ReuseExternal => {
                     println!("Health check passed — reusing external server on port {}", SERVER_PORT);
+                    _start_permit.commit(|| ()).ok_or("Server startup cancelled")?;
                     return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
                 }
                 server_process::ListenerDecision::Conflict(command) => {
@@ -425,9 +429,11 @@ async fn start_server(
             if check_health(SERVER_PORT) {
                 if let Some(pid) = find_voicebox_pid_on_port(SERVER_PORT) {
                     println!("Found healthy voicebox-server on port {} (PID: {}), reusing it", SERVER_PORT, pid);
-                    *state.server_pid.lock().unwrap() = Some(pid);
+                    _start_permit.commit(|| *state.server_pid.lock().unwrap() = Some(pid))
+                        .ok_or("Server startup cancelled")?;
                 } else {
                     println!("Health check passed — reusing external server on port {}", SERVER_PORT);
+                    _start_permit.commit(|| ()).ok_or("Server startup cancelled")?;
                 }
                 return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
             }
@@ -456,13 +462,15 @@ async fn start_server(
                 if !server_process::linux_server_executable(pid) {
                     continue;
                 }
-                println!("Found healthy voicebox-server on legacy port {} (PID: {}), stopping it...", LEGACY_PORT, pid);
-                let _ = Command::new("kill")
-                    .args(["-9", "--", &format!("-{}", pid)])
-                    .output();
-                let _ = Command::new("kill")
-                    .args(["-9", &pid.to_string()])
-                    .output();
+                _start_permit.commit(|| {
+                    println!("Found healthy voicebox-server on legacy port {} (PID: {}), stopping it...", LEGACY_PORT, pid);
+                    let _ = Command::new("kill")
+                        .args(["-9", "--", &format!("-{}", pid)])
+                        .output();
+                    let _ = Command::new("kill")
+                        .args(["-9", &pid.to_string()])
+                        .output();
+                }).ok_or("Server startup cancelled")?;
             }
         }
     }
@@ -475,10 +483,12 @@ async fn start_server(
             std::time::Duration::from_secs(1),
         ).is_ok() && check_health(LEGACY_PORT) {
             if let Some(pid) = find_voicebox_pid_on_port(LEGACY_PORT) {
-                println!("Found orphaned voicebox-server on legacy port {} (PID: {}), killing it...", LEGACY_PORT, pid);
-                let _ = std::process::Command::new("taskkill")
-                    .args(["/PID", &pid.to_string(), "/T", "/F"])
-                    .output();
+                _start_permit.commit(|| {
+                    println!("Found orphaned voicebox-server on legacy port {} (PID: {}), killing it...", LEGACY_PORT, pid);
+                    let _ = std::process::Command::new("taskkill")
+                        .args(["/PID", &pid.to_string(), "/T", "/F"])
+                        .output();
+                }).ok_or("Server startup cancelled")?;
             }
         }
     }
@@ -596,6 +606,7 @@ async fn start_server(
                 // Try to connect to the server port
                 if manual_server_available(SERVER_PORT).await {
                     println!("Found server already running on port {}", SERVER_PORT);
+                    _start_permit.commit(|| ()).ok_or("Server startup cancelled")?;
                     return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
                 }
 
@@ -665,57 +676,67 @@ async fn start_server(
     // If CUDA binary exists, launch it from the onedir directory.
     // .current_dir() is critical: PyInstaller onedir expects all DLLs and
     // support files relative to the exe.
-    let spawn_result = if backend_override.as_deref() != Some("cpu") {
-        let mut gpu_spawn = None;
+    let spawn_result = _start_permit.commit(|| {
+        let result = if backend_override.as_deref() != Some("cpu") {
+            let mut gpu_spawn = None;
 
-        if let Some(ref rocm_path) = rocm_binary {
-            let rocm_dir = rocm_path.parent().unwrap();
-            println!("Launching ROCm backend: {:?} (cwd: {:?})", rocm_path, rocm_dir);
-            let mut cmd = app.shell().command(rocm_path.to_str().unwrap());
-            cmd = cmd.current_dir(rocm_dir);
-            cmd = cmd.args(&server_args);
-            if let Some(ref dir) = effective_models_dir { cmd = cmd.env("VOICEBOX_MODELS_DIR", dir); }
-            match cmd.spawn() {
-                Ok(r) => { gpu_spawn = Some(Ok(r)); }
-                Err(e) => { println!("ROCm spawn failed ({}), trying CUDA/CPU fallback", e); }
-            }
-        }
-
-        if gpu_spawn.is_none() {
-            if let Some(ref cuda_path) = cuda_binary {
-                let cuda_dir = cuda_path.parent().unwrap();
-                println!("Launching CUDA backend: {:?} (cwd: {:?})", cuda_path, cuda_dir);
-                let mut cmd = app.shell().command(cuda_path.to_str().unwrap());
-                cmd = cmd.current_dir(cuda_dir);
+            if let Some(ref rocm_path) = rocm_binary {
+                let rocm_dir = rocm_path.parent().unwrap();
+                println!("Launching ROCm backend: {:?} (cwd: {:?})", rocm_path, rocm_dir);
+                let mut cmd = app.shell().command(rocm_path.to_str().unwrap());
+                cmd = cmd.current_dir(rocm_dir);
                 cmd = cmd.args(&server_args);
                 if let Some(ref dir) = effective_models_dir { cmd = cmd.env("VOICEBOX_MODELS_DIR", dir); }
                 match cmd.spawn() {
                     Ok(r) => { gpu_spawn = Some(Ok(r)); }
-                    Err(e) => { println!("CUDA spawn failed ({}), falling back to CPU", e); }
+                    Err(e) => { println!("ROCm spawn failed ({}), trying CUDA/CPU fallback", e); }
                 }
             }
-        }
 
-        if let Some(result) = gpu_spawn {
-            result
+            if gpu_spawn.is_none() {
+                if let Some(ref cuda_path) = cuda_binary {
+                    let cuda_dir = cuda_path.parent().unwrap();
+                    println!("Launching CUDA backend: {:?} (cwd: {:?})", cuda_path, cuda_dir);
+                    let mut cmd = app.shell().command(cuda_path.to_str().unwrap());
+                    cmd = cmd.current_dir(cuda_dir);
+                    cmd = cmd.args(&server_args);
+                    if let Some(ref dir) = effective_models_dir { cmd = cmd.env("VOICEBOX_MODELS_DIR", dir); }
+                    match cmd.spawn() {
+                        Ok(r) => { gpu_spawn = Some(Ok(r)); }
+                        Err(e) => { println!("CUDA spawn failed ({}), falling back to CPU", e); }
+                    }
+                }
+            }
+
+            if let Some(result) = gpu_spawn {
+                result
+            } else {
+                // Fall back to bundled CPU sidecar
+                sidecar = sidecar.args(&server_args);
+                if let Some(ref dir) = effective_models_dir { sidecar = sidecar.env("VOICEBOX_MODELS_DIR", dir); }
+                println!("Spawning bundled CPU server process...");
+                sidecar.spawn()
+            }
         } else {
-            // Fall back to bundled CPU sidecar
+            // Override forces CPU — use bundled sidecar, GPU binary stays on disk
+            println!("Backend override=cpu: using bundled CPU sidecar");
             sidecar = sidecar.args(&server_args);
-            if let Some(ref dir) = effective_models_dir { sidecar = sidecar.env("VOICEBOX_MODELS_DIR", dir); }
-            println!("Spawning bundled CPU server process...");
+            if let Some(ref dir) = effective_models_dir {
+                sidecar = sidecar.env("VOICEBOX_MODELS_DIR", dir);
+            }
             sidecar.spawn()
-        }
-    } else {
-        // Override forces CPU — use bundled sidecar, GPU binary stays on disk
-        println!("Backend override=cpu: using bundled CPU sidecar");
-        sidecar = sidecar.args(&server_args);
-        if let Some(ref dir) = effective_models_dir {
-            sidecar = sidecar.env("VOICEBOX_MODELS_DIR", dir);
-        }
-        sidecar.spawn()
-    };
+        };
+        result.map(|(rx, child)| {
+            let process_pid = child.pid();
+            let mut pid = state.server_pid.lock().unwrap();
+            let mut managed_child = state.child.lock().unwrap();
+            *pid = Some(process_pid);
+            *managed_child = Some(child);
+            (rx, process_pid)
+        })
+    }).ok_or("Server startup cancelled")?;
 
-    let (mut rx, child) = match spawn_result {
+    let (mut rx, process_pid) = match spawn_result {
         Ok(result) => result,
         Err(e) => {
             eprintln!("Failed to spawn server process: {}", e);
@@ -725,6 +746,7 @@ async fn start_server(
             {
                 if manual_server_available(SERVER_PORT).await {
                     println!("Found manually-started server on port {}", SERVER_PORT);
+                    _start_permit.commit(|| ()).ok_or("Server startup cancelled")?;
                     return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
                 }
 
@@ -754,15 +776,6 @@ async fn start_server(
     println!("Server process spawned, waiting for ready signal...");
     println!("=================================================================");
 
-    // Store child process and PID
-    let process_pid = child.pid();
-    {
-        let mut pid = state.server_pid.lock().unwrap();
-        let mut managed_child = state.child.lock().unwrap();
-        *pid = Some(process_pid);
-        *managed_child = Some(child);
-    }
-
     let startup = server_startup::wait_for_startup(&mut rx, std::time::Duration::from_secs(120), |stream, line| {
         if stream == "stderr" { eprintln!("Server: {line}"); } else { println!("Server output: {line}"); }
         let _ = app.emit("server-log", serde_json::json!({ "stream": stream, "line": line }));
@@ -789,6 +802,7 @@ async fn start_server(
             {
                 if manual_server_available(SERVER_PORT).await {
                     println!("Found manually-started server on port {}", SERVER_PORT);
+                    _start_permit.commit(|| ()).ok_or("Server startup cancelled")?;
                     return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
                 }
                 return Err("Dev mode: Start server manually with 'bun run dev:server'".to_string());
@@ -798,6 +812,7 @@ async fn start_server(
         }
     }
 
+    _start_permit.commit(|| ()).ok_or("Server startup cancelled")?;
     // Spawn task to continue reading output and emit to frontend
     let app_handle = app.clone();
     tokio::spawn(async move {
@@ -822,9 +837,12 @@ async fn stop_server_if_owned(
     state: State<'_, ServerState>,
     expected: Option<u32>,
 ) -> Result<(), String> {
-    if let Some((pid, child)) =
+    let process = if expected.is_none() {
+        state.start_gate.cancel_and(|| server_process::take_process(&state.server_pid, &state.child, expected))
+    } else {
         server_process::take_process(&state.server_pid, &state.child, expected)
-    {
+    };
+    if let Some((pid, child)) = process {
         tokio::task::spawn_blocking(move || {
             let _child = child;
             println!("stop_server: Stopping server with PID: {}", pid);
