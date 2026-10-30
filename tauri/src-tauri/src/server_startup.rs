@@ -42,6 +42,30 @@ pub(crate) async fn wait_for_startup(
     }
 }
 
+/// Forward sidecar output after readiness. Only a confirmed termination may
+/// clear ownership; a channel error alone does not prove the child has exited.
+pub(crate) async fn forward_events(
+    rx: &mut Receiver<CommandEvent>,
+    mut log: impl FnMut(&str, &str),
+    mut on_termination: impl FnMut(),
+) {
+    while let Some(event) = rx.recv().await {
+        match event {
+            CommandEvent::Stdout(bytes) => {
+                log("stdout", String::from_utf8_lossy(&bytes).trim_end())
+            }
+            CommandEvent::Stderr(bytes) => {
+                log("stderr", String::from_utf8_lossy(&bytes).trim_end())
+            }
+            CommandEvent::Terminated(_) => {
+                on_termination();
+                break;
+            }
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,5 +207,104 @@ mod tests {
             Outcome::Exited
         );
         assert_eq!(logs, ["x�"]);
+    }
+
+    #[tokio::test]
+    async fn termination_clears_only_the_matching_managed_child() {
+        use std::sync::Mutex;
+        let pid = Mutex::new(Some(123));
+        let child = Mutex::new(Some("child"));
+        let (tx, mut rx) = channel(2);
+        tx.send(CommandEvent::Terminated(TerminatedPayload {
+            code: Some(1),
+            signal: None,
+        }))
+        .await
+        .unwrap();
+        drop(tx);
+        forward_events(
+            &mut rx,
+            |_, _| {},
+            || {
+                crate::server_process::take_process(&pid, &child, Some(123));
+            },
+        )
+        .await;
+        assert_eq!(*pid.lock().unwrap(), None);
+        assert_eq!(*child.lock().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn late_termination_does_not_clear_a_replacement_child() {
+        use std::sync::Mutex;
+        let pid = Mutex::new(Some(456));
+        let child = Mutex::new(Some("replacement"));
+        let (tx, mut rx) = channel(2);
+        tx.send(CommandEvent::Terminated(TerminatedPayload {
+            code: Some(0),
+            signal: None,
+        }))
+        .await
+        .unwrap();
+        drop(tx);
+        let mut called = false;
+        forward_events(
+            &mut rx,
+            |_, _| {},
+            || {
+                called = true;
+                crate::server_process::take_process(&pid, &child, Some(123));
+            },
+        )
+        .await;
+        assert!(called);
+        assert_eq!(*pid.lock().unwrap(), Some(456));
+        assert_eq!(*child.lock().unwrap(), Some("replacement"));
+    }
+
+    #[tokio::test]
+    async fn post_start_logs_are_forwarded_before_termination() {
+        let (tx, mut rx) = channel(4);
+        tx.send(CommandEvent::Stdout(b"hello\n".to_vec()))
+            .await
+            .unwrap();
+        tx.send(CommandEvent::Stderr(b"warning\n".to_vec()))
+            .await
+            .unwrap();
+        tx.send(CommandEvent::Terminated(TerminatedPayload {
+            code: None,
+            signal: Some(9),
+        }))
+        .await
+        .unwrap();
+        drop(tx);
+        let mut logs = Vec::new();
+        let mut terminated = 0;
+        forward_events(
+            &mut rx,
+            |stream, line| logs.push((stream.to_string(), line.to_string())),
+            || terminated += 1,
+        )
+        .await;
+        assert_eq!(
+            logs,
+            [
+                ("stdout".into(), "hello".into()),
+                ("stderr".into(), "warning".into())
+            ]
+        );
+        assert_eq!(terminated, 1);
+    }
+
+    #[tokio::test]
+    async fn channel_closure_without_termination_does_not_clear_a_live_child() {
+        let (tx, mut rx) = channel(1);
+        tx.send(CommandEvent::Error("reader failed".into()))
+            .await
+            .unwrap();
+        drop(tx);
+        let mut terminated = false;
+        forward_events(&mut rx, |_, _| {}, || terminated = true).await;
+        assert!(!terminated);
     }
 }

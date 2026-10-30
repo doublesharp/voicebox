@@ -758,27 +758,13 @@ async fn start_server(
     // Spawn task to continue reading output and emit to frontend
     let app_handle = app.clone();
     tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            match event {
-                tauri_plugin_shell::process::CommandEvent::Stdout(line) => {
-                    let line_str = String::from_utf8_lossy(&line);
-                    println!("Server: {}", line_str);
-                    let _ = app_handle.emit("server-log", serde_json::json!({
-                        "stream": "stdout",
-                        "line": line_str.trim_end(),
-                    }));
-                }
-                tauri_plugin_shell::process::CommandEvent::Stderr(line) => {
-                    let line_str = String::from_utf8_lossy(&line);
-                    eprintln!("Server error: {}", line_str);
-                    let _ = app_handle.emit("server-log", serde_json::json!({
-                        "stream": "stderr",
-                        "line": line_str.trim_end(),
-                    }));
-                }
-                _ => {}
-            }
-        }
+        server_startup::forward_events(&mut rx, |stream, line| {
+            if stream == "stderr" { eprintln!("Server error: {line}"); } else { println!("Server: {line}"); }
+            let _ = app_handle.emit("server-log", serde_json::json!({ "stream": stream, "line": line }));
+        }, || {
+            let state = app_handle.state::<ServerState>();
+            server_process::take_process(&state.server_pid, &state.child, Some(process_pid));
+        }).await;
     });
 
     Ok(format!("http://127.0.0.1:{}", SERVER_PORT))
