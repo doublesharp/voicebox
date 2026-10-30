@@ -653,6 +653,24 @@ fn prepare_output_pcm(
     Ok(pcm)
 }
 
+fn start_output_streams<T>(
+    streams: &[T],
+    controls: &PlaybackControls,
+    cancellation: &str,
+    mut start: impl FnMut(&T) -> Result<(), String>,
+) -> Result<(), String> {
+    for stream in streams {
+        if controls.stopped.load(Ordering::Acquire) {
+            return Err(cancellation.into());
+        }
+        start(stream)?;
+    }
+    if controls.stopped.load(Ordering::Acquire) {
+        return Err(cancellation.into());
+    }
+    Ok(())
+}
+
 fn acknowledge_audio_start(
     controls: &PlaybackControls,
     ready: &mut Option<tokio::sync::oneshot::Sender<Result<PlaybackSession, String>>>,
@@ -753,14 +771,11 @@ fn run_session(
     }
     // Build all streams first; callbacks remain silent behind the shared pause
     // gate until every stream has started. Hardware latency may differ by device.
-    for stream in &streams {
+    start_output_streams(&streams, &controls, "Playback cancelled", |stream| {
         stream
             .play()
-            .map_err(|error| format!("Unable to start output: {error}"))?;
-    }
-    if controls.stopped.load(Ordering::Acquire) {
-        return Err("Playback cancelled".into());
-    }
+            .map_err(|error| format!("Unable to start output: {error}"))
+    })?;
     let start_position = controls.requested_position().min(duration);
     if !acknowledge_audio_start(
         &controls,
@@ -970,12 +985,9 @@ fn run_pcm_session(
             .push(queue);
         streams.push(stream);
     }
-    for stream in &streams {
-        stream.play().map_err(|error| error.to_string())?;
-    }
-    if controls.stopped.load(Ordering::Acquire) {
-        return Err("Preview cancelled".into());
-    }
+    start_output_streams(&streams, &controls, "Preview cancelled", |stream| {
+        stream.play().map_err(|error| error.to_string())
+    })?;
     if !acknowledge_audio_start(
         &controls,
         ready,
@@ -2349,5 +2361,80 @@ mod startup_ack_tests {
         assert!(controls.paused.load(Ordering::Acquire));
         drop(ready);
         assert!(rx.await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod output_start_tests {
+    use super::*;
+
+    #[test]
+    fn all_outputs_start_in_order_while_the_pause_gate_remains_closed() {
+        let controls = PlaybackControls::new(0.0, 1.0);
+        let mut started = Vec::new();
+        start_output_streams(&[1, 2, 3], &controls, "Playback cancelled", |id| {
+            assert!(controls.paused.load(Ordering::Acquire));
+            started.push(*id);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(started, [1, 2, 3]);
+        assert!(controls.paused.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn cancellation_before_start_never_starts_any_output() {
+        let controls = PlaybackControls::new(0.0, 1.0);
+        controls.stop();
+        let mut started = Vec::new();
+        let result = start_output_streams(&[1, 2], &controls, "Playback cancelled", |id| {
+            started.push(*id);
+            Ok(())
+        });
+        assert_eq!(result.unwrap_err(), "Playback cancelled");
+        assert!(started.is_empty());
+    }
+
+    #[test]
+    fn cancellation_during_start_does_not_start_later_outputs() {
+        let controls = PlaybackControls::new(0.0, 1.0);
+        let mut started = Vec::new();
+        let result = start_output_streams(&[1, 2, 3], &controls, "Preview cancelled", |id| {
+            started.push(*id);
+            if *id == 1 {
+                controls.stop();
+            }
+            Ok(())
+        });
+        assert_eq!(result.unwrap_err(), "Preview cancelled");
+        assert_eq!(started, [1]);
+        assert!(controls.paused.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn device_start_error_is_returned_and_later_devices_are_not_started() {
+        let controls = PlaybackControls::new(0.0, 1.0);
+        let mut started = Vec::new();
+        let result = start_output_streams(&[1, 2, 3], &controls, "Playback cancelled", |id| {
+            started.push(*id);
+            if *id == 2 {
+                Err("device disconnected".into())
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(result.unwrap_err(), "device disconnected");
+        assert_eq!(started, [1, 2]);
+        assert!(controls.paused.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn cancellation_during_the_final_start_is_reported() {
+        let controls = PlaybackControls::new(0.0, 1.0);
+        let result = start_output_streams(&[1], &controls, "Preview cancelled", |_| {
+            controls.stop();
+            Ok(())
+        });
+        assert_eq!(result.unwrap_err(), "Preview cancelled");
     }
 }
