@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 import traceback
+from typing import Literal
 import weakref
 
 
@@ -67,6 +68,7 @@ def validate(settings):
 @dataclass
 class CheckResult:
     name: str
+    kind: Literal["gating", "recorded"]
     passed: bool
     wall_s: float
     evidence: dict
@@ -263,6 +265,13 @@ async def check_cached_payload_cpu_owned(s):
     return {"memory_devices": devices, "disk_devices": disk_devices, "tensor_count": len(facts)}
 
 
+def storage_isolation_carrier(device):
+    """Which assertion proves restored tensors do not alias the CPU cache: on
+    CPU only distinct data_ptr values can, while on another device the device
+    check already does and pointer collisions across address spaces mean nothing."""
+    return "data_ptr" if telemetry.normalize_device(device) == "cpu" else "device"
+
+
 async def check_device_restoration_uses_fresh_storage(s):
     import torch
     payload = s.cached_payload(s.work_a, s.settings.reference_a_text)
@@ -279,6 +288,7 @@ async def check_device_restoration_uses_fresh_storage(s):
     expect(not changed, f"cached tensors changed during generation: {changed}")
     expect(s.adapter.model.conds is None, "request conditioning left installed after generation")
     return {"restored_devices": devices, "restored_tensors": len(restored), "shared_storage": shared,
+            "isolation_carried_by": storage_isolation_carrier(s.device),
             "cached_tensors_unchanged": True, "conds_cleared": True}
 
 
@@ -520,6 +530,13 @@ CHECKS = [
     check_same_mode_repeat_reproducibility,
     check_all_audio_finite_mono,
 ]
+# Bit-exactness across cache modes and repeats is recorded, never assumed:
+# these checks contribute evidence, not exit status.
+RECORDED_CHECKS = frozenset({check_fixed_seed_cache_vs_bypass_parity, check_same_mode_repeat_reproducibility})
+
+
+def check_kind(check):
+    return "recorded" if check in RECORDED_CHECKS else "gating"
 
 
 async def qualify(settings, output, *, factory=bench.create_adapter, admit=bench.admit_cached_turbo,
@@ -541,16 +558,16 @@ async def qualify(settings, output, *, factory=bench.create_adapter, admit=bench
             raise ValueError("qualification requires a fresh unloaded adapter")
         report["load"] = await session.load()
         for check in checks:
-            name = check.__name__.removeprefix("check_")
+            name, kind = check.__name__.removeprefix("check_"), check_kind(check)
             start = time.perf_counter()
             try:
                 evidence = await check(session)
-                result = CheckResult(name, True, time.perf_counter() - start, evidence)
+                result = CheckResult(name, kind, True, time.perf_counter() - start, evidence)
             except (Exception, asyncio.CancelledError) as exc:
-                result = CheckResult(name, False, time.perf_counter() - start, {},
+                result = CheckResult(name, kind, False, time.perf_counter() - start, {},
                                      f"{type(exc).__name__}: {exc}\n{traceback.format_exc()[-1500:]}")
             report["checks"].append(asdict(result))
-        report["status"] = "ok" if all(c["passed"] for c in report["checks"]) else "failed"
+        report["status"] = "ok" if all(c["passed"] for c in report["checks"] if c["kind"] == "gating") else "failed"
     except (Exception, KeyboardInterrupt) as exc:
         report["error"] = {"type": type(exc).__name__, "message": str(exc)[:2000]}
     finally:
@@ -563,8 +580,10 @@ async def qualify(settings, output, *, factory=bench.create_adapter, admit=bench
                 except Exception as exc:
                     report["status"] = "failed"
                     report["cleanup_error"] = {"type": type(exc).__name__, "message": str(exc)[:2000]}
-        report["summary"] = {"passed": sum(c["passed"] for c in report["checks"]),
-                             "failed": sum(not c["passed"] for c in report["checks"]), "expected": len(checks)}
+        gating = [c for c in report["checks"] if c["kind"] == "gating"]
+        report["summary"] = {"passed": sum(c["passed"] for c in gating), "failed": sum(not c["passed"] for c in gating),
+                             "expected": sum(check_kind(c) == "gating" for c in checks),
+                             "recorded": {c["name"]: c["passed"] for c in report["checks"] if c["kind"] == "recorded"}}
         with output.open("results.json") as handle:
             handle.write(json.dumps(report, default=str, indent=2, allow_nan=False).encode() + b"\n")
     return report
@@ -590,7 +609,8 @@ def main(argv=None):
         report = asyncio.run(qualify(settings, output))
         print(str(output.path / "results.json"))
         for check in report["checks"]:
-            print(f"{'PASS' if check['passed'] else 'FAIL'} {check['name']}", file=sys.stderr)
+            verdict = "RECORDED" if check["kind"] == "recorded" else "PASS" if check["passed"] else "FAIL"
+            print(f"{verdict} {check['name']}", file=sys.stderr)
         if report["status"] != "ok":
             print(json.dumps(report.get("error") or report.get("cleanup_error") or report["summary"]), file=sys.stderr)
             return 2

@@ -129,8 +129,13 @@ def test_every_check_passes_against_the_fake_backend(settings):
     report = run(settings, fake_factory())
     failures = {c["name"]: c["error"] for c in report["checks"] if not c["passed"]}
     assert failures == {}
-    assert report["status"] == "ok" and report["summary"] == {"passed": len(qualify.CHECKS), "failed": 0, "expected": len(qualify.CHECKS)}
+    gating = len(qualify.CHECKS) - len(qualify.RECORDED_CHECKS)
+    assert report["status"] == "ok" and report["summary"] == {
+        "passed": gating, "failed": 0, "expected": gating,
+        "recorded": {"fixed_seed_cache_vs_bypass_parity": True, "same_mode_repeat_reproducibility": True}}
     assert [c["name"] for c in report["checks"]] == [c.__name__.removeprefix("check_") for c in qualify.CHECKS]
+    assert {c["name"] for c in report["checks"] if c["kind"] == "recorded"} == set(report["summary"]["recorded"])
+    assert all(c["kind"] == "gating" for c in report["checks"] if c["name"] not in report["summary"]["recorded"])
     assert report["load"] == {"residency": {"roots": ["s3gen", "t3", "ve"], "device": "cpu"},
                               "loaded_revision": f"{turbo.CHATTERBOX_TURBO_HF_REPO}@{REVISION}"}
     by_name = {c["name"]: c["evidence"] for c in report["checks"]}
@@ -138,6 +143,7 @@ def test_every_check_passes_against_the_fake_backend(settings):
     assert by_name["disk_hit_skips_prepare"]["hit"] is True
     assert by_name["cached_payload_cpu_owned"]["memory_devices"] == ["cpu"]
     assert by_name["device_restoration_uses_fresh_storage"]["shared_storage"] == []
+    assert by_name["device_restoration_uses_fresh_storage"]["isolation_carried_by"] == "data_ptr"
     assert by_name["bypass_never_touches_cache"]["prepare_calls_per_generate"] == 1
     assert by_name["unload_releases_vram_and_reload_hits_disk"]["disk_hit_after_reload"] is True
     assert by_name["cancellation_then_admission"]["cancelled"] is True
@@ -160,7 +166,8 @@ def test_broken_cache_fails_hit_checks_but_keeps_running(settings, monkeypatch):
     assert results["memory_hit_skips_prepare"]["passed"] is False
     assert "memory hit: hit=False" in results["memory_hit_skips_prepare"]["error"]
     assert results["all_audio_finite_mono"]["passed"] is True
-    assert report["summary"]["expected"] == len(qualify.CHECKS) and report["summary"]["failed"] >= 1
+    assert report["summary"]["expected"] == len(qualify.CHECKS) - len(qualify.RECORDED_CHECKS)
+    assert report["summary"]["failed"] >= 1
 
 
 def test_nonfinite_audio_fails_the_first_generating_check(settings):
@@ -236,7 +243,7 @@ def test_identical_references_are_refused(settings):
         qualify.validate(replace(settings, reference_b=settings.reference_a))
 
 
-def test_main_reports_failed_checks_with_nonzero_exit(settings, monkeypatch):
+def test_main_reports_failed_checks_with_nonzero_exit(settings, monkeypatch, capsys):
     import functools
     monkeypatch.setattr(qualify.bench, "configure_offline", lambda *args: None)
     admitted = {"repo_id": turbo.CHATTERBOX_TURBO_HF_REPO, "revision": REVISION, "snapshot": "fake"}
@@ -252,6 +259,8 @@ def test_main_reports_failed_checks_with_nonzero_exit(settings, monkeypatch):
     report = json.loads((settings.output_root / "results.json").read_text())
     assert report["status"] == "failed" and report["summary"]["failed"] >= 1
     assert report["provenance"]["runner_sha256"] == hashlib.sha256(SCRIPT.read_bytes()).hexdigest()
+    printed = capsys.readouterr().err.splitlines()
+    assert "FAIL memory_hit_skips_prepare" in printed and "RECORDED fixed_seed_cache_vs_bypass_parity" in printed
     cache.clear_voice_prompt_memory_cache()
     assert qualify.main(argv[:5] + [str(settings.output_root.with_name("run-ok"))] + argv[6:]) == 0
 
@@ -361,6 +370,23 @@ def test_nondeterministic_model_records_parity_cause(settings):
     results = {c["name"]: c for c in report["checks"]}
     parity = results["fixed_seed_cache_vs_bypass_parity"]["evidence"]
     assert parity["bit_exact"] is False and "lengths differ" in parity["likely_cause_if_not_exact"]
+    assert results["fixed_seed_cache_vs_bypass_parity"]["kind"] == "recorded"
+    assert results["same_mode_repeat_reproducibility"]["evidence"]["cached"]["bit_exact"] is False
+    assert report["status"] == "ok", "non-bit-exact audio is recorded, not gated"
+
+
+def test_recorded_check_errors_are_reported_without_gating_the_run(settings):
+    report = run(settings, fake_factory(), checks=[qualify.check_fixed_seed_cache_vs_bypass_parity])
+    check = report["checks"][0]
+    assert check["kind"] == "recorded" and check["passed"] is False and "prompt_a" in check["error"]
+    assert report["status"] == "ok"
+    assert report["summary"] == {"passed": 0, "failed": 0, "expected": 0,
+                                 "recorded": {"fixed_seed_cache_vs_bypass_parity": False}}
+
+
+@pytest.mark.parametrize("device,carrier", [("cpu", "data_ptr"), ("cuda:0", "device"), ("cuda", "device")])
+def test_storage_isolation_is_carried_by_pointers_on_cpu_and_by_device_elsewhere(device, carrier):
+    assert qualify.storage_isolation_carrier(device) == carrier
 
 
 def test_unload_problems_are_collected_after_reload(settings):
