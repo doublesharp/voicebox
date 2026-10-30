@@ -211,6 +211,48 @@ mod macos {
             assert_eq!(seen, [0, 1, 2, 3, 4]);
         }
 
+        static CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        #[test]
+        fn live_layout_resolution_refreshes_the_paste_key_cache() {
+            let _lock = CACHE_TEST_LOCK.lock().unwrap();
+            struct Restore(u16);
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    V_KEYCODE.store(self.0, Ordering::Relaxed);
+                }
+            }
+            let _restore = Restore(V_KEYCODE.load(Ordering::Relaxed));
+            V_KEYCODE.store(u16::MAX, Ordering::Relaxed);
+            resolve_into_cache();
+            let cached = super::super::paste_keycode_v();
+            assert!(cached <= MAX_KEYCODE, "cache was not updated");
+        }
+
+        #[test]
+        fn layout_change_notification_refreshes_the_paste_key_cache() {
+            let _lock = CACHE_TEST_LOCK.lock().unwrap();
+            struct Restore(u16);
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    V_KEYCODE.store(self.0, Ordering::Relaxed);
+                }
+            }
+            let _restore = Restore(V_KEYCODE.load(Ordering::Relaxed));
+            V_KEYCODE.store(u16::MAX, Ordering::Relaxed);
+            layout_changed(
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+            );
+            assert!(
+                super::super::paste_keycode_v() <= MAX_KEYCODE,
+                "notification did not refresh the cache"
+            );
+        }
+
         #[test]
         fn current_macos_layout_resolution_stays_within_the_scanned_range() {
             if let Some(key) = resolve_v_keycode() {
