@@ -386,10 +386,10 @@ trait DictationTarget {
     fn signal(&self, window: &Self::Window, event: &'static str);
 }
 
-struct NativeDictationTarget<'a>(&'a AppHandle);
+struct NativeDictationTarget<'a, R: tauri::Runtime>(&'a AppHandle<R>);
 
-impl DictationTarget for NativeDictationTarget<'_> {
-    type Window = tauri::WebviewWindow;
+impl<R: tauri::Runtime> DictationTarget for NativeDictationTarget<'_, R> {
+    type Window = tauri::WebviewWindow<R>;
     fn capture_focus(&self) -> Option<focus_capture::FocusSnapshot> {
         focus_capture::capture_focus().ok()
     }
@@ -437,7 +437,7 @@ impl DictationTarget for NativeDictationTarget<'_> {
     }
 }
 
-fn apply_effect(app: &AppHandle, effect: Effect) {
+fn apply_effect<R: tauri::Runtime>(app: &AppHandle<R>, effect: Effect) {
     apply_effect_to(&NativeDictationTarget(app), effect);
 }
 
@@ -794,5 +794,65 @@ mod window_bridge_tests {
             ]
         );
         assert_eq!(target.payloads.borrow()[0]["focus"]["pid"], 42);
+    }
+}
+
+#[cfg(test)]
+mod tauri_target_integration_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use tauri::Listener;
+
+    fn window(
+        app: &tauri::App<tauri::test::MockRuntime>,
+    ) -> tauri::WebviewWindow<tauri::test::MockRuntime> {
+        tauri::WebviewWindowBuilder::new(app, DICTATE_WINDOW_LABEL, Default::default())
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn native_target_delivers_recording_signals_to_dictate_window() {
+        let app = tauri::test::mock_app();
+        let window = window(&app);
+        let events = Arc::new(Mutex::new(Vec::<(String, serde_json::Value)>::new()));
+        for name in ["dictate:start", "dictate:stop", "dictate:restart"] {
+            let events = events.clone();
+            window.listen(name, move |event| {
+                events
+                    .lock()
+                    .unwrap()
+                    .push((name.into(), serde_json::from_str(event.payload()).unwrap()));
+            });
+        }
+        let target = NativeDictationTarget(app.handle());
+        let payload =
+            serde_json::json!({"focus":{"pid":42,"bundle_id":"example.app","role":"AXTextField"}});
+        target.present(&window);
+        target.start(&window, payload.clone());
+        apply_effect(app.handle(), Effect::StopRecording(ChordAction::PushToTalk));
+        apply_effect(
+            app.handle(),
+            Effect::RestartRecording(ChordAction::ToggleToTalk),
+        );
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                ("dictate:start".into(), payload),
+                ("dictate:stop".into(), serde_json::Value::Null),
+                ("dictate:restart".into(), serde_json::Value::Null),
+            ]
+        );
+    }
+
+    #[test]
+    fn stop_and_restart_are_safe_when_dictate_window_is_missing() {
+        let app = tauri::test::mock_app();
+        apply_effect(app.handle(), Effect::StopRecording(ChordAction::PushToTalk));
+        apply_effect(
+            app.handle(),
+            Effect::RestartRecording(ChordAction::ToggleToTalk),
+        );
+        assert!(app.get_webview_window(DICTATE_WINDOW_LABEL).is_none());
     }
 }
