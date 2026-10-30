@@ -109,10 +109,12 @@ unsafe fn ns_string_to_rust(s: Id) -> Option<String> {
     if bytes.is_null() {
         return None;
     }
-    std::ffi::CStr::from_ptr(bytes)
-        .to_str()
+    // NSString can contain NULs, so use the UTF-8 byte length rather than
+    // treating UTF8String as a C string.
+    let len: usize = msg_send![s, lengthOfBytesUsingEncoding: 4u64];
+    std::str::from_utf8(std::slice::from_raw_parts(bytes as *const u8, len))
         .ok()
-        .map(|x| x.to_owned())
+        .map(str::to_owned)
 }
 
 /// Build a `+1` retained CFString from an ASCII constant. Caller owns the
@@ -640,6 +642,37 @@ mod macos_string_tests {
             CFRelease(string as *const std::ffi::c_void);
             result
         }
+    }
+
+    fn convert_ns(text: &str) -> Option<String> {
+        unsafe {
+            let _pool = AutoreleasePool::new();
+            let allocated: Id = msg_send![class!(NSString), alloc];
+            let string: Id = msg_send![allocated, initWithBytes: text.as_ptr() length: text.len() encoding: 4u64];
+            assert!(!string.is_null());
+            let result = ns_string_to_rust(string);
+            let _: () = msg_send![string, release];
+            result
+        }
+    }
+
+    #[test]
+    fn foundation_strings_preserve_unicode_and_embedded_nuls() {
+        for text in [
+            "",
+            "com.example.Voicebox",
+            "café 日本語 🦜",
+            "before\0after",
+            "\0",
+            "a\0b\0c",
+        ] {
+            assert_eq!(convert_ns(text).as_deref(), Some(text));
+        }
+    }
+
+    #[test]
+    fn null_foundation_string_is_rejected() {
+        assert_eq!(unsafe { ns_string_to_rust(std::ptr::null_mut()) }, None);
     }
 
     #[test]
