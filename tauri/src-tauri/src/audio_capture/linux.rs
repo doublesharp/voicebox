@@ -1,6 +1,4 @@
 use crate::audio_capture::AudioCaptureState;
-use super::wav::samples_to_wav;
-use base64::{engine::general_purpose, Engine as _};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -109,7 +107,7 @@ pub async fn start_capture(
     state: &AudioCaptureState,
     max_duration_secs: u32,
 ) -> Result<(), String> {
-    let (capture, mut rx, timeout_tx) = state.begin_portable_capture();
+    let (capture, mut rx, timeout_tx, done_tx) = state.begin_portable_capture();
     let samples = capture.samples.clone();
     let sample_rate_arc = capture.sample_rate.clone();
     let channels_arc = capture.channels.clone();
@@ -127,6 +125,7 @@ pub async fn start_capture(
 
     // Spawn capture on a dedicated thread
     thread::spawn(move || {
+        let _completion = super::capture_worker_completion(done_tx);
         let host = cpal::default_host();
         let monitor_source = find_monitor_source_via_pactl();
 
@@ -287,37 +286,7 @@ pub async fn start_capture(
 }
 
 pub async fn stop_capture(state: &AudioCaptureState) -> Result<String, String> {
-    // Take and stop the same session whose data will be returned.
-    let capture = state.take_portable_capture()?;
-    super::signal_capture_stop(&capture.stop_tx);
-
-    // Wait a bit for capture to stop
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-    // Check if there was an error during capture
-    if let Some(error) = capture.error.lock().unwrap().as_ref() {
-        return Err(error.clone());
-    }
-
-    // Get samples
-    let samples = capture.samples.lock().unwrap().clone();
-    let sample_rate = *capture.sample_rate.lock().unwrap();
-    let channels = *capture.channels.lock().unwrap();
-
-    if samples.is_empty() {
-        return Err(
-            "No audio samples captured. Make sure audio is playing on your system during recording."
-                .to_string(),
-        );
-    }
-
-    // Convert to WAV
-    let wav_data = samples_to_wav(&samples, sample_rate, channels)?;
-
-    // Encode to base64
-    let base64_data = general_purpose::STANDARD.encode(&wav_data);
-
-    Ok(base64_data)
+    super::stop_portable_capture(state).await
 }
 
 pub fn is_supported() -> bool {
