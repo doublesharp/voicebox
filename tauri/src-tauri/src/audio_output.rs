@@ -90,6 +90,37 @@ struct SessionHandle {
     streaming: Option<StreamQueues>,
 }
 
+struct SessionCleanup {
+    active: Arc<Mutex<Option<SessionHandle>>>,
+    controls: Arc<PlaybackControls>,
+    id: String,
+}
+
+impl SessionCleanup {
+    fn new(
+        active: Arc<Mutex<Option<SessionHandle>>>,
+        controls: Arc<PlaybackControls>,
+        id: String,
+    ) -> Self {
+        Self {
+            active,
+            controls,
+            id,
+        }
+    }
+}
+
+impl Drop for SessionCleanup {
+    fn drop(&mut self) {
+        self.controls.stop();
+        if let Ok(mut active) = self.active.lock() {
+            if active.as_ref().is_some_and(|session| session.id == self.id) {
+                active.take();
+            }
+        }
+    }
+}
+
 /// CPAL streams are created and retained by their owner thread. The Tauri
 /// command awaits only a startup acknowledgement, never the clip's duration.
 pub struct AudioOutputState {
@@ -188,12 +219,13 @@ impl AudioOutputState {
             });
         }
         let (sender, ready) = tokio::sync::oneshot::channel();
-        let active = self.active.clone();
+        let cleanup = SessionCleanup::new(self.active.clone(), controls.clone(), id.clone());
         let worker_id = id.clone();
         let worker_controls = controls.clone();
         let spawned = std::thread::Builder::new()
             .name(format!("voicebox-{id}"))
             .spawn(move || {
+                let _cleanup = cleanup;
                 let mut ready = Some(sender);
                 if let Err(error) = run_pcm_session(
                     &app,
@@ -217,15 +249,6 @@ impl AudioOutputState {
                         0.0,
                         if stopped { None } else { Some(error) },
                     );
-                }
-                worker_controls.stop();
-                if let Ok(mut active) = active.lock() {
-                    if active
-                        .as_ref()
-                        .is_some_and(|current| current.id == worker_id)
-                    {
-                        active.take();
-                    }
                 }
             });
         if let Err(error) = spawned {
@@ -362,12 +385,13 @@ impl AudioOutputState {
             });
         }
         let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
-        let active = self.active.clone();
+        let cleanup = SessionCleanup::new(self.active.clone(), controls.clone(), id.clone());
         let worker_id = id.clone();
         let worker_controls = controls.clone();
         let spawned = std::thread::Builder::new()
             .name(format!("voicebox-{id}"))
             .spawn(move || {
+                let _cleanup = cleanup;
                 let mut ready = Some(ready_sender);
                 if let Err(error) = run_session(
                     &app,
@@ -390,14 +414,6 @@ impl AudioOutputState {
                         0.0,
                         if stopped { None } else { Some(error) },
                     );
-                }
-                if let Ok(mut current) = active.lock() {
-                    if current
-                        .as_ref()
-                        .is_some_and(|session| session.id == worker_id)
-                    {
-                        current.take();
-                    }
                 }
             });
         if let Err(error) = spawned {
@@ -2566,5 +2582,89 @@ mod wav_truncation_regression_tests {
         bytes[header + 4..header + 8].copy_from_slice(&u32::MAX.to_le_bytes());
         let (samples, rate, channels) = decode_audio(bytes).unwrap();
         assert_eq!((samples.len(), rate, channels), (4, 24000, 2));
+    }
+}
+
+#[cfg(test)]
+mod worker_cleanup_regression_tests {
+    use super::*;
+    use crate::audio_stream::PcmQueue;
+
+    fn session(
+        state: &AudioOutputState,
+        id: &str,
+        queue: Option<Arc<Mutex<PcmQueue>>>,
+    ) -> Arc<PlaybackControls> {
+        let controls = Arc::new(PlaybackControls::new(0.0, 1.0));
+        let (wake, _) = mpsc::channel();
+        *state.active.lock().unwrap() = Some(SessionHandle {
+            id: id.into(),
+            controls: controls.clone(),
+            wake,
+            streaming: queue.map(|queue| Arc::new(Mutex::new(vec![queue]))),
+        });
+        controls
+    }
+
+    #[test]
+    fn normal_worker_exit_clears_and_stops_its_session() {
+        let state = AudioOutputState::new();
+        let controls = session(&state, "first", None);
+        let cleanup = SessionCleanup::new(state.active.clone(), controls.clone(), "first".into());
+        drop(cleanup);
+        assert!(controls.stopped.load(Ordering::Acquire));
+        assert!(state.active.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn panicking_worker_clears_and_stops_its_session() {
+        let state = AudioOutputState::new();
+        let controls = session(&state, "first", None);
+        let cleanup = SessionCleanup::new(state.active.clone(), controls.clone(), "first".into());
+        let worker = std::thread::spawn(move || {
+            let _cleanup = cleanup;
+            panic!("worker failure");
+        });
+        assert!(worker.join().is_err());
+        assert!(controls.stopped.load(Ordering::Acquire));
+        assert!(state.active.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn old_worker_exit_cannot_clear_replacement_session() {
+        let state = AudioOutputState::new();
+        let old = session(&state, "old", None);
+        let cleanup = SessionCleanup::new(state.active.clone(), old.clone(), "old".into());
+        let current = session(&state, "new", None);
+        drop(cleanup);
+        assert!(old.stopped.load(Ordering::Acquire));
+        assert!(!current.stopped.load(Ordering::Acquire));
+        assert_eq!(state.active.lock().unwrap().as_ref().unwrap().id, "new");
+    }
+
+    #[tokio::test]
+    async fn worker_panic_releases_backpressured_preview_append() {
+        let state = Arc::new(AudioOutputState::new());
+        let queue = Arc::new(Mutex::new(PcmQueue::new(8000).unwrap()));
+        queue.lock().unwrap().append(&vec![0.0; 16000]).unwrap();
+        let controls = session(&state, "preview", Some(queue));
+        let pending_state = state.clone();
+        let pending =
+            tokio::spawn(
+                async move { pending_state.append_pcm_stream("preview", vec![0, 0]).await },
+            );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!pending.is_finished());
+        let cleanup = SessionCleanup::new(state.active.clone(), controls, "preview".into());
+        let worker = std::thread::spawn(move || {
+            let _cleanup = cleanup;
+            panic!("worker failure");
+        });
+        assert!(worker.join().is_err());
+        assert!(tokio::time::timeout(Duration::from_secs(1), pending)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
     }
 }
