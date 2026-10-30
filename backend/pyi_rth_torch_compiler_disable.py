@@ -52,6 +52,7 @@ _NoopDecorator pass-through.
 """
 
 import os
+import re
 import sys
 import tempfile
 import types
@@ -229,11 +230,7 @@ def _patch_scipy_distn_source(source: str) -> str:
     Returns the input unchanged if the target line isn't found (e.g. scipy
     version has changed).
     """
-    target = "\ndel obj\n"
-    replacement = "\nglobals().pop('obj', None)\n"
-    if target in source:
-        return source.replace(target, replacement, 1)
-    return source
+    return re.sub(r"(?m)^del obj[ \t]*(?=\r?$)", "globals().pop('obj', None)", source, count=1)
 
 
 def _patch_masking_utils_source(source: str) -> str:
