@@ -477,8 +477,18 @@ fn validate_wave_frame_alignment(data: &[u8]) -> Result<(), String> {
         let size = u32::from_le_bytes(header[4..8].try_into().unwrap());
         let body = offset + 8;
         if &header[..4] == b"data" {
+            let available = data.len() - body;
+            if size != u32::MAX && u64::from(size) > available as u64 {
+                return Err("Audio file is truncated".into());
+            }
             if let Some(align) = pcm_block_align {
-                if size != u32::MAX && size % align != 0 {
+                // A streaming data chunk extends to EOF when its size is unknown.
+                let audio_bytes = if size == u32::MAX {
+                    available as u64
+                } else {
+                    u64::from(size)
+                };
+                if audio_bytes % u64::from(align) != 0 {
                     return Err("WAV data ends in an incomplete audio frame".into());
                 }
             }
@@ -2436,5 +2446,125 @@ mod output_start_tests {
             Ok(())
         });
         assert_eq!(result.unwrap_err(), "Preview cancelled");
+    }
+}
+
+#[cfg(test)]
+mod wav_truncation_regression_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn wav() -> Vec<u8> {
+        let mut out = Cursor::new(Vec::new());
+        {
+            let mut writer = hound::WavWriter::new(
+                &mut out,
+                hound::WavSpec {
+                    channels: 2,
+                    sample_rate: 24000,
+                    bits_per_sample: 16,
+                    sample_format: hound::SampleFormat::Int,
+                },
+            )
+            .unwrap();
+            for sample in [0_i16, 1000, -1000, 2000] {
+                writer.write_sample(sample).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+        out.into_inner()
+    }
+
+    fn data_header(bytes: &[u8]) -> usize {
+        bytes.windows(4).position(|bytes| bytes == b"data").unwrap()
+    }
+
+    #[test]
+    fn streaming_wave_accepts_each_complete_stereo_frame_count() {
+        for frames in 1..=8 {
+            let mut bytes = wav();
+            let header = data_header(&bytes);
+            bytes.truncate(header + 8);
+            bytes.extend(std::iter::repeat_n(0, frames * 4));
+            bytes[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+            bytes[header + 4..header + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+            assert_eq!(decode_audio(bytes).unwrap().0.len(), frames * 2);
+        }
+    }
+
+    #[test]
+    fn streaming_wave_rejects_every_partial_stereo_frame_length() {
+        for remainder in 1..=3 {
+            let mut bytes = wav();
+            let header = data_header(&bytes);
+            bytes.extend(std::iter::repeat_n(0, remainder));
+            bytes[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+            bytes[header + 4..header + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+            assert!(
+                decode_audio(bytes).is_err(),
+                "accepted {remainder} extra bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn known_data_size_does_not_include_a_following_metadata_chunk() {
+        let mut bytes = wav();
+        bytes.extend_from_slice(b"JUNK\x04\x00\x00\x00test");
+        let length = (bytes.len() - 8) as u32;
+        bytes[4..8].copy_from_slice(&length.to_le_bytes());
+        assert_eq!(decode_audio(bytes).unwrap().0.len(), 4);
+    }
+
+    #[test]
+    fn playback_metadata_defaults_and_size_limit_are_enforced() {
+        let body = tauri::ipc::InvokeBody::Raw(vec![1, 2]);
+        let (bytes, ids, options) =
+            read_playback_request(&body, Some(r#"{"deviceIds":["a"]}"#)).unwrap();
+        assert_eq!(bytes, [1, 2]);
+        assert_eq!(ids, ["a"]);
+        assert!(options.is_none());
+        assert!(read_playback_request(&body, Some(&" ".repeat(16 * 1024 + 1))).is_err());
+        assert!(read_playback_request(&body, Some(r#"{"deviceIds":42}"#)).is_err());
+    }
+
+    #[test]
+    fn wave_rejects_a_data_chunk_larger_than_available_bytes() {
+        let mut bytes = wav();
+        let header = data_header(&bytes);
+        bytes[header + 4..header + 8].copy_from_slice(&100_u32.to_le_bytes());
+        assert!(
+            decode_audio(bytes).is_err(),
+            "a truncated data chunk must not play as a successful recording"
+        );
+    }
+
+    #[test]
+    fn wave_with_unknown_container_length_still_rejects_truncated_known_data() {
+        let mut bytes = wav();
+        let header = data_header(&bytes);
+        bytes[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        bytes[header + 4..header + 8].copy_from_slice(&100_u32.to_le_bytes());
+        assert!(decode_audio(bytes).is_err());
+    }
+
+    #[test]
+    fn streaming_wave_with_unknown_data_size_rejects_partial_frame() {
+        let mut bytes = wav();
+        let header = data_header(&bytes);
+        bytes[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        bytes[header + 4..header + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+        bytes.pop();
+        assert!(decode_audio(bytes).is_err());
+    }
+
+    #[test]
+    fn valid_streaming_wave_with_unknown_sizes_decodes_complete_frames() {
+        let mut bytes = wav();
+        let header = data_header(&bytes);
+        bytes[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        bytes[header + 4..header + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+        let (samples, rate, channels) = decode_audio(bytes).unwrap();
+        assert_eq!((samples.len(), rate, channels), (4, 24000, 2));
     }
 }
