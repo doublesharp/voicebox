@@ -158,6 +158,20 @@ def test_peak_rss_falls_back_to_rusage_without_peak_wset(monkeypatch):
     assert telemetry.process_memory(PosixProcess()) == (5, 7)
 
 
+def test_meter_without_psutil_records_unknown_process_memory():
+    meter = telemetry.StageMeter("cpu", cuda=None, process=None, clock=iter([0, 1]).__next__)
+    with meter.stage("load"):
+        pass
+    assert (meter.stages["load"].rss_bytes, meter.stages["load"].peak_rss_bytes) == (None, None)
+
+
+def test_real_meter_for_cpu_measures_this_process():
+    meter = telemetry.StageMeter.for_device("cpu")
+    with meter.stage("noop"):
+        pass
+    assert meter.stages["noop"].wall_s >= 0 and meter.stages["noop"].rss_bytes > 0
+
+
 torch = pytest.importorskip("torch")
 
 

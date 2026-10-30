@@ -50,7 +50,7 @@ class DeviceIdentity:
 class StageMeasurement:
     name: str
     wall_s: float
-    rss_bytes: int
+    rss_bytes: int | None
     peak_rss_bytes: int | None
     cuda_allocated_start_bytes: int | None
     cuda_allocated_bytes: int | None
@@ -137,7 +137,10 @@ def _rusage_peak_rss_bytes():
 
 
 def process_memory(process):
-    """(rss, peak rss) in bytes; peak is the Windows peak working set or ru_maxrss."""
+    """(rss, peak rss) in bytes; peak is the Windows peak working set or ru_maxrss.
+    Without psutil both are None rather than guessed."""
+    if process is None:
+        return None, None
     info = process.memory_info()
     peak = getattr(info, "peak_wset", None)
     if peak is None:
@@ -154,13 +157,17 @@ class StageMeter:
         self.stages = {}
 
     @classmethod
-    def for_device(cls, device):
-        import psutil
+    def for_device(cls, device, clock=time.perf_counter_ns):
+        try:
+            import psutil
+            process = psutil.Process()
+        except ImportError:
+            process = None
         cuda = None
         if device.startswith("cuda"):
             import torch
             cuda = torch.cuda
-        return cls(device, cuda=cuda, process=psutil.Process())
+        return cls(device, cuda=cuda, process=process, clock=clock)
 
     def cuda_allocated_bytes(self):
         return None if self.cuda is None else self.cuda.memory_allocated(self.device)
