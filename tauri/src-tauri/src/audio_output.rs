@@ -746,6 +746,28 @@ fn run_session(
         }
     }
     emit(app, id, "playing", start_position, duration, None);
+    monitor_playback(
+        &controls,
+        &positions,
+        &wake,
+        &error_receiver,
+        duration,
+        |state, position| {
+            emit(app, id, state, position, duration, None);
+        },
+    )?;
+    drop(streams);
+    Ok(())
+}
+
+fn monitor_playback(
+    controls: &PlaybackControls,
+    positions: &[(Arc<RenderPosition>, usize, u32)],
+    wake: &mpsc::Receiver<()>,
+    errors: &mpsc::Receiver<String>,
+    duration: f64,
+    mut report: impl FnMut(&'static str, f64),
+) -> Result<(), String> {
     let mut last_event = Instant::now();
     loop {
         let command = wake.recv_timeout(Duration::from_millis(20)).is_ok();
@@ -755,36 +777,31 @@ fn run_session(
             controls.requested_position().min(duration)
         };
         if controls.stopped.load(Ordering::Acquire) {
-            emit(app, id, "stopped", position, duration, None);
+            report("stopped", position);
             break;
         }
-        if let Ok(error) = error_receiver.try_recv() {
+        if let Ok(error) = errors.try_recv() {
             return Err(format!("Audio output failed: {error}"));
         }
         if positions.iter().all(|(position, frames, _)| {
             position.frame.load(Ordering::Acquire) >= *frames
                 && position.revision.load(Ordering::Acquire) == controls.revision()
         }) {
-            emit(app, id, "ended", duration, duration, None);
+            report("ended", duration);
             break;
         }
         if command || last_event.elapsed() >= Duration::from_millis(100) {
-            emit(
-                app,
-                id,
+            report(
                 if controls.paused.load(Ordering::Acquire) {
                     "paused"
                 } else {
                     "playing"
                 },
                 position.min(duration),
-                duration,
-                None,
             );
             last_event = Instant::now();
         }
     }
-    drop(streams);
     Ok(())
 }
 
@@ -944,11 +961,14 @@ fn run_pcm_session(
             controls.stop();
         }
     }
-    let mut last_event = Instant::now();
-    let mut last_device_check = Instant::now();
-    loop {
-        let _ = wake.recv_timeout(Duration::from_millis(20));
-        if last_device_check.elapsed() >= Duration::from_secs(1) {
+    monitor_preview(
+        &controls,
+        &queues,
+        &wake,
+        &receiver,
+        Duration::from_secs(1),
+        Duration::from_millis(100),
+        || {
             if default_route {
                 let current = host
                     .default_output_device()
@@ -966,6 +986,30 @@ fn run_pcm_session(
                     return Err("A selected audio output disconnected".into());
                 }
             }
+            Ok(())
+        },
+        |state, position, duration| emit(app, id, state, position, duration, None),
+    )?;
+    drop(streams);
+    Ok(())
+}
+
+fn monitor_preview(
+    controls: &PlaybackControls,
+    queues: &StreamQueues,
+    wake: &mpsc::Receiver<()>,
+    errors: &mpsc::Receiver<String>,
+    device_check_interval: Duration,
+    event_interval: Duration,
+    mut check_devices: impl FnMut() -> Result<(), String>,
+    mut report: impl FnMut(&'static str, f64, f64),
+) -> Result<(), String> {
+    let mut last_event = Instant::now();
+    let mut last_device_check = Instant::now();
+    loop {
+        let _ = wake.recv_timeout(Duration::from_millis(20));
+        if last_device_check.elapsed() >= device_check_interval {
+            check_devices()?;
             last_device_check = Instant::now();
         }
         let (position, ended) = {
@@ -980,23 +1024,282 @@ fn run_pcm_session(
             )
         };
         if controls.stopped.load(Ordering::Acquire) {
-            emit(app, id, "stopped", position, 0.0, None);
+            report("stopped", position, 0.0);
             break;
         }
-        if let Ok(error) = receiver.try_recv() {
+        if let Ok(error) = errors.try_recv() {
             return Err(format!("Audio output disconnected: {error}"));
         }
         if ended {
-            emit(app, id, "ended", position, position, None);
+            report("ended", position, position);
             break;
         }
-        if last_event.elapsed() >= Duration::from_millis(100) {
-            emit(app, id, "playing", position, 0.0, None);
+        if last_event.elapsed() >= event_interval {
+            let status = if controls.paused.load(Ordering::Acquire) {
+                "paused"
+            } else {
+                "playing"
+            };
+            report(status, position, 0.0);
             last_event = Instant::now();
         }
     }
-    drop(streams);
     Ok(())
+}
+
+#[cfg(test)]
+mod monitor_tests {
+    use super::*;
+    use crate::audio_stream::PcmQueue;
+
+    fn position(frame: usize, revision: usize) -> Arc<RenderPosition> {
+        let position = Arc::new(RenderPosition::default());
+        position.frame.store(frame, Ordering::Release);
+        position.revision.store(revision, Ordering::Release);
+        position
+    }
+
+    #[test]
+    fn clip_monitor_reports_stop_at_the_rendered_position() {
+        let controls = PlaybackControls::new(0.0, 1.0);
+        controls.stop();
+        let positions = vec![(position(25, controls.revision()), 100, 100)];
+        let (wake_tx, wake) = mpsc::channel();
+        let (_error_tx, errors) = mpsc::channel();
+        wake_tx.send(()).unwrap();
+        let mut events = Vec::new();
+        monitor_playback(&controls, &positions, &wake, &errors, 1.0, |state, time| {
+            events.push((state, time))
+        })
+        .unwrap();
+        assert_eq!(events, vec![("stopped", 0.25)]);
+    }
+
+    #[test]
+    fn clip_monitor_reports_device_errors_instead_of_success() {
+        let controls = PlaybackControls::new(0.0, 1.0);
+        let positions = vec![(position(100, controls.revision()), 100, 100)];
+        let (wake_tx, wake) = mpsc::channel();
+        let (error_tx, errors) = mpsc::channel();
+        error_tx.send("device lost".into()).unwrap();
+        wake_tx.send(()).unwrap();
+        let mut events = Vec::new();
+        let error = monitor_playback(&controls, &positions, &wake, &errors, 1.0, |state, time| {
+            events.push((state, time))
+        })
+        .unwrap_err();
+        assert_eq!(error, "Audio output failed: device lost");
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn clip_monitor_waits_for_every_output_to_finish() {
+        let controls = PlaybackControls::new(0.0, 1.0);
+        controls.paused.store(false, Ordering::Release);
+        let first = position(100, controls.revision());
+        let second = position(25, controls.revision());
+        let positions = vec![(first, 100, 100), (second.clone(), 100, 100)];
+        let (wake_tx, wake) = mpsc::channel();
+        let (_error_tx, errors) = mpsc::channel();
+        wake_tx.send(()).unwrap();
+        let mut events = Vec::new();
+        monitor_playback(&controls, &positions, &wake, &errors, 1.0, |state, time| {
+            events.push((state, time));
+            if state == "playing" {
+                second.frame.store(100, Ordering::Release);
+                wake_tx.send(()).unwrap();
+            }
+        })
+        .unwrap();
+        assert_eq!(events, vec![("playing", 1.0), ("ended", 1.0)]);
+    }
+
+    #[test]
+    fn clip_monitor_uses_requested_seek_until_renderers_acknowledge_it() {
+        let controls = PlaybackControls::new(0.0, 1.0);
+        controls.paused.store(false, Ordering::Release);
+        let output = position(100, controls.revision());
+        controls.seek(0.4);
+        let positions = vec![(output.clone(), 100, 100)];
+        let (wake_tx, wake) = mpsc::channel();
+        let (_error_tx, errors) = mpsc::channel();
+        wake_tx.send(()).unwrap();
+        let mut events = Vec::new();
+        monitor_playback(&controls, &positions, &wake, &errors, 1.0, |state, time| {
+            events.push((state, time));
+            if state == "playing" {
+                output.frame.store(100, Ordering::Release);
+                output
+                    .revision
+                    .store(controls.revision(), Ordering::Release);
+                wake_tx.send(()).unwrap();
+            }
+        })
+        .unwrap();
+        assert_eq!(events, vec![("playing", 0.4), ("ended", 1.0)]);
+    }
+
+    #[test]
+    fn clip_monitor_reports_pause_and_clamps_progress_to_duration() {
+        let controls = PlaybackControls::new(0.0, 1.0);
+        let positions = vec![(position(150, controls.revision()), 200, 100)];
+        let (wake_tx, wake) = mpsc::channel();
+        let (_error_tx, errors) = mpsc::channel();
+        wake_tx.send(()).unwrap();
+        let mut events = Vec::new();
+        monitor_playback(&controls, &positions, &wake, &errors, 1.0, |state, time| {
+            events.push((state, time));
+            if state == "paused" {
+                controls.stop();
+                wake_tx.send(()).unwrap();
+            }
+        })
+        .unwrap();
+        assert_eq!(events[0], ("paused", 1.0));
+        assert_eq!(events[1].0, "stopped");
+    }
+
+    fn preview_queue() -> Arc<Mutex<PcmQueue>> {
+        Arc::new(Mutex::new(PcmQueue::new(8000).unwrap()))
+    }
+
+    #[test]
+    fn preview_monitor_reports_paused_state_before_stopping() {
+        let controls = PlaybackControls::new(0.0, 1.0);
+        let queues: StreamQueues = Arc::new(Mutex::new(vec![preview_queue()]));
+        let (wake_tx, wake) = mpsc::channel();
+        let (_error_tx, errors) = mpsc::channel();
+        wake_tx.send(()).unwrap();
+        let mut events = Vec::new();
+        monitor_preview(
+            &controls,
+            &queues,
+            &wake,
+            &errors,
+            Duration::from_secs(1),
+            Duration::ZERO,
+            || Ok(()),
+            |state, _, _| {
+                events.push(state);
+                if events.len() == 1 {
+                    controls.stop();
+                    wake_tx.send(()).unwrap();
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(events, vec!["paused", "stopped"]);
+    }
+
+    #[test]
+    fn preview_monitor_waits_for_all_output_queues() {
+        let controls = PlaybackControls::new(0.0, 1.0);
+        controls.paused.store(false, Ordering::Release);
+        let first = preview_queue();
+        first.lock().unwrap().finished = true;
+        let second = preview_queue();
+        {
+            let mut queue = second.lock().unwrap();
+            queue.append(&[0.2, 0.4]).unwrap();
+            queue.finished = true;
+        }
+        let queues: StreamQueues = Arc::new(Mutex::new(vec![first, second.clone()]));
+        let (wake_tx, wake) = mpsc::channel();
+        let (_error_tx, errors) = mpsc::channel();
+        wake_tx.send(()).unwrap();
+        let mut events = Vec::new();
+        monitor_preview(
+            &controls,
+            &queues,
+            &wake,
+            &errors,
+            Duration::from_secs(1),
+            Duration::ZERO,
+            || Ok(()),
+            |state, _, _| {
+                events.push(state);
+                if state == "playing" {
+                    second
+                        .lock()
+                        .unwrap()
+                        .render(&mut [0.0; 2], 8000, 1, |sample| sample);
+                    wake_tx.send(()).unwrap();
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(events, vec!["playing", "ended"]);
+    }
+
+    #[test]
+    fn preview_monitor_reports_output_errors_before_completion() {
+        let controls = PlaybackControls::new(0.0, 1.0);
+        let queue = preview_queue();
+        queue.lock().unwrap().finished = true;
+        let queues: StreamQueues = Arc::new(Mutex::new(vec![queue]));
+        let (wake_tx, wake) = mpsc::channel();
+        let (error_tx, errors) = mpsc::channel();
+        error_tx.send("speaker disappeared".into()).unwrap();
+        wake_tx.send(()).unwrap();
+        let mut events = Vec::new();
+        let error = monitor_preview(
+            &controls,
+            &queues,
+            &wake,
+            &errors,
+            Duration::from_secs(1),
+            Duration::ZERO,
+            || Ok(()),
+            |state, _, _| events.push(state),
+        )
+        .unwrap_err();
+        assert_eq!(error, "Audio output disconnected: speaker disappeared");
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn preview_monitor_stops_when_the_output_route_changes() {
+        let controls = PlaybackControls::new(0.0, 1.0);
+        let queues: StreamQueues = Arc::new(Mutex::new(vec![preview_queue()]));
+        let (wake_tx, wake) = mpsc::channel();
+        let (_error_tx, errors) = mpsc::channel();
+        wake_tx.send(()).unwrap();
+        let error = monitor_preview(
+            &controls,
+            &queues,
+            &wake,
+            &errors,
+            Duration::ZERO,
+            Duration::ZERO,
+            || Err("device changed".into()),
+            |_, _, _| {},
+        )
+        .unwrap_err();
+        assert_eq!(error, "device changed");
+    }
+
+    #[test]
+    fn preview_monitor_reports_stopped_without_claiming_completion() {
+        let controls = PlaybackControls::new(0.0, 1.0);
+        controls.stop();
+        let queues: StreamQueues = Arc::new(Mutex::new(vec![preview_queue()]));
+        let (wake_tx, wake) = mpsc::channel();
+        let (_error_tx, errors) = mpsc::channel();
+        wake_tx.send(()).unwrap();
+        let mut events = Vec::new();
+        monitor_preview(
+            &controls,
+            &queues,
+            &wake,
+            &errors,
+            Duration::from_secs(1),
+            Duration::ZERO,
+            || Ok(()),
+            |state, position, duration| events.push((state, position, duration)),
+        )
+        .unwrap();
+        assert_eq!(events, vec![("stopped", 0.0, 0.0)]);
+    }
 }
 
 #[cfg(test)]
@@ -1435,21 +1738,33 @@ mod tests {
     async fn multi_output_preview_waits_until_every_queue_can_accept_a_block() {
         let state = Arc::new(AudioOutputState::new());
         let controls = Arc::new(PlaybackControls::new(0.0, 1.0));
-        let fast = Arc::new(Mutex::new(crate::audio_stream::PcmQueue::new(8000).unwrap()));
-        let slow = Arc::new(Mutex::new(crate::audio_stream::PcmQueue::new(8000).unwrap()));
+        let fast = Arc::new(Mutex::new(
+            crate::audio_stream::PcmQueue::new(8000).unwrap(),
+        ));
+        let slow = Arc::new(Mutex::new(
+            crate::audio_stream::PcmQueue::new(8000).unwrap(),
+        ));
         slow.lock().unwrap().append(&vec![0.5; 16000]).unwrap();
         let (wake, _receiver) = mpsc::channel();
         *state.active.lock().unwrap() = Some(SessionHandle {
-            id: "multi".into(), controls, wake,
+            id: "multi".into(),
+            controls,
+            wake,
             streaming: Some(Arc::new(Mutex::new(vec![fast.clone(), slow.clone()]))),
         });
         let pending_state = state.clone();
-        let pending = tokio::spawn(async move { pending_state.append_pcm_stream("multi", vec![0, 64, 0, 192]).await });
+        let pending = tokio::spawn(async move {
+            pending_state
+                .append_pcm_stream("multi", vec![0, 64, 0, 192])
+                .await
+        });
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(!pending.is_finished());
         assert_eq!(fast.lock().unwrap().samples_len_for_test(), 0);
         let mut output = [0.0_f32; 4];
-        slow.lock().unwrap().render(&mut output, 8000, 1, |sample| sample);
+        slow.lock()
+            .unwrap()
+            .render(&mut output, 8000, 1, |sample| sample);
         pending.await.unwrap().unwrap();
         assert_eq!(fast.lock().unwrap().samples_len_for_test(), 2);
         assert_eq!(slow.lock().unwrap().samples_len_for_test(), 15998);
@@ -1461,16 +1776,23 @@ mod tests {
     #[tokio::test]
     async fn finishing_a_backpressured_multi_output_rejects_the_block_everywhere() {
         let state = Arc::new(AudioOutputState::new());
-        let fast = Arc::new(Mutex::new(crate::audio_stream::PcmQueue::new(8000).unwrap()));
-        let slow = Arc::new(Mutex::new(crate::audio_stream::PcmQueue::new(8000).unwrap()));
+        let fast = Arc::new(Mutex::new(
+            crate::audio_stream::PcmQueue::new(8000).unwrap(),
+        ));
+        let slow = Arc::new(Mutex::new(
+            crate::audio_stream::PcmQueue::new(8000).unwrap(),
+        ));
         slow.lock().unwrap().append(&vec![0.5; 16000]).unwrap();
         let (wake, _receiver) = mpsc::channel();
         *state.active.lock().unwrap() = Some(SessionHandle {
-            id: "multi".into(), controls: Arc::new(PlaybackControls::new(0.0, 1.0)), wake,
+            id: "multi".into(),
+            controls: Arc::new(PlaybackControls::new(0.0, 1.0)),
+            wake,
             streaming: Some(Arc::new(Mutex::new(vec![fast.clone(), slow.clone()]))),
         });
         let pending_state = state.clone();
-        let pending = tokio::spawn(async move { pending_state.append_pcm_stream("multi", vec![0, 0]).await });
+        let pending =
+            tokio::spawn(async move { pending_state.append_pcm_stream("multi", vec![0, 0]).await });
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(!pending.is_finished());
         state.finish_pcm_stream("multi").unwrap();
@@ -1482,12 +1804,17 @@ mod tests {
     #[test]
     fn playback_metadata_checks_limits_types_and_defaults() {
         let body = tauri::ipc::InvokeBody::Raw(vec![0, 1]);
-        let (_, devices, options) = read_playback_request(&body, Some(r#"{"deviceIds":[],"options":{}}"#)).unwrap();
+        let (_, devices, options) =
+            read_playback_request(&body, Some(r#"{"deviceIds":[],"options":{}}"#)).unwrap();
         assert!(devices.is_empty());
         let options = options.unwrap();
         assert_eq!(options.start_time, 0.0);
         assert_eq!(options.volume, 1.0);
-        for metadata in ["{}", r#"{"deviceIds":"speaker"}"#, r#"{"deviceIds":[],"options":{"volume":"loud"}}"#] {
+        for metadata in [
+            "{}",
+            r#"{"deviceIds":"speaker"}"#,
+            r#"{"deviceIds":[],"options":{"volume":"loud"}}"#,
+        ] {
             assert!(read_playback_request(&body, Some(metadata)).is_err());
         }
         assert!(read_playback_request(&body, Some(&" ".repeat(16 * 1024 + 1))).is_err());
@@ -1498,11 +1825,26 @@ mod tests {
         let state = AudioOutputState::new();
         let (wake, _receiver) = mpsc::channel();
         *state.active.lock().unwrap() = Some(SessionHandle {
-            id: "clip".into(), controls: Arc::new(PlaybackControls::new(0.0, 1.0)), wake, streaming: None,
+            id: "clip".into(),
+            controls: Arc::new(PlaybackControls::new(0.0, 1.0)),
+            wake,
+            streaming: None,
         });
-        assert_eq!(state.append_pcm_stream("clip", vec![]).await.unwrap_err(), "Invalid PCM preview block");
-        assert_eq!(state.append_pcm_stream("clip", vec![0, 0]).await.unwrap_err(), "Not a preview session");
-        assert_eq!(state.finish_pcm_stream("clip").unwrap_err(), "Not a preview session");
+        assert_eq!(
+            state.append_pcm_stream("clip", vec![]).await.unwrap_err(),
+            "Invalid PCM preview block"
+        );
+        assert_eq!(
+            state
+                .append_pcm_stream("clip", vec![0, 0])
+                .await
+                .unwrap_err(),
+            "Not a preview session"
+        );
+        assert_eq!(
+            state.finish_pcm_stream("clip").unwrap_err(),
+            "Not a preview session"
+        );
     }
 
     #[tokio::test]
@@ -1510,21 +1852,50 @@ mod tests {
         let state = AudioOutputState::new();
         let controls = Arc::new(PlaybackControls::new(0.0, 1.0));
         controls.paused.store(false, Ordering::Release);
-        let first = Arc::new(Mutex::new(crate::audio_stream::PcmQueue::new(8000).unwrap()));
-        let second = Arc::new(Mutex::new(crate::audio_stream::PcmQueue::new(8000).unwrap()));
+        let first = Arc::new(Mutex::new(
+            crate::audio_stream::PcmQueue::new(8000).unwrap(),
+        ));
+        let second = Arc::new(Mutex::new(
+            crate::audio_stream::PcmQueue::new(8000).unwrap(),
+        ));
         let (wake, _receiver) = mpsc::channel();
         *state.active.lock().unwrap() = Some(SessionHandle {
-            id: "preview".into(), controls: controls.clone(), wake,
+            id: "preview".into(),
+            controls: controls.clone(),
+            wake,
             streaming: Some(Arc::new(Mutex::new(vec![first.clone(), second.clone()]))),
         });
-        state.append_pcm_stream("preview", vec![0, 64, 0, 192]).await.unwrap();
+        state
+            .append_pcm_stream("preview", vec![0, 64, 0, 192])
+            .await
+            .unwrap();
         state.finish_pcm_stream("preview").unwrap();
         state.finish_pcm_stream("preview").unwrap();
-        assert_eq!(state.append_pcm_stream("preview", vec![0, 0]).await.unwrap_err(), "Preview already finished");
+        assert_eq!(
+            state
+                .append_pcm_stream("preview", vec![0, 0])
+                .await
+                .unwrap_err(),
+            "Preview already finished"
+        );
         let mut left = [0.0; 2];
         let mut right = [0.0; 2];
-        render_preview(&mut left, 8000, 1, &mut first.lock().unwrap(), &controls, |s| s);
-        render_preview(&mut right, 8000, 1, &mut second.lock().unwrap(), &controls, |s| s);
+        render_preview(
+            &mut left,
+            8000,
+            1,
+            &mut first.lock().unwrap(),
+            &controls,
+            |s| s,
+        );
+        render_preview(
+            &mut right,
+            8000,
+            1,
+            &mut second.lock().unwrap(),
+            &controls,
+            |s| s,
+        );
         assert_eq!(left, [0.5, -0.5]);
         assert_eq!(right, left);
         assert!(first.lock().unwrap().ended() && second.lock().unwrap().ended());
@@ -1536,10 +1907,19 @@ mod tests {
         let controls = Arc::new(PlaybackControls::new(0.0, 1.0));
         let (wake, receiver) = mpsc::channel();
         *state.active.lock().unwrap() = Some(SessionHandle {
-            id: "preview".into(), controls: controls.clone(), wake,
+            id: "preview".into(),
+            controls: controls.clone(),
+            wake,
             streaming: Some(Arc::new(Mutex::new(vec![]))),
         });
-        let result = state.control_playback("preview", PlaybackControl { paused: Some(false), position: Some(1.0), volume: Some(0.2) });
+        let result = state.control_playback(
+            "preview",
+            PlaybackControl {
+                paused: Some(false),
+                position: Some(1.0),
+                volume: Some(0.2),
+            },
+        );
         assert_eq!(result.unwrap_err(), "Speech preview cannot seek");
         assert!(controls.paused.load(Ordering::Acquire));
         assert_eq!(controls.requested_position(), 0.0);
@@ -1551,7 +1931,10 @@ mod tests {
         let devices = vec!["Speaker".to_string(), "Headphones".to_string()];
         let speaker = device_id(&devices[0]);
         let headphones = device_id(&devices[1]);
-        assert_eq!(selected_device_indices(&devices, &[headphones, speaker.clone(), speaker]).unwrap(), vec![0, 1]);
+        assert_eq!(
+            selected_device_indices(&devices, &[headphones, speaker.clone(), speaker]).unwrap(),
+            vec![0, 1]
+        );
         assert!(selected_device_indices(&devices, &["device_unknown".into()]).is_err());
     }
 
