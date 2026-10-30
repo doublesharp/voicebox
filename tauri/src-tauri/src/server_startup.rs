@@ -1346,3 +1346,79 @@ mod startup_log_regression_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod uvicorn_process_tests {
+    use super::*;
+    use tauri::async_runtime::channel;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::Command;
+
+    // The production shell plugin delivers one CommandEvent per output line.
+    // Use a real Uvicorn subprocess while keeping the Python dependency optional
+    // for the standard Rust suite.
+    async fn run_uvicorn(port: u16) -> (Outcome, Vec<String>) {
+        let python = std::env::var_os("VOICEBOX_TEST_PYTHON")
+            .expect("set VOICEBOX_TEST_PYTHON to a Python with uvicorn installed");
+        let script = r#"
+import uvicorn
+async def app(scope, receive, send):
+    pass
+uvicorn.run(app, host='127.0.0.1', port=int(__import__('sys').argv[1]), log_level='info')
+"#;
+        let mut child = Command::new(python)
+            .args(["-u", "-c", script, &port.to_string()])
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn uvicorn");
+        let (tx, mut rx) = channel(32);
+        let mut stderr = BufReader::new(child.stderr.take().unwrap()).lines();
+        let reader = tokio::spawn(async move {
+            while let Ok(Some(line)) = stderr.next_line().await {
+                if tx
+                    .send(CommandEvent::Stderr(line.into_bytes()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let mut logs = Vec::new();
+        let outcome = wait_for_startup(&mut rx, Duration::from_secs(10), |_, line| {
+            logs.push(line.to_owned());
+        })
+        .await;
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        reader.abort();
+        (outcome, logs)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires VOICEBOX_TEST_PYTHON with uvicorn installed"]
+    async fn real_uvicorn_listening_message_reports_ready() {
+        let (outcome, logs) = run_uvicorn(0).await;
+        assert_eq!(outcome, Outcome::Ready, "logs: {logs:?}");
+        assert!(logs
+            .iter()
+            .any(|line| line.contains("Uvicorn running on http://127.0.0.1:")));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires VOICEBOX_TEST_PYTHON with uvicorn installed"]
+    async fn real_uvicorn_bind_failure_never_reports_ready() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (outcome, logs) = run_uvicorn(port).await;
+        assert_eq!(outcome, Outcome::Exited, "logs: {logs:?}");
+        assert!(
+            logs.iter()
+                .any(|line| line.to_lowercase().contains("address already in use")),
+            "logs: {logs:?}"
+        );
+    }
+}
