@@ -822,3 +822,26 @@ def test_cli_requires_explicit_device(tmp_path):
                             capture_output=True, text=True, timeout=10)
     assert result.returncode == 2 and "--device" in result.stderr
     assert not (tmp_path / "run").exists()
+
+
+def test_qwen_inference_roots_are_the_loaded_model():
+    adapter = SimpleNamespace(model="loaded")
+    assert bench.qwen_inference_roots(adapter) == {"model": "loaded"}
+
+
+def test_socketpair_emulation_gate_admits_only_loopback_connects_from_cpython_emulation(monkeypatch):
+    connect = (SimpleNamespace(family=bench.socket.AF_INET), ("127.0.0.1", 50000))
+
+    def emulated():
+        bench.deny_network("socket.connect", connect)
+        return bench.inside_socketpair_emulation()
+
+    monkeypatch.setattr(bench.socket, "_fallback_socketpair", emulated, raising=False)
+    assert emulated() is True
+    with pytest.raises(OSError, match="network connections"):
+        bench.deny_network("socket.connect", (SimpleNamespace(family=bench.socket.AF_INET), ("10.0.0.1", 50000)))
+    assert bench.inside_socketpair_emulation() is False
+    monkeypatch.delattr(bench.socket, "_fallback_socketpair")
+    assert bench.inside_socketpair_emulation() is False
+    with pytest.raises(OSError, match="network connections"):
+        bench.deny_network("socket.connect", connect)

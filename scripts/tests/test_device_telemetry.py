@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
+import sys
 
 from scripts import device_telemetry as telemetry
 
@@ -174,7 +175,46 @@ def test_real_meter_for_cpu_measures_this_process():
     assert meter.stages["noop"].wall_s >= 0 and meter.stages["noop"].rss_bytes > 0
 
 
+def test_real_nvidia_smi_returns_text_or_none_and_tolerates_failure(monkeypatch):
+    result = telemetry.run_nvidia_smi()
+    assert result is None or telemetry.parse_nvidia_smi(result)
+
+    def missing(*args, **kwargs):
+        raise FileNotFoundError("nvidia-smi")
+
+    monkeypatch.setattr(telemetry.subprocess, "check_output", missing)
+    assert telemetry.run_nvidia_smi() is None
+
+
+def test_parse_skips_blank_lines():
+    assert telemetry.parse_nvidia_smi("\n" + SMI + "\n") == telemetry.parse_nvidia_smi(SMI)
+
+
+def test_meter_without_psutil_module_still_measures(monkeypatch):
+    monkeypatch.setitem(sys.modules, "psutil", None)
+    meter = telemetry.StageMeter.for_device("cpu")
+    with meter.stage("noop"):
+        pass
+    assert meter.stages["noop"].rss_bytes is None
+
+
+def test_rusage_peak_is_none_without_resource_module(monkeypatch):
+    monkeypatch.setitem(sys.modules, "resource", None)
+    assert telemetry._rusage_peak_rss_bytes() is None
+
+
 torch = pytest.importorskip("torch")
+
+def test_real_identity_and_cuda_meter_on_this_host():
+    identity = telemetry.collect_identity("cpu")
+    assert identity.torch_version == torch.__version__ and identity.selected_device == "cpu"
+    if not torch.cuda.is_available():
+        pytest.skip("real CUDA meter needs a CUDA device")
+    meter = telemetry.StageMeter.for_device("cuda:0")
+    with meter.stage("tiny"):
+        torch.ones(4, device="cuda:0").sum().item()
+    assert meter.stages["tiny"].cuda_allocated_peak_bytes >= 0 and meter.cuda_allocated_bytes() >= 0
+
 
 
 def test_residency_reports_devices_of_modules_and_tensors_and_refuses_mismatch():

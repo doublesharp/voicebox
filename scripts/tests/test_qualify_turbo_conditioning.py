@@ -281,3 +281,112 @@ def test_spy_does_not_keep_its_owner_alive():
     del owner
     gc.collect()
     assert alive() is None, "spy retained the model it observes"
+
+
+def test_spy_raises_once_its_owner_is_released():
+    import gc
+
+    class Owner:
+        def method(self):
+            return "alive"
+
+    owner = Owner()
+    spy = qualify.Spy(owner, "method")
+    del owner
+    gc.collect()
+    with pytest.raises(RuntimeError, match="released"):
+        spy()
+
+
+def test_loaded_adapter_and_cleanup_failure_are_refused(settings):
+    def loaded(*args):
+        adapter = fake_factory()(*args)
+        adapter._load_model_sync()
+        return adapter
+
+    report = run(settings, loaded)
+    assert report["status"] == "failed" and "fresh unloaded" in report["error"]["message"]
+
+    def failing_unload(*args):
+        adapter = fake_factory()(*args)
+
+        def unload():
+            raise RuntimeError("unload failed")
+
+        adapter.unload_model = unload
+        return adapter
+
+    from dataclasses import replace
+    report = run(replace(settings, output_root=settings.output_root.with_name("run-cleanup")), failing_unload, checks=[])
+    assert report["status"] == "failed" and report["cleanup_error"]["message"] == "unload failed"
+
+
+def test_nondeterministic_model_records_parity_cause(settings):
+    class Nondeterministic(FakeModel):
+        def generate(self, text, audio_prompt_path=None, **kwargs):
+            import random
+            return super().generate(text, audio_prompt_path, **kwargs)[:, :, : 12000 - random.randrange(1, 100)]
+
+    factory = fake_factory()
+
+    def nondeterministic(*args):
+        adapter = factory(*args)
+
+        def load_sync():
+            adapter._device = "cpu"
+            adapter.model = Nondeterministic()
+            adapter._conditioning_model_id = f"{turbo.CHATTERBOX_TURBO_HF_REPO}@{REVISION}"
+
+        adapter._load_model_sync = load_sync
+        return adapter
+
+    report = run(settings, nondeterministic)
+    results = {c["name"]: c for c in report["checks"]}
+    parity = results["fixed_seed_cache_vs_bypass_parity"]["evidence"]
+    assert parity["bit_exact"] is False and "lengths differ" in parity["likely_cause_if_not_exact"]
+
+
+def test_unload_problems_are_collected_after_reload(settings):
+    class StickyCuda:
+        """Fake torch.cuda whose allocation never drops."""
+
+        def synchronize(self, device):
+            pass
+
+        def reset_peak_memory_stats(self, device):
+            pass
+
+        def memory_allocated(self, device):
+            return 4_000_000_000
+
+        max_memory_allocated = memory_reserved = max_memory_reserved = memory_allocated
+
+    def meter_factory(device):
+        return qualify.telemetry.StageMeter(device, cuda=StickyCuda(), process=None)
+
+    factory = fake_factory()
+
+    def stays_loaded(*args):
+        adapter = factory(*args)
+        original_unload = adapter.unload_model
+
+        def unload():
+            original_unload()
+            adapter.model = FakeModel()
+            adapter._conditioning_model_id = f"{turbo.CHATTERBOX_TURBO_HF_REPO}@{REVISION}"
+
+        adapter.unload_model = unload
+        return adapter
+
+    report = run(settings, stays_loaded, meter_factory=meter_factory)
+    result = {c["name"]: c for c in report["checks"]}["unload_releases_vram_and_reload_hits_disk"]
+    assert result["passed"] is False
+    assert "adapter still loaded" in result["error"] and "VRAM not released" in result["error"]
+    assert {c["name"]: c["passed"] for c in report["checks"]}["cancellation_then_admission"] is True
+
+
+def test_main_refuses_invalid_settings_before_writing(settings):
+    assert qualify.main(["--device", "gpu", "--cache-root", str(settings.cache_root), "--output-root", str(settings.output_root),
+                         "--reference-a", str(settings.reference_a), "--reference-a-text", "A.",
+                         "--reference-b", str(settings.reference_b), "--reference-b-text", "B."]) == 2
+    assert not settings.output_root.exists()
