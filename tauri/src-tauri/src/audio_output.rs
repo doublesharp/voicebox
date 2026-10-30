@@ -1479,6 +1479,82 @@ mod tests {
         assert_eq!(slow.lock().unwrap().samples_len_for_test(), 16000);
     }
 
+    #[test]
+    fn playback_metadata_checks_limits_types_and_defaults() {
+        let body = tauri::ipc::InvokeBody::Raw(vec![0, 1]);
+        let (_, devices, options) = read_playback_request(&body, Some(r#"{"deviceIds":[],"options":{}}"#)).unwrap();
+        assert!(devices.is_empty());
+        let options = options.unwrap();
+        assert_eq!(options.start_time, 0.0);
+        assert_eq!(options.volume, 1.0);
+        for metadata in ["{}", r#"{"deviceIds":"speaker"}"#, r#"{"deviceIds":[],"options":{"volume":"loud"}}"#] {
+            assert!(read_playback_request(&body, Some(metadata)).is_err());
+        }
+        assert!(read_playback_request(&body, Some(&" ".repeat(16 * 1024 + 1))).is_err());
+    }
+
+    #[tokio::test]
+    async fn preview_append_rejects_empty_blocks_and_non_preview_sessions() {
+        let state = AudioOutputState::new();
+        let (wake, _receiver) = mpsc::channel();
+        *state.active.lock().unwrap() = Some(SessionHandle {
+            id: "clip".into(), controls: Arc::new(PlaybackControls::new(0.0, 1.0)), wake, streaming: None,
+        });
+        assert_eq!(state.append_pcm_stream("clip", vec![]).await.unwrap_err(), "Invalid PCM preview block");
+        assert_eq!(state.append_pcm_stream("clip", vec![0, 0]).await.unwrap_err(), "Not a preview session");
+        assert_eq!(state.finish_pcm_stream("clip").unwrap_err(), "Not a preview session");
+    }
+
+    #[tokio::test]
+    async fn preview_block_is_delivered_identically_to_all_outputs_and_finish_is_final() {
+        let state = AudioOutputState::new();
+        let controls = Arc::new(PlaybackControls::new(0.0, 1.0));
+        controls.paused.store(false, Ordering::Release);
+        let first = Arc::new(Mutex::new(crate::audio_stream::PcmQueue::new(8000).unwrap()));
+        let second = Arc::new(Mutex::new(crate::audio_stream::PcmQueue::new(8000).unwrap()));
+        let (wake, _receiver) = mpsc::channel();
+        *state.active.lock().unwrap() = Some(SessionHandle {
+            id: "preview".into(), controls: controls.clone(), wake,
+            streaming: Some(Arc::new(Mutex::new(vec![first.clone(), second.clone()]))),
+        });
+        state.append_pcm_stream("preview", vec![0, 64, 0, 192]).await.unwrap();
+        state.finish_pcm_stream("preview").unwrap();
+        state.finish_pcm_stream("preview").unwrap();
+        assert_eq!(state.append_pcm_stream("preview", vec![0, 0]).await.unwrap_err(), "Preview already finished");
+        let mut left = [0.0; 2];
+        let mut right = [0.0; 2];
+        render_preview(&mut left, 8000, 1, &mut first.lock().unwrap(), &controls, |s| s);
+        render_preview(&mut right, 8000, 1, &mut second.lock().unwrap(), &controls, |s| s);
+        assert_eq!(left, [0.5, -0.5]);
+        assert_eq!(right, left);
+        assert!(first.lock().unwrap().ended() && second.lock().unwrap().ended());
+    }
+
+    #[test]
+    fn preview_rejects_seek_without_applying_other_control_changes() {
+        let state = AudioOutputState::new();
+        let controls = Arc::new(PlaybackControls::new(0.0, 1.0));
+        let (wake, receiver) = mpsc::channel();
+        *state.active.lock().unwrap() = Some(SessionHandle {
+            id: "preview".into(), controls: controls.clone(), wake,
+            streaming: Some(Arc::new(Mutex::new(vec![]))),
+        });
+        let result = state.control_playback("preview", PlaybackControl { paused: Some(false), position: Some(1.0), volume: Some(0.2) });
+        assert_eq!(result.unwrap_err(), "Speech preview cannot seek");
+        assert!(controls.paused.load(Ordering::Acquire));
+        assert_eq!(controls.requested_position(), 0.0);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn device_selection_deduplicates_requests_and_preserves_device_order() {
+        let devices = vec!["Speaker".to_string(), "Headphones".to_string()];
+        let speaker = device_id(&devices[0]);
+        let headphones = device_id(&devices[1]);
+        assert_eq!(selected_device_indices(&devices, &[headphones, speaker.clone(), speaker]).unwrap(), vec![0, 1]);
+        assert!(selected_device_indices(&devices, &["device_unknown".into()]).is_err());
+    }
+
     /// Opt-in host proof: uses the production CPAL callback, no webview/mock device.
     #[test]
     #[ignore = "plays sound on the host; run explicitly for native qualification"]
