@@ -17,6 +17,38 @@ trait PasteBackend {
     fn restore(&self, snapshot: &Self::Snapshot) -> Result<(), String>;
 }
 
+// Restore while still holding the process-wide paste lock, including when the
+// asynchronous paste future is cancelled during the consume delay.
+struct ClipboardRestore<'a, B: PasteBackend> {
+    backend: &'a B,
+    snapshot: B::Snapshot,
+    after_write: i64,
+    armed: bool,
+}
+
+impl<B: PasteBackend> ClipboardRestore<'_, B> {
+    fn restore_if_unchanged(&mut self) -> Result<(), String> {
+        if !self.armed {
+            return Ok(());
+        }
+        self.armed = false;
+        if matches!(self.backend.change_count(), Ok(current) if current == self.after_write) {
+            self.backend.restore(&self.snapshot)
+        } else {
+            eprintln!("[voicebox] clipboard mutated during paste window — skipping restore to preserve newer content");
+            Ok(())
+        }
+    }
+}
+
+impl<B: PasteBackend> Drop for ClipboardRestore<'_, B> {
+    fn drop(&mut self) {
+        if let Err(error) = self.restore_if_unchanged() {
+            eprintln!("[voicebox] failed to restore clipboard after paste cancellation: {error}");
+        }
+    }
+}
+
 pub(crate) struct NativePaste;
 impl PasteBackend for NativePaste {
     type Snapshot = clipboard::ClipboardSnapshot;
@@ -71,14 +103,15 @@ async fn paste_with<B: PasteBackend, F: Future<Output = ()>>(
     sleep(Duration::from_millis(crate::POST_ACTIVATE_SETTLE_MS)).await;
     let snapshot = backend.save()?;
     let after_write = backend.write(text)?;
+    let mut restore = ClipboardRestore {
+        backend,
+        snapshot,
+        after_write,
+        armed: true,
+    };
     let paste_result = backend.send();
     sleep(Duration::from_millis(crate::PASTE_CONSUME_MS)).await;
-    let safe_to_restore = matches!(backend.change_count(), Ok(current) if current == after_write);
-    if safe_to_restore {
-        backend.restore(&snapshot)?;
-    } else {
-        eprintln!("[voicebox] clipboard mutated during paste window — skipping restore to preserve newer content");
-    }
+    restore.restore_if_unchanged()?;
     paste_result?;
     Ok(true)
 }
@@ -363,6 +396,62 @@ mod concurrent_paste_tests {
             assert_eq!(clipboard.sent, ["first", "second"]);
             assert_eq!(
                 clipboard.text,
+                if external_change {
+                    "newer clipboard"
+                } else {
+                    "original clipboard"
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_restores_staged_clipboard_but_preserves_external_changes() {
+        for (fail_first, external_change) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let backend = Backend(RefCell::new(Clipboard {
+                text: "original clipboard".into(),
+                revision: 0,
+                sent: vec![],
+                fail_first,
+            }));
+            let focus = focus_capture::FocusSnapshot {
+                pid: 42,
+                bundle_id: None,
+                role: None,
+            };
+            let entered = Notify::new();
+            let entered_ref = &entered;
+            let mut paste = Box::pin(paste_with(
+                "first",
+                &focus,
+                &backend,
+                |duration| async move {
+                    if duration == Duration::from_millis(crate::PASTE_CONSUME_MS) {
+                        entered_ref.notify_one();
+                        std::future::pending::<()>().await;
+                    }
+                },
+            ));
+            tokio::select! {
+                _ = entered.notified() => {},
+                result = &mut paste => panic!("paste ended before cancellation: {result:?}"),
+            }
+            assert_eq!(backend.0.borrow().text, "first");
+            if external_change {
+                let mut clipboard = backend.0.borrow_mut();
+                clipboard.text = "newer clipboard".into();
+                clipboard.revision += 1;
+            }
+            drop(paste);
+            // A cancelled request must release the transaction lock as well.
+            assert_eq!(
+                paste_with("second", &focus, &backend, |_| async {}).await,
+                Ok(true)
+            );
+            assert_eq!(
+                backend.0.borrow().text,
                 if external_change {
                     "newer clipboard"
                 } else {
