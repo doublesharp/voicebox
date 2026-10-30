@@ -1,6 +1,6 @@
 use crate::audio_capture::AudioCaptureState;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use wasapi::*;
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
@@ -81,7 +81,31 @@ pub async fn start_capture(
 
         // Set sample rate and channels
         let channels = mix_format.get_nchannels() as usize;
-        let bytes_per_sample = (mix_format.get_bitspersample() / 8) as usize;
+        let bits = mix_format.get_bitspersample();
+        let sample_kind = match mix_format.get_subformat() {
+            Ok(SampleType::Float) => super::windows_pcm::SampleKind::Float,
+            Ok(SampleType::Int) => super::windows_pcm::SampleKind::Integer,
+            Err(error) => {
+                super::record_windows_capture_error(
+                    &error_arc,
+                    format!("Unsupported capture format: {error}"),
+                );
+                return;
+            }
+        };
+        let bytes_per_sample = match super::windows_pcm::validate_format(
+            channels,
+            bits,
+            mix_format.get_validbitspersample(),
+            mix_format.get_blockalign() as usize,
+            sample_kind,
+        ) {
+            Ok(width) => width,
+            Err(error) => {
+                super::record_windows_capture_error(&error_arc, error);
+                return;
+            }
+        };
         *sample_rate_arc.lock().unwrap() = mix_format.get_samplespersec();
         *channels_arc.lock().unwrap() = mix_format.get_nchannels();
 
@@ -101,11 +125,13 @@ pub async fn start_capture(
         // For loopback mode: get Render device, initialize with Capture direction
         // This triggers AUDCLNT_STREAMFLAGS_LOOPBACK in the wasapi crate
         let stream_mode = StreamMode::EventsShared {
-            autoconvert: true,  // Enable automatic format conversion
+            autoconvert: true,               // Enable automatic format conversion
             buffer_duration_hns: min_period, // Use minimum period
         };
 
-        if let Err(e) = audio_client.initialize_client(&mix_format, &Direction::Capture, &stream_mode) {
+        if let Err(e) =
+            audio_client.initialize_client(&mix_format, &Direction::Capture, &stream_mode)
+        {
             let error_msg = format!("Failed to initialize audio client: {}", e);
             eprintln!("{}", error_msg);
             *error_arc.lock().unwrap() = Some(error_msg);
@@ -152,29 +178,40 @@ pub async fn start_capture(
                 Ok(Some(frames_available)) => {
                     if frames_available > 0 {
                         // Calculate buffer size needed (frames * channels * bytes_per_sample)
-                        let buffer_size = frames_available as usize * channels * bytes_per_sample;
-
-                        let mut buffer = vec![0u8; buffer_size];
+                        let Some(buffer_size) = (frames_available as usize)
+                            .checked_mul(channels)
+                            .and_then(|value| value.checked_mul(bytes_per_sample))
+                        else {
+                            super::record_windows_capture_error(
+                                &error_arc,
+                                "Capture packet is too large".into(),
+                            );
+                            break;
+                        };
+                        let mut buffer = Vec::new();
+                        if buffer.try_reserve_exact(buffer_size).is_err() {
+                            super::record_windows_capture_error(
+                                &error_arc,
+                                "Capture packet is too large".into(),
+                            );
+                            break;
+                        }
+                        buffer.resize(buffer_size, 0);
                         match capture_client.read_from_device(&mut buffer) {
-                            Ok((frames_read, _buffer_info)) => {
+                            Ok((frames_read, buffer_info)) => {
                                 if frames_read > 0 {
-                                    // Convert bytes to f32 samples
-                                    let samples_read = (frames_read as usize * channels) as usize;
-                                    let mut samples_guard = samples.lock().unwrap();
-
-                                    // Assuming 32-bit float format
-                                    if bytes_per_sample == 4 {
-                                        for i in 0..samples_read {
-                                            let byte_offset = i * 4;
-                                            if byte_offset + 4 <= buffer.len() {
-                                                let sample = f32::from_le_bytes([
-                                                    buffer[byte_offset],
-                                                    buffer[byte_offset + 1],
-                                                    buffer[byte_offset + 2],
-                                                    buffer[byte_offset + 3],
-                                                ]);
-                                                samples_guard.push(sample);
-                                            }
+                                    match super::windows_pcm::decode_packet(
+                                        &buffer,
+                                        frames_read as usize,
+                                        channels,
+                                        bits,
+                                        sample_kind,
+                                        buffer_info.flags.silent,
+                                    ) {
+                                        Ok(decoded) => samples.lock().unwrap().extend(decoded),
+                                        Err(error) => {
+                                            super::record_windows_capture_error(&error_arc, error);
+                                            break;
                                         }
                                     }
                                 }

@@ -1,4 +1,6 @@
 mod wav;
+#[cfg(any(test, target_os = "windows"))]
+mod windows_pcm;
 
 #[cfg(target_os = "linux")]
 mod linux;
