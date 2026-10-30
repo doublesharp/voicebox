@@ -213,15 +213,6 @@ export function useAudioRecording({
     }
   }, [deviceId, maxDurationSeconds, onRecordingComplete, platform.metadata.isTauri, processing]);
 
-  const stopRecording = useCallback(() => {
-    const session = currentRef.current;
-    if (!session?.recorder || session.recorder.state === 'inactive') return;
-    session.stoppedAt = Date.now();
-    session.recorder.stop();
-    setIsRecording(false);
-    clearSessionTimer(session);
-  }, []);
-
   const cancelRecording = useCallback(() => {
     const session = currentRef.current;
     if (!session) return;
@@ -238,6 +229,23 @@ export function useAudioRecording({
     setDuration(0);
     setAudioStream(null);
   }, []);
+
+  // Return true when a pending microphone request was cancelled before a
+  // recorder existed; callers can clear any provisional recording UI.
+  const stopRecording = useCallback((): boolean => {
+    const session = currentRef.current;
+    if (!session) return false;
+    if (!session.recorder) {
+      cancelRecording();
+      return true;
+    }
+    if (session.recorder.state === 'inactive') return false;
+    session.stoppedAt = Date.now();
+    session.recorder.stop();
+    setIsRecording(false);
+    clearSessionTimer(session);
+    return false;
+  }, [cancelRecording]);
 
   useEffect(
     () => () => {

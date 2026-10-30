@@ -279,3 +279,65 @@ test('conversion failure returns the original audio for an uncancelled recording
   expect(completed).toHaveBeenCalledTimes(1);
   expect(await completed.mock.calls[0][0].text()).toBe('original');
 });
+
+
+test('stop while microphone permission is pending cancels startup and releases its late stream', async () => {
+  const media = navigator.mediaDevices;
+  const original = media.getUserMedia;
+  let resolve!: (stream: MediaStream) => void;
+  const pending = new Promise<MediaStream>((r) => { resolve = r; });
+  const track = { stop: mock(() => {}), getSettings: () => ({ deviceId: 'mic' }) };
+  media.getUserMedia = () => pending;
+  try {
+    mount();
+    let starting!: Promise<void>;
+    act(() => { starting = recording.startRecording(); });
+    expect(recording.isStarting).toBe(true);
+    act(() => recording.stopRecording());
+    expect(recording.isStarting).toBe(false);
+    await act(async () => {
+      resolve({ getTracks: () => [track], getAudioTracks: () => [track] } as unknown as MediaStream);
+      await starting;
+    });
+    expect(track.stop).toHaveBeenCalledTimes(1);
+    expect(recorders).toHaveLength(0);
+    expect(recording.isRecording).toBe(false);
+    expect(completed).not.toHaveBeenCalled();
+  } finally {
+    media.getUserMedia = original;
+  }
+});
+
+
+test('restarting while microphone acquisition is pending releases only the old stream', async () => {
+  const media = navigator.mediaDevices;
+  const original = media.getUserMedia;
+  let resolveOld!: (stream: MediaStream) => void;
+  const pending = new Promise<MediaStream>((r) => { resolveOld = r; });
+  const oldTrack = { stop: mock(() => {}), getSettings: () => ({ deviceId: 'old' }) };
+  const newTrack = { stop: mock(() => {}), getSettings: () => ({ deviceId: 'new' }) };
+  let requests = 0;
+  media.getUserMedia = async () => {
+    requests++;
+    return requests === 1 ? pending : { getTracks: () => [newTrack], getAudioTracks: () => [newTrack] } as unknown as MediaStream;
+  };
+  try {
+    mount();
+    let oldStart!: Promise<void>;
+    act(() => { oldStart = recording.startRecording(); });
+    act(() => recording.cancelRecording());
+    await act(async () => { await recording.startRecording(); });
+    expect(recording.isRecording).toBe(true);
+    await act(async () => {
+      resolveOld({ getTracks: () => [oldTrack], getAudioTracks: () => [oldTrack] } as unknown as MediaStream);
+      await oldStart;
+    });
+    expect(oldTrack.stop).toHaveBeenCalledTimes(1);
+    expect(newTrack.stop).not.toHaveBeenCalled();
+    expect(recorders).toHaveLength(1);
+    expect(recording.isRecording).toBe(true);
+    expect(completed).not.toHaveBeenCalled();
+  } finally {
+    media.getUserMedia = original;
+  }
+});

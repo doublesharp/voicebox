@@ -6,6 +6,9 @@ const emissions: string[] = [];
 const invocations: unknown[] = [];
 let finalText: (text: string, capture: unknown, allow: boolean) => Promise<void>;
 let pasteError: Error | null = null;
+const startRecording = mock(() => {});
+const stopRecording = mock(() => {});
+const restartRecording = mock(() => {});
 const sources: FakeSource[] = [];
 const audios: FakeAudio[] = [];
 class FakeSource {
@@ -66,8 +69,9 @@ mock.module('../src/lib/hooks/useCaptureRecordingSession', () => ({
     return {
       pillState: 'hidden',
       isRecording: false,
-      startRecording() {},
-      stopRecording() {},
+      startRecording,
+      stopRecording,
+      restartRecording,
       dismissError() {},
     };
   },
@@ -97,6 +101,9 @@ afterEach(async () => {
   emissions.length = 0;
   invocations.length = 0;
   pasteError = null;
+  startRecording.mockClear();
+  stopRecording.mockClear();
+  restartRecording.mockClear();
 });
 afterAll(() => {
   mock.restore();
@@ -162,4 +169,23 @@ test('failed generation dismisses without creating audio', async () => {
   act(() => sources[0].onmessage?.({ data: '{"status":"failed"}' }));
   expect(audios).toHaveLength(0);
   expect(emissions).toContain('dictate:hide');
+});
+
+
+test('hands-free upgrade restarts the dictation and keeps the original focus', async () => {
+  await mount();
+  const focus = { pid: 42, bundle_id: 'other.app', role: 'AXTextField' };
+  event('dictate:start', { focus });
+  event('dictate:restart', null);
+  expect(startRecording).toHaveBeenCalledTimes(1);
+  expect(restartRecording).toHaveBeenCalledTimes(1);
+  await act(async () => finalText('hello', null, true));
+  expect(invocations[0]).toEqual(['paste_final_text', { text: 'hello', focus }]);
+});
+
+test('stop is delivered even while microphone acquisition is pending', async () => {
+  await mount();
+  event('dictate:start', { focus: null });
+  event('dictate:stop', null);
+  expect(stopRecording).toHaveBeenCalledTimes(1);
 });

@@ -86,6 +86,7 @@ export interface UseCaptureRecordingSessionResult {
   isRefining: boolean;
   startRecording: () => void;
   stopRecording: () => void;
+  restartRecording: () => void;
   toggleRecording: () => void;
   dismissError: () => void;
   uploadFile: (file: File, source: CaptureSource) => void;
@@ -246,7 +247,8 @@ export function useCaptureRecordingSession(
     isRecording,
     duration,
     startRecording: beginAudioRecording,
-    stopRecording,
+    stopRecording: finishAudioRecording,
+    cancelRecording: cancelAudioRecording,
     error: recordError,
     usingDefaultMicrophone,
   } = useAudioRecording({
@@ -288,6 +290,22 @@ export function useCaptureRecordingSession(
     beginAudioRecording();
   }, [isRecording, beginAudioRecording, clearRestTimer, clearErrorTimer]);
 
+  const stopRecording = useCallback(() => {
+    if (finishAudioRecording()) {
+      setPillState('hidden');
+    }
+  }, [finishAudioRecording]);
+
+  const restartRecording = useCallback(() => {
+    cancelAudioRecording();
+    clearRestTimer();
+    clearErrorTimer();
+    setErrorMessage(null);
+    setFrozenElapsedMs(0);
+    setPillState('recording');
+    beginAudioRecording();
+  }, [cancelAudioRecording, beginAudioRecording, clearRestTimer, clearErrorTimer]);
+
   const toggleRecording = useCallback(() => {
     if (isRecording) {
       stopRecording();
@@ -323,6 +341,7 @@ export function useCaptureRecordingSession(
     isRefining: refineMutation.isPending,
     startRecording,
     stopRecording,
+    restartRecording,
     toggleRecording,
     dismissError,
     uploadFile,

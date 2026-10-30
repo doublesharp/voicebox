@@ -28,12 +28,15 @@ mock.module('../src/lib/api/client', () => ({
   },
 }));
 mock.module('@tauri-apps/api/event', () => ({ emit: async () => {} }));
+const recordingOps: string[] = [];
+let stoppedPending = false;
 mock.module('../src/lib/hooks/useAudioRecording', () => ({
   useAudioRecording: () => ({
     isRecording: false,
     duration: 0,
-    startRecording() {},
-    stopRecording() {},
+    startRecording() { recordingOps.push('start'); },
+    stopRecording() { recordingOps.push('stop'); return stoppedPending; },
+    cancelRecording() { recordingOps.push('cancel'); },
   }),
 }));
 const { useCaptureRecordingSession } = await import('../src/lib/hooks/useCaptureRecordingSession');
@@ -45,6 +48,8 @@ afterEach(() => {
   act(() => tree?.unmount());
   client?.clear();
   refinements.clear();
+  recordingOps.length = 0;
+  stoppedPending = false;
 });
 afterAll(() => {
   mock.restore();
@@ -129,4 +134,30 @@ test('starting a recording cancels an earlier error notice timer', async () => {
     await new Promise((r) => setTimeout(r, 2050));
   });
   expect(session.pillState).toBe('recording');
+});
+
+
+test('restart discards the old recording before starting the hands-free recording', () => {
+  let session!: ReturnType<typeof useCaptureRecordingSession>;
+  client = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+  function Harness() { session = useCaptureRecordingSession(); return null; }
+  act(() => { tree = create(<QueryClientProvider client={client}><Harness /></QueryClientProvider>); });
+  act(() => session.startRecording());
+  act(() => session.restartRecording());
+  expect(recordingOps).toEqual(['start', 'cancel', 'start']);
+  expect(session.pillState).toBe('recording');
+});
+
+
+test('stopping pending microphone acquisition hides the provisional pill', () => {
+  let session!: ReturnType<typeof useCaptureRecordingSession>;
+  client = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+  function Harness() { session = useCaptureRecordingSession(); return null; }
+  act(() => { tree = create(<QueryClientProvider client={client}><Harness /></QueryClientProvider>); });
+  act(() => session.startRecording());
+  expect(session.pillState).toBe('recording');
+  stoppedPending = true;
+  act(() => session.stopRecording());
+  expect(session.pillState).toBe('hidden');
+  expect(recordingOps).toEqual(['start', 'stop']);
 });

@@ -81,7 +81,12 @@ export function DictateWindow() {
     );
     unlistens.push(
       listen('dictate:stop', () => {
-        if (sessionRef.current.isRecording) sessionRef.current.stopRecording();
+        sessionRef.current.stopRecording();
+      }),
+    );
+    unlistens.push(
+      listen('dictate:restart', () => {
+        sessionRef.current.restartRecording();
       }),
     );
     return () => {
