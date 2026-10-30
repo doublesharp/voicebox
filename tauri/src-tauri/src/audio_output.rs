@@ -3672,6 +3672,130 @@ mod public_lifecycle_tests {
         assert!(events[1].contains("\"state\":\"error\"") && events[1].contains("native-2"));
     }
 
+    fn install_prior_session(state: &AudioOutputState) -> Arc<PlaybackControls> {
+        let controls = Arc::new(PlaybackControls::new(0.0, 1.0));
+        let (wake, _) = mpsc::channel();
+        *state.active.lock().unwrap() = Some(SessionHandle {
+            id: "prior".into(),
+            controls: controls.clone(),
+            wake,
+            streaming: None,
+        });
+        controls
+    }
+
+    #[tokio::test]
+    async fn public_preview_start_failure_reports_event_and_releases_session() {
+        let app = tauri::test::mock_app();
+        let (tx, rx) = mpsc::channel();
+        app.listen("native-audio-playback", move |event| {
+            let _ = tx.send(event.payload().to_owned());
+        });
+        let state = AudioOutputState::new();
+        let error = state
+            .start_pcm_stream(
+                app.handle().clone(),
+                8000,
+                vec!["voicebox-impossible-device-37e9".into()],
+            )
+            .await
+            .unwrap_err();
+        assert!(!error.is_empty());
+        wait_inactive(&state).await;
+        let event = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(event.contains("\"state\":\"error\""));
+        assert!(event.contains("native-1"));
+        assert!(state
+            .append_pcm_stream("native-1", vec![0, 0])
+            .await
+            .is_err());
+        assert!(state.finish_pcm_stream("native-1").is_err());
+    }
+
+    #[tokio::test]
+    async fn invalid_public_requests_leave_current_playback_running() {
+        let app = tauri::test::mock_app();
+        let state = AudioOutputState::new();
+        let prior = install_prior_session(&state);
+        for rate in [0, 7999, 192001, u32::MAX] {
+            assert!(state
+                .start_pcm_stream(app.handle().clone(), rate, vec![])
+                .await
+                .is_err());
+        }
+        for options in [
+            PlaybackOptions {
+                start_time: f64::INFINITY,
+                volume: 1.0,
+            },
+            PlaybackOptions {
+                start_time: 0.0,
+                volume: -0.1,
+            },
+            PlaybackOptions {
+                start_time: 0.0,
+                volume: 1.1,
+            },
+        ] {
+            assert!(state
+                .play_audio_to_devices(
+                    app.handle().clone(),
+                    vec![],
+                    vec!["device".into()],
+                    Some(options)
+                )
+                .await
+                .is_err());
+        }
+        assert!(!prior.stopped.load(Ordering::Acquire));
+        assert_eq!(state.active.lock().unwrap().as_ref().unwrap().id, "prior");
+    }
+
+    #[tokio::test]
+    async fn failed_preview_replacement_stops_prior_and_later_start_can_retry() {
+        let app = tauri::test::mock_app();
+        let state = AudioOutputState::new();
+        let prior = install_prior_session(&state);
+        for _ in 0..2 {
+            assert!(state
+                .start_pcm_stream(
+                    app.handle().clone(),
+                    8000,
+                    vec!["voicebox-impossible-device-37e9".into()]
+                )
+                .await
+                .is_err());
+            wait_inactive(&state).await;
+        }
+        assert!(prior.stopped.load(Ordering::Acquire));
+        assert_eq!(state.next_id.load(Ordering::Acquire), 3);
+    }
+
+    #[tokio::test]
+    async fn public_failed_clip_replacement_cleans_up_and_rejects_stale_controls() {
+        let app = tauri::test::mock_app();
+        let state = AudioOutputState::new();
+        let prior = install_prior_session(&state);
+        assert!(state
+            .play_audio_to_devices(
+                app.handle().clone(),
+                b"not audio".to_vec(),
+                vec!["device".into()],
+                None
+            )
+            .await
+            .is_err());
+        wait_inactive(&state).await;
+        assert!(prior.stopped.load(Ordering::Acquire));
+        assert!(state
+            .control_playback("prior", PlaybackControl::default())
+            .is_err());
+        assert!(state
+            .control_playback("native-1", PlaybackControl::default())
+            .is_err());
+        assert!(state.stop_playback(Some("prior")).is_ok());
+    }
+
     #[tokio::test]
     #[ignore = "requires a working native output device; emits silence"]
     async fn native_silent_public_replacement_stops_old_preview() {
