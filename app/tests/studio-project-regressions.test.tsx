@@ -5,6 +5,12 @@ let projectId = 'one';
 let renderer: ReactTestRenderer;
 let retryJob: () => Promise<unknown> = async () => {};
 let includeJob = false;
+let initialStatus = 'saved';
+let noProject = false;
+let checkpointResult = true;
+let confirmLeave = false;
+const windowListeners = new Map<string, Set<(event: any) => void>>();
+const checkpoints: string[] = [];
 const commands: unknown[] = [];
 const sessions: any[] = [];
 const playbackInstances: Array<{ tick(position: number): void; getPlayhead(): number }> = [];
@@ -27,7 +33,11 @@ Object.assign(globalThis, {
     setItem: (k: string, v: string) => storage.set(k, v),
     removeItem: (k: string) => storage.delete(k),
   },
-  window: { addEventListener() {}, removeEventListener() {}, confirm: () => false },
+  window: {
+    addEventListener(type: string, listener: (event: any) => void) { if (!windowListeners.has(type)) windowListeners.set(type, new Set()); windowListeners.get(type)!.add(listener); },
+    removeEventListener(type: string, listener: (event: any) => void) { windowListeners.get(type)?.delete(listener); },
+    confirm: () => confirmLeave,
+  },
 });
 mock.module('@tanstack/react-router', () => ({
   Link: pass,
@@ -68,7 +78,7 @@ mock.module('../src/features/studio/session', () => ({
     listeners = new Set<() => void>();
     disposed = false;
     constructor(_client: any, id: string) {
-      this.state = { project: project(id), status: 'saved', recoverySaved: true };
+      this.state = { project: noProject ? null : project(id), status: initialStatus, recoverySaved: true };
       sessions.push(this);
     }
     getSnapshot = () => this.state;
@@ -81,6 +91,13 @@ mock.module('../src/features/studio/session', () => ({
     dispose() {
       this.disposed = true;
     }
+    checkpoint(name: string) { checkpoints.push(name); return Promise.resolve(checkpointResult); }
+    flush() { commands.push(['flush']); return Promise.resolve(); }
+    retry() { commands.push(['retry']); return Promise.resolve(); }
+    reloadSaved() { commands.push(['reload']); return Promise.resolve(); }
+    hasRecoverableEdits() { return true; }
+    recover() { commands.push(['recover']); }
+    recoveryCopy() { return '{"version":1}'; }
     command(type: string, payload: unknown) {
       commands.push([type, payload]);
       return Promise.resolve();
@@ -162,6 +179,12 @@ afterEach(() => {
   storage.clear();
   includeJob = false;
   retryJob = async () => {};
+  initialStatus = 'saved';
+  noProject = false;
+  checkpointResult = true;
+  confirmLeave = false;
+  checkpoints.length = 0;
+  windowListeners.clear();
 });
 async function mount() {
   await act(async () => {
@@ -247,4 +270,136 @@ test('playback clock updates transport without rerendering script and keeps manu
   expect(player.getPlayhead()).toBe(3.5);
   expect(input.props.value).toBe(3.5);
   expect(scriptRenders).toBe(before);
+});
+
+const button = (label: string) => renderer.root.findAllByType('button').find((node) => node.props.children === label)!;
+
+test('keyboard resize clamps each panel and persists the project layout', async () => {
+  storage.set('voicebox-studio:layout', JSON.stringify({ edit: { outline: 999, inspector: 10 } }));
+  await mount();
+  const outline = () => renderer.root.findByProps({ 'aria-label': 'Resize outline' });
+  const inspector = () => renderer.root.findByProps({ 'aria-label': 'Resize inspector' });
+  expect(outline().props['aria-valuenow']).toBe(280);
+  expect(inspector().props['aria-valuenow']).toBe(240);
+  act(() => outline().props.onKeyDown({ key: 'Home', preventDefault() {} }));
+  expect(outline().props['aria-valuenow']).toBe(150);
+  act(() => inspector().props.onKeyDown({ key: 'End', preventDefault() {} }));
+  expect(inspector().props['aria-valuenow']).toBe(420);
+  expect(JSON.parse(storage.get('voicebox-studio:layout')!).edit).toEqual({ outline: 150, inspector: 420 });
+  act(() => button('Reset layout').props.onClick());
+  expect(outline().props['aria-valuenow']).toBe(190);
+  expect(storage.has('voicebox-studio:layout')).toBe(false);
+});
+
+test('pointer resizing follows drag direction and releases pointer capture', async () => {
+  await mount();
+  const outline = () => renderer.root.findByProps({ 'aria-label': 'Resize outline' });
+  let captured = false;
+  const target = { dataset: {} as Record<string, string>, setPointerCapture() { captured = true; }, hasPointerCapture() { return captured; }, releasePointerCapture() { captured = false; } };
+  act(() => outline().props.onPointerDown({ currentTarget: target, pointerId: 1, clientX: 100 }));
+  act(() => outline().props.onPointerMove({ currentTarget: target, pointerId: 1, clientX: 140 }));
+  expect(outline().props['aria-valuenow']).toBe(230);
+  act(() => outline().props.onPointerUp({ currentTarget: target, pointerId: 1 }));
+  expect(captured).toBe(false);
+});
+
+test('save and undo shortcuts dispatch once, while text fields retain undo', async () => {
+  await mount();
+  const send = (key: string, target: any, options = {}) => {
+    let prevented = false;
+    const event = { key, ctrlKey: true, target, preventDefault() { prevented = true; }, stopPropagation() {}, ...options };
+    act(() => windowListeners.get('keydown')?.forEach((listener) => listener(event)));
+    return prevented;
+  };
+  expect(send('s', { tagName: 'TEXTAREA' })).toBe(true);
+  expect(send('z', { tagName: 'TEXTAREA' })).toBe(false);
+  expect(send('z', { tagName: 'DIV' })).toBe(true);
+  expect(send('z', { tagName: 'DIV' }, { shiftKey: true })).toBe(true);
+  expect(commands).toEqual([['flush'], ['undo', undefined], ['redo', undefined]]);
+});
+
+test('dirty projects warn before browser unload and clean projects do not', async () => {
+  await mount();
+  let prevented = 0;
+  const event = { returnValue: 'unchanged', preventDefault() { prevented++; } };
+  act(() => windowListeners.get('beforeunload')?.forEach((listener) => listener(event)));
+  expect(prevented).toBe(0);
+  sessions[0].state = { ...sessions[0].state, status: 'dirty' };
+  act(() => windowListeners.get('beforeunload')?.forEach((listener) => listener(event)));
+  expect(prevented).toBe(1);
+  expect(event.returnValue).toBe('');
+});
+
+test('checkpoint name is required, trimmed, and cleared after success', async () => {
+  await mount();
+  const input = () => renderer.root.findByProps({ placeholder: 'Client review 01' });
+  expect(button('Create checkpoint').props.disabled).toBe(true);
+  act(() => input().props.onChange({ target: { value: '  Review 1  ' } }));
+  expect(button('Create checkpoint').props.disabled).toBe(false);
+  await act(async () => { button('Create checkpoint').props.onClick(); });
+  expect(checkpoints).toEqual(['Review 1']);
+  expect(input().props.value).toBe('');
+});
+
+test('failed project load exposes a retry action', async () => {
+  noProject = true;
+  initialStatus = 'error';
+  await mount();
+  expect(JSON.stringify(renderer.toJSON())).toContain('Project could not be opened');
+  let attempts = 0;
+  sessions[0].load = () => { attempts++; };
+  act(() => button('Retry').props.onClick());
+  expect(attempts).toBe(1);
+});
+
+test('recovery controls require confirmation before discarding local edits', async () => {
+  initialStatus = 'recovery';
+  await mount();
+  expect(JSON.stringify(renderer.toJSON())).toContain('Unfinished edits found');
+  act(() => button('Recover local edits').props.onClick());
+  act(() => button('Reload saved draft').props.onClick());
+  expect(commands).toEqual([['recover']]);
+  confirmLeave = true;
+  act(() => button('Reload saved draft').props.onClick());
+  expect(commands).toEqual([['recover'], ['reload']]);
+});
+
+test('invalid saved panel preferences fall back to usable defaults', async () => {
+  storage.set('voicebox-studio:layout', '{broken json');
+  await mount();
+  expect(renderer.root.findByProps({ 'aria-label': 'Resize outline' }).props['aria-valuenow']).toBe(190);
+  expect(renderer.root.findByProps({ 'aria-label': 'Resize inspector' }).props['aria-valuenow']).toBe(300);
+});
+
+test('a rejected checkpoint keeps the entered name available for retry', async () => {
+  checkpointResult = false;
+  await mount();
+  const input = () => renderer.root.findByProps({ placeholder: 'Client review 01' });
+  act(() => input().props.onChange({ target: { value: 'Client review' } }));
+  await act(async () => { button('Create checkpoint').props.onClick(); });
+  expect(checkpoints).toEqual(['Client review']);
+  expect(input().props.value).toBe('Client review');
+});
+
+test('save failure offers retry without discarding the draft', async () => {
+  initialStatus = 'error';
+  await mount();
+  expect(JSON.stringify(renderer.toJSON())).toContain('Your changes have not been saved');
+  act(() => button('Retry same save').props.onClick());
+  expect(commands).toEqual([['retry']]);
+  expect(nameInput().props.defaultValue).toBe('Project one');
+});
+
+test('repeated job retry clicks do not send concurrent requests', async () => {
+  includeJob = true;
+  let resolve!: () => void;
+  let calls = 0;
+  retryJob = () => { calls++; return new Promise<void>((r) => { resolve = r; }); };
+  await mount();
+  const retry = button('Retry frozen request');
+  act(() => { retry.props.onClick(); retry.props.onClick(); });
+  expect(calls).toBe(1);
+  expect(button('Retry frozen request').props.disabled).toBe(true);
+  await act(async () => { resolve(); });
+  expect(button('Retry frozen request').props.disabled).toBe(false);
 });
