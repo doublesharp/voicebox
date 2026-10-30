@@ -168,7 +168,8 @@ export function ProfileForm() {
   const [audioDuration, setAudioDuration] = useState<number | null>(null);
   const [isValidatingAudio, setIsValidatingAudio] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
-  const savingRef = useRef(false);
+  const savingRef = useRef<number | null>(null);
+  const nextSaveRef = useRef(0);
   const transcriptionRequestRef = useRef(0);
   useEffect(() => () => {
     transcriptionRequestRef.current += 1;
@@ -182,6 +183,10 @@ export function ProfileForm() {
   const isCreating = !editingProfileId;
   const serverUrl = useServerStore((state) => state.serverUrl);
   const serverRevision = useServerStore((state) => state.serverRevision);
+  useEffect(() => {
+    setIsSaving(false);
+    return () => { savingRef.current = null; };
+  }, [open, editingProfileId, serverUrl, serverRevision]);
   const avatarEpoch = useRef(0);
   useEffect(() => () => { avatarEpoch.current += 1; }, [open, editingProfileId, serverUrl, serverRevision]);
   const [profileEffectsChain, setProfileEffectsChain] = useState<EffectConfig[]>([]);
@@ -547,12 +552,20 @@ export function ProfileForm() {
   }
 
   async function onSubmit(data: ProfileFormValues, serverScope: ServerScope) {
-    if (savingRef.current) return;
-    savingRef.current = true;
+    if (savingRef.current !== null) return;
+    const saveId = ++nextSaveRef.current;
+    savingRef.current = saveId;
     setIsSaving(true);
+    const isCurrentSave = () => {
+      const state = useUIStore.getState();
+      return savingRef.current === saveId && state.profileDialogOpen && state.editingProfileId === editingProfileId;
+    };
+    const saveToast = (value: Parameters<typeof toast>[0]) => {
+      if (isCurrentSave()) toast(value);
+    };
     const ensureServer = () => {
       if (isCurrentServer(serverScope)) return true;
-      toast({
+      saveToast({
         title: t('profileForm.toast.serverChangedTitle', { defaultValue: 'Server connection changed' }),
         description: t('profileForm.toast.serverChangedDescription', {
           defaultValue: 'Check the previous server for any partially saved voice.',
@@ -588,7 +601,7 @@ export function ProfileForm() {
             });
           } catch (avatarError) {
             if (!ensureServer()) return;
-            toast({
+            saveToast({
               title: t('profileForm.toast.avatarUploadFailed'),
               description:
                 avatarError instanceof Error
@@ -610,7 +623,7 @@ export function ProfileForm() {
             });
           } catch (fxError) {
             if (!ensureServer()) return;
-            toast({
+            saveToast({
               title: t('profileForm.toast.effectsUpdateFailed'),
               description:
                 fxError instanceof Error
@@ -623,14 +636,14 @@ export function ProfileForm() {
         }
 
         if (!ensureServer()) return;
-        toast({
+        saveToast({
           title: t('profileForm.toast.voiceUpdated'),
           description: t('profileForm.toast.voiceUpdatedDescription', { name: data.name }),
         });
       } else if (voiceSource === 'builtin') {
         // Creating preset profile from built-in voice
         if (!selectedPresetVoiceId) {
-          toast({
+          saveToast({
             title: t('profileForm.toast.noVoiceSelected'),
             description: t('profileForm.toast.noVoiceSelectedDescription'),
             variant: 'destructive',
@@ -662,7 +675,7 @@ export function ProfileForm() {
             });
           } catch (avatarError) {
             if (!ensureServer()) return;
-            toast({
+            saveToast({
               title: t('profileForm.toast.avatarUploadFailed'),
               description:
                 avatarError instanceof Error
@@ -674,7 +687,7 @@ export function ProfileForm() {
         }
 
         if (!ensureServer()) return;
-        toast({
+        saveToast({
           title: t('profileForm.toast.profileCreated'),
           description: t('profileForm.toast.profileCreatedBuiltin', { name: data.name }),
         });
@@ -682,7 +695,7 @@ export function ProfileForm() {
         // Creating a designed profile from a written voice description
         const trimmedDesign = designPrompt.trim();
         if (!trimmedDesign) {
-          toast({
+          saveToast({
             title: t('profileForm.toast.noDesignPrompt'),
             description: t('profileForm.toast.noDesignPromptDescription'),
             variant: 'destructive',
@@ -713,7 +726,7 @@ export function ProfileForm() {
             });
           } catch (avatarError) {
             if (!ensureServer()) return;
-            toast({
+            saveToast({
               title: t('profileForm.toast.avatarUploadFailed'),
               description:
                 avatarError instanceof Error
@@ -725,7 +738,7 @@ export function ProfileForm() {
         }
 
         if (!ensureServer()) return;
-        toast({
+        saveToast({
           title: t('profileForm.toast.profileCreated'),
           description: t('profileForm.toast.profileCreatedDesigned', { name: data.name }),
         });
@@ -739,7 +752,7 @@ export function ProfileForm() {
             type: 'manual',
             message: t('profileForm.validation.sampleRequired'),
           });
-          toast({
+          saveToast({
             title: t('profileForm.toast.sampleRequired'),
             description: t('profileForm.toast.sampleRequiredDescription'),
             variant: 'destructive',
@@ -752,7 +765,7 @@ export function ProfileForm() {
             type: 'manual',
             message: t('profileForm.validation.referenceTextRequired'),
           });
-          toast({
+          saveToast({
             title: t('profileForm.toast.referenceTextRequired'),
             description: t('profileForm.toast.referenceTextRequiredDescription'),
             variant: 'destructive',
@@ -776,7 +789,7 @@ export function ProfileForm() {
                 max: formatAudioDuration(MAX_AUDIO_DURATION_SECONDS),
               }),
             });
-            toast({
+            saveToast({
               title: t('profileForm.toast.invalidAudio'),
               description: t('profileForm.toast.invalidAudioDescription', {
                 duration: formatAudioDuration(duration),
@@ -792,7 +805,7 @@ export function ProfileForm() {
             type: 'manual',
             message: t('profileForm.validation.audioFailed'),
           });
-          toast({
+          saveToast({
             title: t('profileForm.toast.validationError'),
             description:
               error instanceof Error ? error.message : t('profileForm.validation.audioFailed'),
@@ -846,7 +859,7 @@ export function ProfileForm() {
               });
             } catch (avatarError) {
               if (!ensureServer()) return;
-              toast({
+              saveToast({
                 title: 'Avatar upload failed',
                 description:
                   avatarError instanceof Error ? avatarError.message : 'Failed to upload avatar',
@@ -856,7 +869,7 @@ export function ProfileForm() {
           }
 
           if (!ensureServer()) return;
-          toast({
+          saveToast({
             title: t('profileForm.toast.profileCreated'),
             description: t('profileForm.toast.profileCreatedSample', { name: data.name }),
           });
@@ -868,7 +881,7 @@ export function ProfileForm() {
             rollbackSucceeded = true;
           } catch (rollbackError) {
             if (!ensureServer()) return;
-            toast({
+            saveToast({
               title: t('profileForm.toast.rollbackFailed'),
               description:
                 rollbackError instanceof Error
@@ -882,7 +895,7 @@ export function ProfileForm() {
           const rollbackSuffix = rollbackSucceeded
             ? ` ${t('profileForm.toast.profileRolledBack')}`
             : '';
-          toast({
+          saveToast({
             title: t('profileForm.toast.sampleFailed'),
             description:
               sampleError instanceof Error
@@ -896,7 +909,7 @@ export function ProfileForm() {
         }
       }
 
-      if (!ensureServer()) return;
+      if (!ensureServer() || !isCurrentSave()) return;
       // Clear draft and reset form on success
       setProfileFormDraft(null);
       form.reset();
@@ -905,18 +918,24 @@ export function ProfileForm() {
       setOpen(false);
     } catch (error) {
       if (!ensureServer()) return;
-      toast({
+      saveToast({
         title: t('common.error'),
         description: error instanceof Error ? error.message : t('profileForm.toast.saveFailed'),
         variant: 'destructive',
       });
     } finally {
-      savingRef.current = false;
-      setIsSaving(false);
+      if (savingRef.current === saveId) {
+        savingRef.current = null;
+        setIsSaving(false);
+      }
     }
   }
 
   async function handleOpenChange(newOpen: boolean) {
+    if (!newOpen) {
+      savingRef.current = null;
+      setIsSaving(false);
+    }
     if (!newOpen && isCreating) {
       // Save draft when closing the create modal
       const values = form.getValues();

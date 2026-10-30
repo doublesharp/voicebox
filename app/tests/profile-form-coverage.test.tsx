@@ -20,6 +20,8 @@ let addHandler: (arg: any) => Promise<void> = async () => {};
 let createHandler: (arg: any) => Promise<any> = async () => ({ id: 'new' });
 let updateHandler: (arg: any) => Promise<void> = async () => {};
 let avatarHandler: (arg: any) => Promise<void> = async () => {};
+let deleteHandler: (arg: any) => Promise<void> = async () => {};
+let convertHandler: (file: File) => Promise<Blob> = async () => new Blob(['wav'], { type: 'audio/wav' });
 const voices = [{ voice_id: 'v1', name: 'Voice One', gender: 'female', language: 'en' }];
 const mutation = (key: string, result?: unknown) => ({
   isPending: false,
@@ -34,6 +36,7 @@ const mutation = (key: string, result?: unknown) => ({
     if (key === 'create') return createHandler(arg);
     if (key === 'update') await updateHandler(arg);
     if (key === 'avatar') await avatarHandler(arg);
+    if (key === 'delete') await deleteHandler(arg);
     return result;
   },
 });
@@ -65,7 +68,7 @@ mock.module('../src/lib/hooks/useTranscription', () => ({
 mock.module('../src/lib/utils/audio', () => ({
   getAudioDuration: (file: File) => durationHandler(file),
   formatAudioDuration: String,
-  convertToWav: async () => new Blob(['wav'], { type: 'audio/wav' }),
+  convertToWav: (file: File) => convertHandler(file),
 }));
 mock.module('../src/platform/PlatformContext', () => ({
   usePlatform: () => ({ metadata: { isTauri: false } }),
@@ -158,6 +161,8 @@ afterEach(() => {
   createHandler = async () => ({ id: 'new' });
   updateHandler = async () => {};
   avatarHandler = async () => {};
+  deleteHandler = async () => {};
+  convertHandler = async () => new Blob(['wav'], { type: 'audio/wav' });
   useServerStore.setState({ serverUrl: 'http://server-a', serverRevision: 0 });
   profile = undefined;
   useUIStore.setState({ profileDialogOpen: false, editingProfileId: null, profileFormDraft: null });
@@ -834,4 +839,105 @@ test('a successful avatar deletion removes the image and reports success', async
   expect(calls.avatar).toEqual([{ profileId: 'p' }]);
   expect(calls.toast.at(-1).title).toBe('profileForm.toast.avatarRemoved');
   expect(view.root.findAllByProps({ alt: 'profileForm.avatar.alt' })).toHaveLength(0);
+});
+
+test('a completed old profile save cannot close or clear a reopened draft', async () => {
+  let finish!: (profile: { id: string }) => void;
+  createHandler = () => new Promise((resolve) => { finish = resolve; });
+  await mount();
+  click('profileForm.source.design');
+  await name('First');
+  await type('profileForm.design.placeholder', '', 'first voice');
+  let pending!: Promise<void>;
+  await act(async () => { pending = view.root.findByType('form').props.onSubmit({ preventDefault() {}, persist() {} }); await Promise.resolve(); });
+  await act(async () => { await view.root.findAllByType('button').find((n) => n.children.includes('common.cancel'))!.props.onClick(); });
+  await act(async () => { useUIStore.getState().setProfileDialogOpen(true); });
+  await name('Second draft');
+  await act(async () => { finish({ id: 'old' }); await pending; });
+  expect(useUIStore.getState().profileDialogOpen).toBe(true);
+  expect(input('profileForm.fields.namePlaceholder').props.value).toBe('Second draft');
+  expect(calls.toast.some((item) => item.title === 'profileForm.toast.profileCreated')).toBe(false);
+});
+
+test('a failed old profile save cannot display an error in a reopened form', async () => {
+  let reject!: (error: Error) => void;
+  createHandler = () => new Promise((_resolve, fail) => { reject = fail; });
+  await mount();
+  click('profileForm.source.design');
+  await name('First');
+  await type('profileForm.design.placeholder', '', 'first voice');
+  let pending!: Promise<void>;
+  await act(async () => { pending = view.root.findByType('form').props.onSubmit({ preventDefault() {}, persist() {} }); await Promise.resolve(); });
+  await act(async () => { await view.root.findAllByType('button').find((n) => n.children.includes('common.cancel'))!.props.onClick(); });
+  await act(async () => { useUIStore.getState().setProfileDialogOpen(true); });
+  await act(async () => { reject(new Error('old save failed')); await pending; });
+  expect(useUIStore.getState().profileDialogOpen).toBe(true);
+  expect(calls.toast.some((item) => item.description === 'old save failed')).toBe(false);
+});
+
+test('an old save cannot block or unlock a newer profile save', async () => {
+  const pending: Array<(profile: { id: string }) => void> = [];
+  createHandler = () => new Promise((resolve) => { pending.push(resolve); });
+  await mount();
+  click('profileForm.source.design');
+  await name('First');
+  await type('profileForm.design.placeholder', '', 'first voice');
+  let first!: Promise<void>;
+  await act(async () => { first = view.root.findByType('form').props.onSubmit({ preventDefault() {}, persist() {} }); await Promise.resolve(); });
+  await act(async () => { await view.root.findAllByType('button').find((n) => n.children.includes('common.cancel'))!.props.onClick(); });
+  await act(async () => { useUIStore.getState().setProfileDialogOpen(true); });
+  await name('Second');
+  let second!: Promise<void>;
+  await act(async () => { second = view.root.findByType('form').props.onSubmit({ preventDefault() {}, persist() {} }); await Promise.resolve(); });
+  expect(calls.create).toHaveLength(2);
+  await act(async () => { pending[0]({ id: 'old' }); await first; });
+  await act(async () => { await view.root.findByType('form').props.onSubmit({ preventDefault() {}, persist() {} }); });
+  expect(calls.create).toHaveLength(2);
+  await act(async () => { pending[1]({ id: 'new' }); await second; });
+  expect(useUIStore.getState().profileDialogOpen).toBe(false);
+});
+
+test('a clone save completes its original sample without closing a reopened draft', async () => {
+  let finish!: (profile: { id: string }) => void;
+  createHandler = () => new Promise((resolve) => { finish = resolve; });
+  await mount();
+  await name('First');
+  await upload(new File(['voice'], 'first.wav', { type: 'audio/wav' }));
+  await type('profileForm.fields.referenceTextPlaceholder', 'referenceText', 'First words');
+  let pending!: Promise<void>;
+  await act(async () => { pending = view.root.findByType('form').props.onSubmit({ preventDefault() {}, persist() {} }); await new Promise((resolve) => setTimeout(resolve, 0)); });
+  await act(async () => { await view.root.findAllByType('button').find((n) => n.children.includes('common.cancel'))!.props.onClick(); });
+  await act(async () => { useUIStore.getState().setProfileDialogOpen(true); });
+  await name('New draft');
+  await act(async () => { finish({ id: 'old' }); await pending; });
+  expect(calls.add[0]).toMatchObject({ profileId: 'old', referenceText: 'First words' });
+  expect(calls.add[0].file.name).toBe('first.wav');
+  expect(useUIStore.getState().profileDialogOpen).toBe(true);
+  expect(input('profileForm.fields.namePlaceholder').props.value).toBe('New draft');
+});
+
+test.each([true, false])('non-WAV sample upload handles conversion success=%s', async (success) => {
+  if (!success) convertHandler = async () => { throw new Error('unsupported'); };
+  await mount();
+  await name('Clone');
+  await upload(new File(['voice'], 'first.webm', { type: 'audio/webm' }));
+  await type('profileForm.fields.referenceTextPlaceholder', 'referenceText', 'Words');
+  await submit();
+  expect(calls.add[0].file.name).toBe(success ? 'first.wav' : 'first.webm');
+  expect(calls.add[0].file.type).toBe(success ? 'audio/wav' : 'audio/webm');
+  expect(useUIStore.getState().profileDialogOpen).toBe(false);
+});
+
+test('sample and rollback failures are both reported while keeping the draft', async () => {
+  fail = 'add';
+  deleteHandler = async () => { throw new Error('rollback failed'); };
+  await mount();
+  await name('Clone');
+  await upload(new File(['voice'], 'first.wav', { type: 'audio/wav' }));
+  await type('profileForm.fields.referenceTextPlaceholder', 'referenceText', 'Words');
+  await submit();
+  expect(calls.toast.map((item) => item.title)).toContain('profileForm.toast.rollbackFailed');
+  expect(calls.toast.map((item) => item.title)).toContain('profileForm.toast.sampleFailed');
+  expect(useUIStore.getState().profileDialogOpen).toBe(true);
+  expect(input('profileForm.fields.namePlaceholder').props.value).toBe('Clone');
 });
