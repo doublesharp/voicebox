@@ -42,8 +42,8 @@ def test_close_twice_raises_like_a_closed_descriptor(tmp_path):
         output.close()
 
 
-@pytest.mark.parametrize("name", ["", ".", "..", "../escape", "nested/file", "/absolute"])
-def test_artifact_names_cannot_escape_directory(tmp_path, name):
+@pytest.mark.parametrize("name", ["", ".", "..", "../escape", "nested/file", "/absolute", "report.txt:stream", "C:stream"])
+def test_artifact_names_cannot_escape_directory_or_name_an_alternate_stream(tmp_path, name):
     with Output(tmp_path / "run") as output:
         with pytest.raises(ValueError, match="single filename"):
             output.open(name)
@@ -181,6 +181,30 @@ def test_open_run_directory_and_ancestors_cannot_be_moved_or_replaced(tmp_path):
     assert (tmp_path / "parent/run/report").read_text() == "owned"
     output.path.rename(tmp_path / "moved")
     assert (tmp_path / "moved/report").read_text() == "owned"
+
+
+def icacls(path):
+    text = subprocess.run(["icacls", str(path)], capture_output=True, text=True, check=True).stdout
+    lines = text.replace(str(path), "", 1).splitlines()
+    return sorted(line.strip() for line in lines[: lines.index("")] if line.strip())
+
+
+@windows_only
+def test_created_directories_and_artifacts_are_owner_only_and_ancestors_keep_their_acl(tmp_path):
+    ancestor = tmp_path / "ancestor"
+    ancestor.mkdir()
+    inherited = icacls(ancestor)
+    assert any("(I)" in entry for entry in inherited), "a plain mkdir inherits its parent's ACL"
+    with Output(ancestor / "parent/run") as output:
+        output.write_text("report.json", "{}")
+    assert icacls(ancestor) == inherited
+    owner_only = {"nt authority\\system", f"{os.environ['USERDOMAIN']}\\{os.environ['USERNAME']}".lower()}
+    for path in (ancestor / "parent", ancestor / "parent/run", ancestor / "parent/run/report.json"):
+        entries = icacls(path)
+        assert {entry.split(":(")[0].lower() for entry in entries} == owner_only, entries
+        assert not any("(I)" in entry for entry in entries), entries
+        assert all(":(OI)(CI)(F)" in entry for entry in entries) == path.is_dir(), entries
+    assert (ancestor / "parent/run/report.json").read_text() == "{}"
 
 
 @windows_only

@@ -5,8 +5,12 @@ resolving aliases and held open until close, so a symlink, junction or rename
 cannot move a run outside its explicitly chosen directory tree. POSIX hosts do
 this with directory descriptors and O_NOFOLLOW; Windows hosts pin each component
 with a handle that denies delete sharing and never follows reparse points.
+Everything created is private to the current user: mode 0700/0600 on POSIX, a
+protected owner-and-SYSTEM DACL on Windows. Pre-existing ancestors are untouched.
 """
 
+from contextlib import contextmanager
+import functools
 import os
 from pathlib import Path
 
@@ -19,9 +23,20 @@ if os.name == "nt":
     _kernel32.CreateFileW.restype = wintypes.HANDLE
     _kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
                                       wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    _kernel32.CreateDirectoryW.argtypes = [wintypes.LPCWSTR, ctypes.c_void_p]
     _kernel32.GetFileInformationByHandleEx.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
     _kernel32.GetFinalPathNameByHandleW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
     _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    _kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    _kernel32.LocalFree.restype = ctypes.c_void_p
+    _advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    _advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    _advapi32.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+                                              ctypes.POINTER(wintypes.DWORD)]
+    _advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
+    _advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.ULONG)]
     _INVALID_HANDLE = wintypes.HANDLE(-1).value
     _FILE_LIST_DIRECTORY = 0x1
     _GENERIC_WRITE = 0x40000000
@@ -32,9 +47,16 @@ if os.name == "nt":
     _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
     _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
     _FILE_ATTRIBUTE_TAG_INFO = 9
+    _ERROR_ALREADY_EXISTS = 183
+    _TOKEN_QUERY = 0x8
+    _TOKEN_USER = 1
+    _SDDL_REVISION_1 = 1
 
     class _FileAttributeTagInfo(ctypes.Structure):
         _fields_ = [("attributes", wintypes.DWORD), ("reparse_tag", wintypes.DWORD)]
+
+    class _SecurityAttributes(ctypes.Structure):
+        _fields_ = [("length", wintypes.DWORD), ("descriptor", ctypes.c_void_p), ("inherit_handle", wintypes.BOOL)]
 
 
 class _PosixRoot:
@@ -86,14 +108,15 @@ class _WindowsRoot:
             self.handles.append(self._pin(path.anchor))
             parts = path.parts[1:]
             current = Path(path.anchor)
-            for index, part in enumerate(parts):
-                current = current / part
-                try:
-                    os.mkdir(_extended(current))
-                except FileExistsError:
-                    if index == len(parts) - 1:
-                        raise ValueError("output root already exists; choose a fresh run path") from None
-                self.handles.append(self._pin(current))
+            with _owner_only_security(inheritable=True) as security:
+                for index, part in enumerate(parts):
+                    current = current / part
+                    if not _kernel32.CreateDirectoryW(_extended(current), security):
+                        if ctypes.get_last_error() != _ERROR_ALREADY_EXISTS:
+                            raise _win_error(current)
+                        if index == len(parts) - 1:
+                            raise ValueError("output root already exists; choose a fresh run path")
+                    self.handles.append(self._pin(current))
             final = _final_path(self.handles[-1])
             if os.path.normcase(final) != os.path.normcase(_extended(path)):
                 raise ValueError(f"output root {path} resolves to {final}; choose a path on its real volume")
@@ -125,13 +148,55 @@ class _WindowsRoot:
         return handle
 
     def create(self, name):
-        handle = _create_file(_extended(self.path / name), _GENERIC_WRITE, _CREATE_NEW, _FILE_FLAG_OPEN_REPARSE_POINT)
+        with _owner_only_security(inheritable=False) as security:
+            handle = _create_file(_extended(self.path / name), _GENERIC_WRITE, _CREATE_NEW,
+                                  _FILE_FLAG_OPEN_REPARSE_POINT, security)
         return msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY)
 
     def close(self):
         while self.handles:
             _kernel32.CloseHandle(self.handles.pop())
         os.close(self.fd)
+
+
+@functools.cache
+def _current_user_sid():
+    token = wintypes.HANDLE()
+    if not _advapi32.OpenProcessToken(_kernel32.GetCurrentProcess(), _TOKEN_QUERY, ctypes.byref(token)):
+        raise _win_error(None)
+    try:
+        size = wintypes.DWORD()
+        _advapi32.GetTokenInformation(token, _TOKEN_USER, None, 0, ctypes.byref(size))
+        user = ctypes.create_string_buffer(size.value)
+        if not _advapi32.GetTokenInformation(token, _TOKEN_USER, user, size, ctypes.byref(size)):
+            raise _win_error(None)
+        text = wintypes.LPWSTR()
+        # TOKEN_USER starts with SID_AND_ATTRIBUTES, whose first field is the SID pointer.
+        if not _advapi32.ConvertSidToStringSidW(ctypes.c_void_p.from_buffer(user).value, ctypes.byref(text)):
+            raise _win_error(None)
+        try:
+            return text.value
+        finally:
+            _kernel32.LocalFree(text)
+    finally:
+        _kernel32.CloseHandle(token)
+
+
+@contextmanager
+def _owner_only_security(*, inheritable):
+    """SECURITY_ATTRIBUTES with a protected DACL (nothing inherited from the
+    parent) granting full access to the current user and SYSTEM only."""
+    flags = "OICI" if inheritable else ""
+    sddl = f"D:P(A;{flags};FA;;;{_current_user_sid()})(A;{flags};FA;;;SY)"
+    descriptor, size = ctypes.c_void_p(), wintypes.ULONG()
+    if not _advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, _SDDL_REVISION_1,
+                                                                          ctypes.byref(descriptor), ctypes.byref(size)):
+        raise _win_error(None)
+    try:
+        attributes = _SecurityAttributes(ctypes.sizeof(_SecurityAttributes), descriptor, False)
+        yield ctypes.byref(attributes)
+    finally:
+        _kernel32.LocalFree(descriptor)
 
 
 def _extended(path):
@@ -143,8 +208,8 @@ def _extended(path):
     return "\\\\?\\" + text
 
 
-def _create_file(name, access, disposition, flags):
-    handle = _kernel32.CreateFileW(name, access, _SHARE_READ_WRITE, None, disposition, flags, None)
+def _create_file(name, access, disposition, flags, security=None):
+    handle = _kernel32.CreateFileW(name, access, _SHARE_READ_WRITE, security, disposition, flags, None)
     if handle == _INVALID_HANDLE:
         raise _win_error(name)
     return handle
@@ -181,8 +246,9 @@ class Output:
         self.fd, self.path = self._root.fd, path
 
     def open(self, name):
-        if not name or name in (".", "..") or Path(name).name != name:
-            raise ValueError("artifact name must be a single filename")
+        # ':' names an NTFS alternate data stream, which would write through an existing file.
+        if not name or name in (".", "..") or ":" in name or Path(name).name != name:
+            raise ValueError("artifact name must be a single filename without ':'")
         return os.fdopen(self._root.create(name), "wb")
 
     def write_text(self, name, value):
