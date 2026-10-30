@@ -281,6 +281,7 @@ export function ModelManagement() {
     name: string;
     displayName: string;
     sizeMb?: number;
+    server: { url: string; revision: number };
   } | null>(null);
 
   useEffect(() => {
@@ -420,15 +421,17 @@ export function ModelManagement() {
   });
 
   const deleteMutation = useMutation({
-    mutationFn: async (modelName: string) => {
+    mutationFn: async ({ modelName, server }: { modelName: string; displayName: string; server: { url: string; revision: number } }) => {
+      if (!isCurrentServer(server)) throw new Error('Server connection changed');
       const result = await apiClient.deleteModel(modelName);
       return result;
     },
-    onSuccess: async () => {
+    onSuccess: async (_data, { displayName, server }) => {
+      if (!isCurrentServer(server)) return;
       toast({
         title: t('models.toast.deleted'),
         description: t('models.toast.deletedDescription', {
-          name: modelToDelete?.displayName || t('models.defaultName'),
+          name: displayName || t('models.defaultName'),
         }),
       });
       setDeleteDialogOpen(false);
@@ -438,7 +441,8 @@ export function ModelManagement() {
       await queryClient.invalidateQueries({ queryKey: ['modelStatus'], refetchType: 'all' });
       await queryClient.refetchQueries({ queryKey: ['modelStatus'] });
     },
-    onError: (error: Error) => {
+    onError: (error: Error, { server }) => {
+      if (!isCurrentServer(server)) return;
       toast({
         title: t('models.toast.deleteFailed'),
         description: error.message,
@@ -448,10 +452,12 @@ export function ModelManagement() {
   });
 
   const unloadMutation = useMutation({
-    mutationFn: async (modelName: string) => {
+    mutationFn: async ({ modelName, server }: { modelName: string; server: { url: string; revision: number } }) => {
+      if (!isCurrentServer(server)) throw new Error('Server connection changed');
       return await apiClient.unloadModel(modelName);
     },
-    onSuccess: async (_data, modelName) => {
+    onSuccess: async (_data, { modelName, server }) => {
+      if (!isCurrentServer(server)) return;
       toast({
         title: t('models.toast.unloaded'),
         description: t('models.toast.unloadedDescription', { name: modelName }),
@@ -459,7 +465,8 @@ export function ModelManagement() {
       await queryClient.invalidateQueries({ queryKey: ['modelStatus'], refetchType: 'all' });
       await queryClient.refetchQueries({ queryKey: ['modelStatus'] });
     },
-    onError: (error: Error) => {
+    onError: (error: Error, { server }) => {
+      if (!isCurrentServer(server)) return;
       toast({
         title: t('models.toast.unloadFailed'),
         description: error.message,
@@ -983,7 +990,7 @@ export function ModelManagement() {
                       {freshSelectedModel.loaded && (
                         <Button
                           size="sm"
-                          onClick={() => unloadMutation.mutate(freshSelectedModel.model_name)}
+                          onClick={() => unloadMutation.mutate({ modelName: freshSelectedModel.model_name, server: { url: serverUrl, revision: serverRevision } })}
                           variant="outline"
                           disabled={unloadMutation.isPending}
                           className="flex-1"
@@ -1005,6 +1012,7 @@ export function ModelManagement() {
                             name: freshSelectedModel.model_name,
                             displayName: freshSelectedModel.display_name,
                             sizeMb: freshSelectedModel.size_mb,
+                            server: { url: serverUrl, revision: serverRevision },
                           });
                           setDeleteDialogOpen(true);
                         }}
@@ -1062,7 +1070,7 @@ export function ModelManagement() {
             <AlertDialogAction
               onClick={() => {
                 if (modelToDelete) {
-                  deleteMutation.mutate(modelToDelete.name);
+                  deleteMutation.mutate({ modelName: modelToDelete.name, displayName: modelToDelete.displayName, server: modelToDelete.server });
                 }
               }}
               disabled={deleteMutation.isPending}

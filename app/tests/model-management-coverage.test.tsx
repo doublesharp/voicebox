@@ -5,6 +5,8 @@ import { act, create } from 'react-test-renderer';
 const trigger = mock(async (_name: string) => {});
 const cancel = mock(async (_name: string) => {});
 const clearAll = mock(async () => {});
+const deleteModel = mock(async (_name: string) => {});
+const unloadModel = mock(async (_name: string) => {});
 const toast = mock((_value: unknown) => {});
 let downloadCallbacks: any;
 let serverUrl = 'http://server-a';
@@ -17,6 +19,8 @@ mock.module('../src/lib/api/client', () => ({
     triggerModelDownload: trigger,
     cancelDownload: cancel,
     clearAllTasks: clearAll,
+    deleteModel,
+    unloadModel,
   },
 }));
 mock.module('../src/lib/hooks/useModelDownloadToast', () => ({
@@ -46,7 +50,7 @@ mock.module('../src/components/ui/alert-dialog', () => {
   const Part = ({ children }: any) => <div>{children}</div>;
   return {
     AlertDialog: ({ open, children }: any) => (open ? <div>{children}</div> : null),
-    AlertDialogAction: Part,
+    AlertDialogAction: ({ children, ...props }: any) => <button {...props}>{children}</button>,
     AlertDialogCancel: Part,
     AlertDialogContent: Part,
     AlertDialogDescription: Part,
@@ -73,6 +77,8 @@ async function setup(models = [model()], downloads: any[] = []) {
   serverRevision = 0;
   trigger.mockClear();
   cancel.mockClear();
+  deleteModel.mockClear();
+  unloadModel.mockClear();
   toast.mockClear();
   const client = new QueryClient({
     defaultOptions: { queries: { staleTime: Infinity, retry: false } },
@@ -134,6 +140,90 @@ test('shows active progress without offering a cancellation that cannot stop the
   expect(JSON.stringify(s.view.toJSON())).toContain('models.progress.cannotCancel');
   s.finish();
 });
+
+test('deleting a downloaded model requires confirmation and reports success', async () => {
+  const s = await setup([model({ downloaded: true, size_mb: 1024 })]);
+  try {
+    s.open();
+    act(() => s.button('models.actions.deleteModel').props.onClick());
+    expect(deleteModel).not.toHaveBeenCalled();
+    await act(async () => { s.button('common.delete').props.onClick(); await new Promise((r) => setTimeout(r, 10)); });
+    expect(deleteModel).toHaveBeenCalledWith('whisper-small');
+    expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'models.toast.deleted' }));
+  } finally { s.finish(); }
+});
+
+test('a failed model delete reports the error and leaves the confirmation available', async () => {
+  deleteModel.mockImplementationOnce(async () => { throw new Error('disk error'); });
+  const s = await setup([model({ downloaded: true })]);
+  try {
+    s.open();
+    act(() => s.button('models.actions.deleteModel').props.onClick());
+    await act(async () => { s.button('common.delete').props.onClick(); await new Promise((r) => setTimeout(r, 10)); });
+    expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'models.toast.deleteFailed', description: 'disk error' }));
+    expect(s.button('common.delete')).toBeDefined();
+  } finally { s.finish(); }
+});
+
+test('loaded models must be unloaded before deletion', async () => {
+  const s = await setup([model({ downloaded: true, loaded: true })]);
+  try {
+    s.open();
+    expect(s.button('models.actions.deleteModel').props.disabled).toBe(true);
+    await act(async () => { s.button('models.actions.unload').props.onClick(); await new Promise((r) => setTimeout(r, 10)); });
+    expect(unloadModel).toHaveBeenCalledWith('whisper-small');
+    expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'models.toast.unloaded' }));
+  } finally { s.finish(); }
+});
+
+for (const action of ['delete', 'unload'] as const) {
+  test(`queued ${action} cannot dispatch to a different server`, async () => {
+    const s = await setup([model({ downloaded: true, loaded: action === 'unload' })]);
+    try {
+      s.open();
+      if (action === 'delete') act(() => s.button('models.actions.deleteModel').props.onClick());
+      await act(async () => {
+        s.button(action === 'delete' ? 'common.delete' : 'models.actions.unload').props.onClick();
+        serverUrl = 'http://server-b'; serverRevision++;
+        await new Promise((r) => setTimeout(r, 10));
+      });
+      expect(action === 'delete' ? deleteModel : unloadModel).not.toHaveBeenCalled();
+      expect(toast).not.toHaveBeenCalled();
+    } finally { s.finish(); serverUrl = 'http://server-a'; serverRevision++; }
+  });
+  test(`late ${action} failure does not show on the new server`, async () => {
+    let reject!: (error: Error) => void;
+    const fn = action === 'delete' ? deleteModel : unloadModel;
+    fn.mockImplementationOnce(() => new Promise<void>((_resolve, r) => { reject = r; }));
+    const s = await setup([model({ downloaded: true, loaded: action === 'unload' })]);
+    try {
+      s.open();
+      if (action === 'delete') act(() => s.button('models.actions.deleteModel').props.onClick());
+      await act(async () => { s.button(action === 'delete' ? 'common.delete' : 'models.actions.unload').props.onClick(); await new Promise((r) => setTimeout(r, 0)); });
+      serverUrl = 'http://server-b'; serverRevision++;
+      await act(async () => { s.view.update(<QueryClientProvider client={s.client}><ModelManagement /></QueryClientProvider>); });
+      await act(async () => { reject(new Error('old server failure')); await new Promise((r) => setTimeout(r, 10)); });
+      expect(toast).not.toHaveBeenCalled();
+    } finally { s.finish(); serverUrl = 'http://server-a'; serverRevision++; }
+  });
+  test(`late ${action} success does not report success on the new server`, async () => {
+    let resolve!: () => void;
+    const fn = action === 'delete' ? deleteModel : unloadModel;
+    fn.mockImplementationOnce(() => new Promise<void>((r) => { resolve = r; }));
+    const s = await setup([model({ downloaded: true, loaded: action === 'unload' })]);
+    try {
+      s.open();
+      if (action === 'delete') act(() => s.button('models.actions.deleteModel').props.onClick());
+      await act(async () => { s.button(action === 'delete' ? 'common.delete' : 'models.actions.unload').props.onClick(); await new Promise((r) => setTimeout(r, 0)); });
+      serverUrl = 'http://server-b'; serverRevision++;
+      await act(async () => { s.view.update(<QueryClientProvider client={s.client}><ModelManagement /></QueryClientProvider>); });
+      s.open();
+      await act(async () => { resolve(); await new Promise((r) => setTimeout(r, 10)); });
+      expect(toast).not.toHaveBeenCalled();
+      expect(s.button(action === 'delete' ? 'models.actions.deleteModel' : 'models.actions.unload')).toBeDefined();
+    } finally { s.finish(); serverUrl = 'http://server-a'; serverRevision++; }
+  });
+}
 
 test('download failure is shown and retry invokes the model service', async () => {
   const s = await setup();
