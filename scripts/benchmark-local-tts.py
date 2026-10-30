@@ -308,10 +308,19 @@ def inside_socketpair_emulation():
     return False
 
 
+INTERNET_FAMILIES = (socket.AF_INET, socket.AF_INET6)
+
+
 def deny_network(event, args):
+    """Internet sockets may not even be created: asyncio's Proactor loop
+    connects and sends through overlapped Win32 calls that raise no
+    socket.connect or socket.sendto audit event, so creation is the one
+    choke point every path shares."""
     if event in ("socket.getaddrinfo", "socket.gethostbyname", "socket.gethostbyaddr"):
         raise OSError("benchmark forbids network lookup")
-    if event in ("socket.connect", "socket.sendto") and args[0].family in (socket.AF_INET, socket.AF_INET6):
+    if event == "socket.__new__" and args[1] in INTERNET_FAMILIES and not inside_socketpair_emulation():
+        raise OSError("benchmark forbids network sockets")
+    if event in ("socket.connect", "socket.sendto") and args[0].family in INTERNET_FAMILIES:
         if event == "socket.connect" and args[1][0] == "127.0.0.1" and inside_socketpair_emulation():
             return
         raise OSError("benchmark forbids network connections")

@@ -266,6 +266,13 @@ def test_cli_refuses_missing_cache_before_importing_models(tmp_path, settings):
     assert report["status"] == "failed" and report["checks"] == []
 
 
+def test_qualifier_entry_point_installs_the_same_offline_guard(settings):
+    result = subprocess.run([sys.executable, "-B", str(SCRIPT.with_name("tests") / "offline_guard_probe.py"), str(SCRIPT),
+                             str(settings.cache_root), str(settings.output_root)], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "offline guard passed"
+
+
 def test_spy_does_not_keep_its_owner_alive():
     import gc
     import weakref

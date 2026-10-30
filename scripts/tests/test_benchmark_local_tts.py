@@ -460,55 +460,9 @@ def test_main_entry_point_failure_is_nonzero_and_closes_output(settings, monkeyp
                        "--output-root", str(settings.output_root)]) == 2
 
 
-def test_offline_guard_blocks_connections_and_dns_in_subprocess(settings):
-    code = '''
-import importlib.util, os, socket, sys, tempfile
-from pathlib import Path
-spec = importlib.util.spec_from_file_location("benchmark_local_tts", sys.argv[1])
-b = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = b
-spec.loader.exec_module(b)
-settings = b.Settings("qwen_custom_voice", "pytorch", "cpu", "1.7B", "en", "Test", Path(sys.argv[2]), Path(sys.argv[3]), preset_voice="Ryan")
-output = b.Output(settings.output_root)
-b.configure_offline(settings, output)
-assert os.environ["HF_HUB_OFFLINE"] == os.environ["TRANSFORMERS_OFFLINE"] == "1"
-assert os.environ["HF_HUB_CACHE"] == str(settings.cache_root)
-assert Path(tempfile.gettempdir()).is_relative_to(output.path)
-assert not any(name.startswith("backend") for name in sys.modules)
-for callback in (lambda: socket.getaddrinfo("example.invalid", 443), lambda: socket.gethostbyname("example.invalid"), lambda: socket.gethostbyaddr("192.0.2.1")):
-    try:
-        callback()
-    except OSError as error:
-        assert "forbids" in str(error)
-    else:
-        raise AssertionError("DNS lookup admitted")
-for address in (("192.0.2.1", 443), ("127.0.0.1", 9)):
-    with socket.socket() as stream:
-        try:
-            stream.connect(address)
-        except OSError as error:
-            assert "forbids" in str(error), address
-        else:
-            raise AssertionError(f"connection admitted: {address}")
-with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as datagram:
-    try:
-        datagram.sendto(b"test", ("192.0.2.1", 443))
-    except OSError as error:
-        assert "forbids" in str(error)
-    else:
-        raise AssertionError("datagram admitted")
-# The asyncio self-pipe uses local socket pairs and must remain usable,
-# including CPython's loopback-connect emulation on Windows.
-left, right = socket.socketpair()
-left.close()
-right.close()
-import asyncio
-assert asyncio.run(asyncio.sleep(0, result="loop ran")) == "loop ran"
-output.close()
-print("offline guard passed")
-'''
-    result = subprocess.run([sys.executable, "-B", "-c", code, str(SCRIPT), str(settings.cache_root),
-                             str(settings.output_root)], capture_output=True, text=True, timeout=10)
+def test_offline_guard_blocks_sync_and_asyncio_network_in_subprocess(settings):
+    result = subprocess.run([sys.executable, "-B", str(SCRIPT.with_name("tests") / "offline_guard_probe.py"), str(SCRIPT),
+                             str(settings.cache_root), str(settings.output_root)], capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout.strip() == "offline guard passed"
 
@@ -533,6 +487,10 @@ def test_offline_configuration_and_guard_without_process_side_effects(settings, 
         guard("socket.connect", (SimpleNamespace(family=getattr(bench.socket, "AF_UNIX", bench.socket.AF_UNSPEC)), "local"))
         with pytest.raises(OSError, match="network connections"):
             guard("socket.connect", (SimpleNamespace(family=bench.socket.AF_INET), ("127.0.0.1", 80)))
+        for family in (bench.socket.AF_INET, bench.socket.AF_INET6):
+            with pytest.raises(OSError, match="network sockets"):
+                guard("socket.__new__", (None, family, bench.socket.SOCK_STREAM, 0))
+        guard("socket.__new__", (None, getattr(bench.socket, "AF_UNIX", bench.socket.AF_UNSPEC), bench.socket.SOCK_STREAM, 0))
         guard("unrelated.event", ())
     finally:
         output.close()
@@ -833,11 +791,14 @@ def test_socketpair_emulation_gate_admits_only_loopback_connects_from_cpython_em
     connect = (SimpleNamespace(family=bench.socket.AF_INET), ("127.0.0.1", 50000))
 
     def emulated():
+        bench.deny_network("socket.__new__", (None, bench.socket.AF_INET, bench.socket.SOCK_STREAM, 0))
         bench.deny_network("socket.connect", connect)
         return bench.inside_socketpair_emulation()
 
     monkeypatch.setattr(bench.socket, "_fallback_socketpair", emulated, raising=False)
     assert emulated() is True
+    with pytest.raises(OSError, match="network sockets"):
+        bench.deny_network("socket.__new__", (None, bench.socket.AF_INET, bench.socket.SOCK_STREAM, 0))
     with pytest.raises(OSError, match="network connections"):
         bench.deny_network("socket.connect", (SimpleNamespace(family=bench.socket.AF_INET), ("10.0.0.1", 50000)))
     assert bench.inside_socketpair_emulation() is False
