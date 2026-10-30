@@ -24,7 +24,7 @@ mod sse_frames;
 mod synthetic_keys;
 mod window_close;
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::{command, State, Manager, WindowEvent, Emitter, Listener, RunEvent, WebviewUrl, WebviewWindowBuilder, PhysicalPosition};
 use tauri_plugin_shell::ShellExt;
 use tokio::sync::mpsc;
@@ -274,7 +274,7 @@ fn update_models_dir(stored: &Mutex<Option<String>>, requested: Option<&str>) {
 }
 
 struct ServerState {
-    start_gate: server_startup::StartGate,
+    start_gate: Arc<server_startup::StartGate>,
     child: Mutex<Option<tauri_plugin_shell::process::CommandChild>>,
     server_pid: Mutex<Option<u32>>,
     keep_running_on_close: Mutex<bool>,
@@ -360,7 +360,7 @@ async fn start_server(
     remote: Option<bool>,
     models_dir: Option<String>,
 ) -> Result<String, String> {
-    let _start_permit = state.start_gate.try_begin().ok_or("The bundled server is still starting. Please try again shortly.")?;
+    let _start_permit = state.start_gate.try_begin().ok_or("The bundled server is starting or stopping. Please try again shortly.")?;
     let is_remote = resolve_remote_setting(&state.remote, remote);
     // Store models_dir for use on restart (empty string means reset to default)
     update_models_dir(&state.models_dir, models_dir.as_deref());
@@ -374,7 +374,7 @@ async fn start_server(
             _start_permit.commit(|| ()).ok_or("Server startup cancelled")?;
             return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
         }
-        return Err("The bundled server is still starting. Please try again shortly.".to_string());
+        return Err("The bundled server is starting or stopping. Please try again shortly.".to_string());
     }
 
     // Check if a voicebox server is already running on our port (from previous session with keep_running=true,
@@ -837,13 +837,16 @@ async fn stop_server_if_owned(
     state: State<'_, ServerState>,
     expected: Option<u32>,
 ) -> Result<(), String> {
-    let process = if expected.is_none() {
-        state.start_gate.cancel_and(|| server_process::take_process(&state.server_pid, &state.child, expected))
+    let take_process = || server_process::take_process(&state.server_pid, &state.child, expected);
+    let (process, stop_permit) = if expected.is_none() {
+        state.start_gate.begin_stop(take_process)
     } else {
-        server_process::take_process(&state.server_pid, &state.child, expected)
+        state.start_gate.begin_cleanup(take_process)
     };
     if let Some((pid, child)) = process {
         tokio::task::spawn_blocking(move || {
+            // Keep the gate held even if the async caller is cancelled.
+            let _stop_permit = stop_permit;
             let _child = child;
             println!("stop_server: Stopping server with PID: {}", pid);
 
@@ -895,10 +898,10 @@ async fn restart_server(
     // Stop the current server
     stop_server(state.clone()).await?;
 
-    // A cancelled preflight can still be unwinding; wait until its permit is released.
+    // Wait for cancelled startup and any concurrent cleanup to finish.
     tokio::time::timeout(std::time::Duration::from_secs(30), state.start_gate.wait_until_idle())
         .await
-        .map_err(|_| "Previous server startup did not stop in time".to_string())?;
+        .map_err(|_| "Previous server startup or cleanup did not stop in time".to_string())?;
 
     // Wait for port to be released
     println!("restart_server: waiting for port release...");
@@ -1433,7 +1436,7 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
         .manage(ServerState {
-            start_gate: server_startup::StartGate::default(),
+            start_gate: Arc::new(server_startup::StartGate::default()),
             child: Mutex::new(None),
             server_pid: Mutex::new(None),
             keep_running_on_close: Mutex::new(false),

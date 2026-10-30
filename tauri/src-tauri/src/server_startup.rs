@@ -22,6 +22,7 @@ impl Default for StartGate {
 #[derive(Default)]
 struct StartState {
     starting: bool,
+    stopping: usize,
     generation: u64,
 }
 
@@ -30,10 +31,51 @@ pub(crate) struct StartPermit<'a> {
     generation: u64,
 }
 
+pub(crate) struct StopPermit {
+    gate: std::sync::Arc<StartGate>,
+}
+
+impl Drop for StopPermit {
+    fn drop(&mut self) {
+        self.gate.state.lock().unwrap().stopping -= 1;
+        self.gate.changed.send_replace(());
+    }
+}
+
 impl StartGate {
+    pub(crate) fn begin_stop<T>(
+        self: &std::sync::Arc<Self>,
+        action: impl FnOnce() -> T,
+    ) -> (T, StopPermit) {
+        self.begin_cleanup_inner(true, action)
+    }
+
+    pub(crate) fn begin_cleanup<T>(
+        self: &std::sync::Arc<Self>,
+        action: impl FnOnce() -> T,
+    ) -> (T, StopPermit) {
+        self.begin_cleanup_inner(false, action)
+    }
+
+    fn begin_cleanup_inner<T>(
+        self: &std::sync::Arc<Self>,
+        cancel_start: bool,
+        action: impl FnOnce() -> T,
+    ) -> (T, StopPermit) {
+        let mut state = self.state.lock().unwrap();
+        if cancel_start {
+            state.generation = state.generation.wrapping_add(1);
+        }
+        state.stopping += 1;
+        let result = action();
+        drop(state);
+        self.changed.send_replace(());
+        (result, StopPermit { gate: self.clone() })
+    }
+
     pub(crate) fn try_begin(&self) -> Option<StartPermit<'_>> {
         let mut state = self.state.lock().unwrap();
-        if state.starting {
+        if state.starting || state.stopping > 0 {
             return None;
         }
         state.starting = true;
@@ -43,6 +85,7 @@ impl StartGate {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn cancel_and<T>(&self, action: impl FnOnce() -> T) -> T {
         let mut state = self.state.lock().unwrap();
         state.generation = state.generation.wrapping_add(1);
@@ -55,7 +98,11 @@ impl StartGate {
     pub(crate) async fn wait_until_idle(&self) {
         let mut changed = self.changed.subscribe();
         loop {
-            if !self.state.lock().unwrap().starting {
+            let idle = {
+                let state = self.state.lock().unwrap();
+                !state.starting && state.stopping == 0
+            };
+            if idle {
                 return;
             }
             if changed.changed().await.is_err() {
@@ -823,5 +870,97 @@ mod restart_wait_tests {
         tokio::time::timeout(Duration::from_millis(100), gate.wait_until_idle())
             .await
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod stop_ownership_tests {
+    use super::StartGate;
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::time::Duration;
+
+    #[test]
+    fn stop_holds_new_starts_until_cleanup_finishes() {
+        let gate = Arc::new(StartGate::default());
+        let child = Mutex::new(Some(42));
+        let (taken, stop) = gate.begin_stop(|| child.lock().unwrap().take());
+        assert_eq!(taken, Some(42));
+        assert!(gate.try_begin().is_none());
+        drop(stop);
+        assert!(gate.try_begin().is_some());
+    }
+
+    #[test]
+    fn concurrent_cleanups_hold_the_gate_until_both_finish() {
+        let gate = Arc::new(StartGate::default());
+        let (_, first) = gate.begin_stop(|| ());
+        let (_, second) = gate.begin_stop(|| ());
+        drop(first);
+        assert!(gate.try_begin().is_none());
+        drop(second);
+        assert!(gate.try_begin().is_some());
+    }
+
+    #[tokio::test]
+    async fn restart_waits_for_cleanup_to_finish() {
+        let gate = Arc::new(StartGate::default());
+        let (_, stop) = gate.begin_stop(|| ());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), gate.wait_until_idle())
+                .await
+                .is_err()
+        );
+        drop(stop);
+        tokio::time::timeout(Duration::from_secs(1), gate.wait_until_idle())
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn stale_owned_cleanup_does_not_cancel_a_new_start() {
+        let gate = Arc::new(StartGate::default());
+        let start = gate.try_begin().unwrap();
+        let (matched, cleanup) = gate.begin_cleanup(|| None::<u32>);
+        assert_eq!(matched, None);
+        drop(cleanup);
+        assert_eq!(start.commit(|| 42), Some(42));
+    }
+
+    #[test]
+    fn stopping_cancels_inflight_start_and_waits_for_both_owners() {
+        let gate = Arc::new(StartGate::default());
+        let start = gate.try_begin().unwrap();
+        let (_, stop) = gate.begin_stop(|| ());
+        assert_eq!(start.commit(|| 42), None);
+        drop(start);
+        assert!(gate.try_begin().is_none());
+        drop(stop);
+        assert!(gate.try_begin().is_some());
+    }
+
+    #[tokio::test]
+    async fn cancelling_stop_caller_does_not_release_running_cleanup() {
+        let gate = Arc::new(StartGate::default());
+        let (_, stop) = gate.begin_stop(|| ());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let caller = tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                let _stop = stop;
+                let _ = started_tx.send(());
+                let _ = release_rx.recv();
+            })
+            .await
+            .unwrap();
+        });
+        started_rx.await.unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert!(gate.try_begin().is_none());
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), gate.wait_until_idle())
+            .await
+            .unwrap();
+        assert!(gate.try_begin().is_some());
     }
 }
