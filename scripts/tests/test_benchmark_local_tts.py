@@ -482,13 +482,14 @@ for callback in (lambda: socket.getaddrinfo("example.invalid", 443), lambda: soc
         assert "forbids" in str(error)
     else:
         raise AssertionError("DNS lookup admitted")
-with socket.socket() as stream:
-    try:
-        stream.connect(("192.0.2.1", 443))
-    except OSError as error:
-        assert "forbids" in str(error)
-    else:
-        raise AssertionError("connection admitted")
+for address in (("192.0.2.1", 443), ("127.0.0.1", 9)):
+    with socket.socket() as stream:
+        try:
+            stream.connect(address)
+        except OSError as error:
+            assert "forbids" in str(error), address
+        else:
+            raise AssertionError(f"connection admitted: {address}")
 with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as datagram:
     try:
         datagram.sendto(b"test", ("192.0.2.1", 443))
@@ -496,10 +497,13 @@ with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as datagram:
         assert "forbids" in str(error)
     else:
         raise AssertionError("datagram admitted")
-# The asyncio self-pipe uses local socket pairs and must remain usable.
+# The asyncio self-pipe uses local socket pairs and must remain usable,
+# including CPython's loopback-connect emulation on Windows.
 left, right = socket.socketpair()
 left.close()
 right.close()
+import asyncio
+assert asyncio.run(asyncio.sleep(0, result="loop ran")) == "loop ran"
 output.close()
 print("offline guard passed")
 '''
@@ -527,6 +531,8 @@ def test_offline_configuration_and_guard_without_process_side_effects(settings, 
         with pytest.raises(OSError, match="network connections"):
             guard("socket.connect", (SimpleNamespace(family=bench.socket.AF_INET), ("192.0.2.1", 443)))
         guard("socket.connect", (SimpleNamespace(family=getattr(bench.socket, "AF_UNIX", bench.socket.AF_UNSPEC)), "local"))
+        with pytest.raises(OSError, match="network connections"):
+            guard("socket.connect", (SimpleNamespace(family=bench.socket.AF_INET), ("127.0.0.1", 80)))
         guard("unrelated.event", ())
     finally:
         output.close()

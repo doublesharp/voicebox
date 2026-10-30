@@ -290,13 +290,31 @@ def configure_offline(settings, output):
     sys.dont_write_bytecode = True
     tempfile.tempdir = str(temporary)
 
-    def deny_network(event, args):
-        if event in ("socket.getaddrinfo", "socket.gethostbyname", "socket.gethostbyaddr"):
-            raise OSError("benchmark forbids network lookup")
-        if event in ("socket.connect", "socket.sendto") and args[0].family in (socket.AF_INET, socket.AF_INET6):
-            raise OSError("benchmark forbids network connections")
-
     sys.addaudithook(deny_network)
+
+
+def inside_socketpair_emulation():
+    """Windows has no socketpair(2); CPython emulates it by connecting a client
+    socket to its own listening loopback socket, and every asyncio loop builds
+    its self-pipe that way. Only that exact code object is let through."""
+    emulation = getattr(socket, "_fallback_socketpair", None)
+    if emulation is None:
+        return False
+    frame = sys._getframe(1)
+    while frame is not None:
+        if frame.f_code is emulation.__code__:
+            return True
+        frame = frame.f_back
+    return False
+
+
+def deny_network(event, args):
+    if event in ("socket.getaddrinfo", "socket.gethostbyname", "socket.gethostbyaddr"):
+        raise OSError("benchmark forbids network lookup")
+    if event in ("socket.connect", "socket.sendto") and args[0].family in (socket.AF_INET, socket.AF_INET6):
+        if event == "socket.connect" and args[1][0] == "127.0.0.1" and inside_socketpair_emulation():
+            return
+        raise OSError("benchmark forbids network connections")
 
 
 def device_identity(settings):
