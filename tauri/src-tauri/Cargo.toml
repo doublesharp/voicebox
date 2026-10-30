@@ -30,6 +30,7 @@ base64 = "0.22"
 cpal = "0.15"
 symphonia = { version = "0.5", features = ["all"] }
 scopeguard = "1.2.0"
+tempfile = "3.24.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 screencapturekit = { version = "1", features = ["async"] }

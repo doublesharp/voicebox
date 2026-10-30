@@ -21,29 +21,60 @@ impl Drop for StagedFile {
     }
 }
 
+/// Capture the selected path before opening an input stream, which may block.
+pub(crate) struct PublicationTarget {
+    selected: PathBuf,
+    resolved: PathBuf,
+    selected_was_link: bool,
+    selected_was_missing: bool,
+}
+
+pub(crate) fn prepare(destination: &Path) -> io::Result<PublicationTarget> {
+    // Atomic rename must replace the selected file, not a symbolic link to it.
+    // Canonicalizing also rejects dangling links without destroying them.
+    let (resolved, selected_was_link, selected_was_missing) = match fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.file_type().is_symlink() => (fs::canonicalize(destination)?, true, false),
+        Ok(_) => (destination.to_path_buf(), false, false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (destination.to_path_buf(), false, true),
+        Err(error) => return Err(error),
+    };
+    Ok(PublicationTarget {
+        selected: destination.to_path_buf(),
+        resolved,
+        selected_was_link,
+        selected_was_missing,
+    })
+}
+
 // The sibling is created exclusively, so it cannot truncate another file. A failed
 // copy, flush, sync or rename only removes our own staging file.
-pub(crate) fn publish<R: Read>(destination: &Path, mut input: R) -> io::Result<()> {
-    publish_using(destination, |file| {
+pub(crate) fn publish<R: Read>(destination: &Path, input: R) -> io::Result<()> {
+    publish_prepared(&prepare(destination)?, input)
+}
+
+pub(crate) fn publish_prepared<R: Read>(target: &PublicationTarget, mut input: R) -> io::Result<()> {
+    publish_using_prepared(target, |file| {
         io::copy(&mut input, &mut *file)?;
         file.flush()?;
         file.sync_all()
     })
 }
 
+#[cfg(test)]
 fn publish_using(
     destination: &Path,
     write_and_sync: impl FnOnce(&mut fs::File) -> io::Result<()>,
 ) -> io::Result<()> {
-    // Atomic rename must replace the selected file, not a symbolic link to it.
-    // Canonicalizing also rejects dangling links without destroying them.
-    let selected = destination;
-    let (resolved, selected_was_link) = match fs::symlink_metadata(selected) {
-        Ok(metadata) if metadata.file_type().is_symlink() => (fs::canonicalize(selected)?, true),
-        Ok(_) => (selected.to_path_buf(), false),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => (selected.to_path_buf(), false),
-        Err(error) => return Err(error),
-    };
+    publish_using_prepared(&prepare(destination)?, write_and_sync)
+}
+
+fn publish_using_prepared(
+    target: &PublicationTarget,
+    write_and_sync: impl FnOnce(&mut fs::File) -> io::Result<()>,
+) -> io::Result<()> {
+    let selected = target.selected.as_path();
+    let resolved = &target.resolved;
+    let selected_was_link = target.selected_was_link;
     let destination = resolved.as_path();
     let parent = destination
         .parent()
@@ -84,13 +115,15 @@ fn publish_using(
     };
     let file = stage.file.as_mut().unwrap();
     write_and_sync(file)?;
-    match fs::metadata(destination) {
-        Ok(metadata) => {
-            file.set_permissions(metadata.permissions())?;
-            file.sync_all()?;
+    if !target.selected_was_missing {
+        match fs::metadata(destination) {
+            Ok(metadata) => {
+                file.set_permissions(metadata.permissions())?;
+                file.sync_all()?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
     }
     drop(stage.file.take());
     let current = fs::symlink_metadata(selected);
@@ -108,7 +141,15 @@ fn publish_using(
             "Export destination link changed during save",
         ));
     }
-    fs::rename(&stage.path, destination)?;
+    if target.selected_was_missing {
+        // An exporter must not overwrite a file that appeared after selection.
+        // tempfile uses no-replace rename where available, with a safe fallback.
+        tempfile::TempPath::from_path(stage.path.clone())
+            .persist_noclobber(destination)
+            .map_err(|error| error.error)?;
+    } else {
+        fs::rename(&stage.path, destination)?;
+    }
     stage.published = true;
     Ok(())
 }
@@ -209,6 +250,52 @@ mod tests {
         assert!(final_bytes.iter().all(|byte| *byte == final_bytes[0]));
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn new_destination_created_during_staging_is_not_overwritten() {
+        let dir = std::env::temp_dir().join(format!("voicebox-new-destination-{}-{}", std::process::id(), NEXT_STAGE.fetch_add(1, Ordering::Relaxed)));
+        fs::create_dir(&dir).unwrap();
+        let target = dir.join("export.wav");
+        let result = publish_using(&target, |file| {
+            file.write_all(b"export")?;
+            fs::write(&target, b"another application")?;
+            file.sync_all()
+        });
+        let contents = fs::read(&target).unwrap();
+        let remaining = fs::read_dir(&dir).unwrap().count();
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(result.is_err(), "an unapproved new file was overwritten");
+        assert_eq!(contents, b"another application");
+        assert_eq!(remaining, 1, "staging file leaked");
+    }
+
+    #[test]
+    fn competing_new_exports_do_not_overwrite_the_winner() {
+        let dir = std::env::temp_dir().join(format!("voicebox-competing-export-{}-{}", std::process::id(), NEXT_STAGE.fetch_add(1, Ordering::Relaxed)));
+        fs::create_dir(&dir).unwrap();
+        let target = dir.join("export.wav");
+        let barrier = std::sync::Barrier::new(2);
+        let results = std::thread::scope(|scope| {
+            let workers: Vec<_> = [b'A', b'B'].into_iter().map(|byte| {
+                let target = &target;
+                let barrier = &barrier;
+                scope.spawn(move || publish_using(target, |file| {
+                    file.write_all(&vec![byte; 4096])?;
+                    file.sync_all()?;
+                    barrier.wait();
+                    Ok(())
+                }))
+            }).collect();
+            workers.into_iter().map(|worker| worker.join().unwrap()).collect::<Vec<_>>()
+        });
+        let bytes = fs::read(&target).unwrap();
+        let remaining = fs::read_dir(&dir).unwrap().count();
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(bytes.len(), 4096);
+        assert!(bytes.iter().all(|byte| *byte == bytes[0]));
+        assert_eq!(remaining, 1, "staging file leaked");
     }
 
     #[cfg(unix)]

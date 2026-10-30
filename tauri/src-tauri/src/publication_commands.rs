@@ -1,3 +1,5 @@
+use crate::publication::{prepare, publish_prepared};
+#[cfg(test)]
 use crate::publication::publish;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read};
@@ -68,8 +70,9 @@ fn run_with(
             path: None,
         });
     };
+    let target = prepare(&path).map_err(|e| format!("Could not save {}: {e}", path.display()))?;
     let reader = input()?;
-    publish(&path, reader).map_err(|e| format!("Could not save {}: {e}", path.display()))?;
+    publish_prepared(&target, reader).map_err(|e| format!("Could not save {}: {e}", path.display()))?;
     Ok(SaveResult {
         status: "saved",
         path: Some(path.to_string_lossy().into_owned()),
@@ -499,6 +502,8 @@ mod export_flow_tests {
     async fn overlapping_workers_never_publish_mixed_content() {
         let fixture = Fixture::new();
         let target = fixture.target();
+        // Both workers explicitly select a destination that already exists.
+        std::fs::write(&target, b"original").unwrap();
         let first_target = target.clone();
         let second_target = target.clone();
         let first = run_on_worker(
@@ -653,6 +658,79 @@ mod export_flow_tests {
         assert!(error.contains("Could not save"));
         assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 0);
     }
+    #[test]
+    fn new_file_created_after_selection_before_input_is_preserved() {
+        let fixture = Fixture::new();
+        let target = fixture.target();
+        let result = run_with(
+            || Ok(Some(target.clone())),
+            || {
+                std::fs::write(&target, b"another application").unwrap();
+                Ok(input(b"export"))
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"another application");
+        assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_created_after_selection_cannot_redirect_export() {
+        use std::os::unix::fs::symlink;
+        let fixture = Fixture::new();
+        let target = fixture.target();
+        let victim = fixture.0.join("existing.wav");
+        std::fs::write(&victim, b"existing data").unwrap();
+        let result = run_with(
+            || Ok(Some(target.clone())),
+            || {
+                symlink(&victim, &target).unwrap();
+                Ok(input(b"export"))
+            },
+        );
+        assert!(result.is_err());
+        assert!(std::fs::symlink_metadata(&target).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"existing data");
+        assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn competing_file_during_http_download_is_preserved() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let fixture = Fixture::new();
+        let target = fixture.target();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/audio", listener.local_addr().unwrap());
+        let (headers_tx, headers_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            stream.read(&mut request).unwrap();
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\n").unwrap();
+            headers_tx.send(()).unwrap();
+            resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            stream.write_all(b"export").unwrap();
+        });
+        let selected = target.clone();
+        let worker = std::thread::spawn(move || {
+            run_with(|| Ok(Some(selected)), || download(&url, Duration::from_secs(5)))
+        });
+        headers_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        std::fs::write(&target, b"another application").unwrap();
+        resume_tx.send(()).unwrap();
+        let result = worker.join().unwrap();
+        server.join().unwrap();
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"another application");
+        assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 1);
+    }
+
     #[test]
     fn downloaded_export_reaches_the_selected_file() {
         use std::io::Write;
