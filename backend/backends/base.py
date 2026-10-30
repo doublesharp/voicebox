@@ -362,33 +362,30 @@ def model_load_progress(
     tracker = HFProgressTracker(progress_callback, filter_non_downloads=filter_non_downloads)
 
     tracker_context = tracker.patch_download()
-    tracker_context.__enter__()
-
-    if not is_cached:
-        task_manager.start_download(model_name)
-        progress_manager.update_progress(
-            model_name=model_name,
-            current=0,
-            total=0,
-            filename="Connecting to HuggingFace...",
-            status="downloading",
-        )
-
-    try:
-        with force_offline_if_cached(is_cached, model_name):
-            yield tracker_context
-    except Exception as e:
-        # Report error to both managers
-        progress_manager.mark_error(model_name, str(e))
-        task_manager.error_download(model_name, str(e))
-        raise
-    else:
-        # Only mark complete if we were tracking a download
+    with tracker_context:
         if not is_cached:
-            progress_manager.mark_complete(model_name)
-            task_manager.complete_download(model_name)
-    finally:
-        tracker_context.__exit__(None, None, None)
+            task_manager.start_download(model_name)
+            progress_manager.update_progress(
+                model_name=model_name,
+                current=0,
+                total=0,
+                filename="Connecting to HuggingFace...",
+                status="downloading",
+            )
+
+        try:
+            with force_offline_if_cached(is_cached, model_name):
+                yield tracker_context
+        except Exception as e:
+            # Report error to both managers
+            progress_manager.mark_error(model_name, str(e))
+            task_manager.error_download(model_name, str(e))
+            raise
+        else:
+            # Only mark complete if we were tracking a download
+            if not is_cached:
+                progress_manager.mark_complete(model_name)
+                task_manager.complete_download(model_name)
 
 
 def patch_chatterbox_f32(model) -> None:

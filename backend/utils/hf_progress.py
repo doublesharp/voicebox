@@ -218,7 +218,12 @@ class HFProgressTracker:
         """Context manager to patch tqdm for progress tracking."""
         try:
             import tqdm as tqdm_module
+        except ImportError:
+            # Tracking is optional, but errors from the download must propagate.
+            yield
+            return
 
+        try:
             # Store original tqdm class
             self._original_tqdm_class = tqdm_module.tqdm
 
@@ -324,9 +329,6 @@ class HFProgressTracker:
 
             yield
 
-        except ImportError:
-            # If tqdm not available, just yield without patching
-            yield
         finally:
             # Restore original tqdm
             if self._original_tqdm_class:
