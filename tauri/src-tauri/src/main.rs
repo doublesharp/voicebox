@@ -4061,6 +4061,110 @@ mod server_start_flow_tests {
         }
     }
 
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn stopping_during_timeout_health_probe_cancels_and_reaps_sidecar() {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock && std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+                    Err(error) => panic!("health request not received: {error}"),
+                }
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut chunk = [0; 1024];
+            assert!(socket.read(&mut chunk).unwrap() > 0);
+            let _ = accepted_tx.send(());
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        });
+        let fixture = Fixture::new("exec /bin/sleep 5");
+        let mut config = fixture.config();
+        config.port = port;
+        config.startup_timeout = Duration::from_millis(150);
+        let app = app();
+        let handle = app.handle().clone();
+        let startup = tokio::spawn(async move { start_server_with(handle.clone(), handle.state(), None, None, config).await });
+        tokio::time::timeout(Duration::from_secs(5), accepted_rx).await.unwrap().unwrap();
+        let pid = app.state::<ServerState>().server_pid.lock().unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(3), stop_server_if_owned(app.state(), None)).await.unwrap().unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(3), startup).await.unwrap().unwrap().unwrap_err();
+        let _ = release_tx.send(());
+        server.join().unwrap();
+        assert!(error.contains("cancelled"), "{error}");
+        assert!(app.state::<ServerState>().server_pid.lock().unwrap().is_none());
+        assert!(app.state::<ServerState>().child.lock().unwrap().is_none());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let alive = std::process::Command::new("kill").args(["-0", &pid.to_string()]).output().unwrap().status.success();
+                if !alive { break; }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("sidecar remains alive after cancellation");
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn timeout_health_fallback_requires_valid_voicebox_health() {
+        use std::io::{Read, Write};
+        for healthy in [true, false] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock && std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+                        Err(error) => panic!("health request not received: {error}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0; 1024];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let count = socket.read(&mut chunk).unwrap();
+                    assert!(count > 0, "client closed before request headers");
+                    request.extend_from_slice(&chunk[..count]);
+                    assert!(request.len() < 16 * 1024);
+                }
+                assert!(request.starts_with(b"GET /health "));
+                let body = if healthy { r#"{"status":"healthy","model_loaded":false,"gpu_available":false}"# } else { "{}" };
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let fixture = Fixture::new("printf 'ERROR: still starting\\n' >&2\nexec /bin/sleep 5");
+            let mut config = fixture.config();
+            config.port = port;
+            config.startup_timeout = Duration::from_millis(150);
+            let app = app();
+            let result = tokio::time::timeout(Duration::from_secs(7), start_server_with(
+                app.handle().clone(), app.state(), None, None, config,
+            )).await.expect("startup did not finish");
+            server.join().unwrap();
+            let state = app.state::<ServerState>();
+            let owned = state.server_pid.lock().unwrap().is_some();
+            stop_server_if_owned(state.clone(), None).await.unwrap();
+            assert!(state.child.lock().unwrap().is_none());
+            if healthy {
+                assert_eq!(result.unwrap(), format!("http://127.0.0.1:{port}"));
+                assert!(owned);
+            } else {
+                assert!(result.unwrap_err().contains("timed out"));
+                assert!(!owned);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn timed_out_sidecar_is_stopped_and_ownership_is_cleared() {
         let fixture = Fixture::new("printf 'ERROR: still starting\\n' >&2\nexec /bin/sleep 5");
