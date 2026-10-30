@@ -11,7 +11,7 @@ trait PasteBackend {
     fn trusted(&self) -> bool;
     fn activate(&self, pid: i32) -> Result<(), String>;
     fn save(&self) -> Result<Self::Snapshot, String>;
-    fn write(&self, text: &str) -> Result<i64, String>;
+    fn write(&self, text: &str) -> Result<i64, clipboard::ClipboardWriteFailure>;
     fn send(&self) -> Result<(), String>;
     fn change_count(&self) -> Result<i64, String>;
     fn restore(&self, snapshot: &Self::Snapshot) -> Result<(), String>;
@@ -61,8 +61,8 @@ impl PasteBackend for NativePaste {
     fn save(&self) -> Result<Self::Snapshot, String> {
         clipboard::save_clipboard()
     }
-    fn write(&self, text: &str) -> Result<i64, String> {
-        clipboard::write_text(text)
+    fn write(&self, text: &str) -> Result<i64, clipboard::ClipboardWriteFailure> {
+        clipboard::write_text_tracked(text)
     }
     fn send(&self) -> Result<(), String> {
         synthetic_keys::send_paste()
@@ -102,7 +102,26 @@ async fn paste_with<B: PasteBackend, F: Future<Output = ()>>(
     backend.activate(focus.pid)?;
     sleep(Duration::from_millis(crate::POST_ACTIVATE_SETTLE_MS)).await;
     let snapshot = backend.save()?;
-    let after_write = backend.write(text)?;
+    let after_write = match backend.write(text) {
+        Ok(count) => count,
+        Err(failure) => {
+            if let Some(count) = failure.owned_change_count {
+                let mut restore = ClipboardRestore {
+                    backend,
+                    snapshot,
+                    after_write: count,
+                    armed: true,
+                };
+                if let Err(error) = restore.restore_if_unchanged() {
+                    return Err(format!(
+                        "{}; clipboard restoration failed: {error}",
+                        failure.message
+                    ));
+                }
+            }
+            return Err(failure.message);
+        }
+    };
     let mut restore = ClipboardRestore {
         backend,
         snapshot,
@@ -159,9 +178,13 @@ mod tests {
             self.call("save")?;
             Ok("original")
         }
-        fn write(&self, text: &str) -> Result<i64, String> {
+        fn write(&self, text: &str) -> Result<i64, clipboard::ClipboardWriteFailure> {
             assert_eq!(text, "hello");
-            self.call("write")?;
+            self.call("write")
+                .map_err(|message| clipboard::ClipboardWriteFailure {
+                    message,
+                    owned_change_count: None,
+                })?;
             Ok(10)
         }
         fn send(&self) -> Result<(), String> {
@@ -318,7 +341,7 @@ mod concurrent_paste_tests {
         fn save(&self) -> Result<String, String> {
             Ok(self.0.borrow().text.clone())
         }
-        fn write(&self, text: &str) -> Result<i64, String> {
+        fn write(&self, text: &str) -> Result<i64, clipboard::ClipboardWriteFailure> {
             let mut clipboard = self.0.borrow_mut();
             clipboard.text = text.into();
             clipboard.revision += 1;
@@ -459,5 +482,130 @@ mod concurrent_paste_tests {
                 }
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod staging_failure_regression_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[derive(Clone, Copy)]
+    enum Failure {
+        BeforeClear,
+        AfterClear,
+        ExternalAfterClear,
+    }
+    struct State {
+        value: String,
+        revision: i64,
+        restores: usize,
+    }
+    struct Backend {
+        state: RefCell<State>,
+        failure: Failure,
+        restore_fails: bool,
+    }
+    impl PasteBackend for Backend {
+        type Snapshot = String;
+        fn trusted(&self) -> bool {
+            true
+        }
+        fn activate(&self, _: i32) -> Result<(), String> {
+            Ok(())
+        }
+        fn save(&self) -> Result<String, String> {
+            Ok(self.state.borrow().value.clone())
+        }
+        fn write(&self, _: &str) -> Result<i64, clipboard::ClipboardWriteFailure> {
+            let mut state = self.state.borrow_mut();
+            if !matches!(self.failure, Failure::BeforeClear) {
+                state.value.clear();
+                state.revision += 1;
+            }
+            if matches!(self.failure, Failure::ExternalAfterClear) {
+                state.value = "newer".into();
+                state.revision += 1;
+            }
+            Err(clipboard::ClipboardWriteFailure {
+                message: "staging failed".into(),
+                owned_change_count: match self.failure {
+                    Failure::BeforeClear => None,
+                    _ => Some(1),
+                },
+            })
+        }
+        fn send(&self) -> Result<(), String> {
+            panic!("paste must not run after failed staging")
+        }
+        fn change_count(&self) -> Result<i64, String> {
+            Ok(self.state.borrow().revision)
+        }
+        fn restore(&self, snapshot: &String) -> Result<(), String> {
+            if self.restore_fails {
+                return Err("restore failed".into());
+            }
+            let mut state = self.state.borrow_mut();
+            state.value = snapshot.clone();
+            state.revision += 1;
+            state.restores += 1;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_staging_restores_owned_clear_but_preserves_external_changes() {
+        for (failure, expected, restores) in [
+            (Failure::BeforeClear, "original", 0),
+            (Failure::AfterClear, "original", 1),
+            (Failure::ExternalAfterClear, "newer", 0),
+        ] {
+            let backend = Backend {
+                state: RefCell::new(State {
+                    value: "original".into(),
+                    revision: 0,
+                    restores: 0,
+                }),
+                failure,
+                restore_fails: false,
+            };
+            let focus = focus_capture::FocusSnapshot {
+                pid: 42,
+                bundle_id: None,
+                role: None,
+            };
+            assert_eq!(
+                paste_with("dictation", &focus, &backend, |_| async {})
+                    .await
+                    .unwrap_err(),
+                "staging failed"
+            );
+            let state = backend.state.borrow();
+            assert_eq!(state.value, expected);
+            assert_eq!(state.restores, restores);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_recovery_reports_both_staging_and_restore_errors() {
+        let backend = Backend {
+            state: RefCell::new(State {
+                value: "original".into(),
+                revision: 0,
+                restores: 0,
+            }),
+            failure: Failure::AfterClear,
+            restore_fails: true,
+        };
+        let focus = focus_capture::FocusSnapshot {
+            pid: 42,
+            bundle_id: None,
+            role: None,
+        };
+        let error = paste_with("dictation", &focus, &backend, |_| async {})
+            .await
+            .unwrap_err();
+        assert!(error.contains("staging failed"));
+        assert!(error.contains("clipboard restoration failed: restore failed"));
     }
 }

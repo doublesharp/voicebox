@@ -34,6 +34,23 @@ use objc::runtime::Object;
 #[cfg(target_os = "macos")]
 use objc::{class, msg_send, sel, sel_impl};
 
+/// A failed text write may already have cleared the clipboard. The change
+/// count identifies the last mutation made by this write, when known.
+#[derive(Debug)]
+pub(crate) struct ClipboardWriteFailure {
+    pub message: String,
+    pub owned_change_count: Option<i64>,
+}
+
+impl ClipboardWriteFailure {
+    fn before_mutation(message: String) -> Self {
+        Self {
+            message,
+            owned_change_count: None,
+        }
+    }
+}
+
 /// One full-fidelity snapshot of the general pasteboard. Hold on to the value
 /// until the paste has landed, then pass it to [`restore_clipboard`].
 #[derive(Debug, Clone)]
@@ -193,6 +210,42 @@ mod private_pasteboard_tests {
             data(&board.save(), 0, "com.voicebox.test.binary"),
             &[0, 1, 255]
         );
+    }
+
+    #[test]
+    fn failed_private_pasteboard_write_reports_owned_clear_for_recovery() {
+        let board = PrivatePasteboard::new();
+        board.restore(&snapshot(vec![vec![(
+            "com.voicebox.test.original",
+            b"saved",
+        )]]));
+        let original = board.save();
+        let failure =
+            unsafe { write_text_to_with(board.board, "dictation", |_, _, _| false) }.unwrap_err();
+        let after = board.save();
+        assert_eq!(after.item_count(), 0);
+        assert_eq!(failure.owned_change_count, Some(after.change_count()));
+        board.restore(&original);
+        assert_eq!(
+            data(&board.save(), 0, "com.voicebox.test.original"),
+            b"saved"
+        );
+    }
+
+    #[test]
+    fn private_pasteboard_external_write_invalidates_failed_clear_ownership() {
+        let board = PrivatePasteboard::new();
+        board.write("original");
+        let failure = unsafe {
+            write_text_to_with(board.board, "dictation", |pb, _, _| {
+                write_text_to(pb, "newer").unwrap();
+                false
+            })
+        }
+        .unwrap_err();
+        let current = board.save();
+        assert_ne!(failure.owned_change_count, Some(current.change_count()));
+        assert_eq!(data(&current, 0, "public.utf8-plain-text"), b"newer");
     }
 
     #[test]
@@ -384,25 +437,47 @@ unsafe fn save_clipboard_from(pb: Id) -> Result<ClipboardSnapshot, String> {
 /// touched the clipboard in between.
 #[cfg(target_os = "macos")]
 pub fn write_text(text: &str) -> Result<i64, String> {
-    unsafe {
-        let _pool = AutoreleasePool::new();
-        write_text_to(general_pasteboard()?, text)
-    }
+    write_text_tracked(text).map_err(|failure| failure.message)
 }
 
 #[cfg(target_os = "macos")]
-unsafe fn write_text_to(pb: Id, text: &str) -> Result<i64, String> {
-    let _new_count: i64 = msg_send![pb, clearContents];
-
-    let ns_text = ns_string(text);
-    // `public.utf8-plain-text` is the raw UTI behind `NSPasteboardTypeString`
-    // and works for every text-aware paste target we care about.
-    let ns_type = ns_string("public.utf8-plain-text");
-    let ok: bool = msg_send![pb, setString: ns_text forType: ns_type];
-    if !ok {
-        return Err("NSPasteboard setString:forType: returned NO".into());
+pub(crate) fn write_text_tracked(text: &str) -> Result<i64, ClipboardWriteFailure> {
+    unsafe {
+        let _pool = AutoreleasePool::new();
+        let board = general_pasteboard().map_err(ClipboardWriteFailure::before_mutation)?;
+        write_text_to_with(
+            board,
+            text,
+            |pb, value, kind| msg_send![pb, setString: value forType: kind],
+        )
     }
+}
 
+#[cfg(all(test, target_os = "macos"))]
+unsafe fn write_text_to(pb: Id, text: &str) -> Result<i64, String> {
+    write_text_to_with(
+        pb,
+        text,
+        |board, value, kind| msg_send![board, setString: value forType: kind],
+    )
+    .map_err(|failure| failure.message)
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn write_text_to_with(
+    pb: Id,
+    text: &str,
+    write: impl FnOnce(Id, Id, Id) -> bool,
+) -> Result<i64, ClipboardWriteFailure> {
+    let after_clear: i64 = msg_send![pb, clearContents];
+    let ns_text = ns_string(text);
+    let ns_type = ns_string("public.utf8-plain-text");
+    if !write(pb, ns_text, ns_type) {
+        return Err(ClipboardWriteFailure {
+            message: "NSPasteboard setString:forType: returned NO".into(),
+            owned_change_count: Some(after_clear),
+        });
+    }
     let after: i64 = msg_send![pb, changeCount];
     Ok(after)
 }
@@ -855,11 +930,18 @@ pub fn save_clipboard() -> Result<ClipboardSnapshot, String> {
 
 #[cfg(target_os = "windows")]
 pub fn write_text(text: &str) -> Result<i64, String> {
-    let _guard = win::ClipboardGuard::open()?;
-    win::empty()?;
-    win::put_unicode_text(text)?;
-    // `GetClipboardSequenceNumber` reflects the post-write value as soon
-    // as `SetClipboardData` returns.
+    write_text_tracked(text).map_err(|failure| failure.message)
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn write_text_tracked(text: &str) -> Result<i64, ClipboardWriteFailure> {
+    let _guard = win::ClipboardGuard::open().map_err(ClipboardWriteFailure::before_mutation)?;
+    win::empty().map_err(ClipboardWriteFailure::before_mutation)?;
+    let after_clear = win::sequence_number() as i64;
+    win::put_unicode_text(text).map_err(|message| ClipboardWriteFailure {
+        message,
+        owned_change_count: Some(after_clear),
+    })?;
     Ok(win::sequence_number() as i64)
 }
 
@@ -896,6 +978,13 @@ pub fn save_clipboard() -> Result<ClipboardSnapshot, String> {
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn write_text(_text: &str) -> Result<i64, String> {
     Err("clipboard snapshot is not yet implemented on this platform".into())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub(crate) fn write_text_tracked(_text: &str) -> Result<i64, ClipboardWriteFailure> {
+    Err(ClipboardWriteFailure::before_mutation(
+        "clipboard snapshot is not yet implemented on this platform".into(),
+    ))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
