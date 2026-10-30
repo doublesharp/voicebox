@@ -780,7 +780,75 @@ fn run_session<R: tauri::Runtime>(
     )
 }
 
+trait ClipHost: PreviewHost {
+    fn clip_config(&self, device: &Self::Device) -> Result<(StreamConfig, SampleFormat), String>;
+    fn build_clip(
+        &self,
+        device: &Self::Device,
+        config: &StreamConfig,
+        format: SampleFormat,
+        pcm: Arc<[f32]>,
+        controls: Arc<PlaybackControls>,
+        position: Arc<RenderPosition>,
+        errors: mpsc::Sender<String>,
+    ) -> Result<Self::Stream, String>;
+}
+
+impl ClipHost for CpalAudioHost {
+    fn clip_config(&self, device: &Device) -> Result<(StreamConfig, SampleFormat), String> {
+        let supported = device
+            .default_output_config()
+            .map_err(|error| format!("Unable to configure output: {error}"))?;
+        Ok((supported.clone().into(), supported.sample_format()))
+    }
+    fn build_clip(
+        &self,
+        device: &Device,
+        config: &StreamConfig,
+        format: SampleFormat,
+        pcm: Arc<[f32]>,
+        controls: Arc<PlaybackControls>,
+        position: Arc<RenderPosition>,
+        errors: mpsc::Sender<String>,
+    ) -> Result<cpal::Stream, String> {
+        match format {
+            SampleFormat::F32 => {
+                build_stream::<f32>(device, config, pcm, controls, position, errors)
+            }
+            SampleFormat::I16 => {
+                build_stream::<i16>(device, config, pcm, controls, position, errors)
+            }
+            SampleFormat::U16 => {
+                build_stream::<u16>(device, config, pcm, controls, position, errors)
+            }
+            format => Err(format!("Unsupported audio output format: {format:?}")),
+        }
+    }
+}
+
 fn run_session_with(
+    id: &str,
+    data: Vec<u8>,
+    ids: Vec<String>,
+    controls: Arc<PlaybackControls>,
+    wake: mpsc::Receiver<()>,
+    ready: &mut Option<tokio::sync::oneshot::Sender<Result<PlaybackSession, String>>>,
+    report: impl FnMut(&'static str, f64, f64),
+) -> Result<(), String> {
+    run_session_on_host(
+        &CpalAudioHost(cpal::default_host()),
+        id,
+        data,
+        ids,
+        controls,
+        wake,
+        ready,
+        report,
+    )
+}
+
+fn run_session_on_host<H: ClipHost>(
+    host: &H,
     id: &str,
     data: Vec<u8>,
     ids: Vec<String>,
@@ -792,12 +860,12 @@ fn run_session_with(
     let (samples, rate, channels) = decode_audio(data)?;
     let duration = samples.len() as f64 / channels as f64 / rate as f64;
     let samples: Arc<[f32]> = samples.into();
-    let host = cpal::default_host();
-    let devices: Vec<(Device, String)> = host
-        .output_devices()
+    let devices = host
+        .devices()
         .map_err(|error| format!("Unable to list outputs: {error}"))?
-        .filter_map(|device| device.name().ok().map(|name| (device, name)))
-        .collect();
+        .into_iter()
+        .filter_map(|device| host.name(&device).ok().map(|name| (device, name)))
+        .collect::<Vec<_>>();
     let names = devices
         .iter()
         .map(|(_, name)| name.clone())
@@ -816,41 +884,20 @@ fn run_session_with(
         if controls.stopped.load(Ordering::Acquire) {
             return Err("Playback cancelled".into());
         }
-        let supported = device
-            .default_output_config()
-            .map_err(|error| format!("Unable to configure output: {error}"))?;
-        let config: StreamConfig = supported.clone().into();
+        let (config, format) = host.clip_config(&device)?;
         let key = (config.sample_rate.0, config.channels);
         let pcm = prepare_output_pcm(&samples, rate, channels, key, &mut prepared)?;
         let frames = pcm.len() / config.channels as usize;
         let position = Arc::new(RenderPosition::default());
-        let stream = match supported.sample_format() {
-            SampleFormat::F32 => build_stream::<f32>(
-                &device,
-                &config,
-                pcm,
-                controls.clone(),
-                position.clone(),
-                errors.clone(),
-            ),
-            SampleFormat::I16 => build_stream::<i16>(
-                &device,
-                &config,
-                pcm,
-                controls.clone(),
-                position.clone(),
-                errors.clone(),
-            ),
-            SampleFormat::U16 => build_stream::<u16>(
-                &device,
-                &config,
-                pcm,
-                controls.clone(),
-                position.clone(),
-                errors.clone(),
-            ),
-            format => Err(format!("Unsupported audio output format: {format:?}")),
-        }?;
+        let stream = host.build_clip(
+            &device,
+            &config,
+            format,
+            pcm,
+            controls.clone(),
+            position.clone(),
+            errors.clone(),
+        )?;
         streams.push(stream);
         positions.push((position, frames, config.sample_rate.0));
     }
@@ -860,8 +907,7 @@ fn run_session_with(
     // Build all streams first; callbacks remain silent behind the shared pause
     // gate until every stream has started. Hardware latency may differ by device.
     start_output_streams(&streams, &controls, "Playback cancelled", |stream| {
-        stream
-            .play()
+        host.start(stream)
             .map_err(|error| format!("Unable to start output: {error}"))
     })?;
     let start_position = controls.requested_position().min(duration);
@@ -883,9 +929,7 @@ fn run_session_with(
         &wake,
         &error_receiver,
         duration,
-        |state, position| {
-            report(state, position, duration);
-        },
+        |state, position| report(state, position, duration),
     )?;
     drop(streams);
     Ok(())
@@ -1036,8 +1080,8 @@ trait PreviewHost {
     fn start(&self, stream: &Self::Stream) -> Result<(), String>;
 }
 
-struct CpalPreviewHost(cpal::Host);
-impl PreviewHost for CpalPreviewHost {
+struct CpalAudioHost(cpal::Host);
+impl PreviewHost for CpalAudioHost {
     type Device = Device;
     type Stream = cpal::Stream;
     fn default_device(&self) -> Option<Device> {
@@ -1086,7 +1130,7 @@ fn run_pcm_session_with(
     report: impl FnMut(&'static str, f64, f64),
 ) -> Result<(), String> {
     run_pcm_session_on_host(
-        &CpalPreviewHost(cpal::default_host()),
+        &CpalAudioHost(cpal::default_host()),
         id,
         rate,
         ids,
@@ -4421,6 +4465,456 @@ mod preview_host_integration_tests {
         );
         let result = worker.thread.take().unwrap().join().unwrap();
         assert!(result.unwrap_err().contains("disconnected"));
+        assert_eq!(host.0.lock().unwrap().dropped.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod clip_host_integration_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct State {
+        names: Vec<String>,
+        fail_enumeration: bool,
+        fail_config: Option<String>,
+        fail_build: Option<String>,
+        fail_start: Option<String>,
+        cancel_on_build: Option<String>,
+        configured: Vec<String>,
+        built: Vec<String>,
+        started: Vec<String>,
+        dropped: Vec<String>,
+        positions: Vec<Arc<RenderPosition>>,
+        samples: Vec<Arc<[f32]>>,
+        errors: Vec<mpsc::Sender<String>>,
+        enumerations: usize,
+        invalid_config: bool,
+    }
+    #[derive(Clone)]
+    struct Host(Arc<Mutex<State>>);
+    impl Host {
+        fn new(names: &[&str]) -> Self {
+            Self(Arc::new(Mutex::new(State {
+                names: names.iter().map(|n| (*n).into()).collect(),
+                ..Default::default()
+            })))
+        }
+    }
+    struct Stream {
+        name: String,
+        state: Arc<Mutex<State>>,
+        controls: Arc<PlaybackControls>,
+    }
+    impl Drop for Stream {
+        fn drop(&mut self) {
+            self.state.lock().unwrap().dropped.push(self.name.clone());
+        }
+    }
+    impl PreviewHost for Host {
+        type Device = String;
+        type Stream = Stream;
+        fn default_device(&self) -> Option<String> {
+            self.0.lock().unwrap().names.first().cloned()
+        }
+        fn devices(&self) -> Result<Vec<String>, String> {
+            let mut state = self.0.lock().unwrap();
+            state.enumerations += 1;
+            if state.fail_enumeration {
+                Err("enumeration failed".into())
+            } else {
+                Ok(state.names.clone())
+            }
+        }
+        fn name(&self, device: &String) -> Result<String, String> {
+            Ok(device.clone())
+        }
+        fn build(
+            &self,
+            _: &String,
+            _: Arc<Mutex<crate::audio_stream::PcmQueue>>,
+            _: Arc<PlaybackControls>,
+            _: mpsc::Sender<String>,
+        ) -> Result<Stream, String> {
+            panic!("preview build is not used by clip playback")
+        }
+        fn start(&self, stream: &Stream) -> Result<(), String> {
+            assert!(
+                stream.controls.paused.load(Ordering::Acquire),
+                "outputs must remain paused until all start"
+            );
+            let mut state = self.0.lock().unwrap();
+            state.started.push(stream.name.clone());
+            if state.fail_start.as_ref() == Some(&stream.name) {
+                return Err("start failed".into());
+            }
+            Ok(())
+        }
+    }
+    impl ClipHost for Host {
+        fn clip_config(&self, device: &String) -> Result<(StreamConfig, SampleFormat), String> {
+            let mut state = self.0.lock().unwrap();
+            state.configured.push(device.clone());
+            if state.fail_config.as_ref() == Some(device) {
+                return Err("config failed".into());
+            }
+            Ok((
+                StreamConfig {
+                    channels: if state.invalid_config { 0 } else { 1 },
+                    sample_rate: cpal::SampleRate(8000),
+                    buffer_size: cpal::BufferSize::Default,
+                },
+                SampleFormat::F32,
+            ))
+        }
+        fn build_clip(
+            &self,
+            device: &String,
+            _: &StreamConfig,
+            _: SampleFormat,
+            pcm: Arc<[f32]>,
+            controls: Arc<PlaybackControls>,
+            position: Arc<RenderPosition>,
+            errors: mpsc::Sender<String>,
+        ) -> Result<Stream, String> {
+            let mut state = self.0.lock().unwrap();
+            state.built.push(device.clone());
+            if state.cancel_on_build.as_ref() == Some(device) {
+                controls.stop();
+            }
+            if state.fail_build.as_ref() == Some(device) {
+                return Err("build failed".into());
+            }
+            state.positions.push(position);
+            state.samples.push(pcm);
+            state.errors.push(errors);
+            Ok(Stream {
+                name: device.clone(),
+                state: self.0.clone(),
+                controls,
+            })
+        }
+    }
+    fn wav() -> Vec<u8> {
+        let mut output = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = hound::WavWriter::new(
+                &mut output,
+                hound::WavSpec {
+                    channels: 1,
+                    sample_rate: 8000,
+                    bits_per_sample: 16,
+                    sample_format: hound::SampleFormat::Int,
+                },
+            )
+            .unwrap();
+            for sample in 0..800 {
+                writer.write_sample(sample as i16).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+        output.into_inner()
+    }
+    fn ids(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| device_id(n)).collect()
+    }
+    fn failed_start(
+        host: &Host,
+        data: Vec<u8>,
+        selected: Vec<String>,
+        controls: Arc<PlaybackControls>,
+        abandoned: bool,
+    ) -> String {
+        let (_wake_tx, wake) = mpsc::channel();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _receiver = if abandoned {
+            drop(rx);
+            None
+        } else {
+            Some(rx)
+        };
+        let mut ready = Some(tx);
+        run_session_on_host(
+            host,
+            "clip",
+            data,
+            selected,
+            controls,
+            wake,
+            &mut ready,
+            |_, _, _| panic!("failed startup must not emit playback"),
+        )
+        .unwrap_err()
+    }
+
+    #[test]
+    fn invalid_audio_is_rejected_before_device_enumeration() {
+        let host = Host::new(&["A"]);
+        assert!(failed_start(
+            &host,
+            b"not audio".to_vec(),
+            ids(&["A"]),
+            Arc::new(PlaybackControls::new(0.0, 1.0)),
+            false
+        )
+        .contains("audio"));
+        assert_eq!(host.0.lock().unwrap().enumerations, 0);
+    }
+
+    #[test]
+    fn unavailable_and_ambiguous_outputs_never_open_streams() {
+        for (names, selected) in [
+            (vec!["A"], ids(&["missing"])),
+            (vec!["USB Audio", "USB_Audio"], ids(&["USB Audio"])),
+            (vec!["A"], vec![]),
+        ] {
+            let host = Host::new(&names);
+            assert!(!failed_start(
+                &host,
+                wav(),
+                selected,
+                Arc::new(PlaybackControls::new(0.0, 1.0)),
+                false
+            )
+            .is_empty());
+            assert!(host.0.lock().unwrap().configured.is_empty());
+        }
+    }
+
+    #[test]
+    fn enumeration_and_invalid_config_fail_without_opening_streams() {
+        let host = Host::new(&["A"]);
+        host.0.lock().unwrap().fail_enumeration = true;
+        assert!(failed_start(
+            &host,
+            wav(),
+            ids(&["A"]),
+            Arc::new(PlaybackControls::new(0.0, 1.0)),
+            false
+        )
+        .contains("enumeration failed"));
+        let host = Host::new(&["A"]);
+        host.0.lock().unwrap().invalid_config = true;
+        assert!(failed_start(
+            &host,
+            wav(),
+            ids(&["A"]),
+            Arc::new(PlaybackControls::new(0.0, 1.0)),
+            false
+        )
+        .contains("Invalid PCM"));
+        assert!(host.0.lock().unwrap().built.is_empty());
+    }
+
+    #[test]
+    fn failed_second_config_or_build_drops_first_without_starting() {
+        for config_failure in [true, false] {
+            let host = Host::new(&["A", "B"]);
+            {
+                let mut state = host.0.lock().unwrap();
+                if config_failure {
+                    state.fail_config = Some("B".into());
+                } else {
+                    state.fail_build = Some("B".into());
+                }
+            }
+            let controls = Arc::new(PlaybackControls::new(0.0, 1.0));
+            let error = failed_start(&host, wav(), ids(&["A", "B"]), controls.clone(), false);
+            assert_eq!(
+                error,
+                if config_failure {
+                    "config failed"
+                } else {
+                    "build failed"
+                }
+            );
+            let state = host.0.lock().unwrap();
+            assert!(state.started.is_empty());
+            assert_eq!(state.dropped, ["A"]);
+            assert!(controls.paused.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn failed_second_start_keeps_all_outputs_paused_and_releases_them() {
+        let host = Host::new(&["A", "B"]);
+        host.0.lock().unwrap().fail_start = Some("B".into());
+        let controls = Arc::new(PlaybackControls::new(0.0, 1.0));
+        assert!(
+            failed_start(&host, wav(), ids(&["A", "B"]), controls.clone(), false)
+                .contains("start failed")
+        );
+        let state = host.0.lock().unwrap();
+        assert_eq!(state.started, ["A", "B"]);
+        assert_eq!(state.dropped.len(), 2);
+        assert!(controls.paused.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn cancellation_during_build_and_abandoned_ack_never_unpause() {
+        for cancel_build in [true, false] {
+            let host = Host::new(&["A", "B"]);
+            if cancel_build {
+                host.0.lock().unwrap().cancel_on_build = Some("A".into());
+            }
+            let controls = Arc::new(PlaybackControls::new(0.0, 1.0));
+            assert_eq!(
+                failed_start(
+                    &host,
+                    wav(),
+                    ids(&["A", "B"]),
+                    controls.clone(),
+                    !cancel_build
+                ),
+                "Playback cancelled"
+            );
+            assert!(controls.stopped.load(Ordering::Acquire));
+            assert!(controls.paused.load(Ordering::Acquire));
+            let state = host.0.lock().unwrap();
+            if cancel_build {
+                assert_eq!(state.built, ["A"]);
+                assert!(state.started.is_empty());
+            } else {
+                assert_eq!(state.started, ["A", "B"]);
+            }
+        }
+    }
+
+    struct Worker {
+        controls: Arc<PlaybackControls>,
+        wake: mpsc::Sender<()>,
+        thread: Option<std::thread::JoinHandle<Result<(), String>>>,
+    }
+    impl Drop for Worker {
+        fn drop(&mut self) {
+            self.controls.stop();
+            let _ = self.wake.send(());
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+    fn launch(
+        host: Host,
+    ) -> (
+        Worker,
+        tokio::sync::oneshot::Receiver<Result<PlaybackSession, String>>,
+        mpsc::Receiver<(&'static str, f64, f64)>,
+    ) {
+        let controls = Arc::new(PlaybackControls::new(0.03, 1.0));
+        let (wake_tx, wake_rx) = mpsc::channel();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (event_tx, events) = mpsc::channel();
+        let worker_controls = controls.clone();
+        let thread = std::thread::spawn(move || {
+            let mut ready = Some(tx);
+            run_session_on_host(
+                &host,
+                "clip",
+                wav(),
+                ids(&["A", "B"]),
+                worker_controls,
+                wake_rx,
+                &mut ready,
+                |state, position, duration| {
+                    let _ = event_tx.send((state, position, duration));
+                },
+            )
+        });
+        (
+            Worker {
+                controls,
+                wake: wake_tx,
+                thread: Some(thread),
+            },
+            rx,
+            events,
+        )
+    }
+    fn wait_ready(
+        mut receiver: tokio::sync::oneshot::Receiver<Result<PlaybackSession, String>>,
+    ) -> PlaybackSession {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match receiver.try_recv() {
+                Ok(result) => return result.unwrap(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                    if Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(error) => panic!("clip did not report readiness: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn clip_waits_for_both_outputs_and_reuses_matching_pcm() {
+        let host = Host::new(&["A", "B"]);
+        let (mut worker, ready, events) = launch(host.clone());
+        let session = wait_ready(ready);
+        assert_eq!(session.session_id, "clip");
+        assert!((session.duration - 0.1).abs() < 1e-6);
+        assert!((session.position - 0.03).abs() < 1e-6);
+        assert_eq!(
+            events.recv_timeout(Duration::from_secs(2)).unwrap().0,
+            "playing"
+        );
+        let positions = {
+            let state = host.0.lock().unwrap();
+            assert_eq!(state.started, ["A", "B"]);
+            assert!(Arc::ptr_eq(&state.samples[0], &state.samples[1]));
+            state.positions.clone()
+        };
+        let revision = worker.controls.revision();
+        positions[0].frame.store(800, Ordering::Release);
+        positions[0].revision.store(revision, Ordering::Release);
+        worker.wake.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !worker.thread.as_ref().unwrap().is_finished(),
+            "clip ended before second output finished"
+        );
+        positions[1].frame.store(800, Ordering::Release);
+        positions[1].revision.store(revision, Ordering::Release);
+        worker.wake.send(()).unwrap();
+        loop {
+            let event = events.recv_timeout(Duration::from_secs(2)).unwrap();
+            if event.0 == "ended" {
+                assert!((event.1 - 0.1).abs() < 1e-6);
+                break;
+            }
+        }
+        worker.thread.take().unwrap().join().unwrap().unwrap();
+        assert_eq!(host.0.lock().unwrap().dropped.len(), 2);
+    }
+
+    #[test]
+    fn output_failure_after_ready_returns_error_and_releases_streams() {
+        let host = Host::new(&["A", "B"]);
+        let (mut worker, ready, events) = launch(host.clone());
+        let _session = wait_ready(ready);
+        assert_eq!(
+            events.recv_timeout(Duration::from_secs(2)).unwrap().0,
+            "playing"
+        );
+        host.0.lock().unwrap().errors[1]
+            .send("device failed".into())
+            .unwrap();
+        worker.wake.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !worker.thread.as_ref().unwrap().is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(worker.thread.as_ref().unwrap().is_finished());
+        assert!(worker
+            .thread
+            .take()
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap_err()
+            .contains("device failed"));
         assert_eq!(host.0.lock().unwrap().dropped.len(), 2);
     }
 }
