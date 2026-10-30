@@ -121,6 +121,28 @@ impl Drop for SessionCleanup {
     }
 }
 
+fn execute_audio_worker(
+    controls: &PlaybackControls,
+    mut ready: Option<tokio::sync::oneshot::Sender<Result<PlaybackSession, String>>>,
+    run: impl FnOnce(
+        &mut Option<tokio::sync::oneshot::Sender<Result<PlaybackSession, String>>>,
+    ) -> Result<(), String>,
+    mut report: impl FnMut(&'static str, Option<String>),
+) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&mut ready)))
+        .unwrap_or_else(|_| Err("Audio output worker failed unexpectedly".into()));
+    if let Err(error) = result {
+        if let Some(sender) = ready.take() {
+            let _ = sender.send(Err(error.clone()));
+        }
+        let stopped = controls.stopped.load(Ordering::Acquire);
+        report(
+            if stopped { "stopped" } else { "error" },
+            if stopped { None } else { Some(error) },
+        );
+    }
+}
+
 /// CPAL streams are created and retained by their owner thread. The Tauri
 /// command awaits only a startup acknowledgement, never the clip's duration.
 pub struct AudioOutputState {
@@ -226,30 +248,23 @@ impl AudioOutputState {
             .name(format!("voicebox-{id}"))
             .spawn(move || {
                 let _cleanup = cleanup;
-                let mut ready = Some(sender);
-                if let Err(error) = run_pcm_session(
-                    &app,
-                    &worker_id,
-                    rate,
-                    ids,
-                    worker_controls.clone(),
-                    queues,
-                    receiver,
-                    &mut ready,
-                ) {
-                    if let Some(sender) = ready.take() {
-                        let _ = sender.send(Err(error.clone()));
-                    }
-                    let stopped = worker_controls.stopped.load(Ordering::Acquire);
-                    emit(
-                        &app,
-                        &worker_id,
-                        if stopped { "stopped" } else { "error" },
-                        0.0,
-                        0.0,
-                        if stopped { None } else { Some(error) },
-                    );
-                }
+                execute_audio_worker(
+                    &worker_controls,
+                    Some(sender),
+                    |ready| {
+                        run_pcm_session(
+                            &app,
+                            &worker_id,
+                            rate,
+                            ids,
+                            worker_controls.clone(),
+                            queues,
+                            receiver,
+                            ready,
+                        )
+                    },
+                    |state, error| emit(&app, &worker_id, state, 0.0, 0.0, error),
+                );
             });
         if let Err(error) = spawned {
             controls.stop();
@@ -392,29 +407,22 @@ impl AudioOutputState {
             .name(format!("voicebox-{id}"))
             .spawn(move || {
                 let _cleanup = cleanup;
-                let mut ready = Some(ready_sender);
-                if let Err(error) = run_session(
-                    &app,
-                    &worker_id,
-                    audio_data,
-                    device_ids,
-                    worker_controls.clone(),
-                    wake_receiver,
-                    &mut ready,
-                ) {
-                    if let Some(sender) = ready.take() {
-                        let _ = sender.send(Err(error.clone()));
-                    }
-                    let stopped = worker_controls.stopped.load(Ordering::Acquire);
-                    emit(
-                        &app,
-                        &worker_id,
-                        if stopped { "stopped" } else { "error" },
-                        0.0,
-                        0.0,
-                        if stopped { None } else { Some(error) },
-                    );
-                }
+                execute_audio_worker(
+                    &worker_controls,
+                    Some(ready_sender),
+                    |ready| {
+                        run_session(
+                            &app,
+                            &worker_id,
+                            audio_data,
+                            device_ids,
+                            worker_controls.clone(),
+                            wake_receiver,
+                            ready,
+                        )
+                    },
+                    |state, error| emit(&app, &worker_id, state, 0.0, 0.0, error),
+                );
             });
         if let Err(error) = spawned {
             controls.stop();
@@ -2666,5 +2674,167 @@ mod worker_cleanup_regression_tests {
             .unwrap()
             .unwrap()
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod worker_reporting_regression_tests {
+    use super::*;
+
+    fn session() -> PlaybackSession {
+        PlaybackSession {
+            session_id: "one".into(),
+            duration: 2.0,
+            position: 0.0,
+        }
+    }
+
+    #[tokio::test]
+    async fn panic_before_ready_reports_error_to_caller_and_event_listener() {
+        let controls = PlaybackControls::new(0.0, 1.0);
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let mut events = Vec::new();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            execute_audio_worker(
+                &controls,
+                Some(sender),
+                |_| panic!("device failed"),
+                |state, error| events.push((state, error)),
+            );
+        }));
+        assert!(outcome.is_ok(), "worker panic escaped error handling");
+        assert!(receiver.await.unwrap().unwrap_err().contains("worker"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "error");
+        assert!(events[0].1.as_ref().unwrap().contains("worker"));
+    }
+
+    #[tokio::test]
+    async fn panic_after_ready_reports_a_terminal_error_event() {
+        let controls = PlaybackControls::new(0.0, 1.0);
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let mut events = Vec::new();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            execute_audio_worker(
+                &controls,
+                Some(sender),
+                |ready| {
+                    ready.take().unwrap().send(Ok(session())).unwrap();
+                    panic!("callback failed");
+                },
+                |state, error| events.push((state, error)),
+            );
+        }));
+        assert!(outcome.is_ok());
+        assert_eq!(receiver.await.unwrap().unwrap().session_id, "one");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "error");
+        assert!(events[0].1.is_some());
+    }
+
+    #[tokio::test]
+    async fn normal_start_failure_is_returned_and_reported_once() {
+        let controls = PlaybackControls::new(0.0, 1.0);
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let mut events = Vec::new();
+        execute_audio_worker(
+            &controls,
+            Some(sender),
+            |_| Err("device unavailable".into()),
+            |state, error| events.push((state, error)),
+        );
+        assert_eq!(receiver.await.unwrap().unwrap_err(), "device unavailable");
+        assert_eq!(events, [("error", Some("device unavailable".into()))]);
+    }
+
+    #[tokio::test]
+    async fn stop_during_failure_reports_stopped_without_error_event() {
+        let controls = PlaybackControls::new(0.0, 1.0);
+        controls.stop();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let mut events = Vec::new();
+        execute_audio_worker(
+            &controls,
+            Some(sender),
+            |_| Err("cancelled".into()),
+            |state, error| events.push((state, error)),
+        );
+        assert_eq!(receiver.await.unwrap().unwrap_err(), "cancelled");
+        assert_eq!(events, [("stopped", None)]);
+    }
+
+    #[tokio::test]
+    async fn worker_panic_reports_error_and_releases_owned_session() {
+        let state = AudioOutputState::new();
+        let controls = Arc::new(PlaybackControls::new(0.0, 1.0));
+        let (wake, _) = mpsc::channel();
+        *state.active.lock().unwrap() = Some(SessionHandle {
+            id: "one".into(),
+            controls: controls.clone(),
+            wake,
+            streaming: None,
+        });
+        let cleanup = SessionCleanup::new(state.active.clone(), controls.clone(), "one".into());
+        let worker_controls = controls.clone();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let (event_tx, event_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _cleanup = cleanup;
+            execute_audio_worker(
+                &worker_controls,
+                Some(sender),
+                |_| panic!("worker failure"),
+                |state, error| {
+                    event_tx.send((state, error)).unwrap();
+                },
+            );
+        });
+        worker.join().unwrap();
+        assert!(receiver.await.unwrap().is_err());
+        assert_eq!(event_rx.recv().unwrap().0, "error");
+        assert!(controls.stopped.load(Ordering::Acquire));
+        assert!(state.active.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn panic_after_stop_reports_stopped() {
+        let controls = PlaybackControls::new(0.0, 1.0);
+        controls.stop();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let mut events = Vec::new();
+        execute_audio_worker(
+            &controls,
+            Some(sender),
+            |_| panic!("worker failure"),
+            |state, error| events.push((state, error)),
+        );
+        assert!(receiver.await.unwrap().is_err());
+        assert_eq!(events, [("stopped", None)]);
+    }
+
+    #[test]
+    fn successful_worker_does_not_emit_a_failure_event() {
+        let controls = PlaybackControls::new(0.0, 1.0);
+        execute_audio_worker(
+            &controls,
+            None,
+            |_| Ok(()),
+            |_, _| panic!("unexpected failure"),
+        );
+    }
+
+    #[test]
+    fn abandoned_start_caller_does_not_prevent_error_event() {
+        let controls = PlaybackControls::new(0.0, 1.0);
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        drop(receiver);
+        let mut events = Vec::new();
+        execute_audio_worker(
+            &controls,
+            Some(sender),
+            |_| Err("failure".into()),
+            |state, error| events.push((state, error)),
+        );
+        assert_eq!(events, [("error", Some("failure".into()))]);
     }
 }
