@@ -1,3 +1,18 @@
+/// Find the default sink monitor or the first available monitor in pactl output.
+pub(super) fn monitor_source_from_pactl<'a>(
+    sources: &'a str,
+    default_sink: Option<&str>,
+) -> Option<&'a str> {
+    let names = || sources.lines().filter_map(|line| line.split('\t').nth(1));
+    if let Some(sink) = default_sink {
+        let target = format!("{sink}.monitor");
+        if let Some(name) = names().find(|name| *name == target) {
+            return Some(name);
+        }
+    }
+    names().find(|name| name.ends_with(".monitor"))
+}
+
 /// Select a system-audio monitor without falling back to a microphone.
 pub(super) fn select_monitor_device<D>(
     devices: Vec<D>,
@@ -24,7 +39,7 @@ pub(super) fn select_monitor_device<D>(
 
 #[cfg(test)]
 mod tests {
-    use super::select_monitor_device;
+    use super::{monitor_source_from_pactl, select_monitor_device};
 
     #[derive(Debug, PartialEq)]
     struct Device(&'static str, Option<&'static str>);
@@ -100,5 +115,66 @@ mod tests {
     #[test]
     fn never_uses_default_input_when_device_enumeration_is_empty() {
         assert_eq!(choose(vec![], None), None);
+    }
+    const SOURCES: &str =
+        "0\tmic.input\tmodule\n1\tother.monitor\tmodule\n2\tsink.monitor\tmodule\n";
+
+    #[test]
+    fn pactl_prefers_monitor_for_default_sink_even_when_listed_last() {
+        assert_eq!(
+            monitor_source_from_pactl(SOURCES, Some("sink")),
+            Some("sink.monitor")
+        );
+    }
+
+    #[test]
+    fn pactl_uses_first_monitor_when_default_sink_is_missing() {
+        assert_eq!(
+            monitor_source_from_pactl(SOURCES, Some("unknown")),
+            Some("other.monitor")
+        );
+    }
+
+    #[test]
+    fn pactl_uses_first_monitor_without_a_default_sink() {
+        assert_eq!(
+            monitor_source_from_pactl(SOURCES, None),
+            Some("other.monitor")
+        );
+    }
+
+    #[test]
+    fn pactl_rejects_microphones_and_monitor_substrings() {
+        assert_eq!(
+            monitor_source_from_pactl(
+                "0\tmic.input\tmodule\n1\tmonitor.input\tmodule\n2\tfake.monitor.extra\tmodule\n",
+                None
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn pactl_ignores_malformed_lines_and_accepts_crlf() {
+        assert_eq!(
+            monitor_source_from_pactl("malformed\r\n\r\n3\tsink.monitor\tmodule\r\n", Some("sink")),
+            Some("sink.monitor")
+        );
+    }
+
+    #[test]
+    fn pactl_requires_an_exact_default_sink_name() {
+        assert_eq!(
+            monitor_source_from_pactl(
+                "0\tsink-extra.monitor\tmodule\n1\tsink.monitor\tmodule\n",
+                Some("sink")
+            ),
+            Some("sink.monitor")
+        );
+    }
+
+    #[test]
+    fn pactl_returns_none_for_empty_or_malformed_output() {
+        assert_eq!(monitor_source_from_pactl("\nno tabs\n", Some("sink")), None);
     }
 }

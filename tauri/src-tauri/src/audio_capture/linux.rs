@@ -32,35 +32,12 @@ fn find_monitor_source_via_pactl() -> Option<String> {
             }
         });
 
-    // If we know the default sink, look for its .monitor specifically
-    if let Some(sink_name) = &default_sink {
-        let monitor_name = format!("{}.monitor", sink_name);
-        for line in stdout.lines() {
-            let parts: Vec<&str> = line.split('\t').collect();
-            if parts.len() >= 2 && parts[1] == monitor_name {
-                eprintln!(
-                    "Linux audio capture: Found default sink monitor via pactl: {}",
-                    monitor_name
-                );
-                return Some(monitor_name);
-            }
-        }
-    }
-
-    // Fallback: find any .monitor source
-    for line in stdout.lines() {
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() >= 2 && parts[1].ends_with(".monitor") {
-            let name = parts[1].to_string();
-            eprintln!(
-                "Linux audio capture: Found monitor source via pactl: {}",
-                name
-            );
-            return Some(name);
-        }
-    }
-
-    None
+    let monitor = super::linux_device::monitor_source_from_pactl(&stdout, default_sink.as_deref())?;
+    eprintln!(
+        "Linux audio capture: Found monitor source via pactl: {}",
+        monitor
+    );
+    Some(monitor.to_owned())
 }
 
 /// Select the capture device: prefer an exact match against the monitor
