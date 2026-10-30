@@ -1617,4 +1617,118 @@ mod shell_process_integration_tests {
         .unwrap();
         assert!(terminated);
     }
+
+    struct KillChild(Option<tauri_plugin_shell::process::CommandChild>);
+    impl Drop for KillChild {
+        fn drop(&mut self) {
+            if let Some(child) = self.0.take() {
+                let _ = child.kill();
+            }
+        }
+    }
+
+    fn spawn_health_server(
+        port: u16,
+        healthy: bool,
+    ) -> (tauri::async_runtime::Receiver<CommandEvent>, KillChild) {
+        let app = app();
+        let python = std::env::var("VOICEBOX_TEST_PYTHON").expect("set VOICEBOX_TEST_PYTHON");
+        let script = r#"
+import sys, uvicorn
+async def app(scope, receive, send):
+    body = b'{"status":"healthy","model_loaded":false,"gpu_available":true}' if sys.argv[2] == 'yes' else b'{"status":"healthy"}'
+    await send({"type":"http.response.start", "status":200, "headers":[(b"content-type", b"application/json")]})
+    await send({"type":"http.response.body", "body":body})
+uvicorn.run(app, host='127.0.0.1', port=int(sys.argv[1]), lifespan='off', log_level='info')
+"#;
+        let (rx, child) = app
+            .shell()
+            .command(python)
+            .args([
+                "-u",
+                "-c",
+                script,
+                &port.to_string(),
+                if healthy { "yes" } else { "no" },
+            ])
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .spawn()
+            .unwrap();
+        (rx, KillChild(Some(child)))
+    }
+
+    fn free_port() -> u16 {
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        socket.local_addr().unwrap().port()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires VOICEBOX_TEST_PYTHON with uvicorn installed"]
+    async fn actual_uvicorn_readiness_and_voicebox_health_agree() {
+        for healthy in [true, false] {
+            let port = free_port();
+            let (mut rx, _child) = spawn_health_server(port, healthy);
+            let mut logs = Vec::new();
+            let outcome = wait_for_startup(
+                &mut rx,
+                Duration::from_secs(10),
+                Some(("127.0.0.1", port)),
+                |_, line| logs.push(line.to_owned()),
+            )
+            .await;
+            assert_eq!(outcome, Outcome::Ready, "logs: {logs:?}");
+            let gate = StartGate::default();
+            let permit = gate.try_begin().unwrap();
+            assert_eq!(
+                crate::startup_health_check(port, &permit).await.unwrap(),
+                healthy
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires VOICEBOX_TEST_PYTHON with uvicorn installed"]
+    async fn actual_uvicorn_bind_failure_is_not_ready_through_tauri_shell() {
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let (mut rx, _child) = spawn_health_server(port, true);
+        let mut logs = Vec::new();
+        let outcome = wait_for_startup(
+            &mut rx,
+            Duration::from_secs(10),
+            Some(("127.0.0.1", port)),
+            |_, line| logs.push(line.to_owned()),
+        )
+        .await;
+        assert_eq!(outcome, Outcome::Exited, "logs: {logs:?}");
+        assert!(
+            logs.iter()
+                .any(|line| line.to_lowercase().contains("address already in use")),
+            "logs: {logs:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires VOICEBOX_TEST_PYTHON with uvicorn installed"]
+    async fn actual_uvicorn_wrong_endpoint_cannot_mark_the_expected_server_ready() {
+        let port = free_port();
+        let other = if port == u16::MAX { port - 1 } else { port + 1 };
+        let (mut rx, _child) = spawn_health_server(port, true);
+        let mut logs = Vec::new();
+        let outcome = wait_for_startup(
+            &mut rx,
+            Duration::from_secs(2),
+            Some(("127.0.0.1", other)),
+            |_, line| logs.push(line.to_owned()),
+        )
+        .await;
+        assert!(
+            matches!(outcome, Outcome::TimedOut(_)),
+            "outcome: {outcome:?}; logs: {logs:?}"
+        );
+        assert!(
+            logs.iter().any(|line| line.contains("Uvicorn running on")),
+            "logs: {logs:?}"
+        );
+    }
 }

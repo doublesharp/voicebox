@@ -133,6 +133,26 @@ CI coverage. It opens output streams on the host; the separate tests that play
 audible samples or require a running backend are not selected by this filter.
 Both LCOV runs must use the same checkout, target directory, and instrumentation.
 
+### Real Uvicorn startup coverage
+
+The ignored `uvicorn` Rust tests start short-lived loopback Uvicorn subprocesses
+and check readiness, bind failures, endpoint matching, and Voicebox health
+responses. Set `VOICEBOX_TEST_PYTHON` to an existing Python interpreter with
+Uvicorn installed, then run them explicitly:
+
+```sh
+export VOICEBOX_TEST_PYTHON="/absolute/path/to/python-with-uvicorn"
+PYTHONDONTWRITEBYTECODE=1 TAURI_CONFIG='{"bundle":{"externalBin":[]}}' \
+  cargo llvm-cov --no-clean --manifest-path tauri/src-tauri/Cargo.toml \
+  --lib --bin voicebox --lcov \
+  --output-path "$VOICEBOX_RUST_COVERAGE_ROOT/reports/desktop-with-uvicorn.lcov" \
+  -- uvicorn --ignored --test-threads=1
+```
+
+As with native audio, `--no-clean` adds these results to the existing profile
+for the same checkout and target directory. These tests use a minimal ASGI app;
+they do not qualify the full Python backend or packaged sidecar.
+
 The source tree must match the one used for the LCOV run; LCOV does not record
 source hashes, so the reporter cannot verify that itself. LCOV and LLVM JSON
 can count different mapped lines and should not be compared as identical
