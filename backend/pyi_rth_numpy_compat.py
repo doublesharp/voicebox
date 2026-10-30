@@ -76,8 +76,12 @@ def _patch_torch_from_numpy():
             ):
                 try:
                     return _orig(arr)
-                except RuntimeError:
-                    a = _np.ascontiguousarray(arr)
+                except RuntimeError as error:
+                    if "numpy is not available" not in str(error).lower():
+                        raise
+                    a = _np.asarray(arr)
+                    if not a.flags.c_contiguous:
+                        a = _np.ascontiguousarray(a)
                     key = str(a.dtype)
                     if key not in _map:
                         raise TypeError(
