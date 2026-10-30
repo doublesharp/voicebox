@@ -218,6 +218,16 @@ async fn manual_server_available(port: u16) -> bool {
         .unwrap_or(false)
 }
 
+async fn startup_health_check(
+    port: u16,
+    permit: &server_startup::StartPermit<'_>,
+) -> Result<bool, String> {
+    permit
+        .until_cancelled(manual_server_available(port))
+        .await
+        .ok_or_else(|| "Server startup cancelled".to_string())
+}
+
 fn eligible_gpu_backends(
     pin: Option<&str>,
     rocm: Option<std::path::PathBuf>,
@@ -437,10 +447,7 @@ async fn start_server_with<R: tauri::Runtime>(
     // Check if server is already running (managed by this app instance)
     let has_managed_child = state.child.lock().unwrap().is_some();
     if has_managed_child {
-        let port = config.port;
-        let ready = tokio::task::spawn_blocking(move || check_health(port))
-            .await
-            .unwrap_or(false);
+        let ready = startup_health_check(config.port, &_start_permit).await?;
         if ready {
             _start_permit.commit(|| ()).ok_or("Server startup cancelled")?;
             return Ok(format!("http://127.0.0.1:{}", config.port));
@@ -459,7 +466,7 @@ async fn start_server_with<R: tauri::Runtime>(
         {
             let output_str = String::from_utf8_lossy(&output.stdout);
             let healthy = output_str.lines().skip(1).any(|line| !line.trim().is_empty())
-                && manual_server_available(config.port).await;
+                && startup_health_check(config.port, &_start_permit).await?;
             match server_process::classify_listener(&output_str, healthy) {
                 server_process::ListenerDecision::Unoccupied => {}
                 server_process::ListenerDecision::ReuseOwned(pid) => {
@@ -497,7 +504,7 @@ async fn start_server_with<R: tauri::Runtime>(
             &format!("127.0.0.1:{}", config.port).parse().unwrap(),
             std::time::Duration::from_secs(1),
         ).is_ok() {
-            if manual_server_available(config.port).await {
+            if startup_health_check(config.port, &_start_permit).await? {
                 if let Some(pid) = find_voicebox_pid_on_port(config.port) {
                     println!("Found healthy voicebox-server on port {} (PID: {}), reusing it", config.port, pid);
                     _start_permit.commit(|| *state.server_pid.lock().unwrap() = Some(pid))
@@ -527,7 +534,7 @@ async fn start_server_with<R: tauri::Runtime>(
         {
             let output_str = String::from_utf8_lossy(&output.stdout);
             let healthy = output_str.lines().skip(1).any(|line| !line.trim().is_empty())
-                && manual_server_available(legacy_port).await;
+                && startup_health_check(legacy_port, &_start_permit).await?;
             for pid in server_process::legacy_pids(&output_str, healthy) {
                 #[cfg(target_os = "linux")]
                 if !server_process::linux_server_executable(pid) {
@@ -552,7 +559,7 @@ async fn start_server_with<R: tauri::Runtime>(
         if TcpStream::connect_timeout(
             &format!("127.0.0.1:{}", legacy_port).parse().unwrap(),
             std::time::Duration::from_secs(1),
-        ).is_ok() && manual_server_available(legacy_port).await {
+        ).is_ok() && startup_health_check(legacy_port, &_start_permit).await? {
             if let Some(pid) = find_voicebox_pid_on_port(legacy_port) {
                 _start_permit.commit(|| {
                     println!("Found orphaned voicebox-server on legacy port {} (PID: {}), killing it...", legacy_port, pid);
@@ -620,7 +627,7 @@ async fn start_server_with<R: tauri::Runtime>(
                 eprintln!("Dev mode: Checking if server is already running on port {}...", config.port);
 
                 // Try to connect to the server port
-                if manual_server_available(config.port).await {
+                if startup_health_check(config.port, &_start_permit).await? {
                     println!("Found server already running on port {}", config.port);
                     _start_permit.commit(|| ()).ok_or("Server startup cancelled")?;
                     return Ok(format!("http://127.0.0.1:{}", config.port));
@@ -721,7 +728,7 @@ async fn start_server_with<R: tauri::Runtime>(
             // In dev mode, check if a manually-started server is available
             #[cfg(debug_assertions)]
             {
-                if manual_server_available(config.port).await {
+                if startup_health_check(config.port, &_start_permit).await? {
                     println!("Found manually-started server on port {}", config.port);
                     _start_permit.commit(|| ()).ok_or("Server startup cancelled")?;
                     return Ok(format!("http://127.0.0.1:{}", config.port));
@@ -773,7 +780,7 @@ async fn start_server_with<R: tauri::Runtime>(
             eprintln!("Server startup timeout after 120 seconds");
             for line in errors { eprintln!("  {line}"); }
             #[cfg(debug_assertions)]
-            let healthy = manual_server_available(config.port).await;
+            let healthy = startup_health_check(config.port, &_start_permit).await?;
             #[cfg(not(debug_assertions))]
             let healthy = false;
             if healthy {
@@ -790,7 +797,7 @@ async fn start_server_with<R: tauri::Runtime>(
             server_process::take_process(&state.server_pid, &state.child, Some(process_pid));
             #[cfg(debug_assertions)]
             {
-                if manual_server_available(config.port).await {
+                if startup_health_check(config.port, &_start_permit).await? {
                     println!("Found manually-started server on port {}", config.port);
                     _start_permit.commit(|| ()).ok_or("Server startup cancelled")?;
                     return Ok(format!("http://127.0.0.1:{}", config.port));
@@ -3083,6 +3090,7 @@ mod server_start_flow_tests {
                 loop {
                     match listener.accept() {
                         Ok((mut socket, _)) => {
+                            socket.set_nonblocking(false).unwrap();
                             socket
                                 .set_read_timeout(Some(Duration::from_secs(1)))
                                 .unwrap();
@@ -3210,6 +3218,89 @@ mod server_start_flow_tests {
                 probes
             );
             stop_server_if_owned(app.state(), None).await.unwrap();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn stop_interrupts_stalled_current_and_legacy_health_probes() {
+        use std::io::{Read, Write};
+        for legacy in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(5))
+                        }
+                        Err(e) => panic!("health probe did not connect: {e}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut headers = Vec::new();
+                let mut chunk = [0; 1024];
+                while !headers.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let n = socket.read(&mut chunk).unwrap();
+                    assert!(n > 0);
+                    headers.extend_from_slice(&chunk[..n]);
+                }
+                let _ = accepted_tx.send(());
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+                let body = r#"{"status":"healthy","model_loaded":false,"gpu_available":false}"#;
+                let _ = write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+            });
+            let fixture = Fixture::new("touch \"$2/sidecar-started\"\nexec /bin/sleep 5");
+            let mut config = fixture.config();
+            if legacy {
+                config.legacy_port = Some(port);
+            } else {
+                config.port = port;
+            }
+            let app = app();
+            let handle = app.handle().clone();
+            let mut startup = tokio::spawn(async move {
+                start_server_with(handle.clone(), handle.state(), None, None, config).await
+            });
+            tokio::time::timeout(Duration::from_secs(5), accepted_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            stop_server_if_owned(app.state(), None).await.unwrap();
+            let timely = tokio::time::timeout(Duration::from_millis(500), &mut startup).await;
+            let _ = release_tx.send(());
+            server.join().unwrap();
+            let result = match timely {
+                Ok(joined) => joined.unwrap(),
+                Err(_) => {
+                    let _ = startup.await;
+                    panic!("stop waited for stalled health probe, legacy={legacy}");
+                }
+            };
+            assert!(result.unwrap_err().contains("cancelled"), "legacy={legacy}");
+            assert!(!fixture.dir.join("data/sidecar-started").exists());
+            assert!(app
+                .state::<ServerState>()
+                .server_pid
+                .lock()
+                .unwrap()
+                .is_none());
         }
     }
 }
