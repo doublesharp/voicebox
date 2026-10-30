@@ -1201,31 +1201,54 @@ fn enable_hotkey(
 
     // Fire the Input Monitoring TCC prompt explicitly from the user's
     // toggle click, before keytap's Tap would do it implicitly via
-    // CGEventTap creation. Two reasons: (1) the prompt timing becomes
-    // deterministic — it appears in response to a click instead of as a
-    // mysterious side-effect of "the app started"; (2) on subsequent
-    // launches we can short-circuit the spawn entirely if the user
-    // revoked the grant, instead of relying on the tap silently failing.
-    // The call returns the current grant state; we ignore it because
-    // keytap returns an error if the tap cannot start, and the settings UI
-    // polls `check_input_monitoring_permission` separately.
+    // CGEventTap creation. This makes the prompt timing deterministic — it appears in response to a click instead of as a
+    // mysterious side-effect of "the app started". The call returns the
+    // current grant state; keytap reports an error if the tap cannot start,
+    // and the settings UI polls permission separately.
     let _ = input_monitoring::request();
 
-    // The dictate pill webview must exist before the first chord fires so it
-    // can subscribe to `dictate:start`. Build it here (idempotent — Tauri
-    // returns the existing window when one with this label already exists).
-    if app.get_webview_window(DICTATE_WINDOW_LABEL).is_none() {
-        if let Err(e) = build_dictate_window(&app) {
-            eprintln!("Failed to build dictate window: {}", e);
+    configure_hotkey_window(
+        app.get_webview_window(DICTATE_WINDOW_LABEL).is_some(),
+        || build_dictate_window(&app).map(|_| ()).map_err(|e| e.to_string()),
+        || stop_hotkey(&state),
+        || {
+            let mut slot = state.monitor.lock().map_err(|e| e.to_string())?;
+            match slot.as_mut() {
+                Some(monitor) => monitor.update_bindings(bindings)?,
+                None => {
+                    *slot = Some(hotkey_monitor::HotkeyMonitor::spawn(app.clone(), bindings)?);
+                }
+            }
+            Ok(())
+        },
+    )
+}
+
+// The dictation window must exist before chords can reach the recorder.
+#[cfg(desktop)]
+fn configure_hotkey_window(
+    window_exists: bool,
+    create_window: impl FnOnce() -> Result<(), String>,
+    stop: impl FnOnce() -> Result<(), String>,
+    arm: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    if !window_exists {
+        if let Err(error) = create_window() {
+            let error = format!("Unable to create dictation window: {error}");
+            return match stop() {
+                Ok(()) => Err(error),
+                Err(stop_error) => Err(format!("{error}; unable to stop hotkey: {stop_error}")),
+            };
         }
     }
+    arm()
+}
 
+#[cfg(desktop)]
+fn stop_hotkey(state: &HotkeyState) -> Result<(), String> {
     let mut slot = state.monitor.lock().map_err(|e| e.to_string())?;
-    match slot.as_mut() {
-        Some(monitor) => monitor.update_bindings(bindings)?,
-        None => {
-            *slot = Some(hotkey_monitor::HotkeyMonitor::spawn(app, bindings)?);
-        }
+    if let Some(monitor) = slot.as_mut() {
+        monitor.update_bindings(hotkey_monitor::Bindings::new())?;
     }
     Ok(())
 }
@@ -1237,11 +1260,7 @@ fn enable_hotkey(
 #[cfg(desktop)]
 #[command]
 fn disable_hotkey(state: State<'_, HotkeyState>) -> Result<(), String> {
-    let mut slot = state.monitor.lock().map_err(|e| e.to_string())?;
-    if let Some(monitor) = slot.as_mut() {
-        monitor.update_bindings(hotkey_monitor::Bindings::new())?;
-    }
-    Ok(())
+    stop_hotkey(&state)
 }
 
 /// Push a new chord configuration into the running `HotkeyMonitor`. Called
@@ -4093,5 +4112,105 @@ mod server_start_flow_tests {
             format!("http://127.0.0.1:{}", fixture.port)
         );
         assert!(args.windows(2).any(|pair| pair == ["--host", "0.0.0.0"]));
+    }
+}
+
+#[cfg(all(test, desktop))]
+mod hotkey_window_startup_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn failed_window_creation_stops_existing_listener_and_fails_startup() {
+        let events = RefCell::new(Vec::new());
+        let result = configure_hotkey_window(
+            false,
+            || {
+                events.borrow_mut().push("create");
+                Err("window unavailable".into())
+            },
+            || {
+                events.borrow_mut().push("stop");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("arm");
+                Ok(())
+            },
+        );
+        assert!(result.unwrap_err().contains("window unavailable"));
+        assert_eq!(*events.borrow(), ["create", "stop"]);
+    }
+
+    #[test]
+    fn existing_window_arms_without_rebuilding_or_stopping() {
+        let result = configure_hotkey_window(
+            true,
+            || panic!("existing window must not be rebuilt"),
+            || panic!("existing listener must not be stopped"),
+            || Ok(()),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn new_window_is_created_before_listener_is_armed() {
+        let events = RefCell::new(Vec::new());
+        let result = configure_hotkey_window(
+            false,
+            || {
+                events.borrow_mut().push("create");
+                Ok(())
+            },
+            || panic!("successful startup must not stop"),
+            || {
+                events.borrow_mut().push("arm");
+                Ok(())
+            },
+        );
+        assert!(result.is_ok());
+        assert_eq!(*events.borrow(), ["create", "arm"]);
+    }
+
+    #[test]
+    fn listener_start_error_reaches_caller_after_window_creation() {
+        let result = configure_hotkey_window(
+            false,
+            || Ok(()),
+            || Ok(()),
+            || Err("tap unavailable".into()),
+        );
+        assert_eq!(result.unwrap_err(), "tap unavailable");
+    }
+
+    #[test]
+    fn window_and_stop_errors_are_both_reported_without_arming() {
+        let result = configure_hotkey_window(
+            false,
+            || Err("window unavailable".into()),
+            || Err("monitor unavailable".into()),
+            || panic!("must not arm without a window"),
+        );
+        let error = result.unwrap_err();
+        assert!(error.contains("window unavailable"));
+        assert!(error.contains("monitor unavailable"));
+    }
+
+    #[test]
+    fn stopping_before_a_listener_exists_is_safe_and_idempotent() {
+        let state = HotkeyState::default();
+        assert!(stop_hotkey(&state).is_ok());
+        assert!(stop_hotkey(&state).is_ok());
+        assert!(state.monitor.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn poisoned_monitor_state_returns_error_instead_of_panicking() {
+        let state = HotkeyState::default();
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = state.monitor.lock().unwrap();
+            panic!("simulate monitor owner panic");
+        });
+        assert!(stop_hotkey(&state).is_err());
     }
 }
