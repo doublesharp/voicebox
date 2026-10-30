@@ -321,6 +321,11 @@ fn server_arguments(data_dir: &str, port: u16, parent_pid: u32, remote: bool) ->
 
 #[cfg(any(target_os = "linux", test))]
 fn trusted_microphone_origin(uri: &str) -> bool {
+    trusted_microphone_origin_for_build(uri, cfg!(debug_assertions))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn trusted_microphone_origin_for_build(uri: &str, development: bool) -> bool {
     let Ok(url) = reqwest::Url::parse(uri) else {
         return false;
     };
@@ -330,7 +335,7 @@ fn trusted_microphone_origin(uri: &str) -> bool {
     match (url.scheme(), url.host_str(), url.port()) {
         ("tauri", Some("localhost"), None) => true,
         ("https", Some("tauri.localhost"), None) => true,
-        ("http", Some("localhost" | "127.0.0.1"), _) => true,
+        ("http", Some("localhost" | "127.0.0.1"), Some(5173)) if development => true,
         _ => false,
     }
 }
@@ -2180,6 +2185,50 @@ mod microphone_origin_tests {
 }
 
 #[cfg(test)]
+mod microphone_origin_build_regression_tests {
+    use super::trusted_microphone_origin_for_build;
+
+    #[test]
+    fn production_allows_bundled_origins() {
+        for uri in ["tauri://localhost/", "https://tauri.localhost/index.html"] {
+            assert!(trusted_microphone_origin_for_build(uri, false), "{uri}");
+        }
+    }
+
+    #[test]
+    fn production_does_not_grant_microphone_to_local_http_servers() {
+        for uri in ["http://localhost:5173/", "http://127.0.0.1:5173/", "http://localhost:17493/", "http://127.0.0.1/", "http://localhost:1/"] {
+            assert!(!trusted_microphone_origin_for_build(uri, false), "{uri}");
+        }
+    }
+
+    #[test]
+    fn development_allows_only_the_configured_local_dev_port() {
+        for uri in ["http://localhost:5173/", "http://127.0.0.1:5173/index.html"] {
+            assert!(trusted_microphone_origin_for_build(uri, true), "{uri}");
+        }
+        for uri in ["http://localhost:5174/", "http://127.0.0.1:17493/", "http://localhost/", "http://localhost:80/", "http://127.0.0.1:1/"] {
+            assert!(!trusted_microphone_origin_for_build(uri, true), "{uri}");
+        }
+    }
+
+    #[test]
+    fn development_origin_requires_an_exact_loopback_host_and_no_credentials() {
+        for uri in ["http://localhost.evil:5173/", "http://evil.localhost:5173/", "http://127.0.0.2:5173/", "http://user@localhost:5173/", "https://localhost:5173/"] {
+            assert!(!trusted_microphone_origin_for_build(uri, true), "{uri}");
+        }
+    }
+
+    #[test]
+    fn dev_port_matches_the_desktop_configuration() {
+        let config: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let url = config["build"]["devUrl"].as_str().unwrap();
+        assert!(trusted_microphone_origin_for_build(url, true));
+        assert!(!trusted_microphone_origin_for_build(url, false));
+    }
+}
+
+#[cfg(test)]
 mod media_permission_tests {
     use super::allow_media_request;
 
@@ -2190,6 +2239,13 @@ mod media_permission_tests {
             for (audio, video, display) in [(false, true, false), (true, true, false), (false, false, true), (true, false, true), (true, true, true), (false, false, false)] {
                 assert!(!allow_media_request(uri, audio, video, display), "{uri}: {audio} {video} {display}");
             }
+        }
+    }
+
+    #[test]
+    fn a_different_loopback_service_cannot_receive_microphone_permission() {
+        for uri in ["http://localhost:5174/", "http://127.0.0.1:17493/"] {
+            assert!(!allow_media_request(uri, true, false, false), "{uri}");
         }
     }
 
