@@ -126,11 +126,10 @@ async fn stream_once_with(
         return Err("speak_monitor: backend did not return an event stream".into());
     }
     let mut buf = FrameBuffer::default();
-    let mut saw_data = false;
     loop {
         let chunk = match tokio::time::timeout(idle_timeout, resp.chunk()).await {
             Ok(Ok(Some(chunk))) => chunk,
-            Ok(Ok(None)) => return Ok(saw_data),
+            Ok(Ok(None)) => return Ok(buf.has_complete_frame()),
             Ok(Err(e)) => return Err(Box::new(e)),
             Err(_) => {
                 return Err(format!(
@@ -140,7 +139,6 @@ async fn stream_once_with(
                 .into())
             }
         };
-        saw_data = true;
         for (event, data) in buf.push(&chunk)? {
             on_event(&event, &data);
         }
@@ -339,6 +337,59 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("maximum frame size"));
         assert!(events.is_empty());
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn truncated_or_empty_frames_do_not_reset_reconnect_backoff() {
+        for body in ["event: speak-start\ndata: incomplete", "\n\n\r\n"] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/events/speak", listener.local_addr().unwrap());
+            let payload = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}");
+            let task = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 1024];
+                let _ = stream.read(&mut request).await;
+                stream.write_all(payload.as_bytes()).await.unwrap();
+            });
+            let productive = stream_once_with(&reqwest::Client::new(), &url, Duration::from_secs(1), |_, _| panic!("incomplete event dispatched")).await.unwrap();
+            assert!(!productive, "partial or empty frames must not reset retry backoff");
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_complete_heartbeat_is_a_productive_connection() {
+        let (url, task) = serve(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n: ping\n\n", Duration::ZERO).await;
+        let productive = stream_once_with(&reqwest::Client::new(), &url, Duration::from_secs(1), |_, _| panic!("heartbeat dispatched")).await.unwrap();
+        assert!(productive);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fragmented_utf8_events_arrive_once_and_in_order() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/events/speak", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).await;
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: Text/Event-Stream; charset=utf-8\r\nConnection: close\r\n\r\nevent: speak-start\ndata: \xe2").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            stream.write_all(b"\x82\xac\n\nevent: speak-end\ndata: done\n\n").await.unwrap();
+        });
+        let mut events = Vec::new();
+        assert!(stream_once_with(&reqwest::Client::new(), &url, Duration::from_secs(1), |event, data| events.push((event.to_string(), data.to_string()))).await.unwrap());
+        assert_eq!(events, [("speak-start".into(), "€".into()), ("speak-end".into(), "done".into())]);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn event_followed_by_partial_frame_is_productive_without_dispatching_partial_data() {
+        let (url, task) = serve(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\nevent: speak-end\ndata: done\n\nevent: speak-start\ndata: incomplete", Duration::ZERO).await;
+        let mut events = Vec::new();
+        assert!(stream_once_with(&reqwest::Client::new(), &url, Duration::from_secs(1), |event, data| events.push((event.to_string(), data.to_string()))).await.unwrap());
+        assert_eq!(events, [("speak-end".into(), "done".into())]);
         task.await.unwrap();
     }
 }

@@ -8,6 +8,7 @@ pub(crate) struct FrameBuffer {
     buf: Vec<u8>,
     line_start: usize,
     skip_lf: bool,
+    completed_frame: bool,
 }
 
 impl FrameBuffer {
@@ -25,6 +26,9 @@ impl FrameBuffer {
                     let frame = std::str::from_utf8(&self.buf).map_err(|error| {
                         std::io::Error::new(std::io::ErrorKind::InvalidData, error)
                     })?;
+                    if !self.buf.is_empty() {
+                        self.completed_frame = true;
+                    }
                     if let Some(event) = parse_frame(frame) {
                         result.push(event);
                     }
@@ -40,6 +44,10 @@ impl FrameBuffer {
             }
         }
         Ok(result)
+    }
+
+    pub(crate) fn has_complete_frame(&self) -> bool {
+        self.completed_frame
     }
 
     fn push_byte(&mut self, byte: u8) -> Result<(), std::io::Error> {
