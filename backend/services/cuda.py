@@ -25,6 +25,7 @@ from ..config import get_data_dir
 from ..utils.platform_detect import SUPPORTED_GPU_ASSET_PLATFORMS, server_asset_platform
 from ..utils.progress import get_progress_manager
 from ..utils.release_archive import extract_release_archive
+from ..utils.binary_version import parse_server_version
 
 logger = logging.getLogger(__name__)
 
@@ -396,10 +397,7 @@ def get_cuda_binary_version() -> Optional[str]:
             timeout=30,
             cwd=str(cuda_path.parent),  # Run from the onedir directory
         )
-        # Output format: "voicebox-server 0.3.0"
-        for line in result.stdout.strip().splitlines():
-            if "voicebox-server" in line:
-                return line.split()[-1]
+        return parse_server_version(result.returncode, result.stdout)
     except Exception as e:
         logger.warning(f"Could not get CUDA binary version: {e}")
     return None

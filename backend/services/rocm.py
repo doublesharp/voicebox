@@ -25,6 +25,7 @@ from ..config import get_data_dir
 from ..utils.platform_detect import server_asset_platform
 from ..utils.progress import get_progress_manager
 from ..utils.release_archive import extract_release_archive
+from ..utils.binary_version import parse_server_version
 from .. import __version__
 
 logger = logging.getLogger(__name__)
@@ -410,10 +411,7 @@ def get_rocm_binary_version() -> Optional[str]:
             timeout=30,
             cwd=str(rocm_path.parent),  # Run from the onedir directory
         )
-        # Output format: "voicebox-server 0.3.0"
-        for line in result.stdout.strip().splitlines():
-            if "voicebox-server" in line:
-                return line.split()[-1]
+        return parse_server_version(result.returncode, result.stdout)
     except Exception as e:
         logger.warning(f"Could not get ROCm binary version: {e}")
     return None
