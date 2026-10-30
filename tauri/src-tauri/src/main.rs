@@ -229,6 +229,25 @@ fn eligible_gpu_backends(
     (if pin_cuda { None } else { rocm }, if pin_rocm { None } else { cuda })
 }
 
+/// Launch eligible GPU backends in order, falling back to the CPU on spawn failure.
+fn launch_backend<T, E: std::fmt::Display>(
+    pin: Option<&str>,
+    rocm: Option<&std::path::Path>,
+    cuda: Option<&std::path::Path>,
+    mut spawn_gpu: impl FnMut(&std::path::Path) -> Result<T, E>,
+    spawn_cpu: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    if pin != Some("cpu") {
+        for path in [rocm, cuda].into_iter().flatten() {
+            match spawn_gpu(path) {
+                Ok(child) => return Ok(child),
+                Err(error) => println!("GPU backend {:?} spawn failed ({}), trying fallback", path, error),
+            }
+        }
+    }
+    spawn_cpu()
+}
+
 fn server_arguments(data_dir: &str, port: u16, parent_pid: u32, remote: bool) -> Vec<String> {
     let mut args = vec![
         "--data-dir".into(), data_dir.into(), "--port".into(), port.to_string(),
@@ -634,55 +653,24 @@ async fn start_server(
     // .current_dir() is critical: PyInstaller onedir expects all DLLs and
     // support files relative to the exe.
     let spawn_result = _start_permit.commit(|| {
-        let result = if backend_override.as_deref() != Some("cpu") {
-            let mut gpu_spawn = None;
-
-            if let Some(ref rocm_path) = rocm_binary {
-                let rocm_dir = rocm_path.parent().unwrap();
-                println!("Launching ROCm backend: {:?} (cwd: {:?})", rocm_path, rocm_dir);
-                let mut cmd = app.shell().command(rocm_path.to_str().unwrap());
-                cmd = cmd.current_dir(rocm_dir);
-                cmd = cmd.args(&server_args);
-                if let Some(ref dir) = effective_models_dir { cmd = cmd.env("VOICEBOX_MODELS_DIR", dir); }
-                match cmd.spawn() {
-                    Ok(r) => { gpu_spawn = Some(Ok(r)); }
-                    Err(e) => { println!("ROCm spawn failed ({}), trying CUDA/CPU fallback", e); }
-                }
-            }
-
-            if gpu_spawn.is_none() {
-                if let Some(ref cuda_path) = cuda_binary {
-                    let cuda_dir = cuda_path.parent().unwrap();
-                    println!("Launching CUDA backend: {:?} (cwd: {:?})", cuda_path, cuda_dir);
-                    let mut cmd = app.shell().command(cuda_path.to_str().unwrap());
-                    cmd = cmd.current_dir(cuda_dir);
-                    cmd = cmd.args(&server_args);
-                    if let Some(ref dir) = effective_models_dir { cmd = cmd.env("VOICEBOX_MODELS_DIR", dir); }
-                    match cmd.spawn() {
-                        Ok(r) => { gpu_spawn = Some(Ok(r)); }
-                        Err(e) => { println!("CUDA spawn failed ({}), falling back to CPU", e); }
-                    }
-                }
-            }
-
-            if let Some(result) = gpu_spawn {
-                result
-            } else {
-                // Fall back to bundled CPU sidecar
+        let result = launch_backend(
+            backend_override.as_deref(),
+            rocm_binary.as_deref(),
+            cuda_binary.as_deref(),
+            |path| {
+                let dir = path.parent().unwrap();
+                println!("Launching GPU backend: {:?} (cwd: {:?})", path, dir);
+                let mut cmd = app.shell().command(path.to_str().unwrap()).current_dir(dir).args(&server_args);
+                if let Some(ref models) = effective_models_dir { cmd = cmd.env("VOICEBOX_MODELS_DIR", models); }
+                cmd.spawn()
+            },
+            || {
                 sidecar = sidecar.args(&server_args);
-                if let Some(ref dir) = effective_models_dir { sidecar = sidecar.env("VOICEBOX_MODELS_DIR", dir); }
+                if let Some(ref models) = effective_models_dir { sidecar = sidecar.env("VOICEBOX_MODELS_DIR", models); }
                 println!("Spawning bundled CPU server process...");
                 sidecar.spawn()
-            }
-        } else {
-            // Override forces CPU — use bundled sidecar, GPU binary stays on disk
-            println!("Backend override=cpu: using bundled CPU sidecar");
-            sidecar = sidecar.args(&server_args);
-            if let Some(ref dir) = effective_models_dir {
-                sidecar = sidecar.env("VOICEBOX_MODELS_DIR", dir);
-            }
-            sidecar.spawn()
-        };
+            },
+        );
         result.map(|(rx, child)| {
             let process_pid = child.pid();
             let mut pid = state.server_pid.lock().unwrap();
@@ -2163,5 +2151,98 @@ mod gpu_startup_regression_tests {
         tokio::select! { _ = &mut work => panic!("probe finished early"), _ = waiting => {} }
         gate.cancel_and(|| ());
         assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(1), work).await.unwrap().unwrap_err(), "Server startup cancelled");
+    }
+}
+
+#[cfg(test)]
+mod launch_fallback_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    fn run(pin: Option<&str>, rocm: bool, cuda: bool, fail: &[&str], cpu_fails: bool) -> (Result<String, &'static str>, Vec<String>) {
+        let calls = RefCell::new(Vec::new());
+        let (rocm, cuda) = eligible_gpu_backends(pin, rocm.then(|| "rocm".into()), cuda.then(|| "cuda".into()));
+        let result = launch_backend(pin, rocm.as_deref(), cuda.as_deref(), |path| {
+            let name = path.to_str().unwrap();
+            calls.borrow_mut().push(name.to_owned());
+            if fail.contains(&name) { Err("gpu failed") } else { Ok(name.to_owned()) }
+        }, || {
+            calls.borrow_mut().push("cpu".into());
+            if cpu_fails { Err("cpu failed") } else { Ok("cpu".into()) }
+        });
+        (result, calls.into_inner())
+    }
+
+    #[test]
+    fn available_rocm_is_preferred_without_starting_other_backends() {
+        let (result, calls) = run(None, true, true, &[], false);
+        assert_eq!(result.unwrap(), "rocm");
+        assert_eq!(calls, ["rocm"]);
+    }
+
+    #[test]
+    fn failed_rocm_falls_back_to_cuda() {
+        let (result, calls) = run(None, true, true, &["rocm"], false);
+        assert_eq!(result.unwrap(), "cuda");
+        assert_eq!(calls, ["rocm", "cuda"]);
+    }
+
+    #[test]
+    fn failed_gpu_launches_fall_back_to_cpu() {
+        let (result, calls) = run(None, true, true, &["rocm", "cuda"], false);
+        assert_eq!(result.unwrap(), "cpu");
+        assert_eq!(calls, ["rocm", "cuda", "cpu"]);
+    }
+
+    #[test]
+    fn no_gpu_and_explicit_cpu_start_only_cpu() {
+        for (pin, rocm, cuda) in [(None, false, false), (Some("cpu"), true, true)] {
+            let (result, calls) = run(pin, rocm, cuda, &[], false);
+            assert_eq!(result.unwrap(), "cpu");
+            assert_eq!(calls, ["cpu"]);
+        }
+    }
+
+    #[test]
+    fn pinned_gpu_runs_without_trying_the_other_installed_gpu() {
+        for (pin, selected) in [("cuda", "cuda"), ("rocm", "rocm")] {
+            let (result, calls) = run(Some(pin), true, true, &[selected], false);
+            assert_eq!(result.unwrap(), "cpu");
+            assert_eq!(calls, [selected, "cpu"]);
+        }
+    }
+
+    #[test]
+    fn missing_pinned_gpu_uses_the_installed_alternative() {
+        for (pin, rocm, cuda, selected) in [("cuda", true, false, "rocm"), ("rocm", false, true, "cuda")] {
+            let (result, calls) = run(Some(pin), rocm, cuda, &[], false);
+            assert_eq!(result.unwrap(), selected);
+            assert_eq!(calls, [selected]);
+        }
+    }
+
+    #[test]
+    fn cpu_error_is_propagated_after_gpu_failures() {
+        let (result, calls) = run(None, true, true, &["rocm", "cuda"], true);
+        assert_eq!(result.unwrap_err(), "cpu failed");
+        assert_eq!(calls, ["rocm", "cuda", "cpu"]);
+    }
+
+    #[test]
+    fn cancelled_start_never_launches_any_backend() {
+        let gate = server_startup::StartGate::default();
+        let permit = gate.try_begin().unwrap();
+        gate.cancel_and(|| ());
+        assert!(permit.commit(|| launch_backend(None, Some(Path::new("rocm")), Some(Path::new("cuda")), |_| -> Result<(), &str> { panic!("gpu spawned") }, || { panic!("cpu spawned") })).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_spawn_failure_falls_back_to_a_real_cpu_process() {
+        let child = launch_backend(None, Some(Path::new("/dev/null/no-binary")), None,
+            |path| std::process::Command::new(path).spawn(),
+            || std::process::Command::new("/usr/bin/true").spawn()).unwrap();
+        assert!(child.wait_with_output().unwrap().status.success());
     }
 }
