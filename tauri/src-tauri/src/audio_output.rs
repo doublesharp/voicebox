@@ -653,6 +653,27 @@ fn prepare_output_pcm(
     Ok(pcm)
 }
 
+fn acknowledge_audio_start(
+    controls: &PlaybackControls,
+    ready: &mut Option<tokio::sync::oneshot::Sender<Result<PlaybackSession, String>>>,
+    session: PlaybackSession,
+) -> bool {
+    let Some(sender) = ready.take() else {
+        controls.stop();
+        return false;
+    };
+    if controls.stopped.load(Ordering::Acquire) || sender.is_closed() {
+        controls.stop();
+        return false;
+    }
+    controls.paused.store(false, Ordering::Release);
+    if sender.send(Ok(session)).is_err() {
+        controls.stop();
+        return false;
+    }
+    true
+}
+
 fn run_session(
     app: &tauri::AppHandle,
     id: &str,
@@ -740,19 +761,17 @@ fn run_session(
     if controls.stopped.load(Ordering::Acquire) {
         return Err("Playback cancelled".into());
     }
-    controls.paused.store(false, Ordering::Release);
     let start_position = controls.requested_position().min(duration);
-    if let Some(sender) = ready.take() {
-        if sender
-            .send(Ok(PlaybackSession {
-                session_id: id.into(),
-                duration,
-                position: start_position,
-            }))
-            .is_err()
-        {
-            controls.stop();
-        }
+    if !acknowledge_audio_start(
+        &controls,
+        ready,
+        PlaybackSession {
+            session_id: id.into(),
+            duration,
+            position: start_position,
+        },
+    ) {
+        return Err("Playback cancelled".into());
     }
     emit(app, id, "playing", start_position, duration, None);
     monitor_playback(
@@ -957,18 +976,16 @@ fn run_pcm_session(
     if controls.stopped.load(Ordering::Acquire) {
         return Err("Preview cancelled".into());
     }
-    controls.paused.store(false, Ordering::Release);
-    if let Some(sender) = ready.take() {
-        if sender
-            .send(Ok(PlaybackSession {
-                session_id: id.into(),
-                duration: 0.0,
-                position: 0.0,
-            }))
-            .is_err()
-        {
-            controls.stop();
-        }
+    if !acknowledge_audio_start(
+        &controls,
+        ready,
+        PlaybackSession {
+            session_id: id.into(),
+            duration: 0.0,
+            position: 0.0,
+        },
+    ) {
+        return Err("Preview cancelled".into());
     }
     monitor_preview(
         &controls,
@@ -2271,5 +2288,66 @@ mod output_preparation_tests {
         let mut cache = HashMap::new();
         assert!(prepare_output_pcm(&samples, 48000, 2, (24000, 1), &mut cache).is_err());
         assert!(cache.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod startup_ack_tests {
+    use super::*;
+
+    fn session() -> PlaybackSession {
+        PlaybackSession {
+            session_id: "native-1".into(),
+            duration: 4.0,
+            position: 1.5,
+        }
+    }
+
+    #[tokio::test]
+    async fn active_caller_receives_session_and_playback_is_unpaused() {
+        let controls = PlaybackControls::new(1.5, 1.0);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut ready = Some(tx);
+        assert!(acknowledge_audio_start(&controls, &mut ready, session()));
+        let result = rx.await.unwrap().unwrap();
+        assert_eq!(
+            (result.session_id.as_str(), result.duration, result.position),
+            ("native-1", 4.0, 1.5)
+        );
+        assert!(!controls.paused.load(Ordering::Acquire));
+        assert!(!controls.stopped.load(Ordering::Acquire));
+        assert!(ready.is_none());
+    }
+
+    #[test]
+    fn abandoned_caller_never_unpauses_or_reports_start() {
+        let controls = PlaybackControls::new(0.0, 1.0);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        drop(rx);
+        let mut ready = Some(tx);
+        assert!(!acknowledge_audio_start(&controls, &mut ready, session()));
+        assert!(controls.stopped.load(Ordering::Acquire));
+        assert!(controls.paused.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn missing_acknowledgement_is_treated_as_cancelled() {
+        let controls = PlaybackControls::new(0.0, 1.0);
+        let mut ready = None;
+        assert!(!acknowledge_audio_start(&controls, &mut ready, session()));
+        assert!(controls.stopped.load(Ordering::Acquire));
+        assert!(controls.paused.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn previously_stopped_session_cannot_report_ready() {
+        let controls = PlaybackControls::new(0.0, 1.0);
+        controls.stop();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut ready = Some(tx);
+        assert!(!acknowledge_audio_start(&controls, &mut ready, session()));
+        assert!(controls.paused.load(Ordering::Acquire));
+        drop(ready);
+        assert!(rx.await.is_err());
     }
 }
