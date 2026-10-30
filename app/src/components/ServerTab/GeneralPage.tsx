@@ -14,6 +14,7 @@ import { useToast } from '@/components/ui/use-toast';
 import { useAutoUpdater } from '@/hooks/useAutoUpdater';
 import { APP_BRANDING } from '@/lib/constants/branding';
 import { useServerHealth } from '@/lib/hooks/useServer';
+import { syncKeepServerRunning } from '@/lib/keepServerRunning';
 import { usePlatform } from '@/platform/PlatformContext';
 import { useServerStore } from '@/stores/serverStore';
 import { CloudSection } from './CloudSection';
@@ -35,7 +36,7 @@ export function GeneralPage() {
   const serverUrl = useServerStore((state) => state.serverUrl);
   const setServerUrl = useServerStore((state) => state.setServerUrl);
   const keepServerRunningOnClose = useServerStore((state) => state.keepServerRunningOnClose);
-  const setKeepServerRunningOnClose = useServerStore((state) => state.setKeepServerRunningOnClose);
+  const keepServerRunningSyncing = useServerStore((state) => state.keepServerRunningSyncing);
   const mode = useServerStore((state) => state.mode);
   const setMode = useServerStore((state) => state.setMode);
   const { toast } = useToast();
@@ -163,23 +164,25 @@ export function GeneralPage() {
             <Toggle
               id="keepServerRunning"
               checked={keepServerRunningOnClose}
+              disabled={keepServerRunningSyncing}
               onCheckedChange={(checked: boolean) => {
-                setKeepServerRunningOnClose(checked);
-                platform.lifecycle.setKeepServerRunning(checked).catch((error) => {
+                void syncKeepServerRunning(checked, (value) =>
+                  platform.lifecycle.setKeepServerRunning(value),
+                ).then((saved) => {
+                  if (!saved) return;
+                  toast({
+                    title: t('settings.general.keepServerRunning.updatedTitle'),
+                    description: checked
+                      ? t('settings.general.keepServerRunning.runningDescription')
+                      : t('settings.general.keepServerRunning.stoppedDescription'),
+                  });
+                }).catch((error) => {
                   console.error('Failed to sync setting to Rust:', error);
-                  setKeepServerRunningOnClose(!checked);
                   toast({
                     title: t('settings.general.keepServerRunning.failedTitle'),
                     description: t('settings.general.keepServerRunning.failedDescription'),
                     variant: 'destructive',
                   });
-                  return;
-                });
-                toast({
-                  title: t('settings.general.keepServerRunning.updatedTitle'),
-                  description: checked
-                    ? t('settings.general.keepServerRunning.runningDescription')
-                    : t('settings.general.keepServerRunning.stoppedDescription'),
                 });
               }}
             />

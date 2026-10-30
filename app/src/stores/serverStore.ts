@@ -17,6 +17,7 @@ interface ServerStore {
   setMode: (mode: 'local' | 'remote') => void;
 
   keepServerRunningOnClose: boolean;
+  keepServerRunningSyncing: boolean;
   setKeepServerRunningOnClose: (keepRunning: boolean) => void;
 
   customModelsDir: string | null;
@@ -91,6 +92,7 @@ export const useServerStore = create<ServerStore>()(
       setMode: (mode) => set({ mode }),
 
       keepServerRunningOnClose: false,
+      keepServerRunningSyncing: false,
       setKeepServerRunningOnClose: (keepRunning) => set({ keepServerRunningOnClose: keepRunning }),
 
       customModelsDir: null,
@@ -98,8 +100,10 @@ export const useServerStore = create<ServerStore>()(
     }),
     {
       name: 'voicebox-server',
+      // In-flight writes are process-local and must not survive a restart.
+      partialize: ({ keepServerRunningSyncing: _pending, ...state }): Partial<ServerStore> => state,
       version: 1,
-      migrate: (persistedState) => {
+      migrate: (persistedState): Partial<ServerStore> => {
         const state = persistedState as Partial<ServerStore>;
         // Older versions did not record whether a URL was saved by the user.
         // Only exact known defaults are safe to treat as automatic. Preserve

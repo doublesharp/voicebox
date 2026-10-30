@@ -19,6 +19,7 @@ import {
 import { Input } from '@/components/ui/input';
 import { useToast } from '@/components/ui/use-toast';
 import { useServerHealth } from '@/lib/hooks/useServer';
+import { syncKeepServerRunning } from '@/lib/keepServerRunning';
 import { usePlatform } from '@/platform/PlatformContext';
 import { useServerStore } from '@/stores/serverStore';
 
@@ -33,7 +34,7 @@ export function ConnectionForm() {
   const serverUrl = useServerStore((state) => state.serverUrl);
   const setServerUrl = useServerStore((state) => state.setServerUrl);
   const keepServerRunningOnClose = useServerStore((state) => state.keepServerRunningOnClose);
-  const setKeepServerRunningOnClose = useServerStore((state) => state.setKeepServerRunningOnClose);
+  const keepServerRunningSyncing = useServerStore((state) => state.keepServerRunningSyncing);
   const mode = useServerStore((state) => state.mode);
   const setMode = useServerStore((state) => state.setMode);
   const { toast } = useToast();
@@ -126,16 +127,25 @@ export function ConnectionForm() {
               id="keepServerRunning"
               className="mt-[6px]"
               checked={keepServerRunningOnClose}
+              disabled={keepServerRunningSyncing}
               onCheckedChange={(checked: boolean) => {
-                setKeepServerRunningOnClose(checked);
-                platform.lifecycle.setKeepServerRunning(checked).catch((error) => {
+                void syncKeepServerRunning(checked, (value) =>
+                  platform.lifecycle.setKeepServerRunning(value),
+                ).then((saved) => {
+                  if (!saved) return;
+                  toast({
+                    title: 'Setting updated',
+                    description: checked
+                      ? 'Server will continue running when app closes'
+                      : 'Server will stop when app closes',
+                  });
+                }).catch((error) => {
                   console.error('Failed to sync setting to Rust:', error);
-                });
-                toast({
-                  title: 'Setting updated',
-                  description: checked
-                    ? 'Server will continue running when app closes'
-                    : 'Server will stop when app closes',
+                  toast({
+                    title: 'Could not update setting',
+                    description: 'The server setting could not be saved.',
+                    variant: 'destructive',
+                  });
                 });
               }}
             />

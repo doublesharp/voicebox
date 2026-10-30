@@ -1,4 +1,5 @@
 import { RouterProvider } from '@tanstack/react-router';
+import { syncKeepServerRunning } from '@/lib/keepServerRunning';
 import { useEffect, useRef, useState } from 'react';
 import { DictateWindow } from '@/components/DictateWindow/DictateWindow';
 import { StartupScreen } from '@/components/StartupScreen';
@@ -74,7 +75,7 @@ function MainApp() {
   useEffect(() => {
     if (platform.metadata.isTauri) {
       const keepRunning = useServerStore.getState().keepServerRunningOnClose;
-      platform.lifecycle.setKeepServerRunning(keepRunning).catch((error) => {
+      syncKeepServerRunning(keepRunning, (value) => platform.lifecycle.setKeepServerRunning(value)).catch((error) => {
         console.error('Failed to sync initial setting to Rust:', error);
       });
     }
