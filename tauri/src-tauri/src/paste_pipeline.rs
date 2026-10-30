@@ -145,9 +145,13 @@ async fn paste_with<B: PasteBackend, F: Future<Output = ()>>(
     }
     let paste_result = backend.send();
     sleep(Duration::from_millis(crate::PASTE_CONSUME_MS)).await;
-    restore.restore_if_unchanged()?;
-    paste_result?;
-    Ok(true)
+    match (paste_result, restore.restore_if_unchanged()) {
+        (Ok(()), Ok(())) => Ok(true),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(restore_error)) => Err(format!(
+            "{error}; clipboard restoration failed: {restore_error}"
+        )),
+    }
 }
 
 pub(crate) struct DiagnosticResult<S> {
@@ -249,6 +253,7 @@ mod tests {
         calls: RefCell<Vec<String>>,
         trusted: bool,
         fail: Option<&'static str>,
+        fail_restore: bool,
         count: Option<i64>,
     }
     impl Fake {
@@ -257,6 +262,7 @@ mod tests {
                 calls: RefCell::new(vec![]),
                 trusted: true,
                 fail: None,
+                fail_restore: false,
                 count: Some(10),
             }
         }
@@ -309,7 +315,12 @@ mod tests {
         }
         fn restore(&self, snapshot: &Self::Snapshot, _expected: i64) -> Result<(), String> {
             assert_eq!(*snapshot, "original");
-            self.call("restore")
+            self.call("restore")?;
+            if self.fail_restore {
+                Err("restore failed".into())
+            } else {
+                Ok(())
+            }
         }
     }
     fn focus(bundle: Option<&str>) -> focus_capture::FocusSnapshot {
@@ -420,6 +431,66 @@ mod tests {
             "restore failed"
         );
     }
+    #[tokio::test]
+    async fn paste_and_restore_failures_are_both_reported() {
+        let mut fake = Fake::new();
+        fake.fail = Some("send");
+        fake.fail_restore = true;
+        let error = run(&fake, &focus(None)).await.unwrap_err();
+        assert!(
+            error.contains("send failed"),
+            "missing paste error: {error}"
+        );
+        assert!(
+            error.contains("restore failed"),
+            "missing restore error: {error}"
+        );
+        assert_eq!(
+            calls(&fake),
+            ["trusted", "activate", "save", "write", "count", "send", "count", "restore"]
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostic_reports_both_send_and_restore_failures() {
+        let mut fake = Fake::new();
+        fake.fail = Some("send");
+        fake.fail_restore = true;
+        let error = diagnostic_with(
+            "hello",
+            Duration::ZERO,
+            Duration::ZERO,
+            true,
+            &fake,
+            |_| async {},
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(error.contains("send failed"));
+        assert!(error.contains("restore failed"));
+    }
+
+    #[tokio::test]
+    async fn diagnostic_without_send_still_restores_original_clipboard() {
+        let fake = Fake::new();
+        let result = diagnostic_with(
+            "hello",
+            Duration::ZERO,
+            Duration::ZERO,
+            false,
+            &fake,
+            |_| async {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.snapshot, "original");
+        assert_eq!(
+            calls(&fake),
+            ["save", "write", "count", "count", "restore", "count"]
+        );
+    }
+
     #[tokio::test]
     async fn failed_paste_preserves_newer_clipboard_content() {
         let mut fake = Fake::new();
