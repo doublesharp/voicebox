@@ -15,6 +15,13 @@ import numpy as np
 import pytest
 
 
+def symlink_or_skip(target, link, **kwargs):
+    try:
+        link.symlink_to(target, **kwargs)
+    except OSError as exc:
+        pytest.skip(f"this account cannot create symlinks (winerror {getattr(exc, 'winerror', None)})")
+
+
 SCRIPT = Path(__file__).resolve().parents[1] / "benchmark-local-tts.py"
 SPEC = importlib.util.spec_from_file_location("benchmark_local_tts", SCRIPT)
 bench = importlib.util.module_from_spec(SPEC)
@@ -26,7 +33,7 @@ SPEC.loader.exec_module(bench)
 def settings(tmp_path):
     cache = tmp_path / "cache"
     cache.mkdir()
-    return bench.Settings("qwen_custom_voice", "pytorch", "1.7B", "en", "Test speech.",
+    return bench.Settings("qwen_custom_voice", "pytorch", "cpu", "1.7B", "en", "Test speech.",
                           cache, tmp_path / "output", preset_voice="Ryan", warm_repeats=2)
 
 
@@ -83,12 +90,18 @@ class FakeAdapter:
 def run_fake(settings, adapter, **kwargs):
     output = bench.Output(settings.output_root)
     ticks = iter(range(0, 100 * 10**9, 10**9))
+    spec = bench.ENGINES[settings.engine]
+    fake_spec = replace(spec, admit=lambda _: {"snapshot": "fake-cached-snapshot", "repo_id": "fake", "revision": "a" * 40},
+                        inference_roots=lambda adapter: {"fake": adapter})
     try:
-        result = asyncio.run(bench.benchmark(
-            settings, output, factory=lambda *args: adapter,
-            admit=lambda _: {"snapshot": "fake-cached-snapshot"}, clock=lambda: next(ticks),
-            get_provenance=lambda: {"fixture": True}, **kwargs,
-        ))
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setitem(bench.ENGINES, settings.engine, fake_spec)
+            result = asyncio.run(bench.benchmark(
+                settings, output, clock=lambda: next(ticks),
+                get_provenance=lambda: {"fixture": True},
+                **{"factory": lambda *args: adapter, "identify": lambda _: {"fixture": True},
+                   "verify_residency": lambda roots, device: {"fixture": True}, **kwargs},
+            ))
         saved = json.loads((settings.output_root / "results.json").read_text())
         assert saved["status"] == result["status"]
         return result
@@ -102,7 +115,7 @@ def test_cli_refuses_missing_cache_before_loading_or_writing_audio(tmp_path):
     output = tmp_path / "run"
     result = subprocess.run(
         [sys.executable, "-B", str(SCRIPT), "--engine", "qwen_custom_voice",
-         "--backend", "pytorch", "--model", "1.7B", "--language", "en",
+         "--backend", "pytorch", "--device", "cpu", "--model", "1.7B", "--language", "en",
          "--preset-voice", "Ryan", "--text", "A short offline test.",
          "--cache-root", str(cache), "--output-root", str(output)],
         env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
@@ -124,7 +137,12 @@ def test_cold_warm_metrics_prompt_and_real_wav(settings):
     assert adapter.calls[0] == ("Test speech.", {"voice_type": "preset", "preset_engine": "qwen_custom_voice",
                                                "preset_voice_id": "Ryan"},
                                 {"language": "en", "seed": 0, "instruct": None})
-    assert result["stages_s"] == {"adapter_init": 1, "load": 1, "reference_preparation": 1}
+    assert {k: v for k, v in result["stages_s"].items() if not k.startswith("generation")} == {
+        "adapter_init": 1, "load": 1, "reference_preparation": 1}
+    assert set(result["stages"]) == {"adapter_init", "load", "reference_preparation", "generation_0", "generation_1", "generation_2"}
+    assert result["stages"]["load"]["rss_bytes"] > 0 and result["stages"]["load"]["cuda_allocated_bytes"] is None
+    assert result["schema_version"] == 2 and result["device"] == {"fixture": True}
+    assert result["reference_preparation"] == {"use_cache": False, "cache_hit": None}
     assert result["cold_load_reference_generation_rtf"] == 3
     assert result["warm"]["wall_audio_rtf"] == {"count": 2, "p50": 1, "p95": 1}
     assert [run["kind"] for run in result["runs"]] == ["cold", "warm", "warm"]
@@ -231,6 +249,8 @@ def test_duration_and_total_artifact_budget(settings, monkeypatch):
     {"max_audio_seconds": 0}, {"instruct": " "}, {"preset_voice": "unknown"}, {"preset_voice": None},
     {"reference_text": "Unexpected reference"}, {"design_prompt": "Unexpected design"},
     {"engine": "qwen"}, {"engine": "qwen_voice_design"}, {"cache_root": Path("relative")},
+    {"device": "auto"}, {"device": "mlx"}, {"device": "cuda0"}, {"device": "CUDA"}, {"device": "gpu"},
+    {"backend": "mlx"}, {"backend": "mlx", "device": "cpu"},
 ])
 def test_invalid_configuration_is_rejected(settings, change):
     with pytest.raises(ValueError):
@@ -243,7 +263,7 @@ def test_base_rejects_silently_ignored_instruction(settings, tmp_path):
     with pytest.raises(ValueError, match="does not support"):
         bench.validate(settings)
     bench.validate(replace(settings, instruct=None))
-    bench.validate(replace(settings, backend="mlx", instruct=None))
+    bench.validate(replace(settings, backend="mlx", device="mlx", instruct=None))
 
 
 def test_readiness_is_local_and_checks_selected_revision(settings, cached, monkeypatch):
@@ -283,7 +303,7 @@ def test_cache_admission_refuses_partial_or_unsafe_snapshots(settings, cached, c
     elif corruption == "alias":
         renamed = repo.with_name("foreign-repo")
         repo.rename(renamed)
-        repo.symlink_to(renamed, target_is_directory=True)
+        symlink_or_skip(renamed, repo, target_is_directory=True)
     with pytest.raises(ValueError, match="not locally ready"):
         bench.admit_cached_model(settings)
 
@@ -295,7 +315,7 @@ def test_shards_and_hf_blob_symlinks_are_supported(settings, cached):
     blob = blobs / "complete"
     blob.write_bytes(b"pretend weights")
     (blobs / "complete.incomplete").write_text("stale incomplete")
-    (snapshot / "shard.safetensors").symlink_to(blob)
+    symlink_or_skip(blob, snapshot / "shard.safetensors")
     (snapshot / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {"weight": "shard.safetensors"}}))
     assert bench.admit_cached_model(settings)["revision"] == "a" * 40
 
@@ -305,7 +325,7 @@ def test_cache_file_symlink_escape_is_refused(settings, cached, tmp_path):
     outside = tmp_path / "outside"
     outside.write_text("weights")
     (snapshot / "model.safetensors").unlink()
-    (snapshot / "model.safetensors").symlink_to(outside)
+    symlink_or_skip(outside, snapshot / "model.safetensors")
     with pytest.raises(ValueError, match="escapes"):
         bench.admit_cached_model(settings)
 
@@ -329,7 +349,7 @@ def test_outputs_require_fresh_absolute_directory_and_no_symlinks(tmp_path):
         output.close()
     with pytest.raises(ValueError, match="already exists"):
         bench.Output(tmp_path / "safe")
-    (tmp_path / "link").symlink_to(tmp_path / "safe", target_is_directory=True)
+    symlink_or_skip(tmp_path / "safe", tmp_path / "link", target_is_directory=True)
     with pytest.raises(OSError):
         bench.Output(tmp_path / "link" / "escape")
     assert not (tmp_path / "safe" / "escape").exists()
@@ -365,6 +385,7 @@ def test_read_json_size_is_bounded(tmp_path):
     ("qwen_voice_design", "mlx", "qwen_mlx_styles_backend", "QwenMLXVoiceDesignBackend"),
     ("qwen_custom_voice", "pytorch", "qwen_custom_voice_backend", "QwenCustomVoiceBackend"),
     ("qwen_voice_design", "pytorch", "qwen_voice_design_backend", "QwenVoiceDesignBackend"),
+    ("chatterbox_turbo", "pytorch", "chatterbox_turbo_backend", "ChatterboxTurboTTSBackend"),
 ])
 def test_factory_uses_only_selected_adapter_and_pins_local_snapshot(settings, monkeypatch, engine, backend, module, class_name):
     config_dirs, requested = [], []
@@ -373,7 +394,7 @@ def test_factory_uses_only_selected_adapter_and_pins_local_snapshot(settings, mo
     monkeypatch.setitem(sys.modules, "backend.utils", SimpleNamespace(hf_offline_patch=patch))
 
     class Constructed:
-        def __init__(self, size):
+        def __init__(self, size="constructed-without-size"):
             self.size = size
 
     def import_module(name):
@@ -381,9 +402,11 @@ def test_factory_uses_only_selected_adapter_and_pins_local_snapshot(settings, mo
         return SimpleNamespace(**{class_name: Constructed}, __file__=str(SCRIPT))
 
     monkeypatch.setattr(bench.importlib, "import_module", import_module)
-    adapter = bench.create_adapter(replace(settings, engine=engine, backend=backend),
+    device = "mlx" if backend == "mlx" else "cpu"
+    adapter = bench.create_adapter(replace(settings, engine=engine, backend=backend, device=device),
                                    {"snapshot": "/explicit/cached/snapshot"}, SimpleNamespace(path=settings.output_root))
-    assert adapter.size == "1.7B" and requested == ["backend.backends." + module]
+    expected_size = "constructed-without-size" if engine == "chatterbox_turbo" else "1.7B"
+    assert adapter.size == expected_size and requested == ["backend.backends." + module]
     assert adapter._get_model_path("1.7B") == "/explicit/cached/snapshot"
     assert adapter._is_model_cached() is True
     assert len(adapter._benchmark_source_sha256) == 64
@@ -416,7 +439,7 @@ def test_cli_help_and_unsafe_output_refusal(tmp_path):
     help_result = subprocess.run([sys.executable, "-B", str(SCRIPT), "--help"], capture_output=True, text=True, timeout=10)
     assert help_result.returncode == 0 and "--warm-repeats" in help_result.stdout
     result = subprocess.run([sys.executable, "-B", str(SCRIPT), "--engine", "qwen_custom_voice",
-                             "--backend", "pytorch", "--model", "1.7B", "--language", "en",
+                             "--backend", "pytorch", "--device", "cpu", "--model", "1.7B", "--language", "en",
                              "--preset-voice", "Ryan", "--text", "Offline test.",
                              "--cache-root", str(tmp_path), "--output-root", "relative-benchmark"],
                             capture_output=True, text=True, timeout=10)
@@ -426,13 +449,13 @@ def test_cli_help_and_unsafe_output_refusal(tmp_path):
 def test_main_entry_point_failure_is_nonzero_and_closes_output(settings, monkeypatch):
     # Keep the irreversible network audit hook out of the pytest process.
     monkeypatch.setattr(bench, "configure_offline", lambda *args: None)
-    code = bench.main(["--engine", settings.engine, "--backend", settings.backend,
+    code = bench.main(["--engine", settings.engine, "--backend", settings.backend, "--device", "cpu",
                        "--model", settings.model, "--language", settings.language,
                        "--text", settings.text, "--preset-voice", "Ryan",
                        "--cache-root", str(settings.cache_root), "--output-root", str(settings.output_root)])
     assert code == 2
     assert json.loads((settings.output_root / "results.json").read_text())["status"] == "failed"
-    assert bench.main(["--engine", "invalid", "--backend", "pytorch", "--model", "1.7B",
+    assert bench.main(["--engine", "invalid", "--backend", "pytorch", "--device", "cpu", "--model", "1.7B",
                        "--language", "en", "--text", "Test", "--cache-root", str(settings.cache_root),
                        "--output-root", str(settings.output_root)]) == 2
 
@@ -445,7 +468,7 @@ spec = importlib.util.spec_from_file_location("benchmark_local_tts", sys.argv[1]
 b = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = b
 spec.loader.exec_module(b)
-settings = b.Settings("qwen_custom_voice", "pytorch", "1.7B", "en", "Test", Path(sys.argv[2]), Path(sys.argv[3]), preset_voice="Ryan")
+settings = b.Settings("qwen_custom_voice", "pytorch", "cpu", "1.7B", "en", "Test", Path(sys.argv[2]), Path(sys.argv[3]), preset_voice="Ryan")
 output = b.Output(settings.output_root)
 b.configure_offline(settings, output)
 assert os.environ["HF_HUB_OFFLINE"] == os.environ["TRANSFORMERS_OFFLINE"] == "1"
@@ -503,7 +526,7 @@ def test_offline_configuration_and_guard_without_process_side_effects(settings, 
             guard("socket.getaddrinfo", ())
         with pytest.raises(OSError, match="network connections"):
             guard("socket.connect", (SimpleNamespace(family=bench.socket.AF_INET), ("192.0.2.1", 443)))
-        guard("socket.connect", (SimpleNamespace(family=bench.socket.AF_UNIX), "local"))
+        guard("socket.connect", (SimpleNamespace(family=getattr(bench.socket, "AF_UNIX", bench.socket.AF_UNSPEC)), "local"))
         guard("unrelated.event", ())
     finally:
         output.close()
@@ -524,7 +547,7 @@ def test_main_success_and_output_close(settings, monkeypatch):
     monkeypatch.setattr(bench, "Output", open_output)
     monkeypatch.setattr(bench, "configure_offline", lambda *args: None)
     monkeypatch.setattr(bench, "benchmark", fake_benchmark)
-    assert bench.main(["--engine", settings.engine, "--backend", settings.backend,
+    assert bench.main(["--engine", settings.engine, "--backend", settings.backend, "--device", "cpu",
                        "--model", settings.model, "--language", settings.language,
                        "--text", settings.text, "--preset-voice", "Ryan",
                        "--cache-root", str(settings.cache_root), "--output-root", str(settings.output_root)]) == 0
@@ -575,10 +598,221 @@ def test_mlx_style_admission_matches_integrated_backend(settings, cached, engine
     repo.rename(mlx_repo)
     snapshot = mlx_repo / "snapshots" / snapshot.name
     (snapshot / "config.json").write_text(json.dumps({"tts_model_type": mode}))
-    selected = replace(settings, backend="mlx", engine=engine,
+    selected = replace(settings, backend="mlx", device="mlx", engine=engine,
                        preset_voice="Ryan" if mode == "custom_voice" else None,
                        design_prompt="A clear natural voice." if mode == "voice_design" else None)
     bench.validate(selected)
     admitted = bench.admit_cached_model(selected)
     assert admitted["repo_id"] == f"mlx-community/Qwen3-TTS-12Hz-1.7B-{variant}-bf16"
     assert admitted["snapshot"] == str(snapshot)
+
+
+def turbo_settings(settings, tmp_path):
+    ref = make_reference(tmp_path / "turbo-ref.wav")
+    return replace(settings, engine="chatterbox_turbo", model="default", preset_voice=None,
+                   reference=ref, reference_text="Turbo reference.")
+
+
+@pytest.fixture
+def turbo_cached(settings):
+    repo = settings.cache_root / "models--ResembleAI--chatterbox-turbo"
+    snapshot = repo / "snapshots" / ("c" * 40)
+    snapshot.mkdir(parents=True)
+    (repo / "refs").mkdir()
+    (repo / "refs" / "main").write_text("c" * 40)
+    for name in bench.TURBO_WEIGHT_FILES:
+        (snapshot / name).write_bytes(b"x" * 8)
+    return repo, snapshot
+
+
+def test_turbo_asset_policy_matches_backend_weight_files():
+    pytest.importorskip("torch")
+    from backend.backends import chatterbox_turbo_backend as turbo
+    assert list(bench.TURBO_WEIGHT_FILES) == turbo._TURBO_WEIGHT_FILES
+    assert bench.TURBO_REPO == turbo.CHATTERBOX_TURBO_HF_REPO
+
+
+def test_turbo_admission_pins_local_revision_and_sizes(settings, turbo_cached, tmp_path):
+    _, snapshot = turbo_cached
+    selected = turbo_settings(settings, tmp_path)
+    bench.validate(selected)
+    admitted = bench.admit_cached_turbo(selected)
+    assert admitted["repo_id"] == "ResembleAI/chatterbox-turbo" and admitted["revision"] == "c" * 40
+    assert admitted["snapshot"] == str(snapshot)
+    assert admitted["files"] == {name: 8 for name in bench.TURBO_WEIGHT_FILES}
+
+
+@pytest.mark.parametrize("corruption", ["missing_weight", "empty_weight", "incomplete", "revision", "alias", "escape"])
+def test_turbo_admission_refuses_partial_or_unsafe_snapshots(settings, turbo_cached, corruption, tmp_path):
+    repo, snapshot = turbo_cached
+    if corruption == "missing_weight":
+        (snapshot / "conds.pt").unlink()
+    elif corruption == "empty_weight":
+        (snapshot / "ve.safetensors").write_bytes(b"")
+    elif corruption == "incomplete":
+        (repo / "blobs").mkdir()
+        (repo / "blobs" / "abc.incomplete").write_text("partial")
+    elif corruption == "revision":
+        (repo / "refs" / "main").write_text("main")
+    elif corruption == "alias":
+        renamed = repo.with_name("foreign-turbo")
+        repo.rename(renamed)
+        symlink_or_skip(renamed, repo, target_is_directory=True)
+    elif corruption == "escape":
+        outside = tmp_path / "outside.safetensors"
+        outside.write_bytes(b"weights")
+        (snapshot / "ve.safetensors").unlink()
+        symlink_or_skip(outside, snapshot / "ve.safetensors")
+    with pytest.raises(ValueError, match="not locally ready"):
+        bench.admit_cached_turbo(turbo_settings(settings, tmp_path))
+
+
+@pytest.mark.parametrize("change", [
+    {"language": "de"}, {"model": "1.7B"}, {"backend": "mlx", "device": "mlx"}, {"instruct": "Whisper."},
+    {"preset_voice": "Ryan"}, {"design_prompt": "A voice."}, {"reference": None}, {"reference_text": None},
+])
+def test_turbo_is_english_cloning_only(settings, tmp_path, change):
+    with pytest.raises(ValueError):
+        bench.validate(replace(turbo_settings(settings, tmp_path), **change))
+
+
+class FakeTurboAdapter(FakeAdapter):
+    """Fake Turbo adapter: records the loaded revision the way the backend does."""
+
+    def __init__(self, revision="c" * 40, hit=False, **kwargs):
+        super().__init__(**kwargs)
+        self._conditioning_model_id = "ResembleAI/chatterbox-turbo"
+        self.revision, self.hit = revision, hit
+        self.model = SimpleNamespace(t3=None, s3gen=None, ve=None)
+
+    async def load_model(self, model):
+        await super().load_model(model)
+        self._conditioning_model_id = f"ResembleAI/chatterbox-turbo@{self.revision}"
+
+    async def create_voice_prompt(self, path, text, use_cache):
+        prompt, _ = await super().create_voice_prompt(path, text, use_cache)
+        return prompt, self.hit
+
+
+def run_turbo(settings, adapter, tmp_path, **kwargs):
+    selected = turbo_settings(settings, tmp_path)
+    admitted = {"snapshot": "fake", "repo_id": "ResembleAI/chatterbox-turbo", "revision": "c" * 40}
+    spec = replace(bench.ENGINES["chatterbox_turbo"], admit=lambda _: admitted)
+    output = bench.Output(selected.output_root)
+    ticks = iter(range(0, 100 * 10**9, 10**9))
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setitem(bench.ENGINES, "chatterbox_turbo", spec)
+            return asyncio.run(bench.benchmark(
+                selected, output, factory=lambda *args: adapter, clock=lambda: next(ticks),
+                get_provenance=lambda: {"fixture": True}, identify=lambda _: {"fixture": True},
+                **{"verify_residency": lambda roots, device: {"roots": sorted(roots)}, **kwargs}))
+    finally:
+        output.close()
+
+
+def test_turbo_run_prepares_through_isolated_cache_and_verifies_revision(settings, tmp_path):
+    adapter = FakeTurboAdapter()
+    result = run_turbo(settings, adapter, tmp_path)
+    assert result["status"] == "ok", result.get("error")
+    assert adapter.references[0][2] is True
+    assert result["reference_preparation"] == {"use_cache": True, "cache_hit": False}
+    assert result["adapter"]["loaded_revision"] == "ResembleAI/chatterbox-turbo@" + "c" * 40
+    assert result["residency"] == {"roots": ["s3gen", "t3", "ve"]}
+    assert adapter.loads == ["default"] and adapter.unloads == 1
+
+
+def test_turbo_run_fails_on_revision_mismatch_before_generating(settings, tmp_path):
+    adapter = FakeTurboAdapter(revision="d" * 40)
+    result = run_turbo(settings, adapter, tmp_path)
+    assert result["status"] == "failed" and result["error"]["stage"] == "residency"
+    assert "expected ResembleAI/chatterbox-turbo@" + "c" * 40 in result["error"]["message"]
+    assert adapter.calls == [] and adapter.unloads == 1
+
+
+def test_turbo_run_fails_when_first_preparation_hits(settings, tmp_path):
+    adapter = FakeTurboAdapter(hit=True)
+    result = run_turbo(settings, adapter, tmp_path)
+    assert result["status"] == "failed" and result["error"]["stage"] == "reference_preparation"
+    assert "cache hit" in result["error"]["message"] and adapter.calls == []
+
+
+def test_residency_mismatch_fails_the_run_after_load(settings, tmp_path):
+    def mismatch(roots, device):
+        raise bench.telemetry.ResidencyError("fake: tensors on ['cpu'], expected cuda:0")
+
+    adapter = FakeAdapter()
+    result = run_fake(settings, adapter, verify_residency=mismatch)
+    assert result["status"] == "failed" and result["error"]["stage"] == "residency"
+    assert adapter.loads == ["1.7B"] and adapter.calls == [] and adapter.unloads == 1
+
+
+def test_real_residency_check_runs_on_adapter_roots(settings):
+    torch = pytest.importorskip("torch")
+    adapter = FakeAdapter()
+    adapter.model = SimpleNamespace(inner=torch.nn.Linear(1, 1))
+    result = run_fake(settings, adapter, verify_residency=bench.telemetry.check_residency)
+    assert result["status"] == "ok", result.get("error")
+    assert result["residency"] == {"fake": {"devices": ["cpu"], "tensors": 2}}
+
+
+def test_device_refusal_happens_before_adapter_construction(settings):
+    def refuse(_):
+        raise bench.telemetry.DeviceRefused("torch reports CUDA not available")
+
+    constructed = []
+    result = run_fake(replace(settings, device="cuda"), FakeAdapter(), identify=refuse,
+                      factory=lambda *args: constructed.append(args))
+    assert result["status"] == "failed" and result["error"] == {
+        "stage": "device", "type": "DeviceRefused", "message": "torch reports CUDA not available"}
+    assert constructed == [] and result["stages"] == {}
+
+
+def test_device_identity_requires_nvidia_for_cuda_and_skips_torch_for_mlx(settings, monkeypatch):
+    calls = []
+
+    def identity(device, **kwargs):
+        calls.append(device)
+        return SimpleNamespace(torch_hip="6.2", torch_cuda=None, cuda_available=False, gpus=())
+
+    monkeypatch.setattr(bench.telemetry, "collect_identity", identity)
+    monkeypatch.setattr(bench.telemetry, "as_record", lambda identity: {"recorded": True})
+    assert bench.device_identity(replace(settings, backend="mlx", device="mlx"))["selected_device"] == "mlx"
+    assert calls == []
+    assert bench.device_identity(settings) == {"recorded": True, "requested_device": "cpu", "cuda_visible_devices": None}
+    with pytest.raises(bench.telemetry.DeviceRefused, match="ROCm"):
+        bench.device_identity(replace(settings, device="cuda:1"))
+    assert calls == ["cpu", "cuda:0"]
+
+
+@pytest.mark.parametrize("device,expected", [
+    ("cpu", {"VOICEBOX_FORCE_CPU": "1"}), ("cuda", {"CUDA_VISIBLE_DEVICES": "0"}),
+    ("cuda:1", {"CUDA_VISIBLE_DEVICES": "1"}), ("mlx", {}),
+])
+def test_device_selection_is_forced_through_environment_before_imports(settings, device, expected):
+    assert bench.device_environment(replace(settings, device=device)) == expected
+    assert bench.torch_device(replace(settings, device=device)) == {"cpu": "cpu", "mlx": "mlx"}.get(device, "cuda:0")
+
+
+def test_offline_configuration_forces_cpu_and_windows_temp(settings, monkeypatch):
+    output = bench.Output(settings.output_root)
+    monkeypatch.setattr(os, "environ", {})
+    monkeypatch.setattr(sys, "addaudithook", lambda hook: None)
+    monkeypatch.setattr(bench.tempfile, "tempdir", None)
+    try:
+        bench.configure_offline(settings, output)
+        temporary = str(settings.output_root / "runtime" / "tmp")
+        assert os.environ["VOICEBOX_FORCE_CPU"] == "1" and "CUDA_VISIBLE_DEVICES" not in os.environ
+        assert os.environ["TMPDIR"] == os.environ["TEMP"] == os.environ["TMP"] == temporary
+    finally:
+        output.close()
+
+
+def test_cli_requires_explicit_device(tmp_path):
+    result = subprocess.run([sys.executable, "-B", str(SCRIPT), "--engine", "qwen_custom_voice",
+                             "--backend", "pytorch", "--model", "1.7B", "--language", "en",
+                             "--preset-voice", "Ryan", "--text", "Offline test.",
+                             "--cache-root", str(tmp_path), "--output-root", str(tmp_path / "run")],
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 2 and "--device" in result.stderr
+    assert not (tmp_path / "run").exists()

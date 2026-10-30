@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark existing Qwen TTS adapters using cached weights and explicit output paths.
+"""Benchmark existing TTS adapters using cached weights and explicit output paths.
 
 Importing is inert. main() is a standalone entry point: it installs a permanent
 network audit guard before importing adapters. See the developer benchmark guide.
@@ -29,15 +29,22 @@ import wave
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 from scripts.portable_output import Output  # noqa: E402
+from scripts import device_telemetry as telemetry  # noqa: E402
 LANGUAGES = ("zh", "en", "ja", "ko", "de", "fr", "ru", "pt", "es", "it")
 PRESETS = ("Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric", "Ryan", "Aiden", "Ono_Anna", "Sohee")
 MAX_ARTIFACT_BYTES = 128 * 1024 * 1024
+TURBO_REPO = "ResembleAI/chatterbox-turbo"
+# Pinned to backend.backends.chatterbox_turbo_backend._TURBO_WEIGHT_FILES by test;
+# admission must not import the backend (and torch) before the offline guard.
+TURBO_WEIGHT_FILES = ("t3_turbo_v1.safetensors", "s3gen_meanflow.safetensors", "ve.safetensors",
+                      "tokenizer_config.json", "vocab.json", "merges.txt", "conds.pt")
 
 
 @dataclass(frozen=True)
 class Settings:
     engine: str
     backend: str
+    device: str
     model: str
     language: str
     text: str
@@ -53,16 +60,27 @@ class Settings:
     max_audio_seconds: float = 30.0
 
 
+def torch_device(settings):
+    """In-process torch device. cuda:N is selected through CUDA_VISIBLE_DEVICES
+    before torch is imported, so the process always sees it as cuda:0."""
+    if settings.device == "mlx":
+        return "mlx"
+    return "cuda:0" if settings.device.startswith("cuda") else "cpu"
+
+
 def validate(settings):
-    if settings.engine not in ("qwen", "qwen_custom_voice", "qwen_voice_design"):
-        raise ValueError("unsupported engine; only audited Qwen adapters are admitted")
-    if settings.backend not in ("mlx", "pytorch"):
-        raise ValueError("backend must be explicit: mlx or pytorch")
-    if settings.model not in ("1.7B", "0.6B") or (
-        settings.engine == "qwen_voice_design" and settings.model != "1.7B"
-    ):
+    if settings.engine not in ENGINES:
+        raise ValueError("unsupported engine; only audited Qwen and Chatterbox Turbo adapters are admitted")
+    spec = ENGINES[settings.engine]
+    if settings.backend not in spec.backends:
+        raise ValueError(f"backend must be explicit: one of {', '.join(spec.backends)}")
+    if settings.backend == "mlx" and settings.device != "mlx":
+        raise ValueError("mlx backend requires --device mlx")
+    if settings.backend == "pytorch" and not re.fullmatch(r"cpu|cuda(:\d+)?", settings.device):
+        raise ValueError("pytorch backend requires --device cpu, cuda or cuda:N; nothing is auto-selected")
+    if settings.model not in spec.models:
         raise ValueError("unsupported model size for this engine")
-    if settings.language not in LANGUAGES:
+    if settings.language not in spec.languages:
         raise ValueError("unsupported language; automatic language fallback is disabled")
     if not settings.text.strip() or len(settings.text) > 2000:
         raise ValueError("text must contain 1..2000 characters")
@@ -73,14 +91,14 @@ def validate(settings):
     for value in (settings.instruct, settings.reference_text, settings.design_prompt):
         if value is not None and (not value.strip() or len(value) > 2000):
             raise ValueError("instructions, design and reference text must contain 1..2000 characters")
-    if settings.engine == "qwen":
+    if spec.voice == "reference":
         if settings.reference is None or not settings.reference_text:
-            raise ValueError("Base requires explicit --reference and --reference-text")
+            raise ValueError(f"{settings.engine} requires explicit --reference and --reference-text")
         if settings.instruct or settings.preset_voice or settings.design_prompt:
-            raise ValueError("Base does not support instruct, presets or voice design")
+            raise ValueError(f"{settings.engine} does not support instruct, presets or voice design")
     elif settings.reference is not None or settings.reference_text:
-        raise ValueError("reference audio is only supported by Base")
-    elif settings.engine == "qwen_custom_voice":
+        raise ValueError("reference audio is only supported by cloning engines")
+    elif spec.voice == "preset":
         if settings.preset_voice not in PRESETS or settings.design_prompt:
             raise ValueError("CustomVoice requires a known explicit --preset-voice")
     elif not settings.design_prompt or settings.preset_voice:
@@ -98,14 +116,10 @@ def read_json(path):
     return json.loads(path.read_text(), parse_constant=reject_nonfinite)
 
 
-def admit_cached_model(settings):
-    """Resolve refs/main locally; never call a Hub API, even for admission."""
-    variant = {"qwen": "Base", "qwen_custom_voice": "CustomVoice",
-               "qwen_voice_design": "VoiceDesign"}[settings.engine]
-    repo_id = f"Qwen/Qwen3-TTS-12Hz-{settings.model}-{variant}"
-    if settings.backend == "mlx":
-        repo_id = f"mlx-community/Qwen3-TTS-12Hz-{settings.model}-{variant}-bf16"
-    cache = settings.cache_root.resolve()
+def admit_local_snapshot(cache_root, repo_id, check):
+    """Resolve refs/main locally; never call a Hub API, even for admission.
+    check(snapshot, required) audits the files and returns extra evidence."""
+    cache = cache_root.resolve()
     repo = cache / ("models--" + repo_id.replace("/", "--"))
     try:
         # Converted MLX weights masquerading as a PyTorch repo are not ready.
@@ -130,6 +144,19 @@ def admit_cached_model(settings):
                 raise ValueError(f"missing/empty cached file: {name}")
             return candidate
 
+        return {"repo_id": repo_id, "revision": revision, "snapshot": str(snapshot), **check(snapshot, required)}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise ValueError(f"model not locally ready: {repo_id}: {exc}") from exc
+
+
+def admit_cached_model(settings):
+    variant = {"qwen": "Base", "qwen_custom_voice": "CustomVoice",
+               "qwen_voice_design": "VoiceDesign"}[settings.engine]
+    repo_id = f"Qwen/Qwen3-TTS-12Hz-{settings.model}-{variant}"
+    if settings.backend == "mlx":
+        repo_id = f"mlx-community/Qwen3-TTS-12Hz-{settings.model}-{variant}-bf16"
+
+    def check(snapshot, required):
         for name in ("config.json", "generation_config.json", "tokenizer_config.json",
                      "vocab.json", "merges.txt", "preprocessor_config.json",
                      "speech_tokenizer/config.json", "speech_tokenizer/preprocessor_config.json"):
@@ -151,11 +178,69 @@ def admit_cached_model(settings):
         expected = {"Base": "base", "CustomVoice": "custom_voice", "VoiceDesign": "voice_design"}
         if config.get("tts_model_type") != expected[variant]:
             raise ValueError("checkpoint voice mode does not match selected engine")
-        return {"repo_id": repo_id, "revision": revision, "snapshot": str(snapshot),
-                "config_sha256": hashlib.sha256((snapshot / "config.json").read_bytes()).hexdigest(),
+        return {"config_sha256": hashlib.sha256((snapshot / "config.json").read_bytes()).hexdigest(),
                 "generation_config": read_json(required("generation_config.json"))}
-    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
-        raise ValueError(f"model not locally ready: {repo_id}: {exc}") from exc
+
+    return admit_local_snapshot(settings.cache_root, repo_id, check)
+
+
+def admit_cached_turbo(settings):
+    def check(snapshot, required):
+        return {"files": {name: required(name).stat().st_size for name in TURBO_WEIGHT_FILES},
+                "tokenizer_config_sha256": hashlib.sha256(required("tokenizer_config.json").read_bytes()).hexdigest()}
+
+    return admit_local_snapshot(settings.cache_root, TURBO_REPO, check)
+
+
+def qwen_inference_roots(adapter):
+    return {"model": adapter.model}
+
+
+def turbo_inference_roots(adapter):
+    # The perth watermarker holds a CPU post-processing network and is not inference.
+    return {"t3": adapter.model.t3, "s3gen": adapter.model.s3gen, "ve": adapter.model.ve}
+
+
+def turbo_loaded_revision(adapter, admitted):
+    expected = f"{admitted['repo_id']}@{admitted['revision']}"
+    loaded = adapter._conditioning_model_id
+    if loaded != expected:
+        raise ValueError(f"adapter loaded {loaded}, admission expected {expected}")
+    return loaded
+
+
+@dataclass(frozen=True)
+class EngineSpec:
+    backends: tuple
+    models: tuple
+    languages: tuple
+    voice: str  # reference | preset | design
+    admit: object
+    adapters: dict  # backend -> (module, class)
+    constructor_takes_model: bool
+    reference_use_cache: bool
+    inference_roots: object
+    loaded_revision: object = None
+
+
+ENGINES = {
+    "qwen": EngineSpec(("mlx", "pytorch"), ("1.7B", "0.6B"), LANGUAGES, "reference", admit_cached_model,
+                       {"mlx": ("mlx_backend", "MLXTTSBackend"), "pytorch": ("pytorch_backend", "PyTorchTTSBackend")},
+                       True, False, qwen_inference_roots),
+    "qwen_custom_voice": EngineSpec(("mlx", "pytorch"), ("1.7B", "0.6B"), LANGUAGES, "preset", admit_cached_model,
+                                    {"mlx": ("qwen_mlx_styles_backend", "QwenMLXCustomVoiceBackend"),
+                                     "pytorch": ("qwen_custom_voice_backend", "QwenCustomVoiceBackend")},
+                                    True, False, qwen_inference_roots),
+    "qwen_voice_design": EngineSpec(("mlx", "pytorch"), ("1.7B",), LANGUAGES, "design", admit_cached_model,
+                                    {"mlx": ("qwen_mlx_styles_backend", "QwenMLXVoiceDesignBackend"),
+                                     "pytorch": ("qwen_voice_design_backend", "QwenVoiceDesignBackend")},
+                                    True, False, qwen_inference_roots),
+    # Turbo defers encoding when use_cache=False, so its reference stage must
+    # encode through the run-isolated cache and the first preparation must miss.
+    "chatterbox_turbo": EngineSpec(("pytorch",), ("default",), ("en",), "reference", admit_cached_turbo,
+                                   {"pytorch": ("chatterbox_turbo_backend", "ChatterboxTurboTTSBackend")},
+                                   False, True, turbo_inference_roots, turbo_loaded_revision),
+}
 
 
 def reference_info(path):
@@ -174,6 +259,16 @@ def reference_info(path):
             "duration_s": duration, "sample_rate": rate}
 
 
+def device_environment(settings):
+    """Device selection that must precede every torch import. The backend
+    honors VOICEBOX_FORCE_CPU; CUDA_VISIBLE_DEVICES pins one physical GPU."""
+    if settings.device == "cpu":
+        return {"VOICEBOX_FORCE_CPU": "1"}
+    if settings.device.startswith("cuda"):
+        return {"CUDA_VISIBLE_DEVICES": settings.device.partition(":")[2] or "0"}
+    return {}
+
+
 def configure_offline(settings, output):
     """Standalone-process guard, applied before model libraries are imported."""
     runtime = output.path / "runtime"
@@ -186,9 +281,11 @@ def configure_offline(settings, output):
         "HF_HUB_CACHE": str(settings.cache_root.resolve()),
         "VOICEBOX_MODELS_DIR": str(settings.cache_root.resolve()),
         "HF_HOME": str(runtime / "huggingface"), "XDG_CACHE_HOME": str(runtime / "cache"),
-        "TORCH_HOME": str(runtime / "torch"), "TMPDIR": str(temporary),
+        "TORCH_HOME": str(runtime / "torch"),
+        "TMPDIR": str(temporary), "TEMP": str(temporary), "TMP": str(temporary),
         "PYTHONPYCACHEPREFIX": str(runtime / "bytecode"), "PYTHONDONTWRITEBYTECODE": "1",
         "VOICEBOX_OFFLINE_PATCH": "0",
+        **device_environment(settings),
     })
     sys.dont_write_bytecode = True
     tempfile.tempdir = str(temporary)
@@ -202,6 +299,17 @@ def configure_offline(settings, output):
     sys.addaudithook(deny_network)
 
 
+def device_identity(settings):
+    """Identity from real tools; refuses non-NVIDIA CUDA. MLX never imports torch."""
+    if settings.device == "mlx":
+        return {"selected_device": "mlx", "os": platform.platform(), "machine": platform.machine()}
+    identity = telemetry.collect_identity(torch_device(settings))
+    if settings.device.startswith("cuda"):
+        telemetry.require_cuda(identity)
+    return {**telemetry.as_record(identity), "requested_device": settings.device,
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES")}
+
+
 def create_adapter(settings, admitted, output):
     # No server/services, global backend singleton, model discovery or ASR.
     sys.path.insert(0, str(REPO))
@@ -210,20 +318,14 @@ def create_adapter(settings, admitted, output):
     from backend.utils import hf_offline_patch
     # mlx_backend explicitly calls this too; never modify shared caches.
     hf_offline_patch.ensure_original_qwen_config_cached = lambda: None
-    modules = {
-        ("qwen", "mlx"): ("mlx_backend", "MLXTTSBackend"),
-        ("qwen", "pytorch"): ("pytorch_backend", "PyTorchTTSBackend"),
-        ("qwen_custom_voice", "mlx"): ("qwen_mlx_styles_backend", "QwenMLXCustomVoiceBackend"),
-        ("qwen_voice_design", "mlx"): ("qwen_mlx_styles_backend", "QwenMLXVoiceDesignBackend"),
-        ("qwen_custom_voice", "pytorch"): ("qwen_custom_voice_backend", "QwenCustomVoiceBackend"),
-        ("qwen_voice_design", "pytorch"): ("qwen_voice_design_backend", "QwenVoiceDesignBackend"),
-    }
-    module, name = modules[(settings.engine, settings.backend)]
+    spec = ENGINES[settings.engine]
+    module, name = spec.adapters[settings.backend]
     imported = importlib.import_module("backend.backends." + module)
-    adapter = getattr(imported, name)(settings.model)
+    cls = getattr(imported, name)
+    adapter = cls(settings.model) if spec.constructor_takes_model else cls()
     adapter._benchmark_source_sha256 = hashlib.sha256(Path(imported.__file__).read_bytes()).hexdigest()
     # Bind precisely the admitted snapshot; refs/main cannot switch this run.
-    adapter._get_model_path = lambda size: admitted["snapshot"]
+    adapter._get_model_path = lambda size=None: admitted["snapshot"]
     adapter._is_model_cached = lambda size=None: True
     return adapter
 
@@ -237,7 +339,7 @@ def provenance():
     except (OSError, subprocess.SubprocessError):
         commit, dirty = None, None
     versions = {}
-    for package in ("numpy", "torch", "mlx", "mlx-audio", "qwen-tts", "transformers", "huggingface-hub"):
+    for package in ("numpy", "torch", "mlx", "mlx-audio", "qwen-tts", "chatterbox-tts", "transformers", "huggingface-hub"):
         try:
             versions[package] = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError:
@@ -291,47 +393,59 @@ def save_wav(output, name, samples, sample_rate):
         target.writeframes(pcm)
 
 
-async def benchmark(settings, output, *, factory=create_adapter, admit=admit_cached_model,
-                    clock=time.perf_counter_ns, get_provenance=provenance):
+async def benchmark(settings, output, *, factory=create_adapter, clock=time.perf_counter_ns,
+                    get_provenance=provenance, identify=device_identity,
+                    meter_factory=telemetry.StageMeter.for_device, verify_residency=telemetry.check_residency):
     """Injectable test boundary. Caller owns offline setup and validation."""
-    report = {"schema_version": 1, "status": "failed", "config": asdict(settings),
-              "provenance": get_provenance(), "stages_s": {}, "runs": [], "warm": None,
-              "timing_scope": "adapter calls; WAV IO/validation excluded; first load in fresh process, not cold disk cache"}
+    spec = ENGINES[settings.engine]
+    report = {"schema_version": 2, "status": "failed", "config": asdict(settings),
+              "provenance": get_provenance(), "stages_s": {}, "stages": {}, "runs": [], "warm": None,
+              "timing_scope": "adapter calls; WAV IO/validation excluded; first load in fresh process, not cold disk cache; "
+                              "CUDA synchronized at stage boundaries only"}
     adapter = None
     stage = "admission"
     try:
-        report["model"] = admit(settings)
+        report["model"] = spec.admit(settings)
         report["reference"] = reference_info(settings.reference)
+        stage = "device"
+        report["device"] = identify(settings)
+        meter = meter_factory(torch_device(settings), clock)
         stage = "adapter_init"
-        start = clock()
-        adapter = factory(settings, report["model"], output)
-        report["stages_s"][stage] = (clock() - start) / 1e9
+        with meter.stage(stage):
+            adapter = factory(settings, report["model"], output)
         report["adapter"] = {"class": type(adapter).__name__, "device": str(getattr(adapter, "device", settings.backend)),
                              "source_sha256": getattr(adapter, "_benchmark_source_sha256", None)}
         if adapter.is_loaded():
             raise ValueError("cold load requires a fresh unloaded adapter")
         stage = "load"
-        start = clock()
-        await adapter.load_model(settings.model)
-        report["stages_s"][stage] = (clock() - start) / 1e9
+        with meter.stage(stage):
+            await adapter.load_model(settings.model)
+        stage = "residency"
+        if settings.backend == "pytorch":
+            report["residency"] = verify_residency(spec.inference_roots(adapter), torch_device(settings))
+        if spec.loaded_revision is not None:
+            report["adapter"]["loaded_revision"] = spec.loaded_revision(adapter, report["model"])
         stage = "reference_preparation"
-        start = clock()
-        if settings.reference is not None:
-            prompt, _ = await adapter.create_voice_prompt(str(settings.reference), settings.reference_text, use_cache=False)
-        elif settings.preset_voice:
-            prompt = {"voice_type": "preset", "preset_engine": settings.engine,
-                      "preset_voice_id": settings.preset_voice}
-        else:
-            prompt = {"voice_type": "designed", "design_prompt": settings.design_prompt}
-        report["stages_s"][stage] = (clock() - start) / 1e9
+        hit = None
+        with meter.stage(stage):
+            if settings.reference is not None:
+                prompt, hit = await adapter.create_voice_prompt(str(settings.reference), settings.reference_text,
+                                                                use_cache=spec.reference_use_cache)
+            elif settings.preset_voice:
+                prompt = {"voice_type": "preset", "preset_engine": settings.engine,
+                          "preset_voice_id": settings.preset_voice}
+            else:
+                prompt = {"voice_type": "designed", "design_prompt": settings.design_prompt}
+        report["reference_preparation"] = {"use_cache": spec.reference_use_cache, "cache_hit": hit}
+        if hit:
+            raise ValueError("first reference preparation reported a cache hit in a fresh run-isolated cache")
         artifact_bytes = 0
         for index in range(settings.warm_repeats + 1):
             stage = f"generation_{index}"
-            start = clock()
-            audio, rate = await adapter.generate(settings.text, prompt, language=settings.language,
-                                                  seed=settings.seed, instruct=settings.instruct)
-            elapsed = (clock() - start) / 1e9
-            samples, metrics = audio_metrics(audio, rate, elapsed, settings.max_audio_seconds)
+            with meter.stage(stage):
+                audio, rate = await adapter.generate(settings.text, prompt, language=settings.language,
+                                                      seed=settings.seed, instruct=settings.instruct)
+            samples, metrics = audio_metrics(audio, rate, meter.stages[stage].wall_s, settings.max_audio_seconds)
             artifact_bytes += samples.size * 2 + 44
             if artifact_bytes > MAX_ARTIFACT_BYTES:
                 raise ValueError("WAV artifacts exceed 128 MiB run budget")
@@ -341,7 +455,7 @@ async def benchmark(settings, output, *, factory=create_adapter, admit=admit_cac
                                    "wav": name, **metrics})
         cold = report["runs"][0]
         report["cold_load_reference_generation_rtf"] = (
-            report["stages_s"]["load"] + report["stages_s"]["reference_preparation"] + cold["generation_s"]
+            meter.stages["load"].wall_s + meter.stages["reference_preparation"].wall_s + cold["generation_s"]
         ) / cold["duration_s"]
         warm = report["runs"][1:]
         report["warm"] = {"generation_s": distribution([r["generation_s"] for r in warm]),
@@ -357,6 +471,9 @@ async def benchmark(settings, output, *, factory=create_adapter, admit=admit_cac
             except Exception as exc:
                 report["status"] = "failed"
                 report["cleanup_error"] = {"type": type(exc).__name__, "message": str(exc)[:2000]}
+        if "meter" in locals():
+            report["stages"] = {name: telemetry.as_record(m) for name, m in meter.stages.items()}
+            report["stages_s"] = {name: m.wall_s for name, m in meter.stages.items()}
         with output.open("results.json") as handle:
             handle.write(json.dumps(report, default=str, indent=2, allow_nan=False).encode() + b"\n")
     return report
@@ -364,7 +481,7 @@ async def benchmark(settings, output, *, factory=create_adapter, admit=admit_cac
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("engine", "backend", "model", "language", "text", "cache-root", "output-root"):
+    for name in ("engine", "backend", "device", "model", "language", "text", "cache-root", "output-root"):
         parser.add_argument("--" + name, required=True, type=Path if name.endswith("root") else str)
     parser.add_argument("--reference", type=Path)
     for name in ("reference-text", "preset-voice", "design-prompt", "instruct"):
