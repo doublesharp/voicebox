@@ -116,10 +116,10 @@ impl Retry {
 /// if at least one frame was received (the connection was genuinely
 /// productive), `Ok(false)` on a clean but empty close, and `Err` for
 /// any connection or parse failure.
-async fn stream_once(
+async fn stream_once<R: tauri::Runtime>(
     client: &reqwest::Client,
     url: &str,
-    app: &AppHandle,
+    app: &AppHandle<R>,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     stream_once_with(client, url, STREAM_IDLE_TIMEOUT, |event, data| {
         dispatch(app, event, data);
@@ -158,11 +158,13 @@ async fn stream_once_with(
             Ok(Ok(Some(chunk))) => chunk,
             Ok(Ok(None)) => return Ok(buf.has_complete_frame()),
             Ok(Err(e)) => return Err(Box::new(e)),
-            Err(_) => return Err(format!(
+            Err(_) => {
+                return Err(format!(
                 "no data forming a complete frame for {:?} (heartbeat should arrive every 15 s)",
                 idle_timeout
             )
-            .into()),
+                .into())
+            }
         };
         let previous_frames = buf.completed_frames();
         let events = buf.push(&chunk)?;
@@ -175,7 +177,7 @@ async fn stream_once_with(
     }
 }
 
-fn dispatch(app: &AppHandle, event: &str, data: &str) {
+fn dispatch<R: tauri::Runtime>(app: &AppHandle<R>, event: &str, data: &str) {
     match event {
         "speak-start" => {
             // Defensive for dev/restart paths where the setup-created pill
@@ -618,5 +620,86 @@ mod progress_timeout_tests {
         .unwrap());
         task.await.unwrap();
         assert_eq!(events, [("speak-start".into(), "hello".into())]);
+    }
+}
+
+#[cfg(all(test, desktop))]
+mod event_delivery_integration_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tauri::{Listener, Manager};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn serve(
+        body: &'static [u8],
+        status: &'static str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/events/speak", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = socket.read(&mut request).await;
+            let header = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+            );
+            socket.write_all(header.as_bytes()).await.unwrap();
+            socket.write_all(body).await.unwrap();
+        });
+        (url, task)
+    }
+
+    #[tokio::test]
+    async fn sse_frames_create_one_window_and_deliver_speech_events() {
+        let app = tauri::test::mock_app();
+        let events = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        for name in ["dictate:speak-start", "dictate:speak-end"] {
+            let events = events.clone();
+            app.listen(name, move |event| {
+                let payload: String = serde_json::from_str(event.payload()).unwrap();
+                events.lock().unwrap().push((name.into(), payload));
+            });
+        }
+        let (url, task) = serve(b": ping\n\nevent: ready\ndata: ignored\n\nevent: speak-start\ndata: hello\n\nevent: speak-start\ndata: again\n\nevent: speak-end\ndata: done\n\n", "200 OK").await;
+        assert!(stream_once(&monitor_client().unwrap(), &url, app.handle())
+            .await
+            .unwrap());
+        task.await.unwrap();
+        assert!(app
+            .get_webview_window(crate::DICTATE_WINDOW_LABEL)
+            .is_some());
+        assert_eq!(app.webview_windows().len(), 1);
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                ("dictate:speak-start".into(), "hello".into()),
+                ("dictate:speak-start".into(), "again".into()),
+                ("dictate:speak-end".into(), "done".into())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_stream_does_not_create_a_window_or_emit_events() {
+        let app = tauri::test::mock_app();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let seen = events.clone();
+        app.listen("dictate:speak-start", move |event| {
+            seen.lock().unwrap().push(event.payload().to_owned())
+        });
+        let (url, task) = serve(
+            b"event: speak-start\ndata: ignored\n\n",
+            "503 Service Unavailable",
+        )
+        .await;
+        assert!(stream_once(&monitor_client().unwrap(), &url, app.handle())
+            .await
+            .is_err());
+        task.await.unwrap();
+        assert!(app
+            .get_webview_window(crate::DICTATE_WINDOW_LABEL)
+            .is_none());
+        assert!(events.lock().unwrap().is_empty());
     }
 }

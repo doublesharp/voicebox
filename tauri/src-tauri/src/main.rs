@@ -38,7 +38,7 @@ const DICTATE_WINDOW_HEIGHT: f64 = 64.0;
 /// Building it at setup avoids a race where the first chord or agent-speech
 /// event fires before the webview subscribes to the `dictate:*` events.
 #[cfg(desktop)]
-fn build_dictate_window(app: &tauri::AppHandle) -> tauri::Result<tauri::WebviewWindow> {
+fn build_dictate_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<tauri::WebviewWindow<R>> {
     let window = WebviewWindowBuilder::new(
         app,
         DICTATE_WINDOW_LABEL,
@@ -81,7 +81,7 @@ fn build_dictate_window(app: &tauri::AppHandle) -> tauri::Result<tauri::WebviewW
 /// agent-speech to prime the webview on speak-start so its listeners can
 /// register before the actual show arrives from `audio.onplaying`.
 #[cfg(desktop)]
-pub fn ensure_dictate_window(app: &tauri::AppHandle) {
+pub fn ensure_dictate_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     if app.get_webview_window(DICTATE_WINDOW_LABEL).is_none() {
         if let Err(e) = build_dictate_window(app) {
             eprintln!("ensure_dictate_window: failed to build pill: {e}");
