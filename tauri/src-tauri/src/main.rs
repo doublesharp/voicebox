@@ -228,6 +228,24 @@ async fn startup_health_check(
         .ok_or_else(|| "Server startup cancelled".to_string())
 }
 
+#[cfg(unix)]
+async fn discover_listeners(
+    port: u16,
+    executable: Option<&std::path::Path>,
+    permit: &server_startup::StartPermit<'_>,
+) -> Result<Option<std::process::Output>, String> {
+    let mut command = tokio::process::Command::new(
+        executable.unwrap_or_else(|| std::path::Path::new("lsof")),
+    );
+    command.args(["+c", "0", "-i", &format!(":{port}"), "-sTCP:LISTEN"]);
+    command.kill_on_drop(true);
+    Ok(permit
+        .until_cancelled(command.output())
+        .await
+        .ok_or_else(|| "Server startup cancelled".to_string())?
+        .ok())
+}
+
 fn eligible_gpu_backends(
     pin: Option<&str>,
     rocm: Option<std::path::PathBuf>,
@@ -419,6 +437,8 @@ async fn start_server<R: tauri::Runtime>(
 struct ServerStartupConfig {
     port: u16,
     discover_listener: bool,
+    listener_executable: Option<std::path::PathBuf>,
+    port_release_delay: std::time::Duration,
     legacy_port: Option<u16>,
     data_dir: Option<std::path::PathBuf>,
     cpu_executable: Option<std::path::PathBuf>,
@@ -429,6 +449,8 @@ impl Default for ServerStartupConfig {
         Self {
             port: SERVER_PORT,
             discover_listener: true,
+            listener_executable: None,
+            port_release_delay: std::time::Duration::from_millis(200),
             legacy_port: Some(LEGACY_PORT),
             data_dir: None,
             cpu_executable: None,
@@ -463,11 +485,7 @@ async fn start_server_with<R: tauri::Runtime>(
     // or an externally started server e.g. via `python`, `uvicorn`, Docker, etc.)
     #[cfg(unix)]
     if config.discover_listener {
-        use std::process::Command;
-        if let Ok(output) = Command::new("lsof")
-            .args(["+c", "0", "-i", &format!(":{}", config.port), "-sTCP:LISTEN"])
-            .output()
-        {
+        if let Some(output) = discover_listeners(config.port, config.listener_executable.as_deref(), &_start_permit).await? {
             let output_str = String::from_utf8_lossy(&output.stdout);
             let healthy = output_str.lines().skip(1).any(|line| !line.trim().is_empty())
                 && startup_health_check(config.port, &_start_permit).await?;
@@ -532,10 +550,7 @@ async fn start_server_with<R: tauri::Runtime>(
     #[cfg(unix)]
     if let Some(legacy_port) = config.legacy_port {
         use std::process::Command;
-        if let Ok(output) = Command::new("lsof")
-            .args(["+c", "0", "-i", &format!(":{}", legacy_port), "-sTCP:LISTEN"])
-            .output()
-        {
+        if let Some(output) = discover_listeners(legacy_port, config.listener_executable.as_deref(), &_start_permit).await? {
             let output_str = String::from_utf8_lossy(&output.stdout);
             let healthy = output_str.lines().skip(1).any(|line| !line.trim().is_empty())
                 && startup_health_check(legacy_port, &_start_permit).await?;
@@ -576,7 +591,10 @@ async fn start_server_with<R: tauri::Runtime>(
     }
     
     // Brief wait for port to be released
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    _start_permit
+        .until_cancelled(tokio::time::sleep(config.port_release_delay))
+        .await
+        .ok_or("Server startup cancelled")?;
 
     // Get app data directory
     let data_dir = match config.data_dir.clone() {
@@ -2917,6 +2935,8 @@ mod server_start_flow_tests {
             ServerStartupConfig {
                 port: self.port,
                 discover_listener: false,
+                listener_executable: None,
+                port_release_delay: Duration::from_millis(200),
                 legacy_port: None,
                 data_dir: Some(self.dir.join("data")),
                 cpu_executable: Some(self.exe.clone()),
@@ -2952,6 +2972,8 @@ mod server_start_flow_tests {
         let config = ServerStartupConfig::default();
         assert_eq!(config.port, SERVER_PORT);
         assert!(config.discover_listener);
+        assert!(config.listener_executable.is_none());
+        assert_eq!(config.port_release_delay, Duration::from_millis(200));
         assert_eq!(config.legacy_port, Some(LEGACY_PORT));
         assert!(config.data_dir.is_none());
         assert!(config.cpu_executable.is_none());
@@ -3390,5 +3412,128 @@ mod server_start_flow_tests {
             .unwrap()
             .iter()
             .any(|entry| entry.contains("after readiness")));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_during_port_release_delay_returns_promptly_without_launch() {
+        let fixture = Fixture::new("touch \"$2/sidecar-started\"\nexec /bin/sleep 5");
+        let mut config = fixture.config();
+        config.port_release_delay = Duration::from_secs(3);
+        let app = app();
+        let handle = app.handle().clone();
+        let mut startup = tokio::spawn(async move {
+            start_server_with(handle.clone(), handle.state(), None, None, config).await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while app.state::<ServerState>().start_gate.try_begin().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        stop_server_if_owned(app.state(), None).await.unwrap();
+        let timely = tokio::time::timeout(Duration::from_millis(800), &mut startup).await;
+        let result = match timely {
+            Ok(result) => result.unwrap(),
+            Err(_) => {
+                let _ = startup.await;
+                panic!("startup did not cancel during port-release delay");
+            }
+        };
+        assert!(result.unwrap_err().contains("cancelled"));
+        assert!(!fixture.dir.join("data/sidecar-started").exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_during_listener_discovery_terminates_probe_and_never_launches_sidecar() {
+        for legacy in [false, true] {
+            let fixture = Fixture::new("touch \"$2/sidecar-started\"\nexec /bin/sleep 5");
+            let marker = fixture.dir.join("listener-pid");
+            let probe = fixture.dir.join("slow-lsof");
+            std::fs::write(
+                &probe,
+                format!(
+                    "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nexec /bin/sleep 3\n",
+                    marker.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut config = fixture.config();
+            config.listener_executable = Some(probe);
+            if legacy {
+                config.legacy_port = Some(12345);
+            } else {
+                config.discover_listener = true;
+            }
+            let app = app();
+            let handle = app.handle().clone();
+            let mut startup = tokio::spawn(async move {
+                start_server_with(handle.clone(), handle.state(), None, None, config).await
+            });
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !marker.exists() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("listener probe did not start");
+            let pid = std::fs::read_to_string(&marker).unwrap();
+            stop_server_if_owned(app.state(), None).await.unwrap();
+            let timely = tokio::time::timeout(Duration::from_millis(800), &mut startup).await;
+            let result = match timely {
+                Ok(result) => result.unwrap(),
+                Err(_) => {
+                    let _ = startup.await;
+                    panic!("startup waited for stalled listener probe, legacy={legacy}");
+                }
+            };
+            assert!(result.unwrap_err().contains("cancelled"));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while std::process::Command::new("/bin/kill")
+                    .args(["-0", pid.as_str()])
+                    .status()
+                    .unwrap()
+                    .success()
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("cancelled listener probe survived");
+            assert!(!fixture.dir.join("data/sidecar-started").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_or_failing_listener_probe_preserves_sidecar_fallback() {
+        for legacy in [false, true] {
+            for missing in [false, true] {
+                let fixture = Fixture::new("printf 'INFO: Uvicorn running on http://127.0.0.1:1\\n' >&2\nexec /bin/sleep 5");
+                let probe = fixture.dir.join("lsof-fixture");
+                if !missing {
+                    std::fs::write(&probe, "#!/bin/sh\nexit 1\n").unwrap();
+                    std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                }
+                let mut config = fixture.config();
+                config.listener_executable = Some(probe);
+                if legacy {
+                    config.legacy_port = Some(12345);
+                } else {
+                    config.discover_listener = true;
+                }
+                let app = app();
+                let result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    start_server_with(app.handle().clone(), app.state(), None, None, config),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(result, format!("http://127.0.0.1:{}", fixture.port));
+                stop_server_if_owned(app.state(), None).await.unwrap();
+            }
+        }
     }
 }
