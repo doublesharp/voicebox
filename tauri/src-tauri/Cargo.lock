@@ -5135,6 +5135,7 @@ dependencies = [
  "tauri-plugin-process",
  "tauri-plugin-shell",
  "tauri-plugin-updater",
+ "tauri-runtime",
  "tokio",
  "wasapi",
  "webkit2gtk",
