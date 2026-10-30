@@ -22,6 +22,7 @@ mod server_startup;
 mod speak_monitor;
 mod sse_frames;
 mod synthetic_keys;
+mod window_close;
 
 use std::sync::Mutex;
 use tauri::{command, State, Manager, WindowEvent, Emitter, Listener, RunEvent, WebviewUrl, WebviewWindowBuilder, PhysicalPosition};
@@ -1563,20 +1564,21 @@ pub fn run() {
                 // Emit event to frontend to check setting and stop server if needed
                 let app_handle = window.app_handle();
 
-                if let Err(e) = app_handle.emit("window-close-requested", ()) {
-                    eprintln!("Failed to emit window-close-requested event: {}", e);
-                    finish_main_window_close(window);
-                    return;
-                }
-
-                // Set up listener for frontend response
                 let window_for_close = window.clone();
                 let closing_for_timeout = closing.clone();
                 let (tx, mut rx) = mpsc::unbounded_channel::<()>();
-
-                let listener_id = window.listen("window-close-allowed", move |_| {
-                    let _ = tx.send(());
-                });
+                let listener_id = match window_close::request_cleanup(
+                    || window.listen("window-close-allowed", move |_| { let _ = tx.send(()); }),
+                    || app_handle.emit("window-close-requested", ()),
+                    |id| window.unlisten(id),
+                ) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        eprintln!("Failed to emit window-close-requested event: {}", e);
+                        finish_main_window_close(window);
+                        return;
+                    }
+                };
 
                 tauri::async_runtime::spawn(async move {
                     tokio::select! {
