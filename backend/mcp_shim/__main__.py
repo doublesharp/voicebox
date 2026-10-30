@@ -118,7 +118,7 @@ async def _handle_request(
             _write_stdout(
                 {
                     "jsonrpc": "2.0",
-                    "id": message.get("id"),
+                    "id": message.get("id") if isinstance(message, dict) else None,
                     "error": {
                         "code": -32000,
                         "message": (
@@ -130,17 +130,26 @@ async def _handle_request(
             return
 
         ctype = response.headers.get("content-type", "")
-        if "text/event-stream" in ctype:
-            # SSE frames: lines prefixed "data: ..." contain the JSON-RPC msg.
+        if ctype.split(";", 1)[0].strip().lower() == "text/event-stream":
+            # SSE data lines belong to one event until its blank-line delimiter.
+            data_lines: list[str] = []
             async for line in response.aiter_lines():
-                if line.startswith("data:"):
-                    payload = line[5:].strip()
+                if not line:
+                    if not data_lines:
+                        continue
+                    payload = "\n".join(data_lines)
+                    data_lines.clear()
                     if not payload:
                         continue
                     try:
                         _write_stdout(json.loads(payload))
                     except json.JSONDecodeError:
                         _err(f"malformed SSE payload: {payload[:200]}")
+                elif line == "data":
+                    data_lines.append("")
+                elif line.startswith("data:"):
+                    value = line[5:]
+                    data_lines.append(value[1:] if value.startswith(" ") else value)
         else:
             body = await response.aread()
             try:
