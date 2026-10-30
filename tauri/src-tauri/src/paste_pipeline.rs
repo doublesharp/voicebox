@@ -954,3 +954,197 @@ mod staging_failure_regression_tests {
         assert!(error.contains("clipboard restoration failed: restore failed"));
     }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+mod private_pasteboard_transaction_tests {
+    use super::*;
+    use crate::clipboard::private_pasteboard_tests::PrivatePasteboard;
+    use std::cell::Cell;
+    use tokio::sync::Notify;
+
+    struct Backend {
+        board: PrivatePasteboard,
+        fail_write: bool,
+        fail_send: bool,
+        sends: Cell<usize>,
+    }
+    impl Backend {
+        fn new() -> Self {
+            let board = PrivatePasteboard::new();
+            board.write("original");
+            Self {
+                board,
+                fail_write: false,
+                fail_send: false,
+                sends: Cell::new(0),
+            }
+        }
+    }
+    impl PasteBackend for Backend {
+        type Snapshot = clipboard::ClipboardSnapshot;
+        fn trusted(&self) -> bool {
+            true
+        }
+        fn activate(&self, _: i32) -> Result<(), String> {
+            Ok(())
+        }
+        fn save(&self) -> Result<Self::Snapshot, String> {
+            Ok(self.board.save())
+        }
+        fn write(&self, text: &str) -> Result<i64, clipboard::ClipboardWriteFailure> {
+            self.board.write_tracked(text, self.fail_write)
+        }
+        fn send(&self) -> Result<(), String> {
+            self.sends.set(self.sends.get() + 1);
+            if self.fail_send {
+                Err("paste failed".into())
+            } else {
+                Ok(())
+            }
+        }
+        fn change_count(&self) -> Result<i64, String> {
+            Ok(self.board.change_count())
+        }
+        fn restore(&self, snapshot: &Self::Snapshot) -> Result<(), String> {
+            self.board.restore(snapshot);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn native_private_diagnostic_restores_original_and_reports_real_counts() {
+        let backend = Backend::new();
+        let before = backend.board.change_count();
+        let result = diagnostic_with(
+            "dictation",
+            Duration::ZERO,
+            Duration::ZERO,
+            true,
+            &backend,
+            |_| async {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.snapshot.change_count(), before);
+        assert!(result.after_write > before);
+        assert_eq!(result.before_restore, result.after_write);
+        assert!(result.after_restore > result.after_write);
+        assert_eq!(backend.board.text().as_deref(), Some("original"));
+        assert_eq!(backend.sends.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn native_private_diagnostic_preserves_newer_content_after_paste() {
+        let backend = Backend::new();
+        let result = diagnostic_with(
+            "dictation",
+            Duration::ZERO,
+            Duration::from_millis(1),
+            true,
+            &backend,
+            |duration| {
+                if !duration.is_zero() {
+                    backend.board.write("newer");
+                }
+                async {}
+            },
+        )
+        .await
+        .unwrap();
+        assert_ne!(result.before_restore, result.after_write);
+        assert_eq!(backend.board.text().as_deref(), Some("newer"));
+    }
+
+    #[tokio::test]
+    async fn native_private_diagnostic_does_not_send_after_external_change() {
+        let backend = Backend::new();
+        let result = diagnostic_with(
+            "dictation",
+            Duration::from_millis(1),
+            Duration::ZERO,
+            true,
+            &backend,
+            |duration| {
+                if !duration.is_zero() {
+                    backend.board.write("newer");
+                }
+                async {}
+            },
+        )
+        .await;
+        assert!(result
+            .err()
+            .unwrap()
+            .contains("changed before diagnostic paste"));
+        assert_eq!(backend.sends.get(), 0);
+        assert_eq!(backend.board.text().as_deref(), Some("newer"));
+    }
+
+    #[tokio::test]
+    async fn native_private_diagnostic_failed_staging_recovers_original_after_clear() {
+        let mut backend = Backend::new();
+        backend.fail_write = true;
+        let error = diagnostic_with(
+            "dictation",
+            Duration::ZERO,
+            Duration::ZERO,
+            true,
+            &backend,
+            |_| async {},
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(error.contains("setString"));
+        assert_eq!(backend.board.text().as_deref(), Some("original"));
+        assert_eq!(backend.sends.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn native_private_diagnostic_send_failure_recovers_original() {
+        let mut backend = Backend::new();
+        backend.fail_send = true;
+        let error = diagnostic_with(
+            "dictation",
+            Duration::ZERO,
+            Duration::ZERO,
+            true,
+            &backend,
+            |_| async {},
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error, "paste failed");
+        assert_eq!(backend.board.text().as_deref(), Some("original"));
+    }
+
+    #[tokio::test]
+    async fn native_private_diagnostic_cancellation_restores_only_unchanged_content() {
+        for external in [false, true] {
+            let backend = Backend::new();
+            let entered = Notify::new();
+            let mut future = Box::pin(diagnostic_with(
+                "dictation",
+                Duration::ZERO,
+                Duration::ZERO,
+                false,
+                &backend,
+                |_| async {
+                    entered.notify_one();
+                    std::future::pending::<()>().await
+                },
+            ));
+            tokio::select! { _ = entered.notified() => {}, _ = &mut future => panic!("unexpected completion") }
+            assert_eq!(backend.board.text().as_deref(), Some("dictation"));
+            if external {
+                backend.board.write("newer");
+            }
+            drop(future);
+            assert_eq!(
+                backend.board.text().as_deref(),
+                Some(if external { "newer" } else { "original" })
+            );
+        }
+    }
+}

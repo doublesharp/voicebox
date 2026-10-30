@@ -77,17 +77,17 @@ impl ClipboardSnapshot {
 }
 
 #[cfg(all(test, target_os = "macos"))]
-mod private_pasteboard_tests {
+pub(crate) mod private_pasteboard_tests {
     use super::*;
 
     // A named private pasteboard is distinct from the user's general clipboard.
-    struct PrivatePasteboard {
+    pub(crate) struct PrivatePasteboard {
         board: Id,
         _pool: AutoreleasePool,
     }
 
     impl PrivatePasteboard {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             unsafe {
                 let pool = AutoreleasePool::new();
                 let board: Id = msg_send![class!(NSPasteboard), pasteboardWithUniqueName];
@@ -95,14 +95,42 @@ mod private_pasteboard_tests {
                 Self { board, _pool: pool }
             }
         }
-        fn save(&self) -> ClipboardSnapshot {
+        pub(crate) fn save(&self) -> ClipboardSnapshot {
             unsafe { save_clipboard_from(self.board).unwrap() }
         }
-        fn write(&self, text: &str) -> i64 {
+        pub(crate) fn write(&self, text: &str) -> i64 {
             unsafe { write_text_to(self.board, text).unwrap() }
         }
-        fn restore(&self, snapshot: &ClipboardSnapshot) {
+        pub(crate) fn restore(&self, snapshot: &ClipboardSnapshot) {
             unsafe { restore_clipboard_to(self.board, snapshot).unwrap() }
+        }
+        pub(crate) fn write_tracked(
+            &self,
+            text: &str,
+            fail: bool,
+        ) -> Result<i64, ClipboardWriteFailure> {
+            unsafe {
+                write_text_to_with(self.board, text, |board, value, kind| {
+                    if fail {
+                        false
+                    } else {
+                        msg_send![board, setString: value forType: kind]
+                    }
+                })
+            }
+        }
+        pub(crate) fn change_count(&self) -> i64 {
+            unsafe { msg_send![self.board, changeCount] }
+        }
+        pub(crate) fn text(&self) -> Option<String> {
+            let saved = self.save();
+            let bytes = &saved
+                .items
+                .first()?
+                .iter()
+                .find(|(kind, _)| kind == "public.utf8-plain-text")?
+                .1;
+            String::from_utf8(bytes.clone()).ok()
         }
     }
 
