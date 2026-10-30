@@ -324,7 +324,8 @@ def deny_network(event, args):
     choke point every path shares."""
     if event in ("socket.getaddrinfo", "socket.gethostbyname", "socket.gethostbyaddr"):
         raise OSError("benchmark forbids network lookup")
-    if event == "socket.__new__" and args[1] in INTERNET_FAMILIES and not inside_socketpair_emulation():
+    # _socket.socket() without a family audits -1 but creates an AF_INET socket.
+    if event == "socket.__new__" and args[1] in (*INTERNET_FAMILIES, -1) and not inside_socketpair_emulation():
         raise OSError("benchmark forbids network sockets")
     if event in ("socket.connect", "socket.sendto") and args[0].family in INTERNET_FAMILIES:
         if event == "socket.connect" and args[1][0] == "127.0.0.1" and inside_socketpair_emulation():

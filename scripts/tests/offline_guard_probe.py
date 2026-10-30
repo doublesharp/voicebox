@@ -86,6 +86,8 @@ def main(script, cache_root, output_root):
     refused("asyncio open_connection remote", lambda: asyncio.run(asyncio_connect(remote)))
     refused("asyncio datagram endpoint", lambda: asyncio.run(asyncio_datagram(local)))
     refused("asyncio sock_connect", lambda: asyncio.run(asyncio_sock_connect(local)))
+    import _socket
+    refused("_socket with no family (audited as -1, created as AF_INET)", lambda: _socket.socket().close())
     listener.close()
     assert not accepted, "a connection reached the local listener"
 
