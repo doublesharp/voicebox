@@ -52,10 +52,10 @@ async def upsert_mcp_binding(
         row = MCPClientBinding(client_id=data.client_id)
         db.add(row)
 
-    row.label = data.label
-    row.profile_id = data.profile_id
-    row.default_engine = data.default_engine
-    row.default_personality = data.default_personality
+    # Omitted fields are unchanged; explicit null/false values still clear them.
+    for field in ("label", "profile_id", "default_engine", "default_personality"):
+        if field in data.model_fields_set:
+            setattr(row, field, getattr(data, field))
     row.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(row)

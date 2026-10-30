@@ -52,10 +52,15 @@ export function MCPPage() {
   const [newLabel, setNewLabel] = useState('');
   const [newProfileId, setNewProfileId] = useState('');
   const [adding, setAdding] = useState(false);
+  const [bindingError, setBindingError] = useState<string | null>(null);
+  const saveError = t('settings.mcp.bindings.saveFailed', {
+    defaultValue: 'Could not save the agent voice binding. Please try again.',
+  });
 
   const handleAdd = async () => {
     if (!newClientId.trim()) return;
     setAdding(true);
+    setBindingError(null);
     try {
       await upsertAsync({
         client_id: newClientId.trim(),
@@ -65,6 +70,8 @@ export function MCPPage() {
       setNewClientId('');
       setNewLabel('');
       setNewProfileId('');
+    } catch {
+      setBindingError(saveError);
     } finally {
       setAdding(false);
     }
@@ -152,6 +159,7 @@ export function MCPPage() {
           title={t('settings.mcp.bindings.title')}
           description={t('settings.mcp.bindings.description')}
         >
+          {bindingError && <p role="alert" className="py-3 text-sm text-destructive">{bindingError}</p>}
           {bindings.length === 0 ? (
             <p className="text-sm text-muted-foreground py-4 italic">
               <Trans i18nKey="settings.mcp.bindings.empty" components={{ code: <code /> }} />
@@ -184,13 +192,14 @@ export function MCPPage() {
                   </div>
                   <Select
                     value={b.profile_id ?? '__default__'}
-                    onValueChange={(v) =>
-                      upsertAsync({
+                    onValueChange={(v) => {
+                      setBindingError(null);
+                      void upsertAsync({
                         client_id: b.client_id,
                         label: b.label,
                         profile_id: v === '__default__' ? null : v,
-                      })
-                    }
+                      }).catch(() => setBindingError(saveError));
+                    }}
                   >
                     <SelectTrigger className="w-[180px]">
                       <SelectValue />
