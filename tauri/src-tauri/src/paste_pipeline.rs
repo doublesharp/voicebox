@@ -61,6 +61,9 @@ async fn paste_with<B: PasteBackend, F: Future<Output = ()>>(
     if focus.bundle_id.as_deref() == Some(crate::VOICEBOX_BUNDLE_ID) {
         return Ok(false);
     }
+    // Clipboard staging and restore must be one transaction across paste requests.
+    static PASTE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _paste_guard = PASTE_LOCK.lock().await;
     if !backend.trusted() {
         return Err("Accessibility permission required for auto-paste. Open System Settings → Privacy & Security → Accessibility and enable Voicebox.".into());
     }
@@ -255,5 +258,117 @@ mod tests {
         fake.count = Some(11);
         assert_eq!(run(&fake, &focus(None)).await.unwrap_err(), "send failed");
         assert!(!calls(&fake).contains(&"restore".into()));
+    }
+}
+
+#[cfg(test)]
+mod concurrent_paste_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use tokio::sync::Notify;
+
+    struct Clipboard {
+        text: String,
+        revision: i64,
+        sent: Vec<String>,
+        fail_first: bool,
+    }
+    struct Backend(RefCell<Clipboard>);
+    impl PasteBackend for Backend {
+        type Snapshot = String;
+        fn trusted(&self) -> bool {
+            true
+        }
+        fn activate(&self, _: i32) -> Result<(), String> {
+            Ok(())
+        }
+        fn save(&self) -> Result<String, String> {
+            Ok(self.0.borrow().text.clone())
+        }
+        fn write(&self, text: &str) -> Result<i64, String> {
+            let mut clipboard = self.0.borrow_mut();
+            clipboard.text = text.into();
+            clipboard.revision += 1;
+            Ok(clipboard.revision)
+        }
+        fn send(&self) -> Result<(), String> {
+            let mut clipboard = self.0.borrow_mut();
+            let text = clipboard.text.clone();
+            clipboard.sent.push(text.clone());
+            if clipboard.fail_first && text == "first" {
+                Err("send failed".into())
+            } else {
+                Ok(())
+            }
+        }
+        fn change_count(&self) -> Result<i64, String> {
+            Ok(self.0.borrow().revision)
+        }
+        fn restore(&self, snapshot: &String) -> Result<(), String> {
+            let mut clipboard = self.0.borrow_mut();
+            clipboard.text = snapshot.clone();
+            clipboard.revision += 1;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn overlapping_pastes_preserve_original_or_newer_clipboard() {
+        for (fail_first, external_change) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let backend = Backend(RefCell::new(Clipboard {
+                text: "original clipboard".into(),
+                revision: 0,
+                sent: vec![],
+                fail_first,
+            }));
+            let focus = focus_capture::FocusSnapshot {
+                pid: 42,
+                bundle_id: None,
+                role: None,
+            };
+            let entered = Notify::new();
+            let release = Notify::new();
+            let attempted = Notify::new();
+            let entered_ref = &entered;
+            let release_ref = &release;
+            let first = paste_with("first", &focus, &backend, |duration| async move {
+                if duration == Duration::from_millis(crate::PASTE_CONSUME_MS) {
+                    entered_ref.notify_one();
+                    release_ref.notified().await;
+                }
+            });
+            let second = async {
+                entered.notified().await;
+                attempted.notify_one();
+                paste_with("second", &focus, &backend, |_| async {}).await
+            };
+            let unblock = async {
+                // The second future has reached the paste call before releasing
+                // the first request from its clipboard-consumption wait.
+                attempted.notified().await;
+                tokio::task::yield_now().await;
+                if external_change {
+                    let mut clipboard = backend.0.borrow_mut();
+                    clipboard.text = "newer clipboard".into();
+                    clipboard.revision += 1;
+                }
+                release.notify_one();
+            };
+            let (first_result, second_result, ()) = tokio::join!(first, second, unblock);
+            assert_eq!(first_result.is_err(), fail_first);
+            assert_eq!(second_result, Ok(true));
+            let clipboard = backend.0.borrow();
+            assert_eq!(clipboard.sent, ["first", "second"]);
+            assert_eq!(
+                clipboard.text,
+                if external_change {
+                    "newer clipboard"
+                } else {
+                    "original clipboard"
+                }
+            );
+        }
     }
 }
