@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use crate::{accessibility, clipboard, focus_capture, synthetic_keys};
 
+static PASTE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 trait PasteBackend {
     type Snapshot;
     fn trusted(&self) -> bool;
@@ -21,7 +23,7 @@ trait PasteBackend {
 // asynchronous paste future is cancelled during the consume delay.
 struct ClipboardRestore<'a, B: PasteBackend> {
     backend: &'a B,
-    snapshot: B::Snapshot,
+    snapshot: Option<B::Snapshot>,
     after_write: i64,
     armed: bool,
 }
@@ -33,7 +35,8 @@ impl<B: PasteBackend> ClipboardRestore<'_, B> {
         }
         self.armed = false;
         if matches!(self.backend.change_count(), Ok(current) if current == self.after_write) {
-            self.backend.restore(&self.snapshot)
+            self.backend
+                .restore(self.snapshot.as_ref().expect("armed clipboard snapshot"))
         } else {
             eprintln!("[voicebox] clipboard mutated during paste window — skipping restore to preserve newer content");
             Ok(())
@@ -94,7 +97,6 @@ async fn paste_with<B: PasteBackend, F: Future<Output = ()>>(
         return Ok(false);
     }
     // Clipboard staging and restore must be one transaction across paste requests.
-    static PASTE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _paste_guard = PASTE_LOCK.lock().await;
     if !backend.trusted() {
         return Err("Accessibility permission required for auto-paste. Open System Settings → Privacy & Security → Accessibility and enable Voicebox.".into());
@@ -108,7 +110,7 @@ async fn paste_with<B: PasteBackend, F: Future<Output = ()>>(
             if let Some(count) = failure.owned_change_count {
                 let mut restore = ClipboardRestore {
                     backend,
-                    snapshot,
+                    snapshot: Some(snapshot),
                     after_write: count,
                     armed: true,
                 };
@@ -124,7 +126,7 @@ async fn paste_with<B: PasteBackend, F: Future<Output = ()>>(
     };
     let mut restore = ClipboardRestore {
         backend,
-        snapshot,
+        snapshot: Some(snapshot),
         after_write,
         armed: true,
     };
@@ -133,6 +135,96 @@ async fn paste_with<B: PasteBackend, F: Future<Output = ()>>(
     restore.restore_if_unchanged()?;
     paste_result?;
     Ok(true)
+}
+
+pub(crate) struct DiagnosticResult<S> {
+    pub snapshot: S,
+    pub after_write: i64,
+    pub before_restore: i64,
+    pub after_restore: i64,
+}
+
+pub(crate) async fn diagnostic_clipboard(
+    text: &str,
+    pre_delay: Duration,
+    post_delay: Duration,
+    send: bool,
+) -> Result<DiagnosticResult<clipboard::ClipboardSnapshot>, String> {
+    diagnostic_with(
+        text,
+        pre_delay,
+        post_delay,
+        send,
+        &NativePaste,
+        tokio::time::sleep,
+    )
+    .await
+}
+
+async fn diagnostic_with<B: PasteBackend, F: Future<Output = ()>>(
+    text: &str,
+    pre_delay: Duration,
+    post_delay: Duration,
+    send: bool,
+    backend: &B,
+    sleep: impl Fn(Duration) -> F,
+) -> Result<DiagnosticResult<B::Snapshot>, String> {
+    let _paste_guard = PASTE_LOCK.lock().await;
+    let snapshot = backend.save()?;
+    let after_write = match backend.write(text) {
+        Ok(count) => count,
+        Err(failure) => {
+            if let Some(count) = failure.owned_change_count {
+                let mut restore = ClipboardRestore {
+                    backend,
+                    snapshot: Some(snapshot),
+                    after_write: count,
+                    armed: true,
+                };
+                if let Err(error) = restore.restore_if_unchanged() {
+                    return Err(format!(
+                        "{}; clipboard restoration failed: {error}",
+                        failure.message
+                    ));
+                }
+            }
+            return Err(failure.message);
+        }
+    };
+    let mut restore = ClipboardRestore {
+        backend,
+        snapshot: Some(snapshot),
+        after_write,
+        armed: true,
+    };
+    sleep(pre_delay).await;
+    if send {
+        if backend.change_count()? != after_write {
+            return Err("Clipboard changed before diagnostic paste; paste cancelled".into());
+        }
+        if let Err(error) = backend.send() {
+            return match restore.restore_if_unchanged() {
+                Ok(()) => Err(error),
+                Err(restore_error) => Err(format!(
+                    "{error}; clipboard restoration failed: {restore_error}"
+                )),
+            };
+        }
+    }
+    sleep(post_delay).await;
+    let before_restore = backend.change_count()?;
+    restore.restore_if_unchanged()?;
+    let after_restore = backend.change_count()?;
+    let snapshot = restore
+        .snapshot
+        .take()
+        .expect("diagnostic clipboard snapshot");
+    Ok(DiagnosticResult {
+        snapshot,
+        after_write,
+        before_restore,
+        after_restore,
+    })
 }
 
 #[cfg(test)]
@@ -369,6 +461,225 @@ mod concurrent_paste_tests {
     }
 
     #[tokio::test]
+    async fn diagnostic_preserves_clipboard_changed_by_another_application() {
+        let backend = Backend(RefCell::new(Clipboard {
+            text: "original".into(),
+            revision: 0,
+            sent: vec![],
+            fail_first: false,
+        }));
+        let result = diagnostic_with(
+            "first",
+            Duration::ZERO,
+            Duration::from_millis(1),
+            true,
+            &backend,
+            |duration| {
+                if !duration.is_zero() {
+                    let mut state = backend.0.borrow_mut();
+                    state.text = "newer".into();
+                    state.revision += 1;
+                }
+                async {}
+            },
+        )
+        .await
+        .unwrap();
+        assert_ne!(result.before_restore, result.after_write);
+        assert_eq!(backend.0.borrow().text, "newer");
+    }
+
+    #[tokio::test]
+    async fn diagnostic_does_not_paste_newer_clipboard_content() {
+        let backend = Backend(RefCell::new(Clipboard {
+            text: "original".into(),
+            revision: 0,
+            sent: vec![],
+            fail_first: false,
+        }));
+        let error = diagnostic_with(
+            "first",
+            Duration::from_millis(1),
+            Duration::ZERO,
+            true,
+            &backend,
+            |duration| {
+                if !duration.is_zero() {
+                    let mut state = backend.0.borrow_mut();
+                    state.text = "newer".into();
+                    state.revision += 1;
+                }
+                async {}
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(error.contains("Clipboard changed before diagnostic paste"));
+        let state = backend.0.borrow();
+        assert_eq!(state.text, "newer");
+        assert!(state.sent.is_empty());
+    }
+
+    #[tokio::test]
+    async fn diagnostic_send_failure_restores_original_clipboard() {
+        let backend = Backend(RefCell::new(Clipboard {
+            text: "original".into(),
+            revision: 0,
+            sent: vec![],
+            fail_first: true,
+        }));
+        assert_eq!(
+            diagnostic_with(
+                "first",
+                Duration::ZERO,
+                Duration::ZERO,
+                true,
+                &backend,
+                |_| async {}
+            )
+            .await
+            .err()
+            .unwrap(),
+            "send failed"
+        );
+        assert_eq!(backend.0.borrow().text, "original");
+    }
+
+    #[tokio::test]
+    async fn diagnostic_cancellation_restores_original_clipboard() {
+        let backend = Backend(RefCell::new(Clipboard {
+            text: "original".into(),
+            revision: 0,
+            sent: vec![],
+            fail_first: false,
+        }));
+        let entered = Notify::new();
+        let mut future = Box::pin(diagnostic_with(
+            "first",
+            Duration::ZERO,
+            Duration::ZERO,
+            false,
+            &backend,
+            |_| async {
+                entered.notify_one();
+                std::future::pending::<()>().await
+            },
+        ));
+        tokio::select! { _ = entered.notified() => {}, _ = &mut future => panic!("unexpected completion") }
+        drop(future);
+        assert_eq!(backend.0.borrow().text, "original");
+    }
+
+    #[tokio::test]
+    async fn diagnostic_roundtrip_restores_snapshot_and_reports_counts() {
+        for send in [false, true] {
+            let backend = Backend(RefCell::new(Clipboard {
+                text: "original".into(),
+                revision: 0,
+                sent: vec![],
+                fail_first: false,
+            }));
+            let result = diagnostic_with(
+                "first",
+                Duration::ZERO,
+                Duration::ZERO,
+                send,
+                &backend,
+                |_| async {},
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.snapshot, "original");
+            assert_eq!(
+                (
+                    result.after_write,
+                    result.before_restore,
+                    result.after_restore
+                ),
+                (1, 1, 2)
+            );
+            let state = backend.0.borrow();
+            assert_eq!(state.text, "original");
+            assert_eq!(state.sent.len(), usize::from(send));
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_diagnostic_preserves_newer_clipboard() {
+        let backend = Backend(RefCell::new(Clipboard {
+            text: "original".into(),
+            revision: 0,
+            sent: vec![],
+            fail_first: false,
+        }));
+        let entered = Notify::new();
+        let mut future = Box::pin(diagnostic_with(
+            "first",
+            Duration::ZERO,
+            Duration::ZERO,
+            false,
+            &backend,
+            |_| async {
+                entered.notify_one();
+                std::future::pending::<()>().await
+            },
+        ));
+        tokio::select! { _ = entered.notified() => {}, _ = &mut future => panic!("unexpected completion") }
+        {
+            let mut state = backend.0.borrow_mut();
+            state.text = "newer".into();
+            state.revision += 1;
+        }
+        drop(future);
+        assert_eq!(backend.0.borrow().text, "newer");
+    }
+
+    #[tokio::test]
+    async fn diagnostic_and_dictation_share_clipboard_transaction_lock() {
+        let backend = Backend(RefCell::new(Clipboard {
+            text: "original".into(),
+            revision: 0,
+            sent: vec![],
+            fail_first: false,
+        }));
+        let entered = Notify::new();
+        let release = Notify::new();
+        let focus = focus_capture::FocusSnapshot {
+            pid: 42,
+            bundle_id: None,
+            role: None,
+        };
+        let entered_ref = &entered;
+        let release_ref = &release;
+        let diagnostic = diagnostic_with(
+            "first",
+            Duration::from_millis(1),
+            Duration::ZERO,
+            false,
+            &backend,
+            |duration| async move {
+                if !duration.is_zero() {
+                    entered_ref.notify_one();
+                    release_ref.notified().await;
+                }
+            },
+        );
+        let dictation = async {
+            entered.notified().await;
+            let paste = paste_with("second", &focus, &backend, |_| async {});
+            tokio::pin!(paste);
+            tokio::select! { _ = &mut paste => panic!("dictation crossed diagnostic transaction"), _ = tokio::task::yield_now() => {} }
+            release.notify_one();
+            paste.await
+        };
+        let (diagnostic_result, dictation_result) = tokio::join!(diagnostic, dictation);
+        assert!(diagnostic_result.is_ok());
+        assert_eq!(dictation_result, Ok(true));
+        assert_eq!(backend.0.borrow().text, "original");
+    }
+
+    #[tokio::test]
     async fn overlapping_pastes_preserve_original_or_newer_clipboard() {
         for (fail_first, external_change) in
             [(false, false), (true, false), (false, true), (true, true)]
@@ -580,6 +891,40 @@ mod staging_failure_regression_tests {
                     .unwrap_err(),
                 "staging failed"
             );
+            let state = backend.state.borrow();
+            assert_eq!(state.value, expected);
+            assert_eq!(state.restores, restores);
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostic_failed_staging_recovers_only_its_own_clear() {
+        for (failure, expected, restores) in [
+            (Failure::BeforeClear, "original", 0),
+            (Failure::AfterClear, "original", 1),
+            (Failure::ExternalAfterClear, "newer", 0),
+        ] {
+            let backend = Backend {
+                state: RefCell::new(State {
+                    value: "original".into(),
+                    revision: 0,
+                    restores: 0,
+                }),
+                failure,
+                restore_fails: false,
+            };
+            let error = diagnostic_with(
+                "dictation",
+                Duration::ZERO,
+                Duration::ZERO,
+                false,
+                &backend,
+                |_| async {},
+            )
+            .await
+            .err()
+            .unwrap();
+            assert_eq!(error, "staging failed");
             let state = backend.state.borrow();
             assert_eq!(state.value, expected);
             assert_eq!(state.restores, restores);

@@ -1345,12 +1345,14 @@ async fn debug_focus_roundtrip(
     // window-ordering animation and lands in the previous frontmost app.
     tokio::time::sleep(std::time::Duration::from_millis(120)).await;
 
-    let clip = clipboard::save_clipboard()?;
-    let after_write = clipboard::write_text(&text)?;
-    synthetic_keys::send_paste()?;
-    tokio::time::sleep(std::time::Duration::from_millis(post_paste_delay_ms)).await;
-    let before_restore = clipboard::current_change_count()?;
-    clipboard::restore_clipboard(&clip)?;
+    let result = paste_pipeline::diagnostic_clipboard(
+        &text,
+        std::time::Duration::ZERO,
+        std::time::Duration::from_millis(post_paste_delay_ms),
+        true,
+    ).await?;
+    let after_write = result.after_write;
+    let before_restore = result.before_restore;
 
     Ok(serde_json::json!({
         "focus": snapshot,
@@ -1363,8 +1365,8 @@ async fn debug_focus_roundtrip(
 /// End-to-end smoke test for the auto-paste pipeline: save the user's
 /// clipboard, stage `text`, optionally wait `pre_paste_delay_ms` so the
 /// caller has time to focus the target app, synthesise ⌘V, wait
-/// `post_paste_delay_ms` for the target app to consume the event, and put
-/// the original clipboard back.
+/// `post_paste_delay_ms` for the target app to consume the event, and restore
+/// the original clipboard if no other application changed it.
 ///
 /// Short-circuits when Accessibility permission is missing — without it
 /// `CGEventPost` silently drops events, so running the full sequence
@@ -1382,19 +1384,16 @@ async fn debug_paste_text(
         );
     }
 
-    let snapshot = clipboard::save_clipboard()?;
-    let before = snapshot.change_count();
-    let after_write = clipboard::write_text(&text)?;
-
-    tokio::time::sleep(std::time::Duration::from_millis(pre_paste_delay_ms)).await;
-
-    synthetic_keys::send_paste()?;
-
-    tokio::time::sleep(std::time::Duration::from_millis(post_paste_delay_ms)).await;
-
-    let before_restore = clipboard::current_change_count()?;
-    clipboard::restore_clipboard(&snapshot)?;
-    let after_restore = clipboard::current_change_count()?;
+    let result = paste_pipeline::diagnostic_clipboard(
+        &text,
+        std::time::Duration::from_millis(pre_paste_delay_ms),
+        std::time::Duration::from_millis(post_paste_delay_ms),
+        true,
+    ).await?;
+    let before = result.snapshot.change_count();
+    let after_write = result.after_write;
+    let before_restore = result.before_restore;
+    let after_restore = result.after_restore;
 
     Ok(serde_json::json!({
         "change_count_before": before,
@@ -1407,24 +1406,25 @@ async fn debug_paste_text(
 
 /// Manual smoke test for the clipboard snapshot/restore primitives used by
 /// the auto-paste pipeline. Stages `text` on the pasteboard, waits
-/// `hold_ms` so the caller can ⌘V into another app, then puts the original
-/// clipboard contents back. The return value reports the change-count deltas
+/// `hold_ms` so the caller can ⌘V into another app, then restores the original
+/// clipboard contents if no other application changed them. The return value reports the change-count deltas
 /// so the harness can verify no third party mutated the clipboard mid-paste.
 #[command]
 async fn debug_clipboard_roundtrip(
     text: String,
     hold_ms: u64,
 ) -> Result<serde_json::Value, String> {
-    let snapshot = clipboard::save_clipboard()?;
-    let before = snapshot.change_count();
-    let item_count = snapshot.item_count();
-    let after_write = clipboard::write_text(&text)?;
-
-    tokio::time::sleep(std::time::Duration::from_millis(hold_ms)).await;
-
-    let before_restore = clipboard::current_change_count()?;
-    clipboard::restore_clipboard(&snapshot)?;
-    let after_restore = clipboard::current_change_count()?;
+    let result = paste_pipeline::diagnostic_clipboard(
+        &text,
+        std::time::Duration::ZERO,
+        std::time::Duration::from_millis(hold_ms),
+        false,
+    ).await?;
+    let before = result.snapshot.change_count();
+    let item_count = result.snapshot.item_count();
+    let after_write = result.after_write;
+    let before_restore = result.before_restore;
+    let after_restore = result.after_restore;
 
     Ok(serde_json::json!({
         "saved_items": item_count,
