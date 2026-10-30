@@ -237,6 +237,22 @@ fn server_arguments(data_dir: &str, port: u16, parent_pid: u32, remote: bool) ->
     args
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn trusted_microphone_origin(uri: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(uri) else {
+        return false;
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    match (url.scheme(), url.host_str(), url.port()) {
+        ("tauri", Some("localhost"), None) => true,
+        ("https", Some("tauri.localhost"), None) => true,
+        ("http", Some("localhost" | "127.0.0.1"), _) => true,
+        _ => false,
+    }
+}
+
 struct ServerState {
     child: Mutex<Option<tauri_plugin_shell::process::CommandChild>>,
     server_pid: Mutex<Option<u32>>,
@@ -1475,10 +1491,7 @@ pub fn run() {
                         wk_webview.connect_permission_request(move |webview, request: &webkit2gtk::PermissionRequest| {
                             if request.is::<webkit2gtk::UserMediaPermissionRequest>() {
                                 let uri = WebViewExt::uri(webview).unwrap_or_default();
-                                let is_trusted = uri.starts_with("tauri://")
-                                    || uri.starts_with("https://tauri.localhost")
-                                    || uri.starts_with("http://localhost")
-                                    || uri.starts_with("http://127.0.0.1");
+                                let is_trusted = trusted_microphone_origin(&uri);
                                 if is_trusted {
                                     request.allow();
                                     return true;
@@ -1926,5 +1939,40 @@ mod server_arguments_tests {
     fn remote_launch_adds_public_host_without_changing_other_arguments() {
         assert_eq!(server_arguments("/data/voice box", 17493, 123, true),
             ["--data-dir", "/data/voice box", "--port", "17493", "--parent-pid", "123", "--host", "0.0.0.0"]);
+    }
+}
+
+#[cfg(test)]
+mod microphone_origin_tests {
+    use super::trusted_microphone_origin;
+
+    #[test]
+    fn permits_the_desktop_origin_and_local_development_servers() {
+        for uri in [
+            "tauri://localhost/", "tauri://localhost/index.html",
+            "https://tauri.localhost/", "https://tauri.localhost/index.html",
+            "http://localhost:5173/", "http://127.0.0.1:5173/index.html",
+        ] {
+            assert!(trusted_microphone_origin(uri), "{uri}");
+        }
+    }
+
+    #[test]
+    fn rejects_prefix_spoofs_and_nonlocal_origins() {
+        for uri in [
+            "http://localhost.evil.example/", "http://localhost@evil.example/",
+            "http://127.0.0.1.evil.example/", "http://127.0.0.1@evil.example/",
+            "https://tauri.localhost.evil.example/", "https://tauri.localhost@evil.example/",
+            "tauri://evil.example/", "tauri://localhost:444/", "https://tauri.localhost:444/", "http://user@localhost/", "https://evil.example/", "file:///example/index.html",
+        ] {
+            assert!(!trusted_microphone_origin(uri), "{uri}");
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_and_unsafe_schemes() {
+        for uri in ["", "http://localhost:invalid/", "http://localhost:99999/", "https://localhost/", "http://tauri.localhost/", "javascript:alert(1)"] {
+            assert!(!trusted_microphone_origin(uri), "{uri}");
+        }
     }
 }
