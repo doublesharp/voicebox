@@ -37,10 +37,10 @@ pub struct FocusSnapshot {
 }
 
 #[cfg(target_os = "macos")]
-use core_foundation_sys::base::{kCFAllocatorDefault, CFRelease};
+use core_foundation_sys::base::{kCFAllocatorDefault, CFRange, CFRelease};
 #[cfg(target_os = "macos")]
 use core_foundation_sys::string::{
-    kCFStringEncodingUTF8, CFStringCreateWithCString, CFStringGetCString, CFStringGetLength,
+    kCFStringEncodingUTF8, CFStringCreateWithCString, CFStringGetCharacters, CFStringGetLength,
     CFStringRef,
 };
 #[cfg(target_os = "macos")]
@@ -121,7 +121,8 @@ unsafe fn ns_string_to_rust(s: Id) -> Option<String> {
 #[cfg(target_os = "macos")]
 unsafe fn cf_string_const(s: &str) -> Option<CFStringRef> {
     let cstr = std::ffi::CString::new(s).ok()?;
-    let result = CFStringCreateWithCString(kCFAllocatorDefault, cstr.as_ptr(), kCFStringEncodingUTF8);
+    let result =
+        CFStringCreateWithCString(kCFAllocatorDefault, cstr.as_ptr(), kCFStringEncodingUTF8);
     if result.is_null() {
         None
     } else {
@@ -135,24 +136,11 @@ unsafe fn cfstring_to_rust(s: CFStringRef) -> Option<String> {
         return None;
     }
     let len = CFStringGetLength(s);
-    if len == 0 {
-        return Some(String::new());
+    let mut chars = vec![0u16; len as usize];
+    if len > 0 {
+        CFStringGetCharacters(s, CFRange::init(0, len), chars.as_mut_ptr());
     }
-    // CFStringGetLength is in UTF-16 code units; UTF-8 can need up to 4
-    // bytes per unit plus the trailing NUL.
-    let max_bytes = (len * 4 + 1) as usize;
-    let mut buf = vec![0u8; max_bytes];
-    let ok = CFStringGetCString(
-        s,
-        buf.as_mut_ptr() as *mut i8,
-        max_bytes as isize,
-        kCFStringEncodingUTF8,
-    );
-    if ok == 0 {
-        return None;
-    }
-    let cstr = std::ffi::CStr::from_ptr(buf.as_ptr() as *const i8);
-    cstr.to_str().ok().map(|x| x.to_owned())
+    String::from_utf16(&chars).ok()
 }
 
 #[cfg(target_os = "macos")]
@@ -182,9 +170,8 @@ pub fn capture_focus() -> Result<FocusSnapshot, String> {
         if system_wide.is_null() {
             return Err("AXUIElementCreateSystemWide returned null".into());
         }
-        let _sys_guard = scopeguard::guard(system_wide, |e| {
-            CFRelease(e as *const std::ffi::c_void)
-        });
+        let _sys_guard =
+            scopeguard::guard(system_wide, |e| CFRelease(e as *const std::ffi::c_void));
 
         let focused_attr = cf_string_const("AXFocusedUIElement")
             .ok_or("Failed to build AXFocusedUIElement CFString")?;
@@ -192,11 +179,7 @@ pub fn capture_focus() -> Result<FocusSnapshot, String> {
             scopeguard::guard(focused_attr, |s| CFRelease(s as *const std::ffi::c_void));
 
         let mut focused: *const std::ffi::c_void = std::ptr::null();
-        let err = AXUIElementCopyAttributeValue(
-            system_wide,
-            focused_attr,
-            &mut focused as *mut _,
-        );
+        let err = AXUIElementCopyAttributeValue(system_wide, focused_attr, &mut focused as *mut _);
         if err != AX_ERROR_SUCCESS || focused.is_null() {
             return Err(format!(
                 "No focused element (AXError {}). Verify Accessibility permission is granted and a focused text field exists.",
@@ -217,9 +200,8 @@ pub fn capture_focus() -> Result<FocusSnapshot, String> {
             let role_attr = cf_string_const("AXRole");
             match role_attr {
                 Some(role_attr) => {
-                    let _role_attr_guard = scopeguard::guard(role_attr, |s| {
-                        CFRelease(s as *const std::ffi::c_void)
-                    });
+                    let _role_attr_guard =
+                        scopeguard::guard(role_attr, |s| CFRelease(s as *const std::ffi::c_void));
                     let mut role_value: *const std::ffi::c_void = std::ptr::null();
                     let err = AXUIElementCopyAttributeValue(
                         focused_elem,
@@ -280,8 +262,7 @@ pub fn activate_pid(pid: i32) -> Result<(), String> {
         }
 
         let activated: bool = if can_yield_activation() {
-            let current: Id =
-                msg_send![class!(NSRunningApplication), currentApplication];
+            let current: Id = msg_send![class!(NSRunningApplication), currentApplication];
             if !current.is_null() {
                 let _: () = msg_send![current, yieldActivationToApplication: target];
             }
@@ -429,17 +410,17 @@ mod win {
             if !IsWindowVisible(hwnd).as_bool() {
                 return BOOL(1);
             }
-            if !GetWindow(hwnd, GW_OWNER).unwrap_or(HWND(std::ptr::null_mut())).is_invalid() {
+            if !GetWindow(hwnd, GW_OWNER)
+                .unwrap_or(HWND(std::ptr::null_mut()))
+                .is_invalid()
+            {
                 return BOOL(1);
             }
             ctx.found = Some(hwnd);
             BOOL(0)
         }
         unsafe {
-            let _ = EnumWindows(
-                Some(callback),
-                LPARAM(&mut ctx as *mut _ as isize),
-            );
+            let _ = EnumWindows(Some(callback), LPARAM(&mut ctx as *mut _ as isize));
         }
         ctx.found
     }
@@ -532,4 +513,59 @@ pub fn capture_focus() -> Result<FocusSnapshot, String> {
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn activate_pid(_pid: i32) -> Result<(), String> {
     Err("app activation is not yet implemented on this platform".into())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_string_tests {
+    use super::*;
+    use core_foundation_sys::string::CFStringCreateWithCharacters;
+
+    fn convert(text: &str) -> String {
+        let chars: Vec<u16> = text.encode_utf16().collect();
+        unsafe {
+            let string = CFStringCreateWithCharacters(
+                kCFAllocatorDefault,
+                chars.as_ptr(),
+                chars.len() as isize,
+            );
+            assert!(!string.is_null());
+            let result = cfstring_to_rust(string).unwrap();
+            CFRelease(string as *const std::ffi::c_void);
+            result
+        }
+    }
+
+    #[test]
+    fn core_foundation_strings_preserve_all_unicode_and_nuls() {
+        for text in ["", "AXTextField", "café 日本語 🦜", "before\0after"] {
+            assert_eq!(convert(text), text);
+        }
+    }
+
+    #[test]
+    fn null_and_invalid_attribute_keys_are_rejected() {
+        unsafe {
+            assert_eq!(cfstring_to_rust(std::ptr::null()), None);
+            assert!(cf_string_const("AX\0Role").is_none());
+            let attr = cf_string_const("AXRole").unwrap();
+            assert_eq!(cfstring_to_rust(attr).as_deref(), Some("AXRole"));
+            CFRelease(attr as *const std::ffi::c_void);
+        }
+    }
+
+    #[test]
+    fn unpaired_surrogate_is_not_reported_as_valid_text() {
+        let chars = [0xD800u16];
+        unsafe {
+            let string = CFStringCreateWithCharacters(kCFAllocatorDefault, chars.as_ptr(), 1);
+            assert!(!string.is_null());
+            assert_eq!(cfstring_to_rust(string), None);
+            CFRelease(string as *const std::ffi::c_void);
+        }
+    }
+
+    #[test]
+    fn nonexistent_application_cannot_be_activated() {
+        assert!(activate_pid(i32::MAX).is_err());
+    }
 }
