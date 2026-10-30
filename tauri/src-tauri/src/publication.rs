@@ -37,10 +37,11 @@ fn publish_using(
 ) -> io::Result<()> {
     // Atomic rename must replace the selected file, not a symbolic link to it.
     // Canonicalizing also rejects dangling links without destroying them.
-    let resolved = match fs::symlink_metadata(destination) {
-        Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(destination)?,
-        Ok(_) => destination.to_path_buf(),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => destination.to_path_buf(),
+    let selected = destination;
+    let (resolved, selected_was_link) = match fs::symlink_metadata(selected) {
+        Ok(metadata) if metadata.file_type().is_symlink() => (fs::canonicalize(selected)?, true),
+        Ok(_) => (selected.to_path_buf(), false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (selected.to_path_buf(), false),
         Err(error) => return Err(error),
     };
     let destination = resolved.as_path();
@@ -92,6 +93,21 @@ fn publish_using(
         Err(error) => return Err(error),
     }
     drop(stage.file.take());
+    let current = fs::symlink_metadata(selected);
+    let unchanged = match current {
+        Ok(metadata) if selected_was_link && metadata.file_type().is_symlink() => {
+            fs::canonicalize(selected).ok().as_deref() == Some(destination)
+        }
+        Ok(metadata) if !selected_was_link => !metadata.file_type().is_symlink(),
+        Err(error) if !selected_was_link && error.kind() == io::ErrorKind::NotFound => true,
+        _ => false,
+    };
+    if !unchanged {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "Export destination link changed during save",
+        ));
+    }
     fs::rename(&stage.path, destination)?;
     stage.published = true;
     Ok(())
@@ -349,6 +365,156 @@ mod symlink_export_tests {
             .file_type()
             .is_symlink());
         assert_eq!(fs::read(&target).unwrap(), b"original");
+        assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 2);
+    }
+
+    struct ChangeDuringRead<F: FnOnce()>(Option<F>);
+    impl<F: FnOnce()> Read for ChangeDuringRead<F> {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if let Some(change) = self.0.take() {
+                change();
+                output[..5].copy_from_slice(b"audio");
+                Ok(5)
+            } else {
+                Ok(0)
+            }
+        }
+    }
+
+    #[test]
+    fn retargeted_symlink_during_staging_does_not_overwrite_either_target() {
+        let fixture = Fixture::new();
+        let first = fixture.path("first.wav");
+        let second = fixture.path("second.wav");
+        let link = fixture.path("selected.wav");
+        fs::write(&first, b"first original").unwrap();
+        fs::write(&second, b"second original").unwrap();
+        symlink("first.wav", &link).unwrap();
+        let changing = link.clone();
+        let result = publish(
+            &link,
+            ChangeDuringRead(Some(move || {
+                fs::remove_file(&changing).unwrap();
+                symlink("second.wav", &changing).unwrap();
+            })),
+        );
+        assert!(result.is_err(), "changed selection must not be published");
+        assert_eq!(fs::read_link(&link).unwrap(), PathBuf::from("second.wav"));
+        assert_eq!(fs::read(&first).unwrap(), b"first original");
+        assert_eq!(fs::read(&second).unwrap(), b"second original");
+        assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 3);
+    }
+
+    #[test]
+    fn removed_symlink_during_staging_does_not_overwrite_its_old_target() {
+        let fixture = Fixture::new();
+        let target = fixture.path("target.wav");
+        let link = fixture.path("selected.wav");
+        fs::write(&target, b"original").unwrap();
+        symlink("target.wav", &link).unwrap();
+        let changing = link.clone();
+        let result = publish(
+            &link,
+            ChangeDuringRead(Some(move || {
+                fs::remove_file(changing).unwrap();
+            })),
+        );
+        assert!(result.is_err());
+        assert!(!link.exists());
+        assert_eq!(fs::read(&target).unwrap(), b"original");
+        assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn changed_intermediate_symlink_during_staging_does_not_overwrite_either_target() {
+        let fixture = Fixture::new();
+        let first = fixture.path("first.wav");
+        let second = fixture.path("second.wav");
+        let middle = fixture.path("middle.wav");
+        let link = fixture.path("selected.wav");
+        fs::write(&first, b"first original").unwrap();
+        fs::write(&second, b"second original").unwrap();
+        symlink("first.wav", &middle).unwrap();
+        symlink("middle.wav", &link).unwrap();
+        let changing = middle.clone();
+        let result = publish(
+            &link,
+            ChangeDuringRead(Some(move || {
+                fs::remove_file(&changing).unwrap();
+                symlink("second.wav", &changing).unwrap();
+            })),
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read(&first).unwrap(), b"first original");
+        assert_eq!(fs::read(&second).unwrap(), b"second original");
+        assert_eq!(fs::read_link(&middle).unwrap(), PathBuf::from("second.wav"));
+        assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 4);
+    }
+
+    #[test]
+    fn newly_introduced_symlink_during_staging_is_not_replaced() {
+        let fixture = Fixture::new();
+        let target = fixture.path("target.wav");
+        let selected = fixture.path("selected.wav");
+        fs::write(&target, b"original").unwrap();
+        let changing = selected.clone();
+        let result = publish(
+            &selected,
+            ChangeDuringRead(Some(move || {
+                symlink("target.wav", &changing).unwrap();
+            })),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_link(&selected).unwrap(),
+            PathBuf::from("target.wav")
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"original");
+        assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn link_replaced_by_a_regular_file_during_staging_is_preserved() {
+        let fixture = Fixture::new();
+        let target = fixture.path("target.wav");
+        let link = fixture.path("selected.wav");
+        fs::write(&target, b"original target").unwrap();
+        symlink("target.wav", &link).unwrap();
+        let changing = link.clone();
+        let result = publish(
+            &link,
+            ChangeDuringRead(Some(move || {
+                fs::remove_file(&changing).unwrap();
+                fs::write(&changing, b"new independent file").unwrap();
+            })),
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read(&link).unwrap(), b"new independent file");
+        assert_eq!(fs::read(&target).unwrap(), b"original target");
+        assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn existing_regular_destination_replaced_by_a_link_is_not_overwritten() {
+        let fixture = Fixture::new();
+        let target = fixture.path("target.wav");
+        let selected = fixture.path("selected.wav");
+        fs::write(&target, b"original target").unwrap();
+        fs::write(&selected, b"old selected").unwrap();
+        let changing = selected.clone();
+        let result = publish(
+            &selected,
+            ChangeDuringRead(Some(move || {
+                fs::remove_file(&changing).unwrap();
+                symlink("target.wav", &changing).unwrap();
+            })),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_link(&selected).unwrap(),
+            PathBuf::from("target.wav")
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"original target");
         assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 2);
     }
 }
