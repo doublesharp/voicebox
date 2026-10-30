@@ -232,6 +232,7 @@ async fn startup_health_check(
 async fn discover_listeners(
     port: u16,
     executable: Option<&std::path::Path>,
+    timeout: std::time::Duration,
     permit: &server_startup::StartPermit<'_>,
 ) -> Result<Option<std::process::Output>, String> {
     let mut command = tokio::process::Command::new(
@@ -240,9 +241,10 @@ async fn discover_listeners(
     command.args(["+c", "0", "-i", &format!(":{port}"), "-sTCP:LISTEN"]);
     command.kill_on_drop(true);
     Ok(permit
-        .until_cancelled(command.output())
+        .until_cancelled(tokio::time::timeout(timeout, command.output()))
         .await
         .ok_or_else(|| "Server startup cancelled".to_string())?
+        .map_err(|_| "Server listener discovery timed out".to_string())?
         .ok())
 }
 
@@ -438,6 +440,7 @@ struct ServerStartupConfig {
     port: u16,
     discover_listener: bool,
     listener_executable: Option<std::path::PathBuf>,
+    listener_timeout: std::time::Duration,
     port_release_delay: std::time::Duration,
     legacy_port: Option<u16>,
     data_dir: Option<std::path::PathBuf>,
@@ -450,6 +453,7 @@ impl Default for ServerStartupConfig {
             port: SERVER_PORT,
             discover_listener: true,
             listener_executable: None,
+            listener_timeout: std::time::Duration::from_secs(10),
             port_release_delay: std::time::Duration::from_millis(200),
             legacy_port: Some(LEGACY_PORT),
             data_dir: None,
@@ -485,7 +489,7 @@ async fn start_server_with<R: tauri::Runtime>(
     // or an externally started server e.g. via `python`, `uvicorn`, Docker, etc.)
     #[cfg(unix)]
     if config.discover_listener {
-        if let Some(output) = discover_listeners(config.port, config.listener_executable.as_deref(), &_start_permit).await? {
+        if let Some(output) = discover_listeners(config.port, config.listener_executable.as_deref(), config.listener_timeout, &_start_permit).await? {
             let output_str = String::from_utf8_lossy(&output.stdout);
             let healthy = output_str.lines().skip(1).any(|line| !line.trim().is_empty())
                 && startup_health_check(config.port, &_start_permit).await?;
@@ -550,7 +554,7 @@ async fn start_server_with<R: tauri::Runtime>(
     #[cfg(unix)]
     if let Some(legacy_port) = config.legacy_port {
         use std::process::Command;
-        if let Some(output) = discover_listeners(legacy_port, config.listener_executable.as_deref(), &_start_permit).await? {
+        if let Some(output) = discover_listeners(legacy_port, config.listener_executable.as_deref(), config.listener_timeout, &_start_permit).await? {
             let output_str = String::from_utf8_lossy(&output.stdout);
             let healthy = output_str.lines().skip(1).any(|line| !line.trim().is_empty())
                 && startup_health_check(legacy_port, &_start_permit).await?;
@@ -2936,6 +2940,7 @@ mod server_start_flow_tests {
                 port: self.port,
                 discover_listener: false,
                 listener_executable: None,
+                listener_timeout: Duration::from_secs(10),
                 port_release_delay: Duration::from_millis(200),
                 legacy_port: None,
                 data_dir: Some(self.dir.join("data")),
@@ -2973,6 +2978,7 @@ mod server_start_flow_tests {
         assert_eq!(config.port, SERVER_PORT);
         assert!(config.discover_listener);
         assert!(config.listener_executable.is_none());
+        assert_eq!(config.listener_timeout, Duration::from_secs(10));
         assert_eq!(config.port_release_delay, Duration::from_millis(200));
         assert_eq!(config.legacy_port, Some(LEGACY_PORT));
         assert!(config.data_dir.is_none());
@@ -3534,6 +3540,77 @@ mod server_start_flow_tests {
                 assert_eq!(result, format!("http://127.0.0.1:{}", fixture.port));
                 stop_server_if_owned(app.state(), None).await.unwrap();
             }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stalled_listener_discovery_times_out_and_terminates_probe() {
+        for legacy in [false, true] {
+            let fixture = Fixture::new("touch \"$2/sidecar-started\"\nexec /bin/sleep 5");
+            let marker = fixture.dir.join("listener-pid");
+            let probe = fixture.dir.join("slow-lsof");
+            std::fs::write(
+                &probe,
+                format!(
+                    "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nexec /bin/sleep 5\n",
+                    marker.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut config = fixture.config();
+            config.listener_executable = Some(probe);
+            config.listener_timeout = Duration::from_millis(1500);
+            if legacy {
+                config.legacy_port = Some(12345);
+            } else {
+                config.discover_listener = true;
+            }
+            let app = app();
+            let handle = app.handle().clone();
+            let mut startup = tokio::spawn(async move {
+                start_server_with(handle.clone(), handle.state(), None, None, config).await
+            });
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !marker.exists() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("listener probe did not start");
+            let pid = std::fs::read_to_string(&marker).unwrap();
+            let timely = tokio::time::timeout(Duration::from_secs(3), &mut startup).await;
+            let result = match timely {
+                Ok(result) => result.unwrap(),
+                Err(_) => {
+                    stop_server_if_owned(app.state(), None).await.unwrap();
+                    let _ = startup.await;
+                    panic!("stalled listener probe did not time out, legacy={legacy}");
+                }
+            };
+            assert!(
+                result.unwrap_err().contains("listener discovery timed out"),
+                "legacy={legacy}"
+            );
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while std::process::Command::new("/bin/kill")
+                    .args(["-0", pid.as_str()])
+                    .status()
+                    .unwrap()
+                    .success()
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("timed-out listener probe survived");
+            assert!(!fixture.dir.join("data/sidecar-started").exists());
+            assert!(app
+                .state::<ServerState>()
+                .server_pid
+                .lock()
+                .unwrap()
+                .is_none());
         }
     }
 }
