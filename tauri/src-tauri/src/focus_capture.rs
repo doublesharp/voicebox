@@ -64,6 +64,7 @@ mod ffi {
     #[link(name = "ApplicationServices", kind = "framework")]
     extern "C" {
         pub fn AXUIElementCreateSystemWide() -> AXUIElementRef;
+        pub fn AXUIElementGetTypeID() -> core_foundation_sys::base::CFTypeID;
         pub fn AXUIElementCopyAttributeValue(
             element: AXUIElementRef,
             attribute: CFStringRef,
@@ -157,6 +158,32 @@ unsafe fn bundle_id_for_pid(pid: i32) -> Option<String> {
     ns_string_to_rust(bundle)
 }
 
+#[cfg(target_os = "macos")]
+unsafe fn focused_element_from_value(
+    value: *const std::ffi::c_void,
+) -> Result<ffi::AXUIElementRef, String> {
+    if value.is_null()
+        || core_foundation_sys::base::CFGetTypeID(value) != ffi::AXUIElementGetTypeID()
+    {
+        return Err("Invalid focused accessibility element".into());
+    }
+    Ok(value as ffi::AXUIElementRef)
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn role_from_value_with(
+    value: *const std::ffi::c_void,
+    convert: impl FnOnce(CFStringRef) -> Option<String>,
+) -> Option<String> {
+    if value.is_null()
+        || core_foundation_sys::base::CFGetTypeID(value)
+            != core_foundation_sys::string::CFStringGetTypeID()
+    {
+        return None;
+    }
+    convert(value as CFStringRef)
+}
+
 /// Read the system-wide focused UI element's PID, bundle id, and AX role.
 ///
 /// Returns an error when no element is focused (e.g. Dock has focus) or
@@ -188,7 +215,7 @@ pub fn capture_focus() -> Result<FocusSnapshot, String> {
         }
         let _focus_guard = scopeguard::guard(focused, |e| CFRelease(e));
 
-        let focused_elem = focused as AXUIElementRef;
+        let focused_elem = focused_element_from_value(focused)?;
 
         let mut pid: Pid = 0;
         let err = AXUIElementGetPid(focused_elem, &mut pid);
@@ -210,7 +237,7 @@ pub fn capture_focus() -> Result<FocusSnapshot, String> {
                     );
                     if err == AX_ERROR_SUCCESS && !role_value.is_null() {
                         let _role_guard = scopeguard::guard(role_value, |e| CFRelease(e));
-                        cfstring_to_rust(role_value as CFStringRef)
+                        role_from_value_with(role_value, |value| cfstring_to_rust(value))
                     } else {
                         None
                     }
@@ -702,5 +729,90 @@ mod activation_decision_tests {
         let _pool = unsafe { AutoreleasePool::new() };
         let first = can_yield_activation();
         assert_eq!(can_yield_activation(), first);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod accessibility_value_type_tests {
+    use super::*;
+    use core_foundation_sys::number::kCFBooleanTrue;
+    use std::cell::Cell;
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        fn AXUIElementCreateApplication(pid: i32) -> ffi::AXUIElementRef;
+    }
+
+    #[test]
+    fn focused_element_rejects_non_accessibility_values() {
+        let value = unsafe { kCFBooleanTrue as *const std::ffi::c_void };
+        assert!(unsafe { focused_element_from_value(value) }.is_err());
+        assert!(unsafe { focused_element_from_value(std::ptr::null()) }.is_err());
+    }
+
+    #[test]
+    fn focused_element_accepts_a_real_application_element() {
+        let element = unsafe { AXUIElementCreateApplication(std::process::id() as i32) };
+        assert!(!element.is_null());
+        assert_eq!(
+            unsafe { focused_element_from_value(element) }.unwrap(),
+            element
+        );
+        unsafe { CFRelease(element as *const std::ffi::c_void) };
+    }
+
+    #[test]
+    fn non_string_role_does_not_reach_string_conversion() {
+        let converted = Cell::new(false);
+        let value = unsafe { kCFBooleanTrue as *const std::ffi::c_void };
+        let role = unsafe {
+            role_from_value_with(value, |_| {
+                converted.set(true);
+                Some("invalid".into())
+            })
+        };
+        assert!(role.is_none());
+        assert!(
+            !converted.get(),
+            "non-string accessibility values must never be cast to CFString"
+        );
+    }
+
+    #[test]
+    fn a_string_is_not_accepted_as_a_focused_element() {
+        let value = unsafe { cf_string_const("AXTextField").unwrap() };
+        assert!(unsafe { focused_element_from_value(value as *const std::ffi::c_void) }.is_err());
+        unsafe { CFRelease(value as *const std::ffi::c_void) };
+    }
+
+    #[test]
+    fn an_accessibility_element_is_not_accepted_as_a_role_string() {
+        let element = unsafe { AXUIElementCreateApplication(std::process::id() as i32) };
+        assert!(!element.is_null());
+        let result = unsafe {
+            role_from_value_with(element as *const std::ffi::c_void, |_| {
+                panic!("element must not be converted to string")
+            })
+        };
+        assert!(result.is_none());
+        unsafe { CFRelease(element as *const std::ffi::c_void) };
+    }
+
+    #[test]
+    fn valid_string_role_is_preserved_and_null_role_is_ignored() {
+        let role = unsafe { cf_string_const("AXTextField").unwrap() };
+        let decoded = unsafe {
+            role_from_value_with(role as *const std::ffi::c_void, |value| {
+                cfstring_to_rust(value)
+            })
+        };
+        assert_eq!(decoded.as_deref(), Some("AXTextField"));
+        unsafe { CFRelease(role as *const std::ffi::c_void) };
+        assert!(unsafe {
+            role_from_value_with(std::ptr::null(), |_| {
+                panic!("null role must not be converted")
+            })
+        }
+        .is_none());
     }
 }
