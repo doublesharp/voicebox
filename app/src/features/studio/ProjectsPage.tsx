@@ -1,6 +1,7 @@
 import { Link, useNavigate } from '@tanstack/react-router';
 import { ArrowRight, FileArchive, FolderOpen, Plus, Search, Upload } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import {
   Dialog,
   DialogContent,
@@ -39,6 +40,13 @@ export function ProjectsPage() {
   const [script, setScript] = useState('');
   const [language, setLanguage] = useState('en');
   const archiveInput = useRef<HTMLInputElement>(null);
+  const searchInput = useRef<HTMLInputElement>(null);
+  const desktopCreateButton = useRef<HTMLButtonElement>(null);
+  const [toolbarTarget, setToolbarTarget] = useState<HTMLElement | null>(null);
+  useEffect(() => {
+    if (typeof document !== 'undefined')
+      setToolbarTarget(document.getElementById('desktop-toolbar-context-actions'));
+  }, []);
   const epoch = useRef(0);
   const busyRef = useRef(false);
   const activeClient = useRef(client);
@@ -128,11 +136,19 @@ export function ProjectsPage() {
         </div>
         <Dialog open={createOpen} onOpenChange={setCreateOpen}>
           <DialogTrigger asChild>
-            <button className="studio-primary" type="button">
+            <button className="studio-primary" type="button" hidden={!!toolbarTarget}>
               <Plus size={16} /> New project
             </button>
           </DialogTrigger>
-          <DialogContent className="studio studio-modal">
+          <DialogContent
+            className="studio studio-modal"
+            onCloseAutoFocus={(event) => {
+              if (toolbarTarget && desktopCreateButton.current) {
+                event.preventDefault();
+                desktopCreateButton.current.focus();
+              }
+            }}
+          >
             <DialogHeader>
               <DialogTitle>Create a project</DialogTitle>
               <DialogDescription>
@@ -215,10 +231,34 @@ export function ProjectsPage() {
           </DialogContent>
         </Dialog>
       </header>
+      {toolbarTarget &&
+        createPortal(
+          <>
+            <button
+              type="button"
+              className="desktop-toolbar-button"
+              aria-label="Focus project search"
+              onClick={() => searchInput.current?.focus()}
+            >
+              <Search size={16} aria-hidden="true" />
+            </button>
+            <button
+              ref={desktopCreateButton}
+              type="button"
+              className="desktop-toolbar-primary"
+              aria-haspopup="dialog"
+              onClick={() => setCreateOpen(true)}
+            >
+              <Plus size={15} aria-hidden="true" /> New project
+            </button>
+          </>,
+          toolbarTarget,
+        )}
       <div className="studio-project-toolbar">
         <div className="studio-search">
           <Search size={16} aria-hidden="true" />
           <Input
+            ref={searchInput}
             aria-label="Search projects"
             placeholder="Search projects or clients"
             value={search}

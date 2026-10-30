@@ -326,3 +326,29 @@
   outline: 2px solid hsl(var(--ring));
   outline-offset: 1px;
 }
+
+.desktop-toolbar-actions,
+.desktop-toolbar-context-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.desktop-toolbar-primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 27px;
+  padding: 0 9px;
+  border-radius: 6px;
+  background: hsl(var(--accent));
+  color: hsl(var(--accent-foreground));
+  font-size: 12px;
+  font-weight: 600;
+}
+.desktop-toolbar-primary:hover {
+  filter: brightness(0.94);
+}
+.desktop-toolbar-primary:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: 2px;
+}

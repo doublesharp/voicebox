@@ -10,6 +10,7 @@ let importStory: (id: string) => Promise<any> = async () => ({ id: 'copy' });
 let importArchive: (file: File) => Promise<any> = async () => ({ id: 'archive' });
 let renderer: ReactTestRenderer;
 const pass = ({ children }: any) => <>{children}</>;
+mock.module('react-dom', () => ({ createPortal: (children: React.ReactNode) => children }));
 mock.module('@tanstack/react-router', () => ({
   Link: ({ children, ...props }: any) => <a {...props}>{children}</a>,
   useNavigate: () => async (value: unknown) => {
@@ -43,8 +44,12 @@ mock.module('../src/features/studio/client', () => ({
   },
 }));
 mock.module('../src/components/ui/dialog', () => ({
-  Dialog: pass,
-  DialogContent: pass,
+  Dialog: ({ children, open }: any) => <div data-project-dialog-open={open}>{children}</div>,
+  DialogContent: ({ children, onCloseAutoFocus }: any) => (
+    <div data-dialog-content onCloseAutoFocus={onCloseAutoFocus}>
+      {children}
+    </div>
+  ),
   DialogDescription: pass,
   DialogHeader: pass,
   DialogTitle: pass,
@@ -215,4 +220,51 @@ test('archive import passes the chosen file and resets the input', async () => {
   expect(received).toBe(file);
   expect(target.value).toBe('');
   expect(destination.params.projectId).toBe('imported');
+});
+
+test('desktop project toolbar opens the existing dialog and focuses project search', async () => {
+  const previousDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
+  const portalTarget = {};
+  Object.defineProperty(globalThis, 'document', {
+    configurable: true,
+    value: {
+      getElementById: (id: string) =>
+        id === 'desktop-toolbar-context-actions' ? portalTarget : null,
+    },
+  });
+  let focused = 0;
+  let createButtonFocused = 0;
+  try {
+    await act(async () => {
+      renderer = create(<ProjectsPage />, {
+        createNodeMock: (element) =>
+          element.type === 'input' && element.props['aria-label'] === 'Search projects'
+            ? { focus: () => focused++ }
+            : element.type === 'button' && element.props['aria-haspopup'] === 'dialog'
+              ? { focus: () => createButtonFocused++ }
+              : null,
+      });
+    });
+    const toolbarNew = renderer.root.findByProps({ 'aria-haspopup': 'dialog' });
+    await act(async () => toolbarNew.props.onClick());
+    expect(renderer.root.findAllByProps({ 'data-project-dialog-open': true })).toHaveLength(1);
+    act(() => renderer.root.findByProps({ 'aria-label': 'Focus project search' }).props.onClick());
+    expect(focused).toBe(1);
+    let defaultPrevented = false;
+    act(() =>
+      renderer.root.findAllByProps({ 'data-dialog-content': true })[0].props.onCloseAutoFocus({
+        preventDefault: () => {
+          defaultPrevented = true;
+        },
+      }),
+    );
+    expect(defaultPrevented).toBe(true);
+    expect(createButtonFocused).toBe(1);
+    expect(
+      renderer.root.findAllByType('button').find((node) => node.props.hidden)?.props.hidden,
+    ).toBe(true);
+  } finally {
+    if (previousDocument) Object.defineProperty(globalThis, 'document', previousDocument);
+    else Reflect.deleteProperty(globalThis, 'document');
+  }
 });

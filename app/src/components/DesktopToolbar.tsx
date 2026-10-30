@@ -34,14 +34,17 @@ export function DesktopToolbar() {
         )}
         <span className="desktop-toolbar-title">{title}</span>
       </div>
-      <button
-        type="button"
-        className="desktop-toolbar-button"
-        aria-label="Keyboard shortcuts"
-        onClick={() => window.dispatchEvent(new Event('voicebox:keyboard-shortcuts'))}
-      >
-        <Keyboard size={16} aria-hidden="true" />
-      </button>
+      <div className="desktop-toolbar-actions">
+        <div id="desktop-toolbar-context-actions" className="desktop-toolbar-context-actions" />
+        <button
+          type="button"
+          className="desktop-toolbar-button"
+          aria-label="Keyboard shortcuts"
+          onClick={() => window.dispatchEvent(new Event('voicebox:keyboard-shortcuts'))}
+        >
+          <Keyboard size={16} aria-hidden="true" />
+        </button>
+      </div>
     </div>
   );
 }
