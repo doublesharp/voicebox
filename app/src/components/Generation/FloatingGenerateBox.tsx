@@ -27,6 +27,7 @@ import { useSpeechPreview } from '@/lib/audio/useSpeechPreview';
 import { engineSupportsInstruct } from '@/lib/constants/engines';
 import { getLanguageOptionsForEngine, type LanguageCode } from '@/lib/constants/languages';
 import { useGenerationForm } from '@/lib/hooks/useGenerationForm';
+import { currentServerScope, isCurrentServer, requireCurrentServer, type ServerScope } from '@/lib/serverScope';
 import { useProfile, useProfiles } from '@/lib/hooks/useProfiles';
 import { useStory } from '@/lib/hooks/useStories';
 import { cn } from '@/lib/utils/cn';
@@ -97,8 +98,12 @@ export function FloatingGenerateBox({
   });
 
   const composeMutation = useMutation({
-    mutationFn: (profileId: string) => apiClient.composeWithPersonality(profileId),
-    onError: (err: Error) => {
+    mutationFn: ({ profileId, scope }: { profileId: string; scope: ServerScope }) => {
+      requireCurrentServer(scope);
+      return apiClient.composeWithPersonality(profileId);
+    },
+    onError: (err: Error, { scope }) => {
+      if (!isCurrentServer(scope)) return;
       toast({
         title: t('generation.compose.failedTitle'),
         description: err.message || t('generation.compose.failedDescription'),
@@ -305,8 +310,12 @@ export function FloatingGenerateBox({
     };
   }, [isExpanded, layout]);
 
-  async function onSubmit(data: Parameters<typeof handleSubmit>[0]) {
+  async function onSubmit(data: Parameters<typeof handleSubmit>[0], scope: ServerScope) {
     await preview.stop();
+    if (!isCurrentServer(scope)) {
+      toast({ title: 'Server changed', description: 'Generation was not started. Your draft was kept.', variant: 'destructive' });
+      return;
+    }
     await handleSubmit(data, selectedProfileId);
   }
 
@@ -343,7 +352,10 @@ export function FloatingGenerateBox({
       >
         <Form {...form}>
           <form
-            onSubmit={form.handleSubmit(onSubmit)}
+            onSubmit={(event) => {
+              const scope = currentServerScope();
+              return form.handleSubmit((data) => onSubmit(data, scope))(event);
+            }}
             onKeyDown={(event) => {
               if (
                 event.key === 'Enter' &&
@@ -586,10 +598,12 @@ export function FloatingGenerateBox({
                         if (!selectedProfileId) return;
                         const profileRevision = profileIdentity.current.revision;
                         const textRevision = useGenerationDraftStore.getState().textRevision;
+                        const scope = currentServerScope();
                         try {
-                          const result = await composeMutation.mutateAsync(selectedProfileId);
+                          const result = await composeMutation.mutateAsync({ profileId: selectedProfileId, scope });
                           if (
                             !mountedRef.current ||
+                            !isCurrentServer(scope) ||
                             profileIdentity.current.revision !== profileRevision ||
                             useGenerationDraftStore.getState().textRevision !== textRevision
                           )

@@ -49,6 +49,8 @@ let previewAvailable = false;
 let previewActive = false;
 const previewRequests: Record<string, unknown>[] = [];
 let previewStops = 0;
+let previewStopHandler: () => Promise<void> = async () => {};
+let mockServer = { serverUrl: 'http://server-a', serverRevision: 0 };
 mock.module('../src/lib/audio/useSpeechPreview', () => ({
   useSpeechPreview: () => ({
     available: previewAvailable,
@@ -58,13 +60,14 @@ mock.module('../src/lib/audio/useSpeechPreview', () => ({
     },
     stop: async () => {
       previewStops++;
+      await previewStopHandler();
     },
   }),
 }));
 const mockServerStore = Object.assign(
   (selector: (state: { serverUrl: string; serverRevision: number }) => unknown) =>
-    selector({ serverUrl: 'http://server-a', serverRevision: 0 }),
-  { getState: () => ({ serverUrl: 'http://server-a', serverRevision: 0 }) },
+    selector(mockServer),
+  { getState: () => mockServer },
 );
 mock.module('../src/stores/serverStore', () => ({ useServerStore: mockServerStore }));
 mock.module('../src/lib/api/client', () => ({
@@ -83,15 +86,15 @@ mock.module('@tanstack/react-query', () => ({
     mutationFn,
     onError,
   }: {
-    mutationFn: (id: string) => Promise<unknown>;
-    onError: (error: Error) => void;
+    mutationFn: (id: any) => Promise<unknown>;
+    onError: (error: Error, id: any) => void;
   }) => ({
     isPending: false,
-    mutateAsync: async (id: string) => {
+    mutateAsync: async (id: any) => {
       try {
         return await mutationFn(id);
       } catch (e) {
-        onError(e as Error);
+        onError(e as Error, id);
         throw e;
       }
     },
@@ -274,6 +277,8 @@ afterEach(() => {
   previewActive = false;
   previewRequests.length = 0;
   previewStops = 0;
+  previewStopHandler = async () => {};
+  mockServer = { serverUrl: 'http://server-a', serverRevision: 0 };
   profiles = structuredClone(initialProfiles);
 });
 
@@ -609,4 +614,41 @@ test('desktop preview speaks the current script without saving or clearing the d
       .props.onClick();
   });
   expect(previewStops).toBe(1);
+});
+
+test('compose result from a previous server cannot replace the draft', async () => {
+  let resolve!: (value: { text: string }) => void;
+  compose = () => new Promise((r) => { resolve = r; });
+  mount();
+  type('My draft');
+  let pending!: Promise<void>;
+  act(() => { pending = renderer.root.findByProps({ 'aria-label': 'generation.compose.ariaLabel' }).props.onClick(); });
+  mockServer = { serverUrl: 'http://server-b', serverRevision: 1 };
+  await act(async () => { resolve({ text: 'old server text' }); await pending; });
+  expect(renderer.root.findByType('textarea').props.value).toBe('My draft');
+});
+
+test('compose failure from a previous server is not shown on the new server', async () => {
+  let reject!: (error: Error) => void;
+  compose = () => new Promise((_resolve, r) => { reject = r; });
+  mount();
+  let pending!: Promise<void>;
+  act(() => { pending = renderer.root.findByProps({ 'aria-label': 'generation.compose.ariaLabel' }).props.onClick(); });
+  mockServer = { serverUrl: 'http://server-b', serverRevision: 1 };
+  await act(async () => { reject(new Error('old server error')); await pending; });
+  expect(toasts).not.toContainEqual(expect.objectContaining({ description: 'old server error' }));
+});
+
+test('server switch while stopping preview cannot submit to the new server', async () => {
+  let resolve!: () => void;
+  previewStopHandler = () => new Promise((r) => { resolve = r; });
+  mount();
+  type('Keep this draft');
+  let pending!: Promise<void>;
+  await act(async () => { pending = renderer.root.findByType('form').props.onSubmit({ preventDefault() {}, persist() {} }); await Promise.resolve(); });
+  mockServer = { serverUrl: 'http://server-b', serverRevision: 1 };
+  await act(async () => { resolve(); await pending; });
+  expect(statusCalls).toBe(0);
+  expect(requests).toHaveLength(0);
+  expect(renderer.root.findByType('textarea').props.value).toBe('Keep this draft');
 });
