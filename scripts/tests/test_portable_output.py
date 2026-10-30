@@ -208,6 +208,26 @@ def test_created_directories_and_artifacts_are_owner_only_and_ancestors_keep_the
 
 
 @windows_only
+def test_win32_failures_surface_as_oserror_without_creating_anything(tmp_path, monkeypatch):
+    from scripts import portable_output
+
+    with pytest.raises(OSError):
+        Output(tmp_path / "bad<name" / "run")
+    monkeypatch.setattr(portable_output._advapi32, "ConvertStringSecurityDescriptorToSecurityDescriptorW", lambda *args: 0)
+    with pytest.raises(OSError):
+        Output(tmp_path / "run")
+    assert not (tmp_path / "run").exists()
+    monkeypatch.setattr(portable_output._advapi32, "OpenProcessToken", lambda *args: 0)
+    portable_output._current_user_sid.cache_clear()
+    try:
+        with pytest.raises(OSError):
+            Output(tmp_path / "run")
+    finally:
+        portable_output._current_user_sid.cache_clear()
+    assert not (tmp_path / "run").exists()
+
+
+@windows_only
 def test_substituted_drive_is_refused_because_the_pinned_path_resolves_elsewhere(tmp_path):
     free = next((f"{letter}:" for letter in "ZYXWVUTSRQ" if not os.path.exists(f"{letter}:\\")), None)
     if free is None or subprocess.run(["subst", free, str(tmp_path)], capture_output=True).returncode != 0:
