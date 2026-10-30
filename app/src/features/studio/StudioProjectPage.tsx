@@ -32,6 +32,7 @@ import { HelpButton } from '@/components/ui/HelpButton';
 import { Hint } from '@/components/ui/Hint';
 import { Input } from '@/components/ui/input';
 import { stopNative } from '@/lib/audio/playbackOwnership';
+import { isCurrentServer } from '@/lib/serverScope';
 import { usePlatform } from '@/platform/PlatformContext';
 import { usePlayerStore } from '@/stores/playerStore';
 import { useServerStore } from '@/stores/serverStore';
@@ -67,12 +68,14 @@ export function StudioProjectPage() {
   const workspace: Workspace =
     params.workspace === 'mix' ? 'mix' : params.workspace === 'review' ? 'review' : 'edit';
   const server = useServerStore((state) => state.serverUrl);
+  const serverRevision = useServerStore((state) => state.serverRevision);
   return (
     <ProjectWorkspace
-      key={`${server}:${projectId}`}
+      key={`${serverRevision}:${server}:${projectId}`}
       projectId={projectId}
       workspace={workspace}
       server={server}
+      serverRevision={serverRevision}
     />
   );
 }
@@ -80,10 +83,12 @@ function ProjectWorkspace({
   projectId,
   workspace,
   server,
+  serverRevision,
 }: {
   projectId: string;
   workspace: Workspace;
   server: string;
+  serverRevision: number;
 }) {
   const platform = usePlatform();
   const navigate = useNavigate();
@@ -171,6 +176,7 @@ function ProjectWorkspace({
     alive.current = true;
     void session.load();
     const poll = setInterval(() => {
+      if (!isCurrentServer({ serverUrl: server, serverRevision })) return;
       void session.refresh();
       void reviewSessions.refresh();
     }, 1800);
@@ -189,7 +195,7 @@ function ProjectWorkspace({
       reviewSessions.dispose();
       playback.dispose();
     };
-  }, [session, playback, reviewSessions]);
+  }, [session, playback, reviewSessions, server, serverRevision]);
   useEffect(() => {
     const request = new AbortController();
     setCapabilitiesError(null);
@@ -247,21 +253,22 @@ function ProjectWorkspace({
   );
   const runAction = useCallback(
     async (action: () => Promise<unknown>) => {
-      if (busyRef.current) return;
+      const isCurrent = () => isCurrentServer({ serverUrl: server, serverRevision });
+      if (busyRef.current || !isCurrent()) return;
       busyRef.current = true;
       setActionBusy(true);
       setActionError(null);
       try {
         await action();
-        if (alive.current) await session.refresh();
+        if (alive.current && isCurrent()) await session.refresh();
       } catch (error) {
-        if (alive.current) setActionError(errorMessage(error));
+        if (alive.current && isCurrent()) setActionError(errorMessage(error));
       } finally {
         busyRef.current = false;
-        if (alive.current) setActionBusy(false);
+        if (alive.current && isCurrent()) setActionBusy(false);
       }
     },
-    [session],
+    [session, server, serverRevision],
   );
   const toggleTransport = useCallback(() => {
     if (playback.getSnapshot().mode !== 'idle') {
@@ -280,6 +287,7 @@ function ProjectWorkspace({
   }, [playback, session, client]);
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      if (!isCurrentServer({ serverUrl: server, serverRevision })) return;
       const target = event.target as HTMLElement | null;
       const timeline = !!target?.closest?.('[data-studio-timeline]');
       const action = studioShortcut(event, timeline);
@@ -310,7 +318,7 @@ function ProjectWorkspace({
     };
     window.addEventListener('keydown', onKeyDown, true);
     return () => window.removeEventListener('keydown', onKeyDown, true);
-  }, [session, selectedClipId, playback, toggleTransport]);
+  }, [session, selectedClipId, playback, toggleTransport, server, serverRevision]);
   const changeWidth = (panel: 'outline' | 'inspector', value: number) => {
     const next = {
       ...layout,
@@ -498,6 +506,7 @@ function ProjectWorkspace({
               defaultValue={project.name}
               disabled={!canMutate}
               onBlur={(event) => {
+                if (!isCurrentServer({ serverUrl: server, serverRevision })) return;
                 const name = event.target.value.trim();
                 if (!name) event.target.value = project.name;
                 else if (name !== project.name) void session.command('update_project', { name });

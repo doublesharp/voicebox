@@ -2,8 +2,11 @@ import { afterEach, expect, mock, test } from 'bun:test';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 
 let projectId = 'one';
+let serverUrl = 'local';
+let serverRevision = 0;
 let renderer: ReactTestRenderer;
 let retryJob: () => Promise<unknown> = async () => {};
+let profilesRequest: (signal: AbortSignal) => Promise<any[]> = async () => [];
 let includeJob = false;
 let initialStatus = 'saved';
 let noProject = false;
@@ -45,8 +48,9 @@ mock.module('@tanstack/react-router', () => ({
   useNavigate: () => () => {},
   useBlocker: () => {},
 }));
+const serverState = () => ({ serverUrl, serverRevision });
 mock.module('../src/stores/serverStore', () => ({
-  useServerStore: (select: any) => select({ serverUrl: 'local' }),
+  useServerStore: Object.assign((select: any) => select(serverState()), { getState: serverState }),
 }));
 mock.module('../src/stores/playerStore', () => ({
   usePlayerStore: {
@@ -62,8 +66,8 @@ mock.module('../src/features/studio/client', () => ({
     retryJob() {
       return retryJob();
     }
-    profiles() {
-      return Promise.resolve([]);
+    profiles(signal: AbortSignal) {
+      return profilesRequest(signal);
     }
     engines() {
       return Promise.resolve({ items: [] });
@@ -176,9 +180,12 @@ afterEach(() => {
   commands.length = 0;
   sessions.length = 0;
   projectId = 'one';
+  serverUrl = 'local';
+  serverRevision = 0;
   storage.clear();
   includeJob = false;
   retryJob = async () => {};
+  profilesRequest = async () => [];
   initialStatus = 'saved';
   noProject = false;
   checkpointResult = true;
@@ -256,6 +263,90 @@ test('a job completion after switching projects cannot refresh the old project',
   expect(nameInput().props.defaultValue).toBe('Project two');
 });
 
+test('reconnecting to the same server URL disposes the previous project session', async () => {
+  await mount();
+  const old = sessions[0];
+  serverRevision += 2; // A connection switch away and back may be batched into one render.
+  await act(async () => renderer.update(<StudioProjectPage />));
+  expect(old.disposed).toBe(true);
+  expect(sessions).toHaveLength(2);
+  expect(nameInput().props.defaultValue).toBe('Project one');
+});
+
+test('a job response from an earlier connection cannot refresh a reconnected project', async () => {
+  includeJob = true;
+  let resolve!: () => void;
+  retryJob = () => new Promise<void>((done) => { resolve = done; });
+  await mount();
+  const old = sessions[0];
+  let refreshes = 0;
+  old.refresh = () => { refreshes++; };
+  act(() => button('Retry frozen request').props.onClick());
+  serverRevision += 2;
+  await act(async () => renderer.update(<StudioProjectPage />));
+  await act(async () => { resolve(); });
+  expect(old.disposed).toBe(true);
+  expect(refreshes).toBe(0);
+  expect(sessions).toHaveLength(2);
+});
+
+test('an old job response cannot refresh before a connection change rerenders the page', async () => {
+  includeJob = true;
+  let resolve!: () => void;
+  retryJob = () => new Promise<void>((done) => { resolve = done; });
+  await mount();
+  let refreshes = 0;
+  sessions[0].refresh = () => { refreshes++; };
+  act(() => button('Retry frozen request').props.onClick());
+  serverRevision += 2;
+  await act(async () => { resolve(); });
+  expect(refreshes).toBe(0);
+});
+
+test('a stale job action cannot dispatch before a server switch rerenders', async () => {
+  includeJob = true;
+  let calls = 0;
+  retryJob = async () => { calls++; };
+  await mount();
+  serverUrl = 'other'; serverRevision++;
+  await act(async () => button('Retry frozen request').props.onClick());
+  expect(calls).toBe(0);
+});
+
+test('a job failure from an old connection is not displayed before rerender', async () => {
+  includeJob = true;
+  let reject!: (error: Error) => void;
+  retryJob = () => new Promise((_resolve, fail) => { reject = fail; });
+  await mount();
+  act(() => button('Retry frozen request').props.onClick());
+  serverRevision += 2;
+  await act(async () => { reject(new Error('old connection failed')); });
+  expect(JSON.stringify(renderer.toJSON())).not.toContain('old connection failed');
+});
+
+test('a successful current job action refreshes its project once', async () => {
+  includeJob = true;
+  await mount();
+  let refreshes = 0;
+  sessions[0].refresh = () => { refreshes++; };
+  await act(async () => { button('Retry frozen request').props.onClick(); });
+  expect(refreshes).toBe(1);
+  expect(button('Retry frozen request').props.disabled).toBe(false);
+});
+
+test('reconnecting aborts old voice-capability requests and ignores their errors', async () => {
+  const requests: Array<{ signal: AbortSignal; reject: (error: Error) => void }> = [];
+  profilesRequest = (signal) => new Promise((_resolve, reject) => { requests.push({ signal, reject }); });
+  await mount();
+  expect(requests).toHaveLength(1);
+  serverRevision += 2;
+  await act(async () => renderer.update(<StudioProjectPage />));
+  expect(requests[0].signal.aborted).toBe(true);
+  expect(requests).toHaveLength(2);
+  await act(async () => { requests[0].reject(new Error('old capability request failed')); });
+  expect(JSON.stringify(renderer.toJSON())).not.toContain('old capability request failed');
+});
+
 test('playback clock updates transport without rerendering script and keeps manual seeks', async () => {
   await mount();
   const player = playbackInstances.at(-1);
@@ -316,6 +407,41 @@ test('save and undo shortcuts dispatch once, while text fields retain undo', asy
   expect(send('z', { tagName: 'DIV' })).toBe(true);
   expect(send('z', { tagName: 'DIV' }, { shiftKey: true })).toBe(true);
   expect(commands).toEqual([['flush'], ['undo', undefined], ['redo', undefined]]);
+});
+
+test('stale project shortcuts cannot dispatch after the connection changes', async () => {
+  await mount();
+  serverUrl = 'other'; serverRevision++;
+  const event = { key: 's', ctrlKey: true, target: { tagName: 'DIV' }, preventDefault() {}, stopPropagation() {} };
+  act(() => windowListeners.get('keydown')?.forEach((listener) => listener(event)));
+  expect(commands).toEqual([]);
+});
+
+test('a stale project-name edit cannot update the previous server', async () => {
+  await mount();
+  serverUrl = 'other'; serverRevision++;
+  act(() => nameInput().props.onBlur({ target: { value: 'Changed after switching' } }));
+  expect(commands).toEqual([]);
+});
+
+test('periodic refresh does not read an old project after a connection change', async () => {
+  const originalSetInterval = globalThis.setInterval;
+  const originalClearInterval = globalThis.clearInterval;
+  let poll!: () => void;
+  globalThis.setInterval = ((callback: () => void) => { poll = callback; return 1; }) as typeof setInterval;
+  globalThis.clearInterval = (() => {}) as typeof clearInterval;
+  try {
+    await mount();
+    let refreshes = 0;
+    sessions[0].refresh = () => { refreshes++; };
+    serverUrl = 'other'; serverRevision++;
+    act(() => poll());
+    expect(refreshes).toBe(0);
+  } finally {
+    act(() => renderer.unmount());
+    globalThis.setInterval = originalSetInterval;
+    globalThis.clearInterval = originalClearInterval;
+  }
 });
 
 test('dirty projects warn before browser unload and clean projects do not', async () => {
