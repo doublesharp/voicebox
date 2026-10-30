@@ -473,6 +473,29 @@ fn selected_device_indices(names: &[String], ids: &[String]) -> Result<Vec<usize
     }
     Ok(selected)
 }
+fn validate_default_output_route(
+    expected: Option<&str>,
+    current: Option<&str>,
+) -> Result<(), String> {
+    if expected.is_none() || expected != current {
+        return Err("Audio output changed; preview stopped".into());
+    }
+    Ok(())
+}
+
+fn validate_selected_output_routes(
+    selected: &[String],
+    available: &[String],
+) -> Result<(), String> {
+    if selected.iter().any(|name| !available.contains(name)) {
+        return Err("A selected audio output disconnected".into());
+    }
+    let ids: Vec<String> = selected.iter().map(|name| device_id(name)).collect();
+    selected_device_indices(available, &ids)
+        .map_err(|_| "A selected audio output is ambiguous; preview stopped".to_string())?;
+    Ok(())
+}
+
 fn emit(
     app: &tauri::AppHandle,
     id: &str,
@@ -1045,18 +1068,17 @@ fn run_pcm_session(
                 let current = host
                     .default_output_device()
                     .and_then(|device| device.name().ok());
-                if current.as_ref() != output_names.first() {
-                    return Err("Audio output changed; preview stopped".into());
-                }
+                validate_default_output_route(
+                    output_names.first().map(String::as_str),
+                    current.as_deref(),
+                )?;
             } else {
                 let available = host
                     .output_devices()
                     .map_err(|error| error.to_string())?
                     .filter_map(|device| device.name().ok())
                     .collect::<Vec<_>>();
-                if output_names.iter().any(|name| !available.contains(name)) {
-                    return Err("A selected audio output disconnected".into());
-                }
+                validate_selected_output_routes(&output_names, &available)?;
             }
             Ok(())
         },
@@ -2836,5 +2858,110 @@ mod worker_reporting_regression_tests {
             |state, error| events.push((state, error)),
         );
         assert_eq!(events, [("error", Some("failure".into()))]);
+    }
+}
+
+#[cfg(test)]
+mod output_route_regression_tests {
+    use super::*;
+    use crate::audio_stream::PcmQueue;
+
+    fn names(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).into()).collect()
+    }
+
+    #[test]
+    fn default_route_requires_the_original_output_to_remain_default() {
+        for (expected, current, valid) in [
+            (Some("Speaker"), Some("Speaker"), true),
+            (Some("Speaker"), Some("Headphones"), false),
+            (Some("Speaker"), None, false),
+            (None, None, false),
+            (None, Some("Speaker"), false),
+        ] {
+            assert_eq!(
+                validate_default_output_route(expected, current).is_ok(),
+                valid
+            );
+        }
+    }
+
+    #[test]
+    fn selected_outputs_stay_valid_when_unrelated_devices_change_order() {
+        assert!(validate_selected_output_routes(
+            &names(&["Speakers", "Headphones"]),
+            &names(&["Headphones", "USB", "Speakers"])
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn missing_any_selected_output_is_an_error() {
+        assert!(validate_selected_output_routes(
+            &names(&["Speakers", "Headphones"]),
+            &names(&["Speakers", "USB"])
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_new_duplicate_of_a_selected_output_is_ambiguous() {
+        for duplicate in ["USB Audio", "USB_Audio", "usb audio"] {
+            let result = validate_selected_output_routes(
+                &names(&["USB Audio"]),
+                &names(&["USB Audio", duplicate]),
+            );
+            assert!(result.is_err(), "accepted ambiguous output {duplicate}");
+        }
+    }
+
+    #[test]
+    fn collisions_between_unselected_outputs_do_not_affect_the_selected_route() {
+        assert!(validate_selected_output_routes(
+            &names(&["Speakers"]),
+            &names(&["Speakers", "USB Audio", "USB_Audio"])
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_renamed_selected_device_is_not_silently_replaced() {
+        assert!(
+            validate_selected_output_routes(&names(&["USB Audio"]), &names(&["USB_Audio"]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn monitor_terminates_when_a_selected_route_becomes_ambiguous() {
+        let controls = PlaybackControls::new(0.0, 1.0);
+        let queues: StreamQueues = Arc::new(Mutex::new(vec![Arc::new(Mutex::new(
+            PcmQueue::new(8000).unwrap(),
+        ))]));
+        let (wake_tx, wake) = mpsc::channel();
+        let (_error_tx, errors) = mpsc::channel();
+        wake_tx.send(()).unwrap();
+        let mut events = Vec::new();
+        let result = monitor_preview(
+            &controls,
+            &queues,
+            &wake,
+            &errors,
+            Duration::ZERO,
+            Duration::ZERO,
+            || {
+                validate_selected_output_routes(
+                    &names(&["USB Audio"]),
+                    &names(&["USB Audio", "USB_Audio"]),
+                )
+            },
+            |state, _, _| {
+                events.push(state);
+                controls.stop();
+                let _ = wake_tx.send(());
+            },
+        );
+        assert!(result.is_err());
+        assert!(events.is_empty());
     }
 }
