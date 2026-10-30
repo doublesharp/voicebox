@@ -59,6 +59,180 @@ impl ClipboardSnapshot {
     }
 }
 
+#[cfg(all(test, target_os = "macos"))]
+mod private_pasteboard_tests {
+    use super::*;
+
+    // A named private pasteboard is distinct from the user's general clipboard.
+    struct PrivatePasteboard {
+        board: Id,
+        _pool: AutoreleasePool,
+    }
+
+    impl PrivatePasteboard {
+        fn new() -> Self {
+            unsafe {
+                let pool = AutoreleasePool::new();
+                let board: Id = msg_send![class!(NSPasteboard), pasteboardWithUniqueName];
+                assert!(!board.is_null());
+                Self { board, _pool: pool }
+            }
+        }
+        fn save(&self) -> ClipboardSnapshot {
+            unsafe { save_clipboard_from(self.board).unwrap() }
+        }
+        fn write(&self, text: &str) -> i64 {
+            unsafe { write_text_to(self.board, text).unwrap() }
+        }
+        fn restore(&self, snapshot: &ClipboardSnapshot) {
+            unsafe { restore_clipboard_to(self.board, snapshot).unwrap() }
+        }
+    }
+
+    impl Drop for PrivatePasteboard {
+        fn drop(&mut self) {
+            unsafe {
+                let _: () = msg_send![self.board, releaseGlobally];
+            }
+        }
+    }
+
+    fn snapshot(items: Vec<Vec<(&str, &[u8])>>) -> ClipboardSnapshot {
+        ClipboardSnapshot {
+            items: items
+                .into_iter()
+                .map(|pairs| {
+                    pairs
+                        .into_iter()
+                        .map(|(kind, bytes)| (kind.to_string(), bytes.to_vec()))
+                        .collect()
+                })
+                .collect(),
+            change_count: 0,
+        }
+    }
+
+    fn data<'a>(snapshot: &'a ClipboardSnapshot, item: usize, kind: &str) -> &'a [u8] {
+        snapshot.items[item]
+            .iter()
+            .find(|(name, _)| name == kind)
+            .unwrap()
+            .1
+            .as_slice()
+    }
+
+    #[test]
+    fn empty_private_pasteboard_is_an_empty_snapshot() {
+        let board = PrivatePasteboard::new();
+        let saved = board.save();
+        assert_eq!(saved.item_count(), 0);
+    }
+
+    #[test]
+    fn text_roundtrips_across_unicode_and_embedded_nulls() {
+        let board = PrivatePasteboard::new();
+        for text in [
+            "hello",
+            "café 世界 🎙",
+            "line one\nline two",
+            "before\0after",
+            "",
+        ] {
+            let written = board.write(text);
+            let saved = board.save();
+            assert_eq!(saved.change_count(), written);
+            assert_eq!(data(&saved, 0, "public.utf8-plain-text"), text.as_bytes());
+        }
+    }
+
+    #[test]
+    fn restoring_multi_item_multi_format_snapshots_preserves_bytes() {
+        let board = PrivatePasteboard::new();
+        let original = snapshot(vec![
+            vec![
+                ("com.voicebox.test.first", b"first\0bytes"),
+                ("com.voicebox.test.second", &[0, 255, 1, 128]),
+            ],
+            vec![("com.voicebox.test.third", b"second item")],
+        ]);
+        board.restore(&original);
+        let saved = board.save();
+        assert_eq!(saved.item_count(), 2);
+        assert_eq!(data(&saved, 0, "com.voicebox.test.first"), b"first\0bytes");
+        assert_eq!(
+            data(&saved, 0, "com.voicebox.test.second"),
+            &[0, 255, 1, 128]
+        );
+        assert_eq!(data(&saved, 1, "com.voicebox.test.third"), b"second item");
+    }
+
+    #[test]
+    fn empty_format_data_survives_snapshot_and_restore() {
+        let board = PrivatePasteboard::new();
+        board.restore(&snapshot(vec![vec![("com.voicebox.test.empty", b"")]]));
+        let saved = board.save();
+        assert_eq!(saved.item_count(), 1);
+        assert_eq!(data(&saved, 0, "com.voicebox.test.empty"), b"");
+    }
+
+    #[test]
+    fn staging_text_then_restoring_recovers_the_original_snapshot() {
+        let board = PrivatePasteboard::new();
+        let original = snapshot(vec![vec![("com.voicebox.test.binary", &[0, 1, 255])]]);
+        board.restore(&original);
+        let captured = board.save();
+        let before = captured.change_count();
+        let after = board.write("dictation");
+        assert!(after > before);
+        assert_eq!(
+            data(&board.save(), 0, "public.utf8-plain-text"),
+            b"dictation"
+        );
+        board.restore(&captured);
+        assert_eq!(
+            data(&board.save(), 0, "com.voicebox.test.binary"),
+            &[0, 1, 255]
+        );
+    }
+
+    #[test]
+    fn restoring_empty_snapshot_clears_previous_contents() {
+        let board = PrivatePasteboard::new();
+        board.write("temporary");
+        board.restore(&snapshot(vec![]));
+        assert_eq!(board.save().item_count(), 0);
+    }
+
+    #[test]
+    fn snapshots_own_bytes_after_the_pasteboard_changes() {
+        let board = PrivatePasteboard::new();
+        board.restore(&snapshot(vec![vec![(
+            "com.voicebox.test.binary",
+            b"original",
+        )]]));
+        let saved = board.save();
+        board.write("replacement");
+        assert_eq!(data(&saved, 0, "com.voicebox.test.binary"), b"original");
+    }
+
+    #[test]
+    fn separate_private_pasteboards_do_not_share_contents() {
+        let first = PrivatePasteboard::new();
+        let second = PrivatePasteboard::new();
+        first.write("first only");
+        assert_eq!(second.save().item_count(), 0);
+        second.write("second only");
+        assert_eq!(
+            data(&first.save(), 0, "public.utf8-plain-text"),
+            b"first only"
+        );
+        assert_eq!(
+            data(&second.save(), 0, "public.utf8-plain-text"),
+            b"second only"
+        );
+    }
+}
+
 #[cfg(target_os = "macos")]
 type Id = *mut Object;
 
@@ -146,59 +320,63 @@ pub fn current_change_count() -> Result<i64, String> {
 pub fn save_clipboard() -> Result<ClipboardSnapshot, String> {
     unsafe {
         let _pool = AutoreleasePool::new();
-        let pb = general_pasteboard()?;
-        let change_count: i64 = msg_send![pb, changeCount];
-
-        let items: Id = msg_send![pb, pasteboardItems];
-        if items.is_null() {
-            return Ok(ClipboardSnapshot {
-                items: Vec::new(),
-                change_count,
-            });
-        }
-
-        let count: usize = msg_send![items, count];
-        let mut saved: Vec<Vec<(String, Vec<u8>)>> = Vec::with_capacity(count);
-
-        for i in 0..count {
-            let item: Id = msg_send![items, objectAtIndex: i];
-            if item.is_null() {
-                continue;
-            }
-            let types: Id = msg_send![item, types];
-            if types.is_null() {
-                continue;
-            }
-            let type_count: usize = msg_send![types, count];
-            let mut pairs: Vec<(String, Vec<u8>)> = Vec::with_capacity(type_count);
-            for j in 0..type_count {
-                let t: Id = msg_send![types, objectAtIndex: j];
-                let Some(type_str) = ns_string_to_rust(t) else {
-                    continue;
-                };
-                let data: Id = msg_send![item, dataForType: t];
-                if data.is_null() {
-                    // Type advertised but no concrete data (lazy provider).
-                    // Skipping is safer than trying to force it to materialise.
-                    continue;
-                }
-                let length: usize = msg_send![data, length];
-                let bytes_ptr: *const u8 = msg_send![data, bytes];
-                let bytes = if bytes_ptr.is_null() || length == 0 {
-                    Vec::new()
-                } else {
-                    std::slice::from_raw_parts(bytes_ptr, length).to_vec()
-                };
-                pairs.push((type_str, bytes));
-            }
-            saved.push(pairs);
-        }
-
-        Ok(ClipboardSnapshot {
-            items: saved,
-            change_count,
-        })
+        save_clipboard_from(general_pasteboard()?)
     }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn save_clipboard_from(pb: Id) -> Result<ClipboardSnapshot, String> {
+    let change_count: i64 = msg_send![pb, changeCount];
+
+    let items: Id = msg_send![pb, pasteboardItems];
+    if items.is_null() {
+        return Ok(ClipboardSnapshot {
+            items: Vec::new(),
+            change_count,
+        });
+    }
+
+    let count: usize = msg_send![items, count];
+    let mut saved: Vec<Vec<(String, Vec<u8>)>> = Vec::with_capacity(count);
+
+    for i in 0..count {
+        let item: Id = msg_send![items, objectAtIndex: i];
+        if item.is_null() {
+            continue;
+        }
+        let types: Id = msg_send![item, types];
+        if types.is_null() {
+            continue;
+        }
+        let type_count: usize = msg_send![types, count];
+        let mut pairs: Vec<(String, Vec<u8>)> = Vec::with_capacity(type_count);
+        for j in 0..type_count {
+            let t: Id = msg_send![types, objectAtIndex: j];
+            let Some(type_str) = ns_string_to_rust(t) else {
+                continue;
+            };
+            let data: Id = msg_send![item, dataForType: t];
+            if data.is_null() {
+                // Type advertised but no concrete data (lazy provider).
+                // Skipping is safer than trying to force it to materialise.
+                continue;
+            }
+            let length: usize = msg_send![data, length];
+            let bytes_ptr: *const u8 = msg_send![data, bytes];
+            let bytes = if bytes_ptr.is_null() || length == 0 {
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts(bytes_ptr, length).to_vec()
+            };
+            pairs.push((type_str, bytes));
+        }
+        saved.push(pairs);
+    }
+
+    Ok(ClipboardSnapshot {
+        items: saved,
+        change_count,
+    })
 }
 
 /// Replace the pasteboard contents with a single plain-text string. Returns
@@ -208,21 +386,25 @@ pub fn save_clipboard() -> Result<ClipboardSnapshot, String> {
 pub fn write_text(text: &str) -> Result<i64, String> {
     unsafe {
         let _pool = AutoreleasePool::new();
-        let pb = general_pasteboard()?;
-        let _new_count: i64 = msg_send![pb, clearContents];
-
-        let ns_text = ns_string(text);
-        // `public.utf8-plain-text` is the raw UTI behind `NSPasteboardTypeString`
-        // and works for every text-aware paste target we care about.
-        let ns_type = ns_string("public.utf8-plain-text");
-        let ok: bool = msg_send![pb, setString: ns_text forType: ns_type];
-        if !ok {
-            return Err("NSPasteboard setString:forType: returned NO".into());
-        }
-
-        let after: i64 = msg_send![pb, changeCount];
-        Ok(after)
+        write_text_to(general_pasteboard()?, text)
     }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn write_text_to(pb: Id, text: &str) -> Result<i64, String> {
+    let _new_count: i64 = msg_send![pb, clearContents];
+
+    let ns_text = ns_string(text);
+    // `public.utf8-plain-text` is the raw UTI behind `NSPasteboardTypeString`
+    // and works for every text-aware paste target we care about.
+    let ns_type = ns_string("public.utf8-plain-text");
+    let ok: bool = msg_send![pb, setString: ns_text forType: ns_type];
+    if !ok {
+        return Err("NSPasteboard setString:forType: returned NO".into());
+    }
+
+    let after: i64 = msg_send![pb, changeCount];
+    Ok(after)
 }
 
 /// Rebuild the pasteboard from a snapshot, replacing whatever is on it now.
@@ -234,39 +416,43 @@ pub fn write_text(text: &str) -> Result<i64, String> {
 pub fn restore_clipboard(snapshot: &ClipboardSnapshot) -> Result<(), String> {
     unsafe {
         let _pool = AutoreleasePool::new();
-        let pb = general_pasteboard()?;
-        let _: i64 = msg_send![pb, clearContents];
-
-        if snapshot.items.is_empty() {
-            return Ok(());
-        }
-
-        let array: Id = msg_send![class!(NSMutableArray), array];
-
-        for pairs in &snapshot.items {
-            let item: Id = msg_send![class!(NSPasteboardItem), alloc];
-            let item: Id = msg_send![item, init];
-            let _: () = msg_send![item, autorelease];
-
-            for (uti, bytes) in pairs {
-                let ns_type = ns_string(uti);
-                let data: Id = msg_send![
-                    class!(NSData),
-                    dataWithBytes: bytes.as_ptr()
-                    length: bytes.len()
-                ];
-                let _ok: bool = msg_send![item, setData: data forType: ns_type];
-            }
-
-            let _: () = msg_send![array, addObject: item];
-        }
-
-        let ok: bool = msg_send![pb, writeObjects: array];
-        if !ok {
-            return Err("NSPasteboard writeObjects: returned NO".into());
-        }
-        Ok(())
+        restore_clipboard_to(general_pasteboard()?, snapshot)
     }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn restore_clipboard_to(pb: Id, snapshot: &ClipboardSnapshot) -> Result<(), String> {
+    let _: i64 = msg_send![pb, clearContents];
+
+    if snapshot.items.is_empty() {
+        return Ok(());
+    }
+
+    let array: Id = msg_send![class!(NSMutableArray), array];
+
+    for pairs in &snapshot.items {
+        let item: Id = msg_send![class!(NSPasteboardItem), alloc];
+        let item: Id = msg_send![item, init];
+        let _: () = msg_send![item, autorelease];
+
+        for (uti, bytes) in pairs {
+            let ns_type = ns_string(uti);
+            let data: Id = msg_send![
+                class!(NSData),
+                dataWithBytes: bytes.as_ptr()
+                length: bytes.len()
+            ];
+            let _ok: bool = msg_send![item, setData: data forType: ns_type];
+        }
+
+        let _: () = msg_send![array, addObject: item];
+    }
+
+    let ok: bool = msg_send![pb, writeObjects: array];
+    if !ok {
+        return Err("NSPasteboard writeObjects: returned NO".into());
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
