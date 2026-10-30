@@ -128,15 +128,19 @@ pub async fn start_capture(
     // Create output handler struct
     struct AudioHandler {
         samples: Arc<Mutex<Vec<f32>>>,
+        errors: Arc<Mutex<Option<String>>>,
         active: Arc<AtomicBool>,
     }
 
     impl SCStreamOutputTrait for AudioHandler {
         fn did_output_sample_buffer(&self, sample: CMSampleBuffer, _type: SCStreamOutputType) {
             if _type == SCStreamOutputType::Audio {
-                if let Ok(audio_samples) = extract_audio_samples(sample) {
-                    append_capture_samples(&self.samples, &self.active, &audio_samples);
-                }
+                record_capture_result(
+                    &self.samples,
+                    &self.errors,
+                    &self.active,
+                    extract_audio_samples(sample),
+                );
             }
         }
     }
@@ -144,6 +148,7 @@ pub async fn start_capture(
     let active = Arc::new(AtomicBool::new(true));
     let handler = AudioHandler {
         samples: samples.clone(),
+        errors: state.error.clone(),
         active: active.clone(),
     };
 
@@ -197,8 +202,16 @@ pub async fn stop_capture(state: &AudioCaptureState) -> Result<String, String> {
     // Wait a bit for capture to stop
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-    // Get samples
-    let samples = state.samples.lock().unwrap().clone();
+    // Take the sample lock first, matching the callback lock order. This waits
+    // for an already-admitted callback to finish recording any error.
+    let (samples, error) = {
+        let samples = state.samples.lock().unwrap();
+        let error = state.error.lock().unwrap();
+        (samples.clone(), error.clone())
+    };
+    if let Some(error) = error {
+        return Err(format!("System audio capture failed: {error}"));
+    }
     let sample_rate = *state.sample_rate.lock().unwrap();
     let channels = *state.channels.lock().unwrap();
 
@@ -524,5 +537,110 @@ mod capture_callback_tests {
         append_capture_samples(&two, &second, &[2.0]);
         assert!(one.lock().unwrap().is_empty());
         assert_eq!(*two.lock().unwrap(), [2.0]);
+    }
+}
+
+fn record_capture_result(
+    samples: &Mutex<Vec<f32>>,
+    errors: &Mutex<Option<String>>,
+    active: &AtomicBool,
+    result: Result<Vec<f32>, String>,
+) {
+    match result {
+        Ok(input) => append_capture_samples(samples, active, &input),
+        Err(error) => {
+            // Serialize with sample appends and recheck ownership after waiting.
+            let _samples = samples.lock().unwrap();
+            if active.load(Ordering::Acquire) {
+                let mut first_error = errors.lock().unwrap();
+                if first_error.is_none() {
+                    *first_error = Some(error);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod capture_error_regression_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_callback_records_the_conversion_error() {
+        let samples = Mutex::new(vec![0.25]);
+        let errors = Mutex::new(None);
+        let active = AtomicBool::new(true);
+        let result = interleave_capture_buffers(&[&[1, 2, 3]]);
+        record_capture_result(&samples, &errors, &active, result);
+        assert_eq!(*samples.lock().unwrap(), [0.25]);
+        assert!(errors
+            .lock()
+            .unwrap()
+            .as_deref()
+            .unwrap()
+            .contains("incomplete"));
+    }
+
+    #[test]
+    fn first_capture_error_is_preserved() {
+        let samples = Mutex::new(Vec::new());
+        let errors = Mutex::new(None);
+        let active = AtomicBool::new(true);
+        record_capture_result(&samples, &errors, &active, Err("first error".into()));
+        record_capture_result(&samples, &errors, &active, Err("second error".into()));
+        assert_eq!(errors.lock().unwrap().as_deref(), Some("first error"));
+    }
+
+    #[test]
+    fn late_error_from_stopped_capture_cannot_poison_replacement() {
+        let samples = Mutex::new(Vec::new());
+        let errors = Mutex::new(None);
+        let old = AtomicBool::new(false);
+        let current = AtomicBool::new(true);
+        record_capture_result(&samples, &errors, &old, Err("old failure".into()));
+        record_capture_result(&samples, &errors, &current, Ok(vec![0.5]));
+        assert_eq!(*errors.lock().unwrap(), None);
+        assert_eq!(*samples.lock().unwrap(), [0.5]);
+    }
+
+    #[test]
+    fn valid_callback_preserves_existing_error_and_appends_audio() {
+        let samples = Mutex::new(Vec::new());
+        let errors = Mutex::new(Some("earlier failure".into()));
+        let active = AtomicBool::new(true);
+        record_capture_result(&samples, &errors, &active, Ok(vec![0.5, -0.5]));
+        assert_eq!(*samples.lock().unwrap(), [0.5, -0.5]);
+        assert_eq!(errors.lock().unwrap().as_deref(), Some("earlier failure"));
+    }
+
+    #[tokio::test]
+    async fn stop_returns_the_capture_error_instead_of_partial_audio() {
+        let state = AudioCaptureState::new();
+        *state.samples.lock().unwrap() = vec![0.25, -0.25];
+        *state.error.lock().unwrap() = Some("incomplete float sample".into());
+        let result = stop_capture(&state).await;
+        assert!(result.unwrap_err().contains("incomplete float sample"));
+    }
+
+    #[tokio::test]
+    async fn capture_error_takes_priority_over_missing_samples() {
+        let state = AudioCaptureState::new();
+        *state.error.lock().unwrap() = Some("capture buffer unavailable".into());
+        assert!(stop_capture(&state)
+            .await
+            .unwrap_err()
+            .contains("capture buffer unavailable"));
+    }
+
+    #[tokio::test]
+    async fn successful_stop_still_returns_decodable_audio() {
+        use base64::Engine;
+        let state = AudioCaptureState::new();
+        *state.samples.lock().unwrap() = vec![0.25, -0.25];
+        let encoded = stop_capture(&state).await.unwrap();
+        let bytes = general_purpose::STANDARD.decode(encoded).unwrap();
+        let reader = hound::WavReader::new(std::io::Cursor::new(bytes)).unwrap();
+        assert_eq!(reader.spec().channels, 2);
+        assert_eq!(reader.duration(), 1);
     }
 }
