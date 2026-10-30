@@ -18,7 +18,10 @@ pub fn resample_interleaved(
         return Ok(samples.to_vec());
     }
     let frames = samples.len() / channels;
-    let output_frames = ((frames as f64 * to_rate as f64 / from_rate as f64).round()) as usize;
+    // A nonempty clip must still produce one output frame when its duration
+    // is shorter than half a destination sample period.
+    let output_frames =
+        (((frames as f64 * to_rate as f64 / from_rate as f64).round()) as usize).max(1);
     let mut output = vec![
         0.0;
         output_frames
@@ -94,7 +97,11 @@ pub fn convert_channels(
     let mut output = Vec::with_capacity(samples.len() / source * destination);
     for frame in samples.chunks_exact(source) {
         if destination == 1 {
-            output.push(frame.iter().sum::<f32>() / source as f32);
+            // Accumulate in f64 so finite f32 channels cannot overflow before averaging.
+            output.push(
+                (frame.iter().map(|&sample| f64::from(sample)).sum::<f64>() / source as f64)
+                    as f32,
+            );
         } else if source == 1 {
             output.extend(std::iter::repeat(frame[0]).take(destination));
         } else {
@@ -290,6 +297,35 @@ impl RenderCursor {
 
 mod tests {
     use super::*;
+    #[test]
+    fn short_nonempty_clips_survive_downsampling() {
+        for (source, target, channels) in [
+            (192000, 8000, 1),
+            (48000, 8000, 2),
+            (44100, 16000, 2),
+        ] {
+            let input = vec![0.5; channels];
+            let output = resample_interleaved(&input, source, target, channels).unwrap();
+            assert_eq!(output.len(), channels, "{source} -> {target}");
+            assert!(output.iter().all(|sample| sample.is_finite() && *sample > 0.0));
+        }
+        assert!(resample_interleaved(&[], 192000, 8000, 1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn mono_downmix_preserves_finite_audio_for_extreme_channels() {
+        let max = f32::MAX;
+        for (input, expected) in [
+            (vec![max, max], max),
+            (vec![-max, -max], -max),
+            (vec![max, max, -max], max / 3.0),
+        ] {
+            let result = convert_channels(&input, input.len(), 1).unwrap()[0];
+            assert!(result.is_finite(), "downmix overflowed for {input:?}");
+            assert!((result / expected - 1.0).abs() < 1e-6);
+        }
+    }
+
     #[test]
     fn resampling_keeps_stereo_channels_separate() {
         let input: Vec<f32> = (0..240).flat_map(|_| [0.4, -0.2]).collect();

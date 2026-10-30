@@ -4873,6 +4873,41 @@ mod clip_host_integration_tests {
     }
 
     #[test]
+    fn decoded_single_frame_reaches_lower_rate_output() {
+        let host = Host::new(&["A"]);
+        host.0.lock().unwrap().cancel_on_build = Some("A".into());
+        let mut output = std::io::Cursor::new(Vec::new());
+        {
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: 192000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut writer = hound::WavWriter::new(&mut output, spec).unwrap();
+            writer.write_sample(16384_i16).unwrap();
+            writer.finalize().unwrap();
+        }
+        assert_eq!(
+            failed_start(
+                &host,
+                output.into_inner(),
+                ids(&["A"]),
+                Arc::new(PlaybackControls::new(0.0, 1.0)),
+                false,
+            ),
+            "Playback cancelled"
+        );
+        let state = host.0.lock().unwrap();
+        assert_eq!(
+            state.samples[0].len(),
+            1,
+            "decoded audio disappeared during resampling"
+        );
+        assert!(state.samples[0][0] > 0.0);
+    }
+
+    #[test]
     fn decoded_surround_center_reaches_a_stereo_output_stream() {
         let host = Host::new(&["A"]);
         {
