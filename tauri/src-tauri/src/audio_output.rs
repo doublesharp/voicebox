@@ -579,7 +579,7 @@ fn validate_wave_frame_alignment(data: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn decode_audio(data: Vec<u8>) -> Result<(Vec<f32>, u32, usize), String> {
+fn decode_audio(mut data: Vec<u8>) -> Result<(Vec<f32>, u32, usize), String> {
     use symphonia::core::audio::SampleBuffer;
     use symphonia::core::errors::Error;
     use symphonia::core::io::MediaSourceStream;
@@ -590,8 +590,16 @@ fn decode_audio(data: Vec<u8>) -> Result<(Vec<f32>, u32, usize), String> {
         let declared = u32::from_le_bytes(data[4..8].try_into().unwrap());
         // Some streaming encoders use the sentinel because the length was
         // unknown at the time the header was written.
-        if declared != u32::MAX && u64::from(declared) + 8 > data.len() as u64 {
-            return Err("Audio file is truncated".into());
+        if declared != u32::MAX {
+            let container_len = u64::from(declared) + 8;
+            if container_len > data.len() as u64 {
+                return Err("Audio file is truncated".into());
+            }
+            if container_len < 12 {
+                return Err("Invalid WAV container length".into());
+            }
+            // Bytes after the RIFF container cannot complete a truncated chunk.
+            data.truncate(container_len as usize);
         }
         validate_wave_frame_alignment(&data)?;
     }
@@ -2753,6 +2761,41 @@ mod wav_truncation_regression_tests {
         bytes[header + 4..header + 8].copy_from_slice(&u32::MAX.to_le_bytes());
         bytes.pop();
         assert!(decode_audio(bytes).is_err());
+    }
+
+    #[test]
+    fn declared_wave_container_must_include_the_complete_data_chunk() {
+        for missing in [1_u32, 2, 4, 8] {
+            let mut bytes = wav();
+            let declared = (bytes.len() - 8) as u32 - missing;
+            bytes[4..8].copy_from_slice(&declared.to_le_bytes());
+            assert!(
+                decode_audio(bytes).is_err(),
+                "accepted a container missing {missing} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_wave_container_allows_unrelated_trailing_bytes() {
+        for tail in [b"x".as_slice(), b"metadata", &[0, 0, 0, 0]] {
+            let mut bytes = wav();
+            bytes.extend_from_slice(tail);
+            let (samples, rate, channels) = decode_audio(bytes).unwrap();
+            assert_eq!((samples.len(), rate, channels), (4, 24000, 2));
+        }
+    }
+
+    #[test]
+    fn wave_rejects_invalid_pcm_alignment_for_each_common_field() {
+        for (offset, value) in [(22, 0_u16), (32, 0), (32, 2), (34, 0)] {
+            let mut bytes = wav();
+            bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+            assert!(
+                decode_audio(bytes).is_err(),
+                "accepted invalid field at {offset}: {value}"
+            );
+        }
     }
 
     #[test]
