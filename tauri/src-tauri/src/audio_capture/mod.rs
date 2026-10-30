@@ -125,6 +125,15 @@ fn signal_capture_stop(slot: &Arc<Mutex<Option<tokio::sync::mpsc::Sender<()>>>>)
     }
 }
 
+#[cfg(any(test, target_os = "windows"))]
+fn record_windows_capture_error(slot: &Arc<Mutex<Option<String>>>, message: String) {
+    eprintln!("{message}");
+    let mut error = slot.lock().unwrap();
+    if error.is_none() {
+        *error = Some(message);
+    }
+}
+
 #[cfg(any(test, target_os = "linux", target_os = "windows"))]
 fn capture_worker_completion(
     sender: tokio::sync::oneshot::Sender<Result<(), String>>,
@@ -267,6 +276,49 @@ mod capture_timeout_tests {
             .await
             .unwrap_err()
             .contains("No system audio capture is active"));
+    }
+
+    #[tokio::test]
+    async fn capture_read_failure_never_returns_partial_audio() {
+        let state = AudioCaptureState::new();
+        let (capture, _rx, _timer, done) = state.begin_portable_capture();
+        *capture.samples.lock().unwrap() = vec![0.25, -0.25];
+        record_windows_capture_error(
+            &capture.error,
+            "Error reading from device: disconnected".into(),
+        );
+        done.send(Ok(())).unwrap();
+        let error = stop_portable_capture_with_timeout(&state, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(error.contains("Error reading from device: disconnected"));
+    }
+
+    #[tokio::test]
+    async fn capture_reports_the_first_failure_even_if_cleanup_also_fails() {
+        let state = AudioCaptureState::new();
+        let (capture, _rx, _timer, done) = state.begin_portable_capture();
+        record_windows_capture_error(&capture.error, "device disconnected".into());
+        record_windows_capture_error(&capture.error, "stop stream failed".into());
+        done.send(Ok(())).unwrap();
+        let error = stop_portable_capture_with_timeout(&state, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(error, "device disconnected");
+    }
+
+    #[tokio::test]
+    async fn capture_setup_failure_is_reported_even_without_samples() {
+        let state = AudioCaptureState::new();
+        let (capture, _rx, _timer, done) = state.begin_portable_capture();
+        record_windows_capture_error(&capture.error, "Failed to initialize COM".into());
+        done.send(Ok(())).unwrap();
+        assert_eq!(
+            stop_portable_capture_with_timeout(&state, Duration::from_secs(1))
+                .await
+                .unwrap_err(),
+            "Failed to initialize COM"
+        );
     }
 
     #[tokio::test]

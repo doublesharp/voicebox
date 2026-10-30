@@ -33,7 +33,10 @@ pub async fn start_capture(
         unsafe {
             let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
             if hr.is_err() {
-                eprintln!("Failed to initialize COM: {:?}", hr);
+                super::record_windows_capture_error(
+                    &error_arc,
+                    format!("Failed to initialize COM: {:?}", hr),
+                );
                 return;
             }
         }
@@ -86,7 +89,10 @@ pub async fn start_capture(
         let (_def_period, min_period) = match audio_client.get_device_period() {
             Ok(periods) => periods,
             Err(e) => {
-                eprintln!("Failed to get device period: {}", e);
+                super::record_windows_capture_error(
+                    &error_arc,
+                    format!("Failed to get device period: {}", e),
+                );
                 return;
             }
         };
@@ -110,7 +116,10 @@ pub async fn start_capture(
         let h_event = match audio_client.set_get_eventhandle() {
             Ok(event) => event,
             Err(e) => {
-                eprintln!("Failed to set event handle: {}", e);
+                super::record_windows_capture_error(
+                    &error_arc,
+                    format!("Failed to set event handle: {}", e),
+                );
                 return;
             }
         };
@@ -171,7 +180,11 @@ pub async fn start_capture(
                                 }
                             }
                             Err(e) => {
-                                eprintln!("Error reading from device: {}", e);
+                                super::record_windows_capture_error(
+                                    &error_arc,
+                                    format!("Error reading from device: {}", e),
+                                );
+                                break;
                             }
                         }
                     }
@@ -180,7 +193,11 @@ pub async fn start_capture(
                     // Exclusive mode - handle differently if needed
                 }
                 Err(e) => {
-                    eprintln!("Error getting next packet size: {}", e);
+                    super::record_windows_capture_error(
+                        &error_arc,
+                        format!("Error getting next packet size: {}", e),
+                    );
+                    break;
                 }
             }
 
@@ -191,7 +208,12 @@ pub async fn start_capture(
         }
 
         // Stop the stream when done
-        audio_client.stop_stream().ok();
+        if let Err(e) = audio_client.stop_stream() {
+            super::record_windows_capture_error(
+                &error_arc,
+                format!("Failed to stop audio stream: {}", e),
+            );
+        }
     });
 
     // Each timer only owns a weak reference to its own capture's stop signal.
