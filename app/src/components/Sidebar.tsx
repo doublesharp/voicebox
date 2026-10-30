@@ -4,14 +4,16 @@ import {
   Box,
   Captions,
   FolderOpen,
+  Keyboard,
   type LucideIcon,
   Mic,
-  Keyboard,
+  PanelLeftClose,
+  PanelLeftOpen,
   Settings,
   Volume2,
   Wand2,
 } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import voiceboxLogo from '@/assets/voicebox-ds-icon.png';
 import { Hint } from '@/components/ui/Hint';
@@ -23,6 +25,11 @@ import { version } from '../../package.json';
 
 interface SidebarProps {
   isMacOS?: boolean;
+  desktop?: boolean;
+  collapsed?: boolean;
+  onToggle?: () => void;
+  width?: number;
+  onResize?: (width: number) => void;
 }
 type NavItem = { path: string; icon: LucideIcon; labelKey?: string; label?: string };
 const createItems: NavItem[] = [
@@ -38,8 +45,17 @@ const toolItems: NavItem[] = [
 const stories: NavItem = { path: '/stories', icon: AudioLines, labelKey: 'nav.stories' };
 const settings: NavItem = { path: '/settings', icon: Settings, labelKey: 'nav.settings' };
 
-export function Sidebar({ isMacOS }: SidebarProps) {
+export function Sidebar({
+  isMacOS,
+  desktop = false,
+  collapsed = false,
+  onToggle,
+  width = 196,
+  onResize,
+}: SidebarProps) {
   const { t } = useTranslation();
+  const dragging = useRef<number | null>(null);
+  const resize = (value: number) => onResize?.(Math.max(160, Math.min(280, value)));
   const path = useRouterState({ select: (state) => state.location.pathname });
   const platform = usePlatform();
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>(platform.updater.getStatus());
@@ -72,8 +88,23 @@ export function Sidebar({ isMacOS }: SidebarProps) {
         isMacOS && 'pt-14',
       )}
     >
+      {desktop && (
+        <div className="app-rail-header">
+          <span className="app-rail-heading">Voicebox</span>
+          <button
+            type="button"
+            className="app-rail-toggle"
+            aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            aria-expanded={!collapsed}
+            aria-controls="desktop-sidebar-navigation"
+            onClick={onToggle}
+          >
+            {collapsed ? <PanelLeftOpen size={17} /> : <PanelLeftClose size={17} />}
+          </button>
+        </div>
+      )}
       <div
-        className="px-3 mb-2 shrink-0 flex justify-center"
+        className={cn('px-3 mb-2 shrink-0 flex justify-center', desktop && 'hidden')}
         title={`${APP_BRANDING.name} · ${APP_BRANDING.edition}`}
       >
         <img
@@ -82,7 +113,11 @@ export function Sidebar({ isMacOS }: SidebarProps) {
           className="sidebar-logo w-12 h-12 object-contain"
         />
       </div>
-      <nav aria-label="Main navigation" className="flex flex-col gap-4 px-2">
+      <nav
+        id={desktop ? 'desktop-sidebar-navigation' : undefined}
+        aria-label="Main navigation"
+        className="flex flex-col gap-4 px-2"
+      >
         <div className="flex flex-col gap-1">
           <span className="app-rail-group-label">Create</span>
           {createItems.map((tab) => (
@@ -115,7 +150,7 @@ export function Sidebar({ isMacOS }: SidebarProps) {
         </Hint>
         {item(settings)}
         <div className="flex flex-col items-center gap-1.5">
-          <span className="text-[10px] text-muted-foreground/50">v{version}</span>
+          {!desktop && <span className="text-[10px] text-muted-foreground/50">v{version}</span>}
           {updateStatus.available && (
             <Link
               to="/settings"
@@ -126,6 +161,51 @@ export function Sidebar({ isMacOS }: SidebarProps) {
           )}
         </div>
       </div>
+      {desktop && !collapsed && (
+        <hr
+          className="app-rail-resizer"
+          tabIndex={0}
+          aria-label="Resize sidebar"
+          aria-controls="desktop-sidebar-navigation"
+          aria-orientation="vertical"
+          aria-valuemin={160}
+          aria-valuemax={280}
+          aria-valuenow={width}
+          onPointerDown={(event) => {
+            if (event.button !== 0) return;
+            dragging.current = event.pointerId;
+            event.currentTarget.setPointerCapture(event.pointerId);
+          }}
+          onPointerMove={(event) => {
+            if (dragging.current === event.pointerId) resize(event.clientX);
+          }}
+          onPointerUp={(event) => {
+            if (dragging.current === event.pointerId) dragging.current = null;
+          }}
+          onPointerCancel={() => {
+            dragging.current = null;
+          }}
+          onLostPointerCapture={() => {
+            dragging.current = null;
+          }}
+          onKeyDown={(event) => {
+            const next =
+              event.key === 'ArrowLeft'
+                ? width - 10
+                : event.key === 'ArrowRight'
+                  ? width + 10
+                  : event.key === 'Home'
+                    ? 160
+                    : event.key === 'End'
+                      ? 280
+                      : null;
+            if (next !== null) {
+              event.preventDefault();
+              resize(next);
+            }
+          }}
+        />
+      )}
     </aside>
   );
 }

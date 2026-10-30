@@ -10,6 +10,13 @@ Object.defineProperty(globalThis, 'navigator', {
 });
 const restored: Array<Record<string, unknown>> = [];
 let downloads: Array<{ model_name: string }> = [];
+let desktopPlatform = false;
+mock.module('../src/platform/PlatformContext', () => ({
+  usePlatform: () => ({ metadata: { isTauri: desktopPlatform } }),
+}));
+mock.module('../src/components/DesktopToolbar', () => ({
+  DesktopToolbar: () => <div data-desktop-toolbar />,
+}));
 const Frame = ({ children }: { children: ReactNode }) => <div data-frame="app">{children}</div>;
 const Studio = ({ children }: { children: ReactNode }) => <div data-frame="studio">{children}</div>;
 const page = (name: string) => () => <div data-page={name}>{name}</div>;
@@ -17,7 +24,25 @@ mock.module('../src/components/AppFrame/AppFrame', () => ({ AppFrame: Frame }));
 mock.module('../src/features/studio/StudioFrame', () => ({ StudioFrame: Studio }));
 mock.module('../src/components/KeyboardShortcuts', () => ({ KeyboardShortcuts: () => null }));
 mock.module('../src/components/Sidebar', () => ({
-  Sidebar: ({ isMacOS }: { isMacOS: boolean }) => <div data-sidebar-mac={isMacOS} />,
+  Sidebar: ({
+    isMacOS,
+    desktop,
+    collapsed,
+    onToggle,
+  }: {
+    isMacOS: boolean;
+    desktop: boolean;
+    collapsed: boolean;
+    onToggle: () => void;
+  }) => (
+    <button
+      type="button"
+      data-sidebar-mac={isMacOS}
+      data-desktop={desktop}
+      data-collapsed={collapsed}
+      onClick={onToggle}
+    />
+  ),
 }));
 mock.module('../src/components/ui/toaster', () => ({ Toaster: () => null }));
 mock.module('../src/components/MainEditor/MainEditor', () => ({ MainEditor: page('generate') }));
@@ -147,3 +172,59 @@ test('non-Mac shell does not restore nonexistent downloads', async () => {
   expect(restored).toHaveLength(0);
   await act(async () => view.unmount());
 });
+
+for (const [os, platform, userAgent] of [
+  ['macos', 'MacIntel', 'Macintosh'],
+  ['windows', 'Win32', 'Windows'],
+] as const) {
+  test(`${os} desktop router retains sidebar state and routes native menu requests`, async () => {
+    const oldWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+    const oldStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+    const target = new EventTarget();
+    const saved = new Map([['voicebox-desktop:sidebar-width', '220']]);
+    Object.defineProperty(globalThis, 'window', { configurable: true, value: target });
+    Object.defineProperty(globalThis, 'localStorage', {
+      configurable: true,
+      value: {
+        getItem: (key: string) => saved.get(key) ?? null,
+        setItem: (key: string, value: string) => saved.set(key, value),
+      },
+    });
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: { platform, userAgent },
+    });
+    desktopPlatform = true;
+    router.update({ history: createMemoryHistory({ initialEntries: ['/'] }) });
+    let view!: ReactTestRenderer;
+    try {
+      await act(async () => {
+        await router.load();
+        view = create(<RouterProvider router={router} />);
+      });
+      const shell = view.root.findByProps({ className: 'app-shell' });
+      expect(shell.props['data-desktop-platform']).toBe(os);
+      expect(shell.props.style['--desktop-sidebar-width']).toBe('220px');
+      await act(async () => {
+        target.dispatchEvent(new Event('voicebox:toggle-sidebar'));
+      });
+      expect(
+        view.root.findByProps({ className: 'app-shell' }).props['data-sidebar-collapsed'],
+      ).toBe(true);
+      expect(saved.get('voicebox-desktop:sidebar-collapsed')).toBe('true');
+      await act(async () => {
+        target.dispatchEvent(new CustomEvent('voicebox:menu-navigate', { detail: '/voices' }));
+        await router.load();
+        view.update(<RouterProvider router={router} />);
+      });
+      expect(router.state.location.pathname).toBe('/voices');
+    } finally {
+      await act(async () => view?.unmount());
+      desktopPlatform = false;
+      if (oldWindow) Object.defineProperty(globalThis, 'window', oldWindow);
+      else Reflect.deleteProperty(globalThis, 'window');
+      if (oldStorage) Object.defineProperty(globalThis, 'localStorage', oldStorage);
+      else Reflect.deleteProperty(globalThis, 'localStorage');
+    }
+  });
+}

@@ -9,6 +9,7 @@ import '@/index.css';
 import { queryClient } from '@/lib/queryClient';
 import { PlatformProvider } from '@/platform/PlatformContext';
 import { tauriPlatform } from './platform';
+import { installDesktopMenu } from './platform/desktopMenu';
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
@@ -22,3 +23,13 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
     </QueryClientProvider>
   </React.StrictMode>,
 );
+
+// The dictate overlay must not replace the main window's application menu.
+const isDictate = new URLSearchParams(window.location.search).get('view') === 'dictate';
+const mac = /mac/i.test(navigator.platform);
+const windows = /windows/i.test(navigator.userAgent);
+if (!isDictate && (mac || windows)) {
+  void installDesktopMenu(mac).catch((error) =>
+    console.error('Could not install desktop menu:', error),
+  );
+}

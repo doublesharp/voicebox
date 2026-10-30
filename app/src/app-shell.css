@@ -146,3 +146,183 @@
     display: block;
   }
 }
+
+/* Desktop navigation stays compact and consistent across all workspaces. */
+.app-shell[data-desktop="true"] {
+  --app-rail-width: var(--desktop-sidebar-width, 196px);
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+.app-shell[data-desktop="true"][data-sidebar-collapsed="true"] {
+  --app-rail-width: 60px;
+}
+.app-shell[data-desktop="true"] .app-rail {
+  gap: 10px;
+}
+.app-shell[data-desktop="true"] .app-rail-header {
+  min-height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 12px;
+  gap: 8px;
+}
+.app-shell[data-desktop="true"] .app-rail-heading {
+  overflow: hidden;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
+}
+.app-shell[data-desktop="true"] .app-rail-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 30px;
+  height: 30px;
+  border-radius: 6px;
+  color: hsl(var(--muted-foreground));
+}
+.app-shell[data-desktop="true"] .app-rail-toggle:hover {
+  background: hsl(var(--muted));
+  color: hsl(var(--foreground));
+}
+.app-shell[data-desktop="true"] .app-rail-toggle:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: 2px;
+}
+.app-shell[data-desktop="true"] .app-rail-link {
+  min-height: 34px;
+  justify-content: flex-start;
+  gap: 10px;
+  padding-inline: 10px;
+  border-radius: 6px;
+}
+.app-shell[data-desktop="true"] .app-rail-link svg {
+  width: 17px;
+  height: 17px;
+}
+.app-shell[data-desktop="true"] .app-rail-label,
+.app-shell[data-desktop="true"] .app-rail-group-label {
+  display: block;
+}
+.app-shell[data-desktop="true"] .app-rail-group-label {
+  padding-inline: 10px;
+  text-transform: none;
+  letter-spacing: normal;
+  font-size: 11px;
+  font-weight: 600;
+}
+.app-shell[data-desktop="true"] .app-rail-link[aria-current="page"] {
+  background: hsl(var(--accent) / 0.16);
+  box-shadow: none;
+}
+.app-shell[data-desktop="true"] .app-rail-link[aria-current="page"]::before {
+  display: none;
+}
+.app-shell[data-desktop="true"] .app-rail-nested {
+  display: block;
+  padding-left: 12px;
+}
+.app-shell[data-desktop="true"][data-sidebar-collapsed="true"] .app-rail-heading,
+.app-shell[data-desktop="true"][data-sidebar-collapsed="true"] .app-rail-label,
+.app-shell[data-desktop="true"][data-sidebar-collapsed="true"] .app-rail-group-label {
+  display: none;
+}
+.app-shell[data-desktop="true"][data-sidebar-collapsed="true"] .app-rail-header {
+  justify-content: center;
+  padding: 0;
+}
+.app-shell[data-desktop="true"][data-sidebar-collapsed="true"] .app-rail-link {
+  justify-content: center;
+  padding-inline: 0;
+}
+.app-shell[data-desktop="true"][data-sidebar-collapsed="true"] .app-rail-nested {
+  padding-left: 0;
+}
+@media (forced-colors: active) {
+  .app-shell[data-desktop="true"] .app-rail-link[aria-current="page"] {
+    outline: 2px solid Highlight;
+    outline-offset: -2px;
+  }
+}
+.desktop-toolbar {
+  display: flex;
+  flex: 0 0 36px;
+  align-items: center;
+  justify-content: space-between;
+  min-width: 0;
+  padding: 0 18px;
+  border-bottom: 1px solid hsl(var(--border));
+  background: hsl(var(--background));
+}
+.desktop-toolbar-leading {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 6px;
+}
+.desktop-toolbar-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 600;
+  color: hsl(var(--muted-foreground));
+}
+.desktop-toolbar-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  color: hsl(var(--muted-foreground));
+}
+.desktop-toolbar-button:hover {
+  background: hsl(var(--muted));
+  color: hsl(var(--foreground));
+}
+.desktop-toolbar-button:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: 1px;
+}
+
+.app-rail-resizer {
+  border: 0;
+  margin: 0;
+  position: absolute;
+  z-index: 1;
+  top: 0;
+  bottom: 0;
+  right: 0;
+  width: 6px;
+  cursor: col-resize;
+  touch-action: none;
+}
+.app-rail-resizer:hover,
+.app-rail-resizer:focus-visible {
+  background: hsl(var(--ring) / 0.5);
+  outline: none;
+}
+
+/* Shared controls retain their web styling outside the desktop shell. */
+.app-shell[data-desktop="true"] .ui-button,
+.app-shell[data-desktop="true"] .ui-input,
+.app-shell[data-desktop="true"] .desktop-list-search {
+  border-radius: 6px;
+  box-shadow: none;
+}
+.app-shell[data-desktop="true"] .desktop-list-search {
+  height: 32px;
+}
+.app-shell[data-desktop="true"] * {
+  scrollbar-width: auto;
+}
+.app-shell[data-desktop="true"] *::-webkit-scrollbar {
+  display: initial;
+}
+
+.app-shell[data-desktop="true"] .desktop-list-search:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: 1px;
+}

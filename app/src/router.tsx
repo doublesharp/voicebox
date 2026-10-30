@@ -5,27 +5,72 @@ import {
   lazyRouteComponent,
   Outlet,
   redirect,
+  useNavigate,
   useRouterState,
 } from '@tanstack/react-router';
-import { useEffect, useRef } from 'react';
+import { type CSSProperties, useEffect, useRef, useState } from 'react';
 import './app-shell.css';
 import { AppFrame } from '@/components/AppFrame/AppFrame';
+import { DesktopToolbar } from '@/components/DesktopToolbar';
 import { KeyboardShortcuts } from '@/components/KeyboardShortcuts';
 import { MainEditor } from '@/components/MainEditor/MainEditor';
 import { Sidebar } from '@/components/Sidebar';
 import { Toaster } from '@/components/ui/toaster';
 import { StudioFrame } from '@/features/studio/StudioFrame';
 import { isProjectWorkspacePath, observeGlobalPlayerHeight } from '@/lib/constants/ui';
+import { attachDesktopCommands } from '@/lib/desktopCommands';
 import { useGenerationProgress } from '@/lib/hooks/useGenerationProgress';
 import { useModelDownloadToast } from '@/lib/hooks/useModelDownloadToast';
 import { MODEL_DISPLAY_NAMES, useRestoreActiveTasks } from '@/lib/hooks/useRestoreActiveTasks';
+import { usePlatform } from '@/platform/PlatformContext';
 
 // Simple platform check that works in both web and Tauri
-const isMacOS = () => navigator.platform.toLowerCase().includes('mac');
+const isMacOS = () => typeof navigator !== 'undefined' && /mac/i.test(navigator.platform);
+const isWindows = () => typeof navigator !== 'undefined' && /win/i.test(navigator.userAgent);
 
 // Root layout component
 function RootLayout() {
   const shellRef = useRef<HTMLDivElement>(null);
+  const { metadata } = usePlatform();
+  const desktop = metadata.isTauri && (isMacOS() || isWindows());
+  const navigate = useNavigate();
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem('voicebox-desktop:sidebar-collapsed') === 'true';
+    } catch {
+      return false;
+    }
+  });
+  const [sidebarWidth, setSidebarWidth] = useState(() => {
+    try {
+      const saved = Number(localStorage.getItem('voicebox-desktop:sidebar-width'));
+      return saved >= 160 && saved <= 280 ? saved : 196;
+    } catch {
+      return 196;
+    }
+  });
+  const toggleSidebar = () => setSidebarCollapsed((previous) => !previous);
+  useEffect(() => {
+    if (!desktop) return;
+    try {
+      localStorage.setItem('voicebox-desktop:sidebar-collapsed', String(sidebarCollapsed));
+      localStorage.setItem('voicebox-desktop:sidebar-width', String(sidebarWidth));
+    } catch {
+      /* Keep the preference for this session if storage is unavailable. */
+    }
+  }, [desktop, sidebarCollapsed, sidebarWidth]);
+  useEffect(() => {
+    if (!desktop) return;
+    return attachDesktopCommands(
+      window,
+      (path) => {
+        void navigate({ to: path }).catch((error) =>
+          console.error('Could not open menu destination:', error),
+        );
+      },
+      () => setSidebarCollapsed((previous) => !previous),
+    );
+  }, [desktop, navigate]);
   const isProjectWorkspace = useRouterState({
     select: (state) => isProjectWorkspacePath(state.location.pathname),
   });
@@ -46,21 +91,37 @@ function RootLayout() {
   const Frame = isStudio ? StudioFrame : AppFrame;
 
   return (
-    <div ref={shellRef} className="app-shell" data-project-workspace={isProjectWorkspace}>
+    <div
+      ref={shellRef}
+      className="app-shell"
+      data-project-workspace={isProjectWorkspace}
+      style={{ '--desktop-sidebar-width': `${sidebarWidth}px` } as CSSProperties}
+      data-desktop={desktop}
+      data-sidebar-collapsed={desktop && sidebarCollapsed}
+      data-desktop-platform={desktop ? (isMacOS() ? 'macos' : 'windows') : undefined}
+    >
       <Frame>
         <KeyboardShortcuts />
         <div className="flex flex-1 min-h-0 overflow-hidden">
-          <Sidebar isMacOS={isMacOS()} />
+          <Sidebar
+            isMacOS={isMacOS()}
+            desktop={desktop}
+            collapsed={sidebarCollapsed}
+            onToggle={toggleSidebar}
+            width={sidebarWidth}
+            onResize={setSidebarWidth}
+          />
 
           <main
             className="flex-1 overflow-hidden flex flex-col"
             style={{ marginLeft: 'var(--app-rail-width)' }}
           >
+            {desktop && <DesktopToolbar />}
             <div
               className={
                 isStudio
-                  ? 'mx-auto w-full px-2 sm:px-4 max-w-[1800px] h-full overflow-hidden flex flex-col'
-                  : 'container mx-auto px-8 max-w-[1800px] h-full overflow-hidden flex flex-col'
+                  ? `mx-auto w-full px-2 sm:px-4 max-w-[1800px] ${desktop ? 'flex-1 min-h-0' : 'h-full'} overflow-hidden flex flex-col`
+                  : `container mx-auto px-8 max-w-[1800px] ${desktop ? 'flex-1 min-h-0' : 'h-full'} overflow-hidden flex flex-col`
               }
             >
               <Outlet />

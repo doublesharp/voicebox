@@ -77,7 +77,7 @@ export function ListPaneSearch({ value, onChange, placeholder, className }: List
         placeholder={placeholder}
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        className="h-9 text-sm rounded-full focus-visible:ring-0 focus-visible:ring-offset-0"
+        className="desktop-list-search h-9 text-sm rounded-full focus-visible:ring-0 focus-visible:ring-offset-0"
       />
     </div>
   );
