@@ -1388,23 +1388,37 @@ fn finish_main_window_close<R: tauri::Runtime>(window: &tauri::Window<R>) {
     }
 }
 
+const CLOSE_IDLE: u8 = 0;
+const CLOSE_CLEANUP: u8 = 1;
+const CLOSE_READY: u8 = 2;
+
 fn handle_window_event<R: tauri::Runtime>(
     window: &tauri::Window<R>,
     event: &WindowEvent,
-    closing: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    closing: std::sync::Arc<std::sync::atomic::AtomicU8>,
 ) {
     if window.label() != "main" {
         return;
     }
+    if matches!(event, WindowEvent::Destroyed) {
+        closing.store(CLOSE_IDLE, std::sync::atomic::Ordering::SeqCst);
+        return;
+    }
     if let WindowEvent::CloseRequested { api, .. } = event {
-        // If we're already in the close flow, let it proceed
-        if closing.load(std::sync::atomic::Ordering::SeqCst) {
-            return;
+        match closing.compare_exchange(
+            CLOSE_IDLE,
+            CLOSE_CLEANUP,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        ) {
+            Ok(_) => api.prevent_close(),
+            Err(CLOSE_CLEANUP) => {
+                // Repeated user close requests must not bypass pending cleanup.
+                api.prevent_close();
+                return;
+            }
+            Err(_) => return, // Cleanup finished; let the final close proceed.
         }
-        closing.store(true, std::sync::atomic::Ordering::SeqCst);
-
-        // Prevent automatic close so frontend can clean up
-        api.prevent_close();
 
         // Emit event to frontend to check setting and stop server if needed
         let app_handle = window.app_handle();
@@ -1424,6 +1438,7 @@ fn handle_window_event<R: tauri::Runtime>(
             Ok(id) => id,
             Err(e) => {
                 eprintln!("Failed to emit window-close-requested event: {}", e);
+                closing.store(CLOSE_READY, std::sync::atomic::Ordering::SeqCst);
                 finish_main_window_close(window);
                 return;
             }
@@ -1431,17 +1446,16 @@ fn handle_window_event<R: tauri::Runtime>(
 
         tauri::async_runtime::spawn(async move {
             tokio::select! {
-                _ = rx.recv() => {
-                    println!("Frontend cleanup complete, closing");
-                    finish_main_window_close(&window_for_close);
-                }
+                _ = rx.recv() => println!("Frontend cleanup complete, closing"),
                 _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {
                     eprintln!("Window close timeout, closing anyway");
-                    finish_main_window_close(&window_for_close);
                 }
             }
             window_for_close.unlisten(listener_id);
-            closing_for_timeout.store(false, std::sync::atomic::Ordering::SeqCst);
+            // close() posts another close request to the native event loop.
+            // Keep it authorized until the window's Destroyed event arrives.
+            closing_for_timeout.store(CLOSE_READY, std::sync::atomic::Ordering::SeqCst);
+            finish_main_window_close(&window_for_close);
         });
     }
 }
@@ -1609,7 +1623,7 @@ pub fn run() {
             update_chord_bindings
         ])
         .on_window_event({
-            let closing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let closing = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(CLOSE_IDLE));
             move |window, event| handle_window_event(window, event, closing.clone())
         })
         .build(tauri::generate_context!())
@@ -2686,7 +2700,7 @@ mod command_ipc_regression_tests {
 #[cfg(test)]
 mod window_lifecycle_integration_tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
     #[test]
     fn closing_dictate_window_does_not_request_main_server_cleanup() {
@@ -2704,7 +2718,7 @@ mod window_lifecycle_integration_tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let event: WindowEvent =
             tauri_runtime::window::WindowEvent::CloseRequested { signal_tx: tx }.into();
-        handle_window_event(&window, &event, Arc::new(AtomicBool::new(false)));
+        handle_window_event(&window, &event, Arc::new(AtomicU8::new(CLOSE_IDLE)));
         assert_eq!(
             requests.load(Ordering::SeqCst),
             0,
@@ -2733,7 +2747,7 @@ mod window_lifecycle_integration_tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let event: WindowEvent =
             tauri_runtime::window::WindowEvent::CloseRequested { signal_tx: tx }.into();
-        handle_window_event(&window, &event, Arc::new(AtomicBool::new(false)));
+        handle_window_event(&window, &event, Arc::new(AtomicU8::new(CLOSE_IDLE)));
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         assert_eq!(rx.try_recv().unwrap(), true);
     }
@@ -2753,8 +2767,75 @@ mod window_lifecycle_integration_tests {
         handle_window_event(
             &window,
             &WindowEvent::Focused(false),
-            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU8::new(CLOSE_IDLE)),
         );
         assert_eq!(requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn repeated_close_is_blocked_while_frontend_cleanup_is_pending() {
+        let app = tauri::test::mock_app();
+        let _webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        let window = app.get_window("main").unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = requests.clone();
+        app.listen("window-close-requested", move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+        });
+        let closing = Arc::new(AtomicU8::new(CLOSE_IDLE));
+        for _ in 0..2 {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let event: WindowEvent =
+                tauri_runtime::window::WindowEvent::CloseRequested { signal_tx: tx }.into();
+            handle_window_event(&window, &event, closing.clone());
+            assert_eq!(
+                rx.try_recv(),
+                Ok(true),
+                "close must be prevented until cleanup completes"
+            );
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        app.emit("window-close-allowed", ()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn acknowledgement_allows_the_final_close_and_destroy_resets_the_gate() {
+        let app = tauri::test::mock_app();
+        let _webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        let window = app.get_window("main").unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = requests.clone();
+        app.listen("window-close-requested", move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+        });
+        let closing = Arc::new(AtomicU8::new(CLOSE_IDLE));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let first: WindowEvent =
+            tauri_runtime::window::WindowEvent::CloseRequested { signal_tx: tx }.into();
+        handle_window_event(&window, &first, closing.clone());
+        assert_eq!(rx.try_recv(), Ok(true));
+        app.emit("window-close-allowed", ()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while closing.load(Ordering::SeqCst) != CLOSE_READY {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("cleanup acknowledgement did not authorize close");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let final_close: WindowEvent =
+            tauri_runtime::window::WindowEvent::CloseRequested { signal_tx: tx }.into();
+        handle_window_event(&window, &final_close, closing.clone());
+        assert!(
+            rx.try_recv().is_err(),
+            "final close should not be prevented"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        handle_window_event(&window, &WindowEvent::Destroyed, closing.clone());
+        assert_eq!(closing.load(Ordering::SeqCst), CLOSE_IDLE);
     }
 }
