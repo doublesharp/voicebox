@@ -473,6 +473,18 @@ where
     Ok(compatible.then_some(binary))
 }
 
+async fn probe_gpu_candidate(
+    path: &std::path::Path,
+    directory: &std::path::Path,
+    app_version: &str,
+    pin: Option<&str>,
+    permit: &server_startup::StartPermit<'_>,
+) -> Result<Option<std::path::PathBuf>, String> {
+    check_gpu_backend(path.to_path_buf(), path.exists(), app_version, pin, permit, || {
+        probe_binary_version(path, directory)
+    }).await
+}
+
 #[command]
 async fn start_server<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
@@ -673,14 +685,22 @@ async fn start_server_with<R: tauri::Runtime>(
     let suffix = if cfg!(windows) { ".exe" } else { "" };
     let rocm_path = rocm_dir.join(format!("voicebox-server-rocm{suffix}"));
     let cuda_path = cuda_dir.join(format!("voicebox-server-cuda{suffix}"));
-    let rocm_binary = check_gpu_backend(
-        rocm_path.clone(), rocm_path.exists(), &app_version, backend_override.as_deref(),
-        &_start_permit, || probe_binary_version(&rocm_path, &rocm_dir),
-    ).await?;
-    let cuda_binary = check_gpu_backend(
-        cuda_path.clone(), cuda_path.exists(), &app_version, backend_override.as_deref(),
-        &_start_permit, || probe_binary_version(&cuda_path, &cuda_dir),
-    ).await?;
+    let pin = backend_override.as_deref();
+    // A compatible pinned backend excludes the other GPU from launch, so do
+    // not execute its version probe. If the pin is stale, probe the fallback.
+    let (rocm_binary, cuda_binary) = if pin == Some("cuda") {
+        let cuda = probe_gpu_candidate(&cuda_path, &cuda_dir, &app_version, pin, &_start_permit).await?;
+        let rocm = if cuda.is_some() { None } else {
+            probe_gpu_candidate(&rocm_path, &rocm_dir, &app_version, pin, &_start_permit).await?
+        };
+        (rocm, cuda)
+    } else {
+        let rocm = probe_gpu_candidate(&rocm_path, &rocm_dir, &app_version, pin, &_start_permit).await?;
+        let cuda = if pin == Some("rocm") && rocm.is_some() { None } else {
+            probe_gpu_candidate(&cuda_path, &cuda_dir, &app_version, pin, &_start_permit).await?
+        };
+        (rocm, cuda)
+    };
 
     #[cfg(target_os = "macos")]
     let custom_cpu = config.cpu_executable.is_some();
@@ -3604,14 +3624,66 @@ mod server_start_flow_tests {
     }
 
     #[tokio::test]
+    async fn pinned_gpu_only_probes_fallback_if_the_pin_is_missing_or_incompatible() {
+        for (pin, rocm_version, cuda_version, expected, expected_probes) in [
+            ("cuda", Some("0.6.0"), Some("0.6.0"), "cuda", (false, true)),
+            ("rocm", Some("0.6.0"), Some("0.6.0"), "rocm", (true, false)),
+            ("cuda", Some("0.6.0"), None, "rocm", (true, false)),
+            ("cuda", Some("0.6.0"), Some("0.5.0"), "rocm", (true, true)),
+            ("rocm", Some("0.5.0"), Some("0.6.0"), "cuda", (true, true)),
+            ("cuda", Some("0.5.0"), Some("0.5.0"), "cpu", (true, true)),
+        ] {
+            let fixture = Fixture::new("printf 'cpu\n' > \"$2/selected\"\nprintf 'INFO: Uvicorn running on http://127.0.0.1:%s\n' \"$4\" >&2\nexec /bin/sleep 5");
+            let rocm = fixture.dir.join("data/backends/rocm");
+            let cuda = fixture.dir.join("data/backends/cuda");
+            if let Some(version) = rocm_version { install_gpu(&fixture, "rocm", version, false); }
+            if let Some(version) = cuda_version { install_gpu(&fixture, "cuda", version, false); }
+            let app = app();
+            *app.state::<ServerState>().backend_override.lock().unwrap() = Some(pin.into());
+            let result = tokio::time::timeout(Duration::from_secs(8), start_server_with(
+                app.handle().clone(), app.state(), None, None, fixture.config(),
+            )).await.unwrap();
+            if result.is_ok() { stop_server_if_owned(app.state(), None).await.unwrap(); }
+            result.unwrap();
+            let selected = std::fs::read_to_string(fixture.dir.join("data/selected")).unwrap();
+            assert_eq!(selected.lines().next(), Some(expected), "pin={pin}");
+            assert_eq!((rocm.join("probe").exists(), cuda.join("probe").exists()), expected_probes, "pin={pin}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_pinned_probe_does_not_probe_the_other_gpu() {
+        let fixture = Fixture::new("exec /bin/sleep 5");
+        let rocm = install_gpu(&fixture, "rocm", "0.6.0", false);
+        let cuda = install_gpu(&fixture, "cuda", "0.6.0", false);
+        let executable = cuda.join("voicebox-server-cuda");
+        std::fs::write(&executable, "#!/bin/sh\nprintf started > probe-started\nexec /bin/sleep 10\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let app = app();
+        *app.state::<ServerState>().backend_override.lock().unwrap() = Some("cuda".into());
+        let handle = app.handle().clone();
+        let config = fixture.config();
+        let task = tokio::spawn(async move { start_server_with(handle.clone(), handle.state(), None, None, config).await });
+        let entered = tokio::time::timeout(Duration::from_secs(4), async {
+            while !cuda.join("probe-started").exists() { tokio::time::sleep(Duration::from_millis(5)).await; }
+        }).await;
+        if entered.is_err() { task.abort(); panic!("selected probe did not start"); }
+        app.state::<ServerState>().start_gate.cancel_and(|| ());
+        let result = tokio::time::timeout(Duration::from_secs(2), task).await.unwrap().unwrap();
+        assert!(result.unwrap_err().contains("cancelled"));
+        assert!(!rocm.join("probe").exists());
+        assert!(app.state::<ServerState>().server_pid.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn real_sidecar_selection_honors_pins_versions_and_spawn_fallback() {
         for (pin, rocm_version, remove_execute, expected, probes) in [
             (None, "0.6.0", false, "rocm", (true, true)),
-            (Some("cuda"), "0.6.0", false, "cuda", (true, true)),
+            (Some("cuda"), "0.6.0", false, "cuda", (false, true)),
             (Some("cpu"), "0.6.0", false, "cpu", (false, false)),
             (None, "0.5.0", false, "cuda", (true, true)),
             (None, "0.6.0", true, "cuda", (true, true)),
-            (Some("rocm"), "0.6.0", true, "cpu", (true, true)),
+            (Some("rocm"), "0.6.0", true, "cpu", (true, false)),
         ] {
             let fixture = Fixture::new("printf 'cpu\\n%s\\n' \"$VOICEBOX_MODELS_DIR\" > \"$2/selected\"\nprintf 'INFO: Uvicorn running on http://127.0.0.1:%s\\n' \"$4\" >&2\nexec /bin/sleep 5");
             let rocm = install_gpu(&fixture, "rocm", rocm_version, remove_execute);
@@ -3658,8 +3730,8 @@ mod server_start_flow_tests {
     async fn saved_gpu_override_selects_backend_after_restart() {
         for (saved, live, install_rocm, expected, probes) in [
             ("cpu", None, true, "cpu", (false, false)),
-            ("cuda", None, true, "cuda", (true, true)),
-            ("rocm", None, true, "rocm", (true, true)),
+            ("cuda", None, true, "cuda", (false, true)),
+            ("rocm", None, true, "rocm", (true, false)),
             ("rocm", None, false, "cuda", (false, true)),
             ("cuda", Some("cpu"), true, "cpu", (false, false)),
         ] {
