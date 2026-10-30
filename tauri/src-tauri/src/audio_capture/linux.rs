@@ -41,8 +41,8 @@ fn find_monitor_source_via_pactl() -> Option<String> {
 }
 
 /// Select the capture device: prefer an exact match against the monitor
-/// source name reported by `pactl`, then fall back to any device whose name
-/// contains "monitor". Never fall back to a microphone.
+/// source name reported by `pactl`, then fall back to recognizable output
+/// monitor names rather than arbitrary input names containing "monitor".
 fn select_capture_device(host: &cpal::Host, monitor_source: Option<&str>) -> Option<cpal::Device> {
     let devices: Vec<cpal::Device> = host.input_devices().ok()?.collect();
 
@@ -55,7 +55,7 @@ fn select_capture_device(host: &cpal::Host, monitor_source: Option<&str>) -> Opt
 /// monitor source via `pactl`, then select the matching cpal input device by
 /// name. This avoids mutating the process environment (`PULSE_SOURCE`), which
 /// is not thread-safe and would affect every thread in the process. If `pactl`
-/// is unavailable, we fall back to searching cpal device names for "monitor".
+/// is unavailable, we fall back to recognizable cpal output-monitor names.
 pub async fn start_capture(
     state: &AudioCaptureState,
     max_duration_secs: u32,
