@@ -1,6 +1,7 @@
 """Turbo qualification runner logic and failure paths with a fake model (no weights)."""
 
 import asyncio
+import dataclasses
 import hashlib
 import importlib.util
 import json
@@ -399,6 +400,36 @@ def test_unload_problems_are_collected_after_reload(settings):
     assert result["passed"] is False
     assert "adapter still loaded" in result["error"] and "VRAM not released" in result["error"]
     assert {c["name"]: c["passed"] for c in report["checks"]}["cancellation_then_admission"] is True
+
+
+def test_cancellation_check_fails_a_backend_that_admits_queued_work_before_draining(settings):
+    class SlowModel(FakeModel):
+        def generate(self, text, audio_prompt_path=None, **kwargs):
+            time.sleep(0.3)
+            return super().generate(text, audio_prompt_path, **kwargs)
+
+    factory = fake_factory()
+
+    def unserialized(*args):
+        adapter = factory(*args)
+
+        def load_sync():
+            adapter._device = "cpu"
+            adapter.model = SlowModel()
+            adapter._conditioning_model_id = f"{turbo.CHATTERBOX_TURBO_HF_REPO}@{REVISION}"
+
+        adapter._load_model_sync = load_sync
+        adapter.create_voice_prompt = turbo.ChatterboxTurboTTSBackend.create_voice_prompt.__wrapped__.__get__(adapter)
+        return adapter
+
+    report = run(settings, unserialized)
+    result = {c["name"]: c for c in report["checks"]}["cancellation_then_admission"]
+    assert result["passed"] is False
+    assert "before the in-flight worker drained" in result["error"]
+    cache.clear_voice_prompt_memory_cache()
+    serialized = run(dataclasses.replace(settings, output_root=settings.output_root.with_name("run-serialized")), fake_factory())
+    evidence = {c["name"]: c for c in serialized["checks"]}["cancellation_then_admission"]["evidence"]
+    assert evidence["queued_started_after_drain"] is True and evidence["drain_to_queued_start_s"] > 0
 
 
 def test_main_refuses_invalid_settings_before_writing(settings):

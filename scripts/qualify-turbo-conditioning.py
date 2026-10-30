@@ -88,10 +88,12 @@ class Spy:
         self.observations = []
         self.started = threading.Event()
         self.finished = threading.Event()
+        self.started_at = self.finished_at = None
         setattr(owner, attribute, self)
 
     def __call__(self, *args, **kwargs):
         self.calls += 1
+        self.started_at = time.perf_counter()
         self.started.set()
         if self.before is not None:
             self.observations.append(self.before())
@@ -103,6 +105,7 @@ class Spy:
                 raise RuntimeError("spied model was released")
             return self.function(owner, *args, **kwargs)
         finally:
+            self.finished_at = time.perf_counter()
             self.finished.set()
 
 
@@ -436,23 +439,32 @@ async def check_cancellation_then_admission(s):
     calls_before = spy.calls
     running = asyncio.create_task(s.adapter.generate(s.settings.text, s.prompt_a, seed=s.settings.seed))
     expect(await asyncio.to_thread(spy.started.wait, 120), "in-flight generation never started")
-    running.cancel()
-    queued = asyncio.create_task(s.adapter.create_voice_prompt(str(s.work_b), s.settings.reference_b_text))
-    await asyncio.sleep(0)
-    admitted_early = queued.done()
-    cancelled = False
+    # The in-flight request has finished its own encoding once model.generate
+    # starts, so from here _encoded_conditioning is the queued request's first
+    # backend work; observe whether the in-flight worker had finished by then.
+    queued_work = Spy(s.adapter, "_encoded_conditioning", before=spy.finished.is_set)
     try:
-        await running
-    except asyncio.CancelledError:
-        cancelled = True
-    expect(cancelled, "cancelled generation did not raise CancelledError")
-    expect(spy.finished.is_set(), "physical worker was not drained before the caller returned")
-    _, hit = await queued
+        running.cancel()
+        queued = asyncio.create_task(s.adapter.create_voice_prompt(str(s.work_b), s.settings.reference_b_text))
+        cancelled = False
+        try:
+            await running
+        except asyncio.CancelledError:
+            cancelled = True
+        expect(cancelled, "cancelled generation did not raise CancelledError")
+        expect(spy.finished.is_set(), "physical worker was not drained before the caller returned")
+        _, hit = await queued
+    finally:
+        del s.adapter._encoded_conditioning
+    expect(queued_work.calls == 1, f"queued request entered the encoder path {queued_work.calls} times")
+    drained_first = queued_work.observations[0]
+    drain_to_queued_start_s = queued_work.started_at - spy.finished_at
+    expect(drained_first, "queued request started backend work before the in-flight worker drained")
     expect(hit is True and spy.calls == calls_before + 1, f"queued request: hit={hit}, inference calls={spy.calls}")
     expect(s.adapter.model.conds is None, "cancelled request left conditioning installed")
     await s.generate("after_cancellation", s.prompt_b, seed=s.settings.seed)
-    return {"cancelled": cancelled, "worker_drained": True, "queued_admitted_before_drain": admitted_early,
-            "queued_hit": hit, "generation_after_cancellation": True}
+    return {"cancelled": cancelled, "worker_drained": True, "queued_started_after_drain": drained_first,
+            "drain_to_queued_start_s": drain_to_queued_start_s, "queued_hit": hit, "generation_after_cancellation": True}
 
 
 async def check_fixed_seed_cache_vs_bypass_parity(s):
