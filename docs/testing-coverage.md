@@ -109,6 +109,30 @@ python3 scripts/rust-production-coverage.py \
   > "$VOICEBOX_RUST_COVERAGE_ROOT/reports/production.json"
 ```
 
+### Silent native audio coverage
+
+On a macOS host with at least two working, uniquely identified output devices,
+the ignored `native_silent` tests exercise actual CPAL streams and Tauri IPC
+using silent samples. Run the standard command above first, then retain its
+coverage profile while adding the native tests:
+
+```sh
+TAURI_CONFIG='{"bundle":{"externalBin":[]}}' cargo llvm-cov --no-clean \
+  --manifest-path tauri/src-tauri/Cargo.toml --lib --bin voicebox --lcov \
+  --output-path "$VOICEBOX_RUST_COVERAGE_ROOT/reports/desktop-with-native.lcov" \
+  -- native_silent --ignored --test-threads=1
+python3 scripts/rust-production-coverage.py \
+  --lcov "$VOICEBOX_RUST_COVERAGE_ROOT/reports/desktop-with-native.lcov" \
+  --root "$PWD" \
+  --span-tool "$VOICEBOX_RUST_COVERAGE_ROOT/helper/debug/rust-test-spans" \
+  > "$VOICEBOX_RUST_COVERAGE_ROOT/reports/production-with-native.json"
+```
+
+This is a hardware-dependent supplement to the standard result, not the default
+CI coverage. It opens output streams on the host; the separate tests that play
+audible samples or require a running backend are not selected by this filter.
+Both LCOV runs must use the same checkout, target directory, and instrumentation.
+
 The source tree must match the one used for the LCOV run; LCOV does not record
 source hashes, so the reporter cannot verify that itself. LCOV and LLVM JSON
 can count different mapped lines and should not be compared as identical

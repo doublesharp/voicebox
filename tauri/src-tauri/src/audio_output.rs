@@ -4082,6 +4082,84 @@ mod public_lifecycle_tests {
             |event| event.contains("\"state\":\"stopped\"") && event.contains(&clip.session_id)
         ));
     }
+
+    fn two_unambiguous_outputs() -> Vec<String> {
+        let host = cpal::default_host();
+        let devices = host
+            .output_devices()
+            .expect("output device enumeration is required");
+        let names: Vec<String> = devices.filter_map(|device| device.name().ok()).collect();
+        let ids: Vec<String> = names.iter().map(|name| device_id(name)).collect();
+        let unique: Vec<String> = ids
+            .iter()
+            .filter(|id| ids.iter().filter(|other| *other == *id).count() == 1)
+            .take(2)
+            .cloned()
+            .collect();
+        assert_eq!(
+            unique.len(),
+            2,
+            "two unambiguous output devices are required"
+        );
+        unique
+    }
+
+    #[tokio::test]
+    #[ignore = "requires two working native output devices; emits silence"]
+    async fn native_silent_public_multi_output_preview_drains_every_device() {
+        let app = tauri::test::mock_app();
+        let (tx, rx) = mpsc::channel();
+        app.listen("native-audio-playback", move |event| {
+            let _ = tx.send(event.payload().to_owned());
+        });
+        let state = AudioOutputState::new();
+        let session = state
+            .start_pcm_stream(app.handle().clone(), 8000, two_unambiguous_outputs())
+            .await
+            .unwrap();
+        let (queues, _) = state.stream_queues(&session.session_id).unwrap();
+        assert_eq!(queues.lock().unwrap().len(), 2);
+        state
+            .append_pcm_stream(&session.session_id, vec![0; 8000])
+            .await
+            .unwrap();
+        state.finish_pcm_stream(&session.session_id).unwrap();
+        wait_inactive(&state).await;
+        let queues = queues.lock().unwrap();
+        assert!(queues.iter().all(|queue| queue.lock().unwrap().ended()));
+        assert!(rx
+            .try_iter()
+            .any(|event| event.contains("\"state\":\"ended\"")
+                && event.contains(&session.session_id)));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires two working native output devices; emits silence"]
+    async fn native_silent_public_multi_output_clip_completes() {
+        let app = tauri::test::mock_app();
+        let (tx, rx) = mpsc::channel();
+        app.listen("native-audio-playback", move |event| {
+            let _ = tx.send(event.payload().to_owned());
+        });
+        let state = AudioOutputState::new();
+        let session = state
+            .play_audio_to_devices(
+                app.handle().clone(),
+                silent_wav(),
+                two_unambiguous_outputs(),
+                None,
+            )
+            .await
+            .unwrap();
+        wait_inactive(&state).await;
+        assert!(rx
+            .try_iter()
+            .any(|event| event.contains("\"state\":\"ended\"")
+                && event.contains(&session.session_id)));
+        assert!(state
+            .control_playback(&session.session_id, PlaybackControl::default())
+            .is_err());
+    }
 }
 
 #[cfg(test)]
