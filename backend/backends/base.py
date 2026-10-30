@@ -363,29 +363,33 @@ def model_load_progress(
 
     tracker_context = tracker.patch_download()
     with tracker_context:
-        if not is_cached:
-            task_manager.start_download(model_name)
-            progress_manager.update_progress(
-                model_name=model_name,
-                current=0,
-                total=0,
-                filename="Connecting to HuggingFace...",
-                status="downloading",
-            )
-
         try:
+            if not is_cached:
+                task_manager.start_download(model_name)
+                progress_manager.update_progress(
+                    model_name=model_name,
+                    current=0,
+                    total=0,
+                    filename="Connecting to HuggingFace...",
+                    status="downloading",
+                )
+
             with force_offline_if_cached(is_cached, model_name):
                 yield tracker_context
-        except Exception as e:
-            # Report error to both managers
-            progress_manager.mark_error(model_name, str(e))
-            task_manager.error_download(model_name, str(e))
-            raise
-        else:
-            # Only mark complete if we were tracking a download
             if not is_cached:
                 progress_manager.mark_complete(model_name)
                 task_manager.complete_download(model_name)
+        except Exception as e:
+            # Reporting must not hide the model error or prevent task cleanup.
+            try:
+                progress_manager.mark_error(model_name, str(e))
+            except Exception:
+                logger.exception("Could not report model progress failure for %s", model_name)
+            try:
+                task_manager.error_download(model_name, str(e))
+            except Exception:
+                logger.exception("Could not mark model download failed for %s", model_name)
+            raise
 
 
 def patch_chatterbox_f32(model) -> None:

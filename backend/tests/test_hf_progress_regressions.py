@@ -158,3 +158,64 @@ def test_model_load_reports_completion_and_failure_with_patch_cleanup(monkeypatc
     assert ('complete_download' in names) is (not cached and not fail)
     assert ('mark_error' in names) is fail
     assert ('error_download' in names) is fail
+
+
+def test_failed_progress_initialization_marks_started_download_failed(monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from backend.backends import base
+    from backend.utils.tasks import TaskManager
+    tasks = TaskManager()
+    errors = []
+    def fail(**_kwargs):
+        raise RuntimeError('cannot initialize progress')
+    progress = SimpleNamespace(update_progress=fail, mark_error=lambda name, error: errors.append((name, error)))
+    monkeypatch.setattr(base, 'get_task_manager', lambda: tasks)
+    monkeypatch.setattr(base, 'get_progress_manager', lambda: progress)
+    monkeypatch.setattr(base, 'HFProgressTracker', lambda *args, **kwargs: SimpleNamespace(patch_download=nullcontext))
+    with pytest.raises(RuntimeError, match='cannot initialize progress'):
+        with base.model_load_progress('voice', is_cached=False):
+            pytest.fail('model loading should not run')
+    assert tasks.get_pending_downloads() == []
+    assert tasks.get_active_downloads()[0].status == 'error'
+    assert errors == [('voice', 'cannot initialize progress')]
+
+
+def test_failure_reporting_cannot_hide_model_error_or_skip_task_cleanup(monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from backend.backends import base
+    from backend.utils.tasks import TaskManager
+    tasks = TaskManager()
+    def fail_reporting(*_args):
+        raise RuntimeError('reporter failed')
+    progress = SimpleNamespace(update_progress=lambda **_kwargs: None, mark_error=fail_reporting)
+    monkeypatch.setattr(base, 'get_task_manager', lambda: tasks)
+    monkeypatch.setattr(base, 'get_progress_manager', lambda: progress)
+    monkeypatch.setattr(base, 'HFProgressTracker', lambda *args, **kwargs: SimpleNamespace(patch_download=nullcontext))
+    monkeypatch.setattr(base, 'force_offline_if_cached', lambda *_args: nullcontext())
+    with pytest.raises(ValueError, match='model failed'):
+        with base.model_load_progress('voice', is_cached=False):
+            raise ValueError('model failed')
+    assert tasks.get_pending_downloads() == []
+    assert tasks.get_active_downloads()[0].error == 'model failed'
+
+
+def test_failed_completion_reporting_does_not_leave_download_pending(monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from backend.backends import base
+    from backend.utils.tasks import TaskManager
+    tasks = TaskManager()
+    def fail_completion(_name):
+        raise RuntimeError('completion report failed')
+    progress = SimpleNamespace(update_progress=lambda **_kwargs: None, mark_complete=fail_completion, mark_error=lambda *_args: None)
+    monkeypatch.setattr(base, 'get_task_manager', lambda: tasks)
+    monkeypatch.setattr(base, 'get_progress_manager', lambda: progress)
+    monkeypatch.setattr(base, 'HFProgressTracker', lambda *args, **kwargs: SimpleNamespace(patch_download=nullcontext))
+    monkeypatch.setattr(base, 'force_offline_if_cached', lambda *_args: nullcontext())
+    with pytest.raises(RuntimeError, match='completion report failed'):
+        with base.model_load_progress('voice', is_cached=False):
+            pass
+    assert tasks.get_pending_downloads() == []
+    assert tasks.get_active_downloads()[0].status == 'error'
