@@ -503,8 +503,15 @@ fn validate_wave_frame_alignment(data: &[u8]) -> Result<(), String> {
             } else {
                 format
             };
-            if matches!(subtype, 1 | 3) && align != 0 {
-                pcm_block_align = Some(u32::from(align));
+            if matches!(subtype, 1 | 3) {
+                let channels = u16::from_le_bytes([chunk[2], chunk[3]]);
+                let bits_per_sample = u16::from_le_bytes([chunk[14], chunk[15]]);
+                let sample_bytes = u32::from(bits_per_sample).div_ceil(8);
+                let expected = u32::from(channels) * sample_bytes;
+                if expected == 0 || u32::from(align) != expected {
+                    return Err("Invalid WAV PCM frame alignment".into());
+                }
+                pcm_block_align = Some(expected);
             }
         }
         let Some(next) = end.checked_add((size & 1) as usize) else {
@@ -1079,6 +1086,57 @@ mod tests {
         assert!((samples[2] + 0.5).abs() < 0.0001);
         assert!(decode_audio(b"not audio".to_vec()).is_err());
         assert!(decode_audio(wav(&[], 1, 24000)).is_err());
+    }
+
+    #[test]
+    fn aligned_pcm_and_float_wav_remain_playable() {
+        for (bits, format) in [
+            (16, hound::SampleFormat::Int),
+            (24, hound::SampleFormat::Int),
+            (32, hound::SampleFormat::Float),
+        ] {
+            let mut cursor = Cursor::new(Vec::new());
+            {
+                let spec = hound::WavSpec {
+                    channels: 2,
+                    sample_rate: 24000,
+                    bits_per_sample: bits,
+                    sample_format: format,
+                };
+                let mut writer = hound::WavWriter::new(&mut cursor, spec).unwrap();
+                match format {
+                    hound::SampleFormat::Float => {
+                        writer.write_sample(0.5_f32).unwrap();
+                        writer.write_sample(-0.5_f32).unwrap();
+                    }
+                    hound::SampleFormat::Int => {
+                        writer.write_sample(0_i32).unwrap();
+                        writer.write_sample(1000_i32).unwrap();
+                    }
+                }
+                writer.finalize().unwrap();
+            }
+            let (samples, rate, channels) = decode_audio(cursor.into_inner()).unwrap();
+            assert_eq!((samples.len(), rate, channels), (2, 24000, 2));
+        }
+    }
+
+    #[test]
+    fn truncated_stereo_wav_cannot_hide_a_partial_frame_behind_invalid_block_alignment() {
+        for declared_alignment in [0_u16, 1, 2, 6] {
+            let mut audio = wav(&[0, 1000, -1000, 2000], 2, 24000);
+            let fmt = audio.windows(4).position(|v| v == b"fmt ").unwrap();
+            let data = audio.windows(4).position(|v| v == b"data").unwrap();
+            audio[fmt + 20..fmt + 22].copy_from_slice(&declared_alignment.to_le_bytes());
+            audio.truncate(audio.len() - 2);
+            let riff_size = (audio.len() as u32) - 8;
+            audio[4..8].copy_from_slice(&riff_size.to_le_bytes());
+            audio[data + 4..data + 8].copy_from_slice(&6_u32.to_le_bytes());
+            assert!(
+                decode_audio(audio).is_err(),
+                "invalid alignment {declared_alignment}"
+            );
+        }
     }
 
     #[test]
