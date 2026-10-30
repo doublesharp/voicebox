@@ -47,6 +47,7 @@ class Settings:
     text: str = "The quick brown fox jumps over the lazy dog near the quiet river."
     seed: int = 42
     max_audio_seconds: float = 30.0
+    lifecycle_cycles: int = 0
 
 
 def benchmark_settings(settings):
@@ -61,6 +62,8 @@ def validate(settings):
         raise ValueError("references A and B must be distinct files")
     if not settings.reference_b_text.strip():
         raise ValueError("reference B requires a transcript")
+    if not 0 <= settings.lifecycle_cycles <= 100:
+        raise ValueError("lifecycle cycles must be 0..100")
     for path in (settings.reference_a, settings.reference_b):
         bench.reference_info(path)
 
@@ -205,6 +208,9 @@ class Session:
 
     def stage_wall(self, suffix):
         return next(m.wall_s for name, m in self.meter.stages.items() if name.endswith(suffix))
+
+    def last_stage_wall(self):
+        return next(reversed(self.meter.stages.values())).wall_s
 
     def cache_key(self, path, text):
         return self.adapter._conditioning_key(str(path), text)
@@ -415,6 +421,11 @@ async def check_repeated_requests_reuse_conditioning(s):
     return {"generations": 3, "prepare_calls_added": s.prepare.calls - before}
 
 
+def vram_released(allocated_before, allocated_after):
+    """None without CUDA; otherwise the unload must leave under 5% of the loaded allocation."""
+    return None if allocated_before is None else allocated_after < allocated_before * 0.05
+
+
 async def check_unload_releases_vram_and_reload_hits_disk(s):
     """Problems are collected, not raised, until the model is loaded again so
     later checks still run against a loaded, spied model."""
@@ -427,7 +438,7 @@ async def check_unload_releases_vram_and_reload_hits_disk(s):
     if s.adapter.is_loaded():
         problems.append("adapter still loaded")
     allocated_after = s.meter.cuda_allocated_bytes()
-    if allocated_before is not None and not allocated_after < allocated_before * 0.05:
+    if vram_released(allocated_before, allocated_after) is False:
         problems.append(f"VRAM not released: {allocated_before} -> {allocated_after}")
     cache.clear_voice_prompt_memory_cache()
     loaded = await s.load()
@@ -510,6 +521,40 @@ async def check_all_audio_finite_mono(s):
             "max_duration_s": max(durations), "clipped_samples_total": sum(e["clipped_samples_pcm16"] for e in s.audio)}
 
 
+async def check_lifecycle_cycles(s):
+    """--lifecycle-cycles N: full load/prepare/generate/unload cycles after the
+    checks. VRAM release and the reload disk hit gate; host RSS is recorded."""
+    from backend.utils import cache
+    problems, rows = [], []
+    with s.stage("unload_before_cycles"):
+        s.adapter.unload_model()
+    for cycle in range(1, s.settings.lifecycle_cycles + 1):
+        cache.clear_voice_prompt_memory_cache()
+        loaded = await s.load()
+        load_s = s.last_stage_wall()
+        prompt, hit = await s.prepare_prompt(s.work_a, s.settings.reference_a_text, label=f"prepare_cycle_{cycle:02d}")
+        prepare_s = s.last_stage_wall()
+        if hit is not True:
+            problems.append(f"cycle {cycle}: reload prepare missed the disk cache (hit={hit})")
+        samples = await s.generate(f"cycle_{cycle:02d}", prompt, seed=s.settings.seed)
+        generate_s = s.last_stage_wall()
+        allocated_before = s.meter.cuda_allocated_bytes()
+        with s.stage(f"unload_cycle_{cycle:02d}"):
+            s.adapter.unload_model()
+        allocated_after = s.meter.cuda_allocated_bytes()
+        if vram_released(allocated_before, allocated_after) is False:
+            problems.append(f"cycle {cycle}: VRAM not released: {allocated_before} -> {allocated_after}")
+        rss, peak_rss = telemetry.process_memory(s.meter.process)
+        rows.append({"cycle": cycle, "load_s": load_s, "prepare_s": prepare_s, "generate_s": generate_s,
+                     "prompt_hit": hit, "samples": int(samples.size),
+                     "cuda_allocated_before_unload_bytes": allocated_before,
+                     "cuda_allocated_after_unload_bytes": allocated_after,
+                     "cuda_reserved_after_unload_bytes": s.meter.cuda_reserved_bytes(),
+                     "rss_after_unload_bytes": rss, "peak_rss_after_unload_bytes": peak_rss, **loaded})
+    expect(not problems, "; ".join(problems))
+    return {"cycle_count": s.settings.lifecycle_cycles, "cycles": rows}
+
+
 CHECKS = [
     check_memory_hit_skips_prepare,
     check_disk_hit_skips_prepare,
@@ -545,6 +590,8 @@ async def qualify(settings, output, *, factory=bench.create_adapter, admit=bench
     """Injectable test boundary. Caller owns offline setup and validation."""
     report = {"schema_version": 1, "status": "failed", "config": asdict(settings), "provenance": get_provenance(),
               "checks": [], "stages": {}, "audio": [], "wavs": []}
+    if settings.lifecycle_cycles:
+        checks = [*checks, check_lifecycle_cycles]
     session = None
     try:
         report["model"] = admitted = admit(benchmark_settings(settings))
@@ -596,6 +643,8 @@ def parse_args(argv):
     parser.add_argument("--text", default=Settings.text)
     parser.add_argument("--seed", type=int, default=Settings.seed)
     parser.add_argument("--max-audio-seconds", type=float, default=Settings.max_audio_seconds)
+    parser.add_argument("--lifecycle-cycles", type=int, default=Settings.lifecycle_cycles,
+                        help="load/prepare/generate/unload cycles to run after the checks (default 0)")
     return Settings(**vars(parser.parse_args(argv)))
 
 

@@ -230,6 +230,7 @@ def test_compare_audio_reports_exactness_or_difference():
 
 @pytest.mark.parametrize("change", [
     {"device": "auto"}, {"device": "mlx"}, {"reference_b_text": " "}, {"text": ""},
+    {"lifecycle_cycles": -1}, {"lifecycle_cycles": 101},
 ])
 def test_invalid_settings_are_refused(settings, change):
     from dataclasses import replace
@@ -262,7 +263,11 @@ def test_main_reports_failed_checks_with_nonzero_exit(settings, monkeypatch, cap
     printed = capsys.readouterr().err.splitlines()
     assert "FAIL memory_hit_skips_prepare" in printed and "RECORDED fixed_seed_cache_vs_bypass_parity" in printed
     cache.clear_voice_prompt_memory_cache()
-    assert qualify.main(argv[:5] + [str(settings.output_root.with_name("run-ok"))] + argv[6:]) == 0
+    ok_root = settings.output_root.with_name("run-ok")
+    assert qualify.main(argv[:5] + [str(ok_root)] + argv[6:] + ["--lifecycle-cycles", "1"]) == 0
+    ok_report = json.loads((ok_root / "results.json").read_text())
+    assert ok_report["config"]["lifecycle_cycles"] == 1
+    assert {c["name"]: c["passed"] for c in ok_report["checks"]}["lifecycle_cycles"] is True
 
 
 def test_provenance_hashes_the_qualifier_and_its_benchmark_dependency():
@@ -421,11 +426,42 @@ def test_unload_problems_are_collected_after_reload(settings):
         adapter.unload_model = unload
         return adapter
 
-    report = run(settings, stays_loaded, meter_factory=meter_factory)
+    report = run(dataclasses.replace(settings, lifecycle_cycles=1), stays_loaded, meter_factory=meter_factory)
     result = {c["name"]: c for c in report["checks"]}["unload_releases_vram_and_reload_hits_disk"]
     assert result["passed"] is False
     assert "adapter still loaded" in result["error"] and "VRAM not released" in result["error"]
     assert {c["name"]: c["passed"] for c in report["checks"]}["cancellation_then_admission"] is True
+    lifecycle = {c["name"]: c for c in report["checks"]}["lifecycle_cycles"]
+    assert lifecycle["passed"] is False and "cycle 1: VRAM not released: 4000000000 -> 4000000000" in lifecycle["error"]
+
+
+def test_lifecycle_cycles_record_each_cycle_and_gate_on_release_and_disk_hit(settings):
+    report = run(dataclasses.replace(settings, lifecycle_cycles=2), fake_factory())
+    checks = {c["name"]: c for c in report["checks"]}
+    assert report["status"] == "ok", {name: c["error"] for name, c in checks.items() if not c["passed"]}
+    lifecycle = checks["lifecycle_cycles"]
+    assert lifecycle["kind"] == "gating" and lifecycle["passed"] is True
+    assert report["summary"]["expected"] == len(qualify.CHECKS) - len(qualify.RECORDED_CHECKS) + 1
+    rows = lifecycle["evidence"]["cycles"]
+    assert [row["cycle"] for row in rows] == [1, 2] and lifecycle["evidence"]["cycle_count"] == 2
+    for row in rows:
+        assert row["prompt_hit"] is True and row["samples"] == 12000
+        assert row["load_s"] > 0 and row["prepare_s"] > 0 and row["generate_s"] > 0
+        assert row["rss_after_unload_bytes"] > 0 and row["peak_rss_after_unload_bytes"] > 0
+        assert row["cuda_allocated_before_unload_bytes"] is None and row["cuda_allocated_after_unload_bytes"] is None
+        assert row["cuda_reserved_after_unload_bytes"] is None
+        assert row["residency"] == {"roots": ["s3gen", "t3", "ve"], "device": "cpu"}
+    assert {"cycle_01.wav", "cycle_02.wav"} <= set(report["wavs"])
+    assert "lifecycle_cycles" not in {c["name"] for c in run(
+        dataclasses.replace(settings, output_root=settings.output_root.with_name("run-no-cycles")), fake_factory())["checks"]}
+
+
+def test_lifecycle_cycles_fail_when_the_reload_misses_the_disk_cache(settings, monkeypatch):
+    monkeypatch.setattr(cache, "get_cached_voice_prompt", lambda key: None)
+    report = run(dataclasses.replace(settings, lifecycle_cycles=1), fake_factory(), checks=[])
+    assert [c["name"] for c in report["checks"]] == ["lifecycle_cycles"] and report["status"] == "failed"
+    lifecycle = report["checks"][0]
+    assert lifecycle["passed"] is False and "cycle 1: reload prepare missed the disk cache (hit=False)" in lifecycle["error"]
 
 
 def test_cancellation_check_fails_a_backend_that_admits_queued_work_before_draining(settings):

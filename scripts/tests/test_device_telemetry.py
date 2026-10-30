@@ -125,6 +125,7 @@ def test_stage_meter_syncs_only_at_boundaries_and_resets_peak_at_start():
         cuda_reserved_bytes=40, cuda_reserved_peak_bytes=60,
     )
     assert asdict(stage)["wall_s"] == 2.0
+    assert (meter.cuda_allocated_bytes(), meter.cuda_reserved_bytes()) == (30, 40)
 
 
 def test_stage_meter_records_failed_stage_and_reraises():
@@ -161,6 +162,7 @@ def test_cpu_meter_has_no_cuda_fields_and_never_touches_cuda():
     stage = meter.stages["load"]
     assert stage.cuda_allocated_bytes is None and stage.cuda_reserved_peak_bytes is None
     assert stage.rss_bytes == 1000 and stage.peak_rss_bytes == 1500
+    assert (meter.cuda_allocated_bytes(), meter.cuda_reserved_bytes()) == (None, None)
 
 
 def test_duplicate_stage_names_are_refused():

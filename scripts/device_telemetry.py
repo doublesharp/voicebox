@@ -169,6 +169,9 @@ class StageMeter:
     def cuda_allocated_bytes(self):
         return None if self.cuda is None else self.cuda.memory_allocated(self.device)
 
+    def cuda_reserved_bytes(self):
+        return None if self.cuda is None else self.cuda.memory_reserved(self.device)
+
     @contextmanager
     def stage(self, name):
         if name in self.stages:
