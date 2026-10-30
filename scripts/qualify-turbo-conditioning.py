@@ -11,6 +11,7 @@ stage telemetry and the saved WAVs. Exit status is nonzero if any check fails.
 import argparse
 import asyncio
 from dataclasses import asdict, dataclass
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -210,6 +211,11 @@ class Session:
     def cache_dir(self):
         from backend.utils import cache
         return cache._get_cache_dir()
+
+
+def provenance():
+    return {**bench.provenance(), "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "benchmark_module_sha256": hashlib.sha256(Path(bench.__file__).read_bytes()).hexdigest()}
 
 
 def expect(condition, message):
@@ -506,7 +512,7 @@ CHECKS = [
 
 async def qualify(settings, output, *, factory=bench.create_adapter, admit=bench.admit_cached_turbo,
                   identify=bench.device_identity, meter_factory=telemetry.StageMeter.for_device,
-                  verify_residency=telemetry.check_residency, get_provenance=bench.provenance, checks=CHECKS):
+                  verify_residency=telemetry.check_residency, get_provenance=provenance, checks=CHECKS):
     """Injectable test boundary. Caller owns offline setup and validation."""
     report = {"schema_version": 1, "status": "failed", "config": asdict(settings), "provenance": get_provenance(),
               "checks": [], "stages": {}, "audio": [], "wavs": []}

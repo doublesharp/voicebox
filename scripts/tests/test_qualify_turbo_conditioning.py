@@ -241,7 +241,7 @@ def test_main_reports_failed_checks_with_nonzero_exit(settings, monkeypatch):
     admitted = {"repo_id": turbo.CHATTERBOX_TURBO_HF_REPO, "revision": REVISION, "snapshot": "fake"}
     monkeypatch.setattr(qualify, "qualify", functools.partial(
         qualify.qualify, factory=fake_factory(), admit=lambda _: admitted, identify=lambda _: {"fixture": True},
-        verify_residency=lambda roots, device: {"fixture": True}, get_provenance=lambda: {"fixture": True}))
+        verify_residency=lambda roots, device: {"fixture": True}))
     argv = ["--device", "cpu", "--cache-root", str(settings.cache_root), "--output-root", str(settings.output_root),
             "--reference-a", str(settings.reference_a), "--reference-a-text", "A.",
             "--reference-b", str(settings.reference_b), "--reference-b-text", "B."]
@@ -250,8 +250,17 @@ def test_main_reports_failed_checks_with_nonzero_exit(settings, monkeypatch):
         assert qualify.main(argv) == 2
     report = json.loads((settings.output_root / "results.json").read_text())
     assert report["status"] == "failed" and report["summary"]["failed"] >= 1
+    assert report["provenance"]["runner_sha256"] == hashlib.sha256(SCRIPT.read_bytes()).hexdigest()
     cache.clear_voice_prompt_memory_cache()
     assert qualify.main(argv[:5] + [str(settings.output_root.with_name("run-ok"))] + argv[6:]) == 0
+
+
+def test_provenance_hashes_the_qualifier_and_its_benchmark_dependency():
+    result = qualify.provenance()
+    assert result["runner_sha256"] == hashlib.sha256(SCRIPT.read_bytes()).hexdigest()
+    assert result["benchmark_module_sha256"] == hashlib.sha256(SCRIPT.with_name("benchmark-local-tts.py").read_bytes()).hexdigest()
+    assert result["runner_sha256"] != result["benchmark_module_sha256"]
+    assert result["versions"]["torch"] and result["recorded_at_utc"].endswith("+00:00")
 
 
 def test_cli_refuses_missing_cache_before_importing_models(tmp_path, settings):
