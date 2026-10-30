@@ -361,7 +361,7 @@ claude mcp add voicebox \
 {
   "mcpServers": {
     "voicebox": {
-      "command": "/Applications/Voicebox.app/Contents/MacOS/voicebox-mcp",
+      "command": "/Applications/VoiceboxDS.app/Contents/MacOS/voicebox-mcp",
       "env": { "VOICEBOX_CLIENT_ID": "claude-desktop" }
     }
   }

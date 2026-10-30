@@ -162,7 +162,7 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           mkdir -p release-assets
-          ditto -c -k --sequesterRsrc --keepParent "tauri/src-tauri/target/$TARGET/release/bundle/macos/Voicebox.app" release-assets/Voicebox-doublesharp-macos-arm64.zip
+          ditto -c -k --sequesterRsrc --keepParent "tauri/src-tauri/target/$TARGET/release/bundle/macos/VoiceboxDS.app" release-assets/Voicebox-doublesharp-macos-arm64.zip
 
       - name: Package Windows installer and complete CUDA backend
         if: runner.os == 'Windows'

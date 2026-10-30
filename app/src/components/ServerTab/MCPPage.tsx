@@ -19,7 +19,7 @@ import { SettingRow, SettingSection } from './SettingRow';
 
 function getStdioShimCommand(): string {
   if (typeof navigator === 'undefined') {
-    return `/Applications/${APP_BRANDING.name}.app/Contents/MacOS/voicebox-mcp`;
+    return '/Applications/VoiceboxDS.app/Contents/MacOS/voicebox-mcp';
   }
 
   const platform = `${navigator.platform} ${navigator.userAgent}`.toLowerCase();
@@ -29,7 +29,7 @@ function getStdioShimCommand(): string {
   if (platform.includes('linux')) {
     return '/opt/voicebox/voicebox-mcp';
   }
-  return `/Applications/${APP_BRANDING.name}.app/Contents/MacOS/voicebox-mcp`;
+  return '/Applications/VoiceboxDS.app/Contents/MacOS/voicebox-mcp';
 }
 
 /**
