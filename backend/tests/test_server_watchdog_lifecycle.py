@@ -17,6 +17,17 @@ def server():
         sys.stdout, sys.stderr = stdout, stderr
 
 
+@pytest.fixture(autouse=True)
+def close_watchdog_log_handlers():
+    import logging
+    logger = logging.getLogger('watchdog')
+    original = set(logger.handlers)
+    yield
+    for handler in set(logger.handlers) - original:
+        logger.removeHandler(handler)
+        handler.close()
+
+
 def test_watchdog_starts_after_custom_app_lifespan(server, monkeypatch):
     import asyncio
     import runpy
@@ -125,3 +136,116 @@ def test_disable_endpoint_stops_running_entrypoint_watchdog(server, monkeypatch)
     finally:
         sys.stdout, sys.stderr = stdout, stderr
     assert calls == [(123, 0)]
+
+
+@pytest.mark.parametrize('outcome', ['sentinel', 'disabled', 'shutdown'])
+def test_parent_exit_respects_grace_period_and_keep_running(server, monkeypatch, tmp_path, outcome):
+    import os
+    import signal
+    import threading
+    import time
+
+    if sys.platform == 'win32':
+        pytest.skip('Unix process probing')
+    monkeypatch.setattr(server.watchdog_state, 'disabled', False)
+    sentinel = tmp_path / '.keep-running'
+    sentinel.write_text('stale')
+    calls = []
+    probes = 0
+
+    def kill(pid, sig):
+        nonlocal probes
+        calls.append((pid, sig))
+        if sig == 0:
+            probes += 1
+            if probes > 1:
+                raise ProcessLookupError('parent exited')
+
+    def sleep(seconds):
+        assert seconds == 1
+        # The watchdog must remove a sentinel left by an earlier session.
+        assert not sentinel.exists()
+        if outcome == 'sentinel':
+            sentinel.write_text('new')
+        elif outcome == 'disabled':
+            server.watchdog_state.disabled = True
+
+    class ImmediateThread:
+        def __init__(self, target, daemon):
+            assert daemon
+            self.target = target
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr(os, 'kill', kill)
+    monkeypatch.setattr(time, 'sleep', sleep)
+    monkeypatch.setattr(threading, 'Thread', ImmediateThread)
+    server._start_parent_watchdog(123, str(tmp_path))
+
+    assert calls[:2] == [(123, 0), (123, 0)]
+    assert calls[2:] == ([(os.getpid(), signal.SIGTERM)] if outcome == 'shutdown' else [])
+    assert not sentinel.exists()
+
+
+def test_missing_parent_at_start_does_not_terminate_server(server, monkeypatch, tmp_path):
+    import os
+    import threading
+
+    if sys.platform == 'win32':
+        pytest.skip('Unix process probing')
+    calls = []
+    def kill(pid, sig):
+        calls.append((pid, sig))
+        if sig == 0:
+            raise ProcessLookupError('parent already gone')
+        pytest.fail('watchdog attempted to terminate server')
+
+    class ImmediateThread:
+        def __init__(self, target, daemon):
+            self.target = target
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr(os, 'kill', kill)
+    monkeypatch.setattr(threading, 'Thread', ImmediateThread)
+    server._start_parent_watchdog(123, str(tmp_path))
+    assert calls == [(123, 0)]
+
+
+def test_disable_watchdog_ignores_hangup_on_unix(server, monkeypatch):
+    import signal
+
+    if sys.platform == 'win32':
+        pytest.skip('Unix signal handling')
+    signals = []
+    monkeypatch.setattr(server.watchdog_state, 'disabled', False)
+    monkeypatch.setattr(signal, 'signal', lambda *args: signals.append(args))
+    server.disable_watchdog()
+    assert server.watchdog_state.disabled
+    assert signals == [(signal.SIGHUP, signal.SIG_IGN)]
+
+
+@pytest.mark.parametrize('exception', [BrokenPipeError, ValueError])
+def test_server_output_survives_disconnected_desktop_pipe(server, exception):
+    class BrokenStream:
+        def write(self, _text):
+            raise exception('pipe closed')
+        def flush(self):
+            raise exception('pipe closed')
+
+    stream = server._PipeSafeStream(BrokenStream())
+    assert stream.write('after exit') == len('after exit')
+    assert stream.write('still usable') == len('still usable')
+    stream.flush()
+    stream._stream.close()
+
+
+def test_server_output_flush_survives_disconnected_desktop_pipe(server):
+    class BrokenStream:
+        def flush(self):
+            raise BrokenPipeError('pipe closed')
+
+    stream = server._PipeSafeStream(BrokenStream())
+    stream.flush()
+    assert stream.write('still usable') == len('still usable')
+    stream._stream.close()
