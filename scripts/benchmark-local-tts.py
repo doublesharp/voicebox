@@ -263,11 +263,12 @@ def reference_info(path):
 
 def device_environment(settings):
     """Device selection that must precede every torch import. The backend
-    honors VOICEBOX_FORCE_CPU; CUDA_VISIBLE_DEVICES pins one physical GPU."""
+    honors VOICEBOX_FORCE_CPU; CUDA_VISIBLE_DEVICES pins one physical GPU
+    (or hides them all for cpu), numbered as nvidia-smi numbers them."""
     if settings.device == "cpu":
-        return {"VOICEBOX_FORCE_CPU": "1"}
+        return {"VOICEBOX_FORCE_CPU": "1", "CUDA_VISIBLE_DEVICES": ""}
     if settings.device.startswith("cuda"):
-        return {"CUDA_VISIBLE_DEVICES": settings.device.partition(":")[2] or "0"}
+        return {"CUDA_VISIBLE_DEVICES": settings.device.partition(":")[2] or "0", "CUDA_DEVICE_ORDER": "PCI_BUS_ID"}
     return {}
 
 
@@ -277,6 +278,7 @@ def configure_offline(settings, output):
     runtime.mkdir()
     temporary = runtime / "tmp"
     temporary.mkdir()
+    os.environ.pop("VOICEBOX_FORCE_CPU", None)
     os.environ.update({
         "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "HF_DATASETS_OFFLINE": "1",
         "HF_HUB_DISABLE_TELEMETRY": "1", "DO_NOT_TRACK": "1",
@@ -333,10 +335,15 @@ def device_identity(settings):
     if settings.device == "mlx":
         return {"selected_device": "mlx", "os": platform.platform(), "machine": platform.machine()}
     identity = telemetry.collect_identity(torch_device(settings))
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    selected_gpu = None
     if settings.device.startswith("cuda"):
         telemetry.require_cuda(identity)
+        selected_gpu = next((asdict(gpu) for gpu in identity.gpus if str(gpu.index) == visible), None)
+        if selected_gpu is None:
+            raise telemetry.DeviceRefused(f"CUDA_VISIBLE_DEVICES={visible!r} is not an nvidia-smi GPU index")
     return {**asdict(identity), "requested_device": settings.device,
-            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES")}
+            "cuda_visible_devices": visible, "selected_gpu": selected_gpu}
 
 
 def create_adapter(settings, admitted, output):

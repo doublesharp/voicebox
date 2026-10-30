@@ -210,23 +210,26 @@ class StageMeter:
             self.stages[name] = measurement
 
 
-def tensor_devices(root, *, max_depth=4):
-    """Devices of every parameter, buffer and tensor reachable from root."""
+def tensor_residency(root, *, max_depth=4):
+    """Devices and dtypes of every parameter, buffer and tensor reachable from root."""
     import torch
-    devices, seen, count = set(), set(), 0
+    devices, dtypes, seen, count = set(), set(), set(), 0
+
+    def record(tensor):
+        nonlocal count
+        devices.add(str(tensor.device))
+        dtypes.add(str(tensor.dtype))
+        count += 1
 
     def visit(value, depth):
-        nonlocal count
         if id(value) in seen or depth > max_depth:
             return
         seen.add(id(value))
         if isinstance(value, torch.Tensor):
-            devices.add(str(value.device))
-            count += 1
+            record(value)
         elif isinstance(value, torch.nn.Module):
             for tensor in list(value.parameters()) + list(value.buffers()):
-                devices.add(str(tensor.device))
-                count += 1
+                record(tensor)
         elif isinstance(value, dict):
             for item in value.values():
                 visit(item, depth + 1)
@@ -238,7 +241,7 @@ def tensor_devices(root, *, max_depth=4):
                 visit(item, depth + 1)
 
     visit(root, 0)
-    return devices, count
+    return devices, dtypes, count
 
 
 def normalize_device(device):
@@ -246,12 +249,13 @@ def normalize_device(device):
 
 
 def check_residency(roots, expected):
-    """Fail unless every tensor under every root lives on the expected device."""
+    """Fail unless every tensor under every root lives on the expected device.
+    The dtypes are recorded so precision is observed rather than inferred."""
     expected = normalize_device(expected)
     evidence = {}
     for name, root in roots.items():
-        devices, count = tensor_devices(root)
-        evidence[name] = {"devices": sorted(devices), "tensors": count}
+        devices, dtypes, count = tensor_residency(root)
+        evidence[name] = {"devices": sorted(devices), "dtypes": sorted(dtypes), "tensors": count}
         if not count:
             raise ResidencyError(f"{name}: no tensors found to verify residency")
         if devices != {expected}:

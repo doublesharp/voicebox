@@ -717,7 +717,7 @@ def test_real_residency_check_runs_on_adapter_roots(settings):
     adapter.model = SimpleNamespace(inner=torch.nn.Linear(1, 1))
     result = run_fake(settings, adapter, verify_residency=bench.telemetry.check_residency)
     assert result["status"] == "ok", result.get("error")
-    assert result["residency"] == {"fake": {"devices": ["cpu"], "tensors": 2}}
+    assert result["residency"] == {"fake": {"devices": ["cpu"], "dtypes": ["torch.float32"], "tensors": 2}}
 
 
 def test_device_refusal_happens_before_adapter_construction(settings):
@@ -746,15 +746,16 @@ def test_device_identity_requires_nvidia_for_cuda_and_skips_torch_for_mlx(settin
     assert bench.device_identity(replace(settings, backend="mlx", device="mlx"))["selected_device"] == "mlx"
     assert calls == []
     assert bench.device_identity(settings) == {**asdict(rocm), "selected_device": "cpu", "requested_device": "cpu",
-                                               "cuda_visible_devices": None}
+                                               "cuda_visible_devices": None, "selected_gpu": None}
     with pytest.raises(bench.telemetry.DeviceRefused, match="ROCm"):
         bench.device_identity(replace(settings, device="cuda:1"))
     assert calls == ["cpu", "cuda:0"]
 
 
 @pytest.mark.parametrize("device,expected", [
-    ("cpu", {"VOICEBOX_FORCE_CPU": "1"}), ("cuda", {"CUDA_VISIBLE_DEVICES": "0"}),
-    ("cuda:1", {"CUDA_VISIBLE_DEVICES": "1"}), ("mlx", {}),
+    ("cpu", {"VOICEBOX_FORCE_CPU": "1", "CUDA_VISIBLE_DEVICES": ""}),
+    ("cuda", {"CUDA_VISIBLE_DEVICES": "0", "CUDA_DEVICE_ORDER": "PCI_BUS_ID"}),
+    ("cuda:1", {"CUDA_VISIBLE_DEVICES": "1", "CUDA_DEVICE_ORDER": "PCI_BUS_ID"}), ("mlx", {}),
 ])
 def test_device_selection_is_forced_through_environment_before_imports(settings, device, expected):
     assert bench.device_environment(replace(settings, device=device)) == expected
@@ -763,16 +764,41 @@ def test_device_selection_is_forced_through_environment_before_imports(settings,
 
 def test_offline_configuration_forces_cpu_and_windows_temp(settings, monkeypatch):
     output = bench.Output(settings.output_root)
-    monkeypatch.setattr(os, "environ", {})
+    monkeypatch.setattr(os, "environ", {"CUDA_VISIBLE_DEVICES": "0"})
     monkeypatch.setattr(sys, "addaudithook", lambda hook: None)
     monkeypatch.setattr(bench.tempfile, "tempdir", None)
     try:
         bench.configure_offline(settings, output)
         temporary = str(settings.output_root / "runtime" / "tmp")
-        assert os.environ["VOICEBOX_FORCE_CPU"] == "1" and "CUDA_VISIBLE_DEVICES" not in os.environ
+        assert os.environ["VOICEBOX_FORCE_CPU"] == "1" and os.environ["CUDA_VISIBLE_DEVICES"] == ""
         assert os.environ["TMPDIR"] == os.environ["TEMP"] == os.environ["TMP"] == temporary
     finally:
         output.close()
+
+
+def test_offline_configuration_for_cuda_drops_an_inherited_cpu_override(settings, monkeypatch):
+    output = bench.Output(settings.output_root)
+    monkeypatch.setattr(os, "environ", {"VOICEBOX_FORCE_CPU": "1"})
+    monkeypatch.setattr(sys, "addaudithook", lambda hook: None)
+    monkeypatch.setattr(bench.tempfile, "tempdir", None)
+    try:
+        bench.configure_offline(replace(settings, device="cuda:1"), output)
+        assert "VOICEBOX_FORCE_CPU" not in os.environ
+        assert os.environ["CUDA_VISIBLE_DEVICES"] == "1" and os.environ["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"
+    finally:
+        output.close()
+
+
+def test_device_identity_records_the_selected_nvidia_smi_gpu(settings, monkeypatch):
+    gpus = (bench.telemetry.Gpu(0, "GPU zero", 8000, "8.9", "610"), bench.telemetry.Gpu(1, "GPU one", 16000, "12.0", "610"))
+    identity = bench.telemetry.DeviceIdentity("os", "x", "2.9", "12.8", None, True, 1, gpus, None, True, "cuda:0", "GPU one", "12.0")
+    monkeypatch.setattr(bench.telemetry, "collect_identity", lambda device, **kwargs: identity)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1")
+    record = bench.device_identity(replace(settings, device="cuda:1"))
+    assert record["selected_gpu"] == asdict(gpus[1]) and record["cuda_visible_devices"] == "1"
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2")
+    with pytest.raises(bench.telemetry.DeviceRefused, match="nvidia-smi"):
+        bench.device_identity(replace(settings, device="cuda:2"))
 
 
 def test_cli_requires_explicit_device(tmp_path):

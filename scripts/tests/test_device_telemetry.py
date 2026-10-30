@@ -241,11 +241,11 @@ def test_residency_reports_devices_of_modules_and_tensors_and_refuses_mismatch()
     class Wrapper:
         def __init__(self):
             self.t3 = torch.nn.Linear(2, 2)
-            self.extra = {"buffer": torch.zeros(1)}
+            self.extra = {"buffer": torch.zeros(1, dtype=torch.float16)}
 
     roots = {"model": Wrapper()}
     evidence = telemetry.check_residency(roots, "cpu")
-    assert evidence == {"model": {"devices": ["cpu"], "tensors": 3}}
+    assert evidence == {"model": {"devices": ["cpu"], "dtypes": ["torch.float16", "torch.float32"], "tensors": 3}}
     with pytest.raises(telemetry.ResidencyError, match="cuda:0"):
         telemetry.check_residency(roots, "cuda")
     with pytest.raises(telemetry.ResidencyError, match="no tensors"):
