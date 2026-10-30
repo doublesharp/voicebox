@@ -84,10 +84,10 @@ struct Active {
 impl HotkeyMonitor {
     /// Build the monitor with initial bindings. Equivalent to constructing
     /// an empty monitor and calling [`Self::update_bindings`] once.
-    pub fn spawn(app: AppHandle, bindings: Bindings) -> Self {
+    pub fn spawn(app: AppHandle, bindings: Bindings) -> Result<Self, String> {
         let mut m = Self { app, active: None };
-        m.apply(bindings);
-        m
+        m.apply(bindings)?;
+        Ok(m)
     }
 
     /// Swap in a fresh set of chord bindings. Tears down the existing
@@ -95,46 +95,136 @@ impl HotkeyMonitor {
     /// closes the OS tap) and spawns a new one. No-op for the "all
     /// empty" case so "disable hotkey" doesn't keep a tap running for
     /// no reason.
-    pub fn update_bindings(&mut self, bindings: Bindings) {
-        self.apply(bindings);
+    pub fn update_bindings(&mut self, bindings: Bindings) -> Result<(), String> {
+        self.apply(bindings)
     }
 
-    fn apply(&mut self, bindings: Bindings) {
-        // Tear down any existing matcher + dispatcher first. The
-        // dispatcher sees the shutdown flag on its next recv_timeout
-        // (≤100ms) and returns; joining waits for that. Dropping the
-        // ChordMatcher stops keytap's chord-worker thread and the
-        // underlying Tap.
-        stop_dispatcher(self.active.take(), || {
-            apply_effect(&self.app, Effect::StopRecording(ChordAction::PushToTalk));
-        });
-
-        if bindings.values().all(|set| set.is_empty()) {
-            return;
-        }
-
-        let matcher = match build_matcher(&bindings) {
-            Ok(m) => m,
-            Err(err) => {
-                eprintln!(
-                    "HotkeyMonitor: ChordMatcher build failed ({err}). Global chord detection is disabled. On macOS, grant Input Monitoring in System Settings → Privacy & Security → Input Monitoring and relaunch."
-                );
-                return;
-            }
-        };
-
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let shutdown_for_thread = shutdown.clone();
+    fn apply(&mut self, bindings: Bindings) -> Result<(), String> {
         let app = self.app.clone();
-        let dispatcher = thread::Builder::new()
-            .name("voicebox-hotkey-dispatcher".into())
-            .spawn(move || dispatcher_loop(app, matcher, shutdown_for_thread))
-            .expect("spawn hotkey dispatcher thread");
+        let app_for_stop = self.app.clone();
+        replace_dispatcher(
+            &mut self.active,
+            bindings,
+            || {
+                apply_effect(
+                    &app_for_stop,
+                    Effect::StopRecording(ChordAction::PushToTalk),
+                );
+            },
+            move |bindings| {
+                let matcher = build_matcher(bindings).map_err(|err| format!("Unable to start global hotkey: {err}. On macOS, check Input Monitoring permission in System Settings."))?;
+                let shutdown = Arc::new(AtomicBool::new(false));
+                let shutdown_for_thread = shutdown.clone();
+                let dispatcher = thread::Builder::new()
+                    .name("voicebox-hotkey-dispatcher".into())
+                    .spawn(move || dispatcher_loop(app, matcher, shutdown_for_thread))
+                    .map_err(|err| format!("Unable to start hotkey dispatcher: {err}"))?;
+                Ok(Active {
+                    dispatcher,
+                    shutdown,
+                })
+            },
+        )
+    }
+}
 
-        self.active = Some(Active {
+fn replace_dispatcher(
+    active: &mut Option<Active>,
+    bindings: Bindings,
+    on_stopped: impl FnOnce(),
+    launch: impl FnOnce(&Bindings) -> Result<Active, String>,
+) -> Result<(), String> {
+    stop_dispatcher(active.take(), on_stopped);
+    if bindings.values().all(|set| set.is_empty()) {
+        return Ok(());
+    }
+    *active = Some(launch(&bindings)?);
+    Ok(())
+}
+
+#[cfg(test)]
+mod startup_failure_tests {
+    use super::*;
+
+    #[test]
+    fn matcher_startup_error_is_returned_to_caller() {
+        let mut active = None;
+        let bindings = Bindings::from([(ChordAction::PushToTalk, HashSet::from([Key::Space]))]);
+        let result = replace_dispatcher(
+            &mut active,
+            bindings,
+            || panic!("nothing to stop"),
+            |_| Err("permission denied".to_owned()),
+        );
+        assert_eq!(result.unwrap_err(), "permission denied");
+        assert!(active.is_none());
+    }
+
+    fn running_dispatcher() -> Active {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let flag = shutdown.clone();
+        let dispatcher = thread::spawn(move || {
+            while !flag.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+        });
+        Active {
             dispatcher,
             shutdown,
-        });
+        }
+    }
+
+    #[test]
+    fn failed_replacement_stops_previous_dispatcher() {
+        let old = running_dispatcher();
+        let stopped_flag = old.shutdown.clone();
+        let mut active = Some(old);
+        let mut stopped = false;
+        let bindings = Bindings::from([(ChordAction::PushToTalk, HashSet::from([Key::Space]))]);
+        let result = replace_dispatcher(
+            &mut active,
+            bindings,
+            || stopped = true,
+            |_| Err("listener unavailable".to_owned()),
+        );
+        assert_eq!(result.unwrap_err(), "listener unavailable");
+        assert!(stopped);
+        assert!(stopped_flag.load(Ordering::Acquire));
+        assert!(active.is_none());
+    }
+
+    #[test]
+    fn empty_bindings_stop_listener_without_starting_another() {
+        let old = running_dispatcher();
+        let stopped_flag = old.shutdown.clone();
+        let mut active = Some(old);
+        let mut stopped = false;
+        replace_dispatcher(
+            &mut active,
+            Bindings::new(),
+            || stopped = true,
+            |_| panic!("empty bindings must not start a listener"),
+        )
+        .unwrap();
+        assert!(stopped);
+        assert!(stopped_flag.load(Ordering::Acquire));
+        assert!(active.is_none());
+    }
+
+    #[test]
+    fn successful_replacement_can_be_disabled() {
+        let mut active = None;
+        let bindings = Bindings::from([(ChordAction::ToggleToTalk, HashSet::from([Key::Space]))]);
+        replace_dispatcher(
+            &mut active,
+            bindings,
+            || panic!("nothing to stop"),
+            |_| Ok(running_dispatcher()),
+        )
+        .unwrap();
+        assert!(active.is_some());
+        replace_dispatcher(&mut active, Bindings::new(), || {}, |_| unreachable!()).unwrap();
+        assert!(active.is_none());
     }
 }
 

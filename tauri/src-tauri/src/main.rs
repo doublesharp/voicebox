@@ -1207,7 +1207,7 @@ fn enable_hotkey(
     // launches we can short-circuit the spawn entirely if the user
     // revoked the grant, instead of relying on the tap silently failing.
     // The call returns the current grant state; we ignore it because
-    // keytap surfaces its own error via stderr, and the settings UI
+    // keytap returns an error if the tap cannot start, and the settings UI
     // polls `check_input_monitoring_permission` separately.
     let _ = input_monitoring::request();
 
@@ -1222,9 +1222,9 @@ fn enable_hotkey(
 
     let mut slot = state.monitor.lock().map_err(|e| e.to_string())?;
     match slot.as_mut() {
-        Some(monitor) => monitor.update_bindings(bindings),
+        Some(monitor) => monitor.update_bindings(bindings)?,
         None => {
-            *slot = Some(hotkey_monitor::HotkeyMonitor::spawn(app, bindings));
+            *slot = Some(hotkey_monitor::HotkeyMonitor::spawn(app, bindings)?);
         }
     }
     Ok(())
@@ -1239,7 +1239,7 @@ fn enable_hotkey(
 fn disable_hotkey(state: State<'_, HotkeyState>) -> Result<(), String> {
     let mut slot = state.monitor.lock().map_err(|e| e.to_string())?;
     if let Some(monitor) = slot.as_mut() {
-        monitor.update_bindings(hotkey_monitor::Bindings::new());
+        monitor.update_bindings(hotkey_monitor::Bindings::new())?;
     }
     Ok(())
 }
@@ -1263,7 +1263,7 @@ fn update_chord_bindings(
     let bindings = build_chord_bindings(&push_to_talk, &toggle_to_talk)?;
     let mut slot = state.monitor.lock().map_err(|e| e.to_string())?;
     if let Some(monitor) = slot.as_mut() {
-        monitor.update_bindings(bindings);
+        monitor.update_bindings(bindings)?;
     }
     Ok(())
 }
