@@ -377,60 +377,88 @@ mod event_tests {
 // Effect → Tauri
 // ========================================================================
 
+trait DictationTarget {
+    type Window;
+    fn capture_focus(&self) -> Option<focus_capture::FocusSnapshot>;
+    fn window(&self) -> Option<Self::Window>;
+    fn present(&self, window: &Self::Window);
+    fn start(&self, window: &Self::Window, payload: serde_json::Value);
+    fn signal(&self, window: &Self::Window, event: &'static str);
+}
+
+struct NativeDictationTarget<'a>(&'a AppHandle);
+
+impl DictationTarget for NativeDictationTarget<'_> {
+    type Window = tauri::WebviewWindow;
+    fn capture_focus(&self) -> Option<focus_capture::FocusSnapshot> {
+        focus_capture::capture_focus().ok()
+    }
+    fn window(&self) -> Option<Self::Window> {
+        self.0.get_webview_window(DICTATE_WINDOW_LABEL)
+    }
+    fn present(&self, window: &Self::Window) {
+        // The previous hide-cycle parked the window off-screen and
+        // made it click-through — undo both before showing, so the
+        // pill lands at top-center and the user can actually click
+        // the error pill / stop button.
+        //
+        // `current_monitor()` returns None when the window is off
+        // any display (our hide handler parks it at -10_000, -10_000
+        // precisely so it never intercepts clicks), so fall back to
+        // the primary monitor for the reposition.
+        let monitor = window
+            .current_monitor()
+            .ok()
+            .flatten()
+            .or_else(|| window.primary_monitor().ok().flatten());
+        if let Some(monitor) = monitor {
+            let monitor_pos = monitor.position();
+            let monitor_size = monitor.size();
+            if let Ok(win_size) = window.outer_size() {
+                let x = monitor_pos.x + (monitor_size.width as i32 - win_size.width as i32) / 2;
+                let y = monitor_pos.y + (monitor_size.height as f64 * 0.04) as i32;
+                let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
+            }
+        }
+        // Skip on Linux: aborts if the window was never realized
+        // (see show_dictate_window in main.rs).
+        #[cfg(not(target_os = "linux"))]
+        let _ = window.set_ignore_cursor_events(false);
+        // Deliberately no set_focus() — taking key focus would yank
+        // it out of whatever app the user was typing in, which is
+        // the opposite of what a dictation overlay should do.
+        let _ = window.show();
+    }
+    fn start(&self, window: &Self::Window, payload: serde_json::Value) {
+        let _ = window.emit("dictate:start", payload);
+    }
+    fn signal(&self, window: &Self::Window, event: &'static str) {
+        let _ = window.emit(event, ());
+    }
+}
+
 fn apply_effect(app: &AppHandle, effect: Effect) {
+    apply_effect_to(&NativeDictationTarget(app), effect);
+}
+
+fn apply_effect_to(target: &impl DictationTarget, effect: Effect) {
     match effect {
         Effect::StartRecording(_) => {
-            // Snapshot focus BEFORE we touch the window — any AppKit
-            // reshuffle triggered by set_position / show could in principle
-            // steal key focus and poison the reading. In practice those
-            // calls leave keyWindow alone, but capturing first is free.
-            let focus = focus_capture::capture_focus().ok();
-
-            if let Some(window) = app.get_webview_window(DICTATE_WINDOW_LABEL) {
-                // The previous hide-cycle parked the window off-screen and
-                // made it click-through — undo both before showing, so the
-                // pill lands at top-center and the user can actually click
-                // the error pill / stop button.
-                //
-                // `current_monitor()` returns None when the window is off
-                // any display (our hide handler parks it at -10_000, -10_000
-                // precisely so it never intercepts clicks), so fall back to
-                // the primary monitor for the reposition.
-                let monitor = window
-                    .current_monitor()
-                    .ok()
-                    .flatten()
-                    .or_else(|| window.primary_monitor().ok().flatten());
-                if let Some(monitor) = monitor {
-                    let monitor_pos = monitor.position();
-                    let monitor_size = monitor.size();
-                    if let Ok(win_size) = window.outer_size() {
-                        let x =
-                            monitor_pos.x + (monitor_size.width as i32 - win_size.width as i32) / 2;
-                        let y = monitor_pos.y + (monitor_size.height as f64 * 0.04) as i32;
-                        let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
-                    }
-                }
-                // Skip on Linux: aborts if the window was never realized
-                // (see show_dictate_window in main.rs).
-                #[cfg(not(target_os = "linux"))]
-                let _ = window.set_ignore_cursor_events(false);
-                // Deliberately no set_focus() — taking key focus would yank
-                // it out of whatever app the user was typing in, which is
-                // the opposite of what a dictation overlay should do.
-                let _ = window.show();
-                let payload = serde_json::json!({ "focus": focus });
-                let _ = window.emit("dictate:start", payload);
+            // Focus must be captured before positioning or showing the pill.
+            let focus = target.capture_focus();
+            if let Some(window) = target.window() {
+                target.present(&window);
+                target.start(&window, serde_json::json!({ "focus": focus }));
             }
         }
         Effect::StopRecording(_) => {
-            if let Some(window) = app.get_webview_window(DICTATE_WINDOW_LABEL) {
-                let _ = window.emit("dictate:stop", ());
+            if let Some(window) = target.window() {
+                target.signal(&window, "dictate:stop");
             }
         }
         Effect::RestartRecording(_) => {
-            if let Some(window) = app.get_webview_window(DICTATE_WINDOW_LABEL) {
-                let _ = window.emit("dictate:restart", ());
+            if let Some(window) = target.window() {
+                target.signal(&window, "dictate:restart");
             }
         }
     }
@@ -618,5 +646,153 @@ mod teardown_tests {
         let mut notifications = 0;
         stop_dispatcher(None, || notifications += 1);
         assert_eq!(notifications, 0);
+    }
+}
+
+#[cfg(test)]
+mod window_bridge_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::time::Instant;
+
+    struct FakeTarget {
+        has_window: bool,
+        focus: Option<focus_capture::FocusSnapshot>,
+        calls: RefCell<Vec<String>>,
+        payloads: RefCell<Vec<serde_json::Value>>,
+    }
+    impl FakeTarget {
+        fn new(has_window: bool, focus: bool) -> Self {
+            Self {
+                has_window,
+                focus: focus.then(|| focus_capture::FocusSnapshot {
+                    pid: 42,
+                    bundle_id: Some("other.app".into()),
+                    role: Some("AXTextField".into()),
+                }),
+                calls: RefCell::new(vec![]),
+                payloads: RefCell::new(vec![]),
+            }
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.borrow().clone()
+        }
+    }
+    impl DictationTarget for FakeTarget {
+        type Window = ();
+        fn capture_focus(&self) -> Option<focus_capture::FocusSnapshot> {
+            self.calls.borrow_mut().push("focus".into());
+            self.focus.clone()
+        }
+        fn window(&self) -> Option<Self::Window> {
+            self.calls.borrow_mut().push("window".into());
+            self.has_window.then_some(())
+        }
+        fn present(&self, _: &()) {
+            self.calls.borrow_mut().push("show".into());
+        }
+        fn start(&self, _: &(), payload: serde_json::Value) {
+            self.calls.borrow_mut().push("dictate:start".into());
+            self.payloads.borrow_mut().push(payload);
+        }
+        fn signal(&self, _: &(), event: &'static str) {
+            self.calls.borrow_mut().push(event.into());
+        }
+    }
+
+    #[test]
+    fn both_start_actions_capture_focus_before_showing_the_pill() {
+        for action in [ChordAction::PushToTalk, ChordAction::ToggleToTalk] {
+            let target = FakeTarget::new(true, true);
+            apply_effect_to(&target, Effect::StartRecording(action));
+            assert_eq!(target.calls(), ["focus", "window", "show", "dictate:start"]);
+            assert_eq!(
+                target.payloads.borrow()[0],
+                serde_json::json!({"focus":{"pid":42,"bundle_id":"other.app","role":"AXTextField"}})
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_focus_is_reported_as_null_without_blocking_recording() {
+        let target = FakeTarget::new(true, false);
+        apply_effect_to(&target, Effect::StartRecording(ChordAction::PushToTalk));
+        assert_eq!(target.calls(), ["focus", "window", "show", "dictate:start"]);
+        assert_eq!(
+            target.payloads.borrow()[0],
+            serde_json::json!({"focus":null})
+        );
+    }
+
+    #[test]
+    fn absent_window_does_not_emit_start_stop_or_restart() {
+        let target = FakeTarget::new(false, true);
+        apply_effect_to(&target, Effect::StartRecording(ChordAction::PushToTalk));
+        apply_effect_to(&target, Effect::StopRecording(ChordAction::PushToTalk));
+        apply_effect_to(&target, Effect::RestartRecording(ChordAction::ToggleToTalk));
+        assert_eq!(target.calls(), ["focus", "window", "window", "window"]);
+        assert!(target.payloads.borrow().is_empty());
+    }
+
+    #[test]
+    fn stop_and_restart_are_distinct_and_do_not_change_focus_or_show_the_window() {
+        let target = FakeTarget::new(true, true);
+        apply_effect_to(&target, Effect::StopRecording(ChordAction::PushToTalk));
+        apply_effect_to(&target, Effect::RestartRecording(ChordAction::ToggleToTalk));
+        assert_eq!(
+            target.calls(),
+            ["window", "dictate:stop", "window", "dictate:restart"]
+        );
+    }
+
+    #[test]
+    fn push_to_hands_free_upgrade_emits_only_restart() {
+        let target = FakeTarget::new(true, true);
+        let time = Instant::now();
+        process_events(
+            ChordEvent::End {
+                id: ChordAction::PushToTalk,
+                time,
+            },
+            || {
+                Some(ChordEvent::Start {
+                    id: ChordAction::ToggleToTalk,
+                    time,
+                })
+            },
+            |effect| apply_effect_to(&target, effect),
+        );
+        assert_eq!(target.calls(), ["window", "dictate:restart"]);
+    }
+
+    #[test]
+    fn unrelated_chords_stop_then_start_with_a_new_focus_snapshot() {
+        let target = FakeTarget::new(true, true);
+        let time = Instant::now();
+        process_events(
+            ChordEvent::End {
+                id: ChordAction::PushToTalk,
+                time,
+            },
+            || {
+                Some(ChordEvent::Start {
+                    id: ChordAction::ToggleToTalk,
+                    time: time + Duration::from_millis(1),
+                })
+            },
+            |effect| apply_effect_to(&target, effect),
+        );
+        assert_eq!(
+            target.calls(),
+            [
+                "window",
+                "dictate:stop",
+                "focus",
+                "window",
+                "show",
+                "dictate:start"
+            ]
+        );
+        assert_eq!(target.payloads.borrow()[0]["focus"]["pid"], 42);
     }
 }
