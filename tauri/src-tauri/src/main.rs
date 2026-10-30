@@ -361,6 +361,23 @@ async fn probe_binary_version(exe: &std::path::Path, cwd: &std::path::Path) -> O
     }
 }
 
+async fn check_gpu_backend<F, Fut>(
+    binary: std::path::PathBuf, installed: bool, app_version: &str, pin: Option<&str>,
+    permit: &server_startup::StartPermit<'_>, probe: F,
+) -> Result<Option<std::path::PathBuf>, String>
+where
+    F: FnOnce() -> Fut, Fut: std::future::Future<Output = Option<String>>,
+{
+    if !installed || pin == Some("cpu") { return Ok(None); }
+    let version = permit.until_cancelled(probe()).await.ok_or("Server startup cancelled")?;
+    let compatible = !app_version.is_empty() && version.as_deref() == Some(app_version);
+    if !compatible {
+        println!("GPU backend {:?} version mismatch: binary={}, app={}",
+            binary, version.as_deref().unwrap_or("<unknown>"), app_version);
+    }
+    Ok(compatible.then_some(binary))
+}
+
 #[command]
 async fn start_server(
     app: tauri::AppHandle,
@@ -519,85 +536,25 @@ async fn start_server(
     println!("Data directory: {:?}", data_dir);
     println!("Remote mode: {}", is_remote);
 
-    // Check for ROCm backend in data directory (onedir layout: backends/rocm/)
-    let rocm_binary = {
-        let rocm_dir = data_dir.join("backends").join("rocm");
-        let rocm_name = if cfg!(windows) {
-            "voicebox-server-rocm.exe"
-        } else {
-            "voicebox-server-rocm"
-        };
-        let exe_path = rocm_dir.join(rocm_name);
-        if exe_path.exists() {
-            println!("Found ROCm backend at {:?}", rocm_dir);
-
-            let app_version = app.config().version.clone().unwrap_or_default();
-            let binary_version = _start_permit.until_cancelled(probe_binary_version(&exe_path, &rocm_dir)).await.ok_or("Server startup cancelled")?;
-            let version_ok = if !app_version.is_empty()
-                && binary_version.as_deref() == Some(app_version.as_str())
-            {
-                println!("ROCm binary version {} matches app version", app_version);
-                true
-            } else {
-                println!(
-                    "ROCm binary version mismatch: binary={}, app={}. Falling back to CPU.",
-                    binary_version.as_deref().unwrap_or("<unknown>"),
-                    app_version
-                );
-                false
-            };
-
-            if version_ok {
-                Some(exe_path)
-            } else {
-                None
-            }
-        } else {
-            println!("No ROCm backend found");
-            None
-        }
+    // Read the override before probing: forcing CPU must not execute GPU binaries.
+    let backend_override = {
+        let in_memory = state.backend_override.lock().unwrap().clone();
+        in_memory.or_else(|| read_persisted_backend_override(&data_dir))
     };
-
-    // Check for CUDA backend in data directory (onedir layout: backends/cuda/)
-    let cuda_binary = {
-        let cuda_dir = data_dir.join("backends").join("cuda");
-        let cuda_name = if cfg!(windows) {
-            "voicebox-server-cuda.exe"
-        } else {
-            "voicebox-server-cuda"
-        };
-        let exe_path = cuda_dir.join(cuda_name);
-        if exe_path.exists() {
-            println!("Found CUDA backend at {:?}", cuda_dir);
-
-            // Version check: run --version from the onedir directory so
-            // PyInstaller can find its support files for the fast --version path
-            let app_version = app.config().version.clone().unwrap_or_default();
-            let binary_version = _start_permit.until_cancelled(probe_binary_version(&exe_path, &cuda_dir)).await.ok_or("Server startup cancelled")?;
-            let version_ok = if !app_version.is_empty()
-                && binary_version.as_deref() == Some(app_version.as_str())
-            {
-                println!("CUDA binary version {} matches app version", app_version);
-                true
-            } else {
-                println!(
-                    "CUDA binary version mismatch: binary={}, app={}. Falling back to CPU.",
-                    binary_version.as_deref().unwrap_or("<unknown>"),
-                    app_version
-                );
-                false
-            };
-
-            if version_ok {
-                Some(exe_path)
-            } else {
-                None
-            }
-        } else {
-            println!("No CUDA backend found, using bundled CPU binary");
-            None
-        }
-    };
+    let app_version = app.config().version.clone().unwrap_or_default();
+    let rocm_dir = data_dir.join("backends").join("rocm");
+    let cuda_dir = data_dir.join("backends").join("cuda");
+    let suffix = if cfg!(windows) { ".exe" } else { "" };
+    let rocm_path = rocm_dir.join(format!("voicebox-server-rocm{suffix}"));
+    let cuda_path = cuda_dir.join(format!("voicebox-server-cuda{suffix}"));
+    let rocm_binary = check_gpu_backend(
+        rocm_path.clone(), rocm_path.exists(), &app_version, backend_override.as_deref(),
+        &_start_permit, || probe_binary_version(&rocm_path, &rocm_dir),
+    ).await?;
+    let cuda_binary = check_gpu_backend(
+        cuda_path.clone(), cuda_path.exists(), &app_version, backend_override.as_deref(),
+        &_start_permit, || probe_binary_version(&cuda_path, &cuda_dir),
+    ).await?;
 
     let sidecar_result = app.shell().sidecar("voicebox-server");
 
@@ -663,14 +620,6 @@ async fn start_server(
     if let Some(ref dir) = effective_models_dir {
         println!("Custom models directory: {}", dir);
     }
-
-    // Respect backend override (e.g., user wants CPU even though a GPU binary
-    // exists, or pinned a specific GPU variant). The in-memory value resets to
-    // None on app launch, so fall back to the persisted choice on disk.
-    let backend_override = {
-        let in_memory = state.backend_override.lock().unwrap().clone();
-        in_memory.or_else(|| read_persisted_backend_override(&data_dir))
-    };
 
     // Honor a pinned GPU variant by ignoring the other one — but only when the
     // pinned variant is actually installed, so a stale pin to a deleted backend
@@ -2155,5 +2104,64 @@ mod override_persistence_regression_tests {
         let state = Mutex::new(Some("cuda".into()));
         assert!(save_backend_override(std::path::Path::new("/dev/null"), &state, None).is_err());
         assert_eq!(state.lock().unwrap().as_deref(), Some("cuda"));
+    }
+}
+
+#[cfg(test)]
+mod gpu_startup_regression_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn forced_cpu_never_probes_an_installed_gpu() {
+        let calls = AtomicUsize::new(0);
+        let gate = server_startup::StartGate::default();
+        let permit = gate.try_begin().unwrap();
+        let result = check_gpu_backend("gpu".into(), true, "0.6.0", Some("cpu"), &permit, || async {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Some("0.6.0".into())
+        }).await.unwrap();
+        assert_eq!(result, None);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn absent_backend_never_starts_a_probe() {
+        let gate = server_startup::StartGate::default();
+        let permit = gate.try_begin().unwrap();
+        assert_eq!(check_gpu_backend("missing".into(), false, "0.6.0", None, &permit, || async { panic!("probe should not run") }).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn version_validation_rejects_missing_mismatched_or_empty_app_version() {
+        let gate = server_startup::StartGate::default();
+        let permit = gate.try_begin().unwrap();
+        for (app, probe) in [("0.6.0", None), ("0.6.0", Some("0.5.0")), ("", Some(""))] {
+            assert_eq!(check_gpu_backend("gpu".into(), true, app, None, &permit, || async { probe.map(str::to_owned) }).await.unwrap(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn compatible_gpu_is_eligible_for_automatic_and_pinned_selection() {
+        let gate = server_startup::StartGate::default();
+        let permit = gate.try_begin().unwrap();
+        for pin in [None, Some("cuda"), Some("rocm")] {
+            assert_eq!(check_gpu_backend("gpu".into(), true, "0.6.0", pin, &permit, || async { Some("0.6.0".into()) }).await.unwrap(), Some("gpu".into()));
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_a_pending_gpu_probe() {
+        let gate = server_startup::StartGate::default();
+        let permit = gate.try_begin().unwrap();
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let work = check_gpu_backend("gpu".into(), true, "0.6.0", None, &permit, || async {
+            entered.send(()).unwrap();
+            std::future::pending::<Option<String>>().await
+        });
+        tokio::pin!(work);
+        tokio::select! { _ = &mut work => panic!("probe finished early"), _ = waiting => {} }
+        gate.cancel_and(|| ());
+        assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(1), work).await.unwrap().unwrap_err(), "Server startup cancelled");
     }
 }
