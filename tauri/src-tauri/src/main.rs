@@ -300,19 +300,27 @@ fn read_persisted_backend_override(data_dir: &std::path::Path) -> Option<String>
         .filter(|s| !s.is_empty())
 }
 
-fn write_persisted_backend_override(data_dir: &std::path::Path, value: Option<&str>) {
+fn write_persisted_backend_override(data_dir: &std::path::Path, value: Option<&str>) -> std::io::Result<()> {
     let path = backend_override_file(data_dir);
     match value {
-        Some(v) => {
-            let _ = std::fs::create_dir_all(data_dir);
-            if let Err(e) = std::fs::write(&path, v) {
-                println!("Failed to persist backend override: {}", e);
-            }
+        Some(value) => {
+            std::fs::create_dir_all(data_dir)?;
+            std::fs::write(path, value)
         }
-        None => {
-            let _ = std::fs::remove_file(&path);
-        }
+        None => match std::fs::remove_file(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            result => result,
+        },
     }
+}
+
+fn save_backend_override(data_dir: &std::path::Path, state: &Mutex<Option<String>>, value: Option<String>) -> Result<(), String> {
+    // Serialize disk and memory updates so concurrent commands cannot disagree.
+    let mut current = state.lock().map_err(|_| "Backend override state unavailable")?;
+    write_persisted_backend_override(data_dir, value.as_deref())
+        .map_err(|error| format!("Failed to persist backend override: {error}"))?;
+    *current = value;
+    Ok(())
 }
 
 /// Run `<exe> --version` with a 10-second timeout to avoid hanging Tauri startup.
@@ -923,12 +931,10 @@ fn set_backend_override(
     app: tauri::AppHandle,
     state: State<'_, ServerState>,
     backend: Option<String>,
-) {
-    println!("set_backend_override called with: {:?}", backend);
-    if let Ok(data_dir) = app.path().app_data_dir() {
-        write_persisted_backend_override(&data_dir, backend.as_deref());
-    }
-    *state.backend_override.lock().unwrap() = backend;
+) -> Result<(), String> {
+    let data_dir = app.path().app_data_dir()
+        .map_err(|error| format!("Failed to locate backend settings: {error}"))?;
+    save_backend_override(&data_dir, &state.backend_override, backend)
 }
 
 #[command]
@@ -1893,14 +1899,38 @@ mod backend_override_tests {
     fn backend_override_survives_restart_and_can_be_cleared() {
         let dir = std::env::temp_dir().join(format!("voicebox-override-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
         assert_eq!(read_persisted_backend_override(&dir), None);
-        write_persisted_backend_override(&dir, Some("cuda"));
+        write_persisted_backend_override(&dir, Some("cuda")).unwrap();
         assert_eq!(read_persisted_backend_override(&dir).as_deref(), Some("cuda"));
-        write_persisted_backend_override(&dir, Some("  rocm\n"));
+        write_persisted_backend_override(&dir, Some("  rocm\n")).unwrap();
         assert_eq!(read_persisted_backend_override(&dir).as_deref(), Some("rocm"));
-        write_persisted_backend_override(&dir, Some(" \n"));
+        write_persisted_backend_override(&dir, Some(" \n")).unwrap();
         assert_eq!(read_persisted_backend_override(&dir), None);
-        write_persisted_backend_override(&dir, None);
+        write_persisted_backend_override(&dir, None).unwrap();
         assert_eq!(read_persisted_backend_override(&dir), None);
+        let current = std::sync::Mutex::new(None);
+        for choice in ["cpu", "cuda", "rocm"] {
+            super::save_backend_override(&dir, &current, Some(choice.into())).unwrap();
+            assert_eq!(current.lock().unwrap().as_deref(), Some(choice));
+            assert_eq!(read_persisted_backend_override(&dir).as_deref(), Some(choice));
+        }
+        super::save_backend_override(&dir, &current, None).unwrap();
+        super::save_backend_override(&dir, &current, None).unwrap();
+        assert_eq!(*current.lock().unwrap(), None);
+        assert_eq!(read_persisted_backend_override(&dir), None);
+
+        // Concurrent settings updates must leave disk and memory in agreement.
+        std::thread::scope(|scope| {
+            for choice in ["cpu", "cuda", "rocm"] {
+                let dir = &dir;
+                let current = &current;
+                scope.spawn(move || {
+                    for _ in 0..10 {
+                        super::save_backend_override(dir, current, Some(choice.into())).unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(*current.lock().unwrap(), read_persisted_backend_override(&dir));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
@@ -2106,5 +2136,24 @@ mod restart_configuration_tests {
         assert!(resolve_remote_setting(&first, Some(true)));
         assert!(!resolve_remote_setting(&second, None));
         assert!(resolve_remote_setting(&first, None));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod override_persistence_regression_tests {
+    use super::*;
+
+    #[test]
+    fn failed_write_reports_error_without_changing_current_choice() {
+        let state = Mutex::new(Some("cpu".into()));
+        assert!(save_backend_override(std::path::Path::new("/dev/null"), &state, Some("cuda".into())).is_err());
+        assert_eq!(state.lock().unwrap().as_deref(), Some("cpu"));
+    }
+
+    #[test]
+    fn failed_reset_reports_error_without_changing_current_choice() {
+        let state = Mutex::new(Some("cuda".into()));
+        assert!(save_backend_override(std::path::Path::new("/dev/null"), &state, None).is_err());
+        assert_eq!(state.lock().unwrap().as_deref(), Some("cuda"));
     }
 }
