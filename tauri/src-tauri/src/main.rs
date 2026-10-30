@@ -947,31 +947,32 @@ fn spawn_server_stop(
 }
 
 #[command]
-async fn restart_server(
-    app: tauri::AppHandle,
+async fn restart_server<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, ServerState>,
     models_dir: Option<String>,
 ) -> Result<String, String> {
+    restart_server_with(app, state, models_dir, ServerStartupConfig::default(), std::time::Duration::from_secs(30), std::time::Duration::from_millis(1000)).await
+}
+
+async fn restart_server_with<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, ServerState>,
+    models_dir: Option<String>,
+    config: ServerStartupConfig,
+    stop_timeout: std::time::Duration,
+    release_delay: std::time::Duration,
+) -> Result<String, String> {
     println!("restart_server: stopping current server...");
-
-    // Update stored models_dir: empty string means reset to default, non-empty means set
     update_models_dir(&state.models_dir, models_dir.as_deref());
-
-    // Stop the current server
     stop_server(state.clone()).await?;
-
-    // Wait for cancelled startup and any concurrent cleanup to finish.
-    tokio::time::timeout(std::time::Duration::from_secs(30), state.start_gate.wait_until_idle())
+    tokio::time::timeout(stop_timeout, state.start_gate.wait_until_idle())
         .await
         .map_err(|_| "Previous server startup or cleanup did not stop in time".to_string())?;
-
-    // Wait for port to be released
     println!("restart_server: waiting for port release...");
-    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-
-    // Start server again (will auto-detect GPU binary and use stored models_dir)
+    tokio::time::sleep(release_delay).await;
     println!("restart_server: starting server...");
-    start_server(app, state.clone(), None, None).await
+    start_server_with(app, state, None, None, config).await
 }
 
 #[command]
@@ -3256,6 +3257,64 @@ mod server_start_flow_tests {
             .unwrap()
             .is_none());
         assert!(app.state::<ServerState>().child.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn restart_replaces_the_sidecar_and_preserves_or_updates_settings() {
+        for (requested, expected) in [(None, "original models"), (Some("new models"), "new models"), (Some(""), "unset")] {
+            let fixture = Fixture::new("printf '%s\\n' \"${VOICEBOX_MODELS_DIR-unset}\" >> \"$2/models\"\nprintf '%s\\n' \"$@\" > \"$2/args\"\nprintf 'INFO: Uvicorn running on http://0.0.0.0:%s\\n' \"$4\" >&2\nexec /bin/sleep 5");
+            let app = app();
+            start_server_with(app.handle().clone(), app.state(), Some(true), Some("original models".into()), fixture.config()).await.unwrap();
+            let original_pid = app.state::<ServerState>().server_pid.lock().unwrap().unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(5), restart_server_with(
+                app.handle().clone(), app.state(), requested.map(str::to_string), fixture.config(), Duration::from_secs(3), Duration::ZERO,
+            )).await.unwrap().unwrap();
+            assert_eq!(result, format!("http://127.0.0.1:{}", fixture.port));
+            let new_pid = app.state::<ServerState>().server_pid.lock().unwrap().unwrap();
+            assert_ne!(original_pid, new_pid);
+            let models = std::fs::read_to_string(fixture.dir.join("data/models")).unwrap();
+            assert_eq!(models.lines().collect::<Vec<_>>(), ["original models", expected]);
+            let args = std::fs::read_to_string(fixture.dir.join("data/args")).unwrap();
+            assert!(args.lines().collect::<Vec<_>>().windows(2).any(|args| args == ["--host", "0.0.0.0"]));
+            assert!(*app.state::<ServerState>().remote.lock().unwrap());
+            assert_eq!(app.state::<ServerState>().models_dir.lock().unwrap().as_deref(), if expected == "unset" { None } else { Some(expected) });
+            stop_server_if_owned(app.state(), None).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_cancels_pending_start_before_launching_replacement() {
+        let old = Fixture::new("exec /bin/sleep 5");
+        let replacement = Fixture::new("printf 'INFO: Uvicorn running on http://127.0.0.1:%s\\n' \"$4\" >&2\nexec /bin/sleep 5");
+        let app = app();
+        let handle = app.handle().clone();
+        let config = old.config();
+        let first = tokio::spawn(async move { start_server_with(handle.clone(), handle.state(), None, None, config).await });
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while app.state::<ServerState>().server_pid.lock().unwrap().is_none() { tokio::time::sleep(Duration::from_millis(10)).await; }
+        }).await.expect("first sidecar did not start");
+        let old_pid = app.state::<ServerState>().server_pid.lock().unwrap().unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), restart_server_with(
+            app.handle().clone(), app.state(), None, replacement.config(), Duration::from_secs(3), Duration::ZERO,
+        )).await.unwrap().unwrap();
+        assert_eq!(result, format!("http://127.0.0.1:{}", replacement.port));
+        assert!(first.await.unwrap().unwrap_err().contains("cancelled"));
+        assert_ne!(old_pid, app.state::<ServerState>().server_pid.lock().unwrap().unwrap());
+        stop_server_if_owned(app.state(), None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_timeout_does_not_launch_a_replacement_while_prior_start_is_busy() {
+        let fixture = Fixture::new("touch \"$2/started\"\nexec /bin/sleep 5");
+        let app = app();
+        let state = app.state::<ServerState>();
+        let pending = state.start_gate.try_begin().unwrap();
+        let error = restart_server_with(app.handle().clone(), state.clone(), None, fixture.config(), Duration::from_millis(40), Duration::ZERO).await.unwrap_err();
+        assert!(error.contains("did not stop in time"));
+        assert!(!fixture.dir.join("data/started").exists());
+        assert!(state.server_pid.lock().unwrap().is_none());
+        drop(pending);
+        assert!(state.start_gate.try_begin().is_some());
     }
 
     #[tokio::test]
