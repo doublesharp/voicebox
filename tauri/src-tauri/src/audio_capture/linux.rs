@@ -65,35 +65,11 @@ fn find_monitor_source_via_pactl() -> Option<String> {
 
 /// Select the capture device: prefer an exact match against the monitor
 /// source name reported by `pactl`, then fall back to any device whose name
-/// contains "monitor", then the host's default input device.
+/// contains "monitor". Never fall back to a microphone.
 fn select_capture_device(host: &cpal::Host, monitor_source: Option<&str>) -> Option<cpal::Device> {
     let devices: Vec<cpal::Device> = host.input_devices().ok()?.collect();
 
-    if let Some(target) = monitor_source {
-        if let Some(pos) = devices
-            .iter()
-            .position(|d| d.name().map(|n| n == target).unwrap_or(false))
-        {
-            eprintln!(
-                "Linux audio capture: Using pactl monitor device: {}",
-                target
-            );
-            return devices.into_iter().nth(pos);
-        }
-    }
-
-    if let Some(pos) = devices.iter().position(|d| {
-        d.name()
-            .map(|n| n.to_lowercase().contains("monitor"))
-            .unwrap_or(false)
-    }) {
-        let name = devices[pos].name().unwrap_or_default();
-        eprintln!("Linux audio capture: Found monitor device by name: {}", name);
-        return devices.into_iter().nth(pos);
-    }
-
-    eprintln!("Linux audio capture: No monitor device found, falling back to default input");
-    host.default_input_device()
+    super::linux_device::select_monitor_device(devices, monitor_source, |device| device.name().ok())
 }
 
 /// Start capturing system audio on Linux using PulseAudio monitor sources.
@@ -132,7 +108,7 @@ pub async fn start_capture(
         let device = match select_capture_device(&host, monitor_source.as_deref()) {
             Some(d) => d,
             None => {
-                let error_msg = "No audio input device available".to_string();
+                let error_msg = "No system audio monitor is available. Check your PulseAudio or PipeWire configuration.".to_string();
                 eprintln!("{}", error_msg);
                 *error_arc.lock().unwrap() = Some(error_msg);
                 return;
