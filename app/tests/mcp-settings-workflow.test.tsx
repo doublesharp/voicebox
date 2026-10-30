@@ -2,12 +2,12 @@ import { afterAll, afterEach, beforeEach, expect, mock, test } from 'bun:test';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 
 const upsert = mock(async (_value: any) => {});
-const remove = mock((_id: string) => {});
+const remove = mock(async (_id: string) => {});
 const update = mock((_value: any) => {});
 const t = (key: string, options?: any) => options?.defaultValue ?? key;
 const binding = { client_id: 'agent', label: 'Agent', profile_id: 'voice-a', default_engine: 'kokoro', default_personality: true, last_seen_at: null };
 mock.module('react-i18next', () => ({ initReactI18next: { type: '3rdParty', init() {} }, useTranslation: () => ({ t }), Trans: ({ i18nKey }: any) => i18nKey }));
-mock.module('../src/lib/hooks/useMCPBindings', () => ({ useMCPBindings: () => ({ bindings: [binding], upsertAsync: upsert, remove }) }));
+mock.module('../src/lib/hooks/useMCPBindings', () => ({ useMCPBindings: () => ({ bindings: [binding], upsertAsync: upsert, removeAsync: remove, isRemoving: false }) }));
 mock.module('../src/lib/hooks/useProfiles', () => ({ useProfiles: () => ({ data: [{ id: 'voice-a', name: 'Voice A' }, { id: 'voice-b', name: 'Voice B' }] }) }));
 mock.module('../src/lib/hooks/useSettings', () => ({ useCaptureSettings: () => ({ settings: { default_playback_voice_id: 'voice-a' }, update }) }));
 mock.module('../src/components/ui/select', () => ({
@@ -63,4 +63,13 @@ test('failed voice selection reports an error rather than leaking a rejection', 
   await mount();
   await act(async () => { try { await selects()[1].props.onChange({ target: { value: 'voice-b' } }); } catch {} });
   expect(view.root.findAllByProps({ role: 'alert' })).toHaveLength(1);
+});
+
+
+test('failed agent removal displays an error and retains the binding', async () => {
+  remove.mockImplementationOnce(async () => { throw new Error('offline'); });
+  await mount();
+  await act(async () => { try { await view.root.findByProps({ 'aria-label': 'settings.mcp.bindings.removeAria' }).props.onClick(); } catch {} });
+  expect(view.root.findAllByProps({ role: 'alert' })).toHaveLength(1);
+  expect(view.root.findByProps({ 'aria-label': 'settings.mcp.bindings.removeAria' })).toBeDefined();
 });

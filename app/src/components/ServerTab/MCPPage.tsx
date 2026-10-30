@@ -40,7 +40,7 @@ function getStdioShimCommand(): string {
 export function MCPPage() {
   const { t } = useTranslation();
   const serverUrl = useServerStore((s) => s.serverUrl);
-  const { bindings, upsertAsync, remove } = useMCPBindings();
+  const { bindings, upsertAsync, removeAsync, isRemoving } = useMCPBindings();
   const { data: profiles } = useProfiles();
   const { settings: captureSettings, update: updateCapture } = useCaptureSettings();
 
@@ -218,7 +218,15 @@ export function MCPPage() {
                   <Button
                     size="icon"
                     variant="ghost"
-                    onClick={() => remove(b.client_id)}
+                    disabled={isRemoving}
+                    onClick={() => {
+                      setBindingError(null);
+                      void removeAsync(b.client_id).catch(() => setBindingError(
+                        t('settings.mcp.bindings.removeFailed', {
+                          defaultValue: 'Could not remove the agent binding. Please try again.',
+                        }),
+                      ));
+                    }}
                     aria-label={t('settings.mcp.bindings.removeAria', { client: b.client_id })}
                   >
                     <Trash2 className="h-4 w-4" />

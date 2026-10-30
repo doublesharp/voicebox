@@ -1,9 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiClient } from '@/lib/api/client';
-import type {
-  MCPClientBindingListResponse,
-  MCPClientBindingUpsert,
-} from '@/lib/api/types';
+import type { MCPClientBindingUpsert } from '@/lib/api/types';
 
 const MCP_BINDINGS_KEY = ['settings', 'mcp', 'bindings'] as const;
 
@@ -30,24 +27,9 @@ export function useMCPBindings() {
 
   const deleteMutation = useMutation({
     mutationFn: (clientId: string) => apiClient.deleteMCPBinding(clientId),
-    onMutate: async (clientId) => {
-      await queryClient.cancelQueries({ queryKey: MCP_BINDINGS_KEY });
-      const prev =
-        queryClient.getQueryData<MCPClientBindingListResponse>(MCP_BINDINGS_KEY);
-      if (prev) {
-        queryClient.setQueryData<MCPClientBindingListResponse>(
-          MCP_BINDINGS_KEY,
-          { items: prev.items.filter((b) => b.client_id !== clientId) },
-        );
-      }
-      return { prev };
-    },
-    onError: (_err, _id, ctx) => {
-      if (ctx?.prev) queryClient.setQueryData(MCP_BINDINGS_KEY, ctx.prev);
-    },
-    onSettled: () => {
-      queryClient.invalidateQueries({ queryKey: MCP_BINDINGS_KEY });
-    },
+    // Keep the confirmed list visible until the server accepts the deletion.
+    // Restoring a whole snapshot on failure would overwrite concurrent edits.
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: MCP_BINDINGS_KEY }),
   });
 
   return {
@@ -56,5 +38,7 @@ export function useMCPBindings() {
     upsert: upsertMutation.mutate,
     upsertAsync: upsertMutation.mutateAsync,
     remove: deleteMutation.mutate,
+    removeAsync: deleteMutation.mutateAsync,
+    isRemoving: deleteMutation.isPending,
   };
 }
