@@ -204,6 +204,7 @@ for (const [os, platform, userAgent] of [
       });
       const shell = view.root.findByProps({ className: 'app-shell' });
       expect(shell.props['data-desktop-platform']).toBe(os);
+      expect(view.root.findByProps({ 'data-desktop-page-content': true })).toBeDefined();
       expect(shell.props.style['--desktop-sidebar-width']).toBe('220px');
       await act(async () => {
         target.dispatchEvent(new Event('voicebox:toggle-sidebar'));

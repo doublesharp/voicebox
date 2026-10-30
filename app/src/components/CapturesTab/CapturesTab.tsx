@@ -452,7 +452,7 @@ export function CapturesTab() {
   };
 
   return (
-    <div className="h-full flex gap-0 overflow-hidden -mx-8">
+    <div className="h-full flex gap-0 overflow-hidden -mx-8 desktop-page-bleed">
       <input
         ref={uploadInputRef}
         type="file"
@@ -476,7 +476,7 @@ export function CapturesTab() {
               <ListPaneTitle>{t('captures.title')}</ListPaneTitle>
               <Badge
                 variant="secondary"
-                className="h-5 px-1.5 -ml-2 text-[10px] font-medium text-accent bg-accent/10 border border-accent/20"
+                className="desktop-list-badge h-5 px-1.5 -ml-2 text-[10px] font-medium text-accent bg-accent/10 border border-accent/20"
               >
                 {t('captures.beta')}
               </Badge>

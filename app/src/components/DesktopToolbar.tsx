@@ -32,7 +32,9 @@ export function DesktopToolbar() {
             <ChevronLeft size={16} aria-hidden="true" />
           </Link>
         )}
-        <span className="desktop-toolbar-title">{title}</span>
+        {(path.startsWith('/studio/') || path.startsWith('/settings')) && (
+          <span className="desktop-toolbar-title">{title}</span>
+        )}
       </div>
       <div className="desktop-toolbar-actions">
         <div id="desktop-toolbar-context-actions" className="desktop-toolbar-context-actions" />

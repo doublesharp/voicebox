@@ -349,7 +349,7 @@ export function ProjectsPage() {
       )}
       {busy && <p aria-live="polite">Importing your project and validating audio…</p>}
       <div className="studio-section-title">
-        <h2>Projects</h2>
+        <h2>Your projects</h2>
         <span>
           {filtered.length} {filtered.length === 1 ? 'project' : 'projects'}
         </span>

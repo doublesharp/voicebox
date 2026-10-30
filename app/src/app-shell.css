@@ -352,3 +352,29 @@
   outline: 2px solid hsl(var(--ring));
   outline-offset: 2px;
 }
+
+/* Keep desktop page content aligned beneath the window toolbar. */
+.app-shell[data-desktop="true"] [data-desktop-page-content="true"] {
+  padding: 20px 24px 0;
+}
+.app-shell[data-desktop="true"] .desktop-page-bleed {
+  margin-left: -24px;
+  margin-right: -24px;
+}
+.app-shell[data-desktop="true"] .desktop-list-header {
+  padding-left: 24px;
+  padding-right: 24px;
+}
+.app-shell[data-desktop="true"] .desktop-list-title {
+  padding-left: 0;
+  padding-right: 0;
+}
+.app-shell[data-desktop="true"] .desktop-list-badge {
+  margin-left: 8px;
+}
+.app-shell[data-desktop="true"] .studio-projects {
+  padding: 0 0 24px;
+}
+.app-shell[data-desktop="true"] .studio-landing-header {
+  margin: 0 0 20px;
+}

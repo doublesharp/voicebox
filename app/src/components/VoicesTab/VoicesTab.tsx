@@ -193,7 +193,7 @@ export function VoicesTab() {
   }
 
   return (
-    <div className="h-full flex gap-0 overflow-hidden -mx-8">
+    <div className="h-full flex gap-0 overflow-hidden -mx-8 desktop-page-bleed">
       {/* Left: Table */}
       <div className="flex-1 min-h-0 min-w-0 flex flex-col relative overflow-hidden">
         {/* Header stays in the layout so wrapped controls never cover the table. */}

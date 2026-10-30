@@ -118,6 +118,7 @@ function RootLayout() {
           >
             {desktop && <DesktopToolbar />}
             <div
+              data-desktop-page-content={desktop}
               className={
                 isStudio
                   ? `mx-auto w-full px-2 sm:px-4 max-w-[1800px] ${desktop ? 'flex-1 min-h-0' : 'h-full'} overflow-hidden flex flex-col`
