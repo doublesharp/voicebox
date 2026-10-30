@@ -263,10 +263,12 @@ def reference_info(path):
 
 def device_environment(settings):
     """Device selection that must precede every torch import. The backend
-    honors VOICEBOX_FORCE_CPU; CUDA_VISIBLE_DEVICES pins one physical GPU
-    (or hides them all for cpu), numbered as nvidia-smi numbers them."""
+    honors VOICEBOX_FORCE_CPU; CUDA_VISIBLE_DEVICES pins one physical GPU,
+    numbered as nvidia-smi numbers them. The invalid index -1 hides every GPU
+    for cpu: an empty value is dropped from the Windows environment block, so
+    the CUDA runtime would still see the devices."""
     if settings.device == "cpu":
-        return {"VOICEBOX_FORCE_CPU": "1", "CUDA_VISIBLE_DEVICES": ""}
+        return {"VOICEBOX_FORCE_CPU": "1", "CUDA_VISIBLE_DEVICES": "-1"}
     if settings.device.startswith("cuda"):
         return {"CUDA_VISIBLE_DEVICES": settings.device.partition(":")[2] or "0", "CUDA_DEVICE_ORDER": "PCI_BUS_ID"}
     return {}

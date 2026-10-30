@@ -753,7 +753,7 @@ def test_device_identity_requires_nvidia_for_cuda_and_skips_torch_for_mlx(settin
 
 
 @pytest.mark.parametrize("device,expected", [
-    ("cpu", {"VOICEBOX_FORCE_CPU": "1", "CUDA_VISIBLE_DEVICES": ""}),
+    ("cpu", {"VOICEBOX_FORCE_CPU": "1", "CUDA_VISIBLE_DEVICES": "-1"}),
     ("cuda", {"CUDA_VISIBLE_DEVICES": "0", "CUDA_DEVICE_ORDER": "PCI_BUS_ID"}),
     ("cuda:1", {"CUDA_VISIBLE_DEVICES": "1", "CUDA_DEVICE_ORDER": "PCI_BUS_ID"}), ("mlx", {}),
 ])
@@ -770,7 +770,7 @@ def test_offline_configuration_forces_cpu_and_windows_temp(settings, monkeypatch
     try:
         bench.configure_offline(settings, output)
         temporary = str(settings.output_root / "runtime" / "tmp")
-        assert os.environ["VOICEBOX_FORCE_CPU"] == "1" and os.environ["CUDA_VISIBLE_DEVICES"] == ""
+        assert os.environ["VOICEBOX_FORCE_CPU"] == "1" and os.environ["CUDA_VISIBLE_DEVICES"] == "-1"
         assert os.environ["TMPDIR"] == os.environ["TEMP"] == os.environ["TMP"] == temporary
     finally:
         output.close()
