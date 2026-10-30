@@ -25,6 +25,8 @@ pub struct AudioCaptureState {
     pub channels: Arc<Mutex<u16>>,
     pub stop_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<()>>>>,
     pub error: Arc<Mutex<Option<String>>>,
+    #[cfg(any(test, target_os = "linux", target_os = "windows"))]
+    portable_capture: Mutex<Option<PortableCapture>>,
     #[cfg(target_os = "macos")]
     pub stream: Arc<Mutex<Option<SCStream>>>,
     #[cfg(target_os = "macos")]
@@ -41,6 +43,8 @@ impl AudioCaptureState {
             channels: Arc::new(Mutex::new(2)),
             stop_tx: Arc::new(Mutex::new(None)),
             error: Arc::new(Mutex::new(None)),
+            #[cfg(any(test, target_os = "linux", target_os = "windows"))]
+            portable_capture: Mutex::new(None),
             #[cfg(target_os = "macos")]
             stream: Arc::new(Mutex::new(None)),
             #[cfg(target_os = "macos")]
@@ -53,6 +57,47 @@ impl AudioCaptureState {
     pub fn reset(&self) {
         *self.samples.lock().unwrap() = Vec::new();
         *self.error.lock().unwrap() = None;
+    }
+}
+
+#[cfg(any(test, target_os = "linux", target_os = "windows"))]
+#[derive(Clone)]
+struct PortableCapture {
+    samples: Arc<Mutex<Vec<f32>>>,
+    sample_rate: Arc<Mutex<u32>>,
+    channels: Arc<Mutex<u16>>,
+    error: Arc<Mutex<Option<String>>>,
+    stop_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<()>>>>,
+}
+
+#[cfg(any(test, target_os = "linux", target_os = "windows"))]
+impl AudioCaptureState {
+    fn begin_portable_capture(
+        &self,
+    ) -> (
+        PortableCapture,
+        tokio::sync::mpsc::Receiver<()>,
+        tokio::sync::mpsc::WeakSender<()>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let timer_sender = tx.downgrade();
+        let capture = PortableCapture {
+            samples: Arc::new(Mutex::new(Vec::new())),
+            sample_rate: Arc::new(Mutex::new(44100)),
+            channels: Arc::new(Mutex::new(2)),
+            error: Arc::new(Mutex::new(None)),
+            stop_tx: Arc::new(Mutex::new(Some(tx))),
+        };
+        *self.portable_capture.lock().unwrap() = Some(capture.clone());
+        (capture, rx, timer_sender)
+    }
+
+    fn take_portable_capture(&self) -> Result<PortableCapture, String> {
+        self.portable_capture
+            .lock()
+            .map_err(|_| "Capture state unavailable")?
+            .take()
+            .ok_or_else(|| "No system audio capture is active".into())
     }
 }
 
@@ -80,6 +125,65 @@ fn signal_capture_stop(slot: &Arc<Mutex<Option<tokio::sync::mpsc::Sender<()>>>>)
 mod capture_timeout_tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn late_worker_from_previous_capture_cannot_contaminate_new_audio() {
+        let state = AudioCaptureState::new();
+        let (old, _old_rx, _timer) = state.begin_portable_capture();
+        old.samples.lock().unwrap().push(0.5);
+        let (new, _new_rx, _timer) = state.begin_portable_capture();
+        *new.sample_rate.lock().unwrap() = 48000;
+        *new.channels.lock().unwrap() = 2;
+        new.samples.lock().unwrap().extend([0.25, -0.25]);
+        old.samples.lock().unwrap().push(0.75);
+        *old.sample_rate.lock().unwrap() = 8000;
+        *old.channels.lock().unwrap() = 1;
+        *old.error.lock().unwrap() = Some("old capture failed".into());
+        assert_eq!(*new.samples.lock().unwrap(), [0.25, -0.25]);
+        assert_eq!(*new.sample_rate.lock().unwrap(), 48000);
+        assert_eq!(*new.channels.lock().unwrap(), 2);
+        assert!(new.error.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn replacement_closes_the_old_channel_and_stop_takes_only_current_capture() {
+        let state = AudioCaptureState::new();
+        let (old, mut old_rx, _timer) = state.begin_portable_capture();
+        drop(old);
+        let (current, mut current_rx, _timer) = state.begin_portable_capture();
+        assert_eq!(old_rx.recv().await, None);
+        let stopped = state.take_portable_capture().unwrap();
+        assert!(Arc::ptr_eq(&stopped.samples, &current.samples));
+        signal_capture_stop(&stopped.stop_tx);
+        assert_eq!(current_rx.recv().await, Some(()));
+        assert!(state.take_portable_capture().is_err());
+    }
+
+    #[test]
+    fn stopping_old_capture_cannot_take_replacement_buffers() {
+        let state = AudioCaptureState::new();
+        let (old, _old_rx, _timer) = state.begin_portable_capture();
+        let taken = state.take_portable_capture().unwrap();
+        let (new, _new_rx, _timer) = state.begin_portable_capture();
+        taken.samples.lock().unwrap().push(0.75);
+        assert!(new.samples.lock().unwrap().is_empty());
+        let current = state.take_portable_capture().unwrap();
+        assert!(Arc::ptr_eq(&current.samples, &new.samples));
+        assert!(Arc::ptr_eq(&old.samples, &taken.samples));
+    }
+
+    #[tokio::test]
+    async fn stop_can_run_before_the_start_caller_schedules_its_timer() {
+        let state = AudioCaptureState::new();
+        let (_capture, mut rx, timer_sender) = state.begin_portable_capture();
+        let stopped = state.take_portable_capture().unwrap();
+        signal_capture_stop(&stopped.stop_tx);
+        assert_eq!(rx.recv().await, Some(()));
+        schedule_capture_timeout(timer_sender, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(rx.recv().await, None);
+    }
 
     #[tokio::test]
     async fn old_capture_timeout_must_not_stop_a_replacement() {

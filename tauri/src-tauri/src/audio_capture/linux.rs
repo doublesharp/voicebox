@@ -109,24 +109,17 @@ pub async fn start_capture(
     state: &AudioCaptureState,
     max_duration_secs: u32,
 ) -> Result<(), String> {
-    // Reset previous samples
-    state.reset();
-
-    let samples = state.samples.clone();
-    let sample_rate_arc = state.sample_rate.clone();
-    let channels_arc = state.channels.clone();
-    let stop_tx = state.stop_tx.clone();
-    let error_arc = state.error.clone();
+    let (capture, mut rx, timeout_tx) = state.begin_portable_capture();
+    let samples = capture.samples.clone();
+    let sample_rate_arc = capture.sample_rate.clone();
+    let channels_arc = capture.channels.clone();
+    let error_arc = capture.error.clone();
 
     // Use AtomicBool for stop signal (works across threads)
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stop_flag_clone = stop_flag.clone();
 
-    // Create tokio channel and spawn a task to bridge it to the AtomicBool
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
-    let timeout_tx = tx.downgrade();
-    *stop_tx.lock().unwrap() = Some(tx);
-
+    // Bridge the capture-owned channel to the worker's stop flag.
     tokio::spawn(async move {
         rx.recv().await;
         stop_flag_clone.store(true, Ordering::Relaxed);
@@ -294,21 +287,22 @@ pub async fn start_capture(
 }
 
 pub async fn stop_capture(state: &AudioCaptureState) -> Result<String, String> {
-    // Signal stop
-    super::signal_capture_stop(&state.stop_tx);
+    // Take and stop the same session whose data will be returned.
+    let capture = state.take_portable_capture()?;
+    super::signal_capture_stop(&capture.stop_tx);
 
     // Wait a bit for capture to stop
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
     // Check if there was an error during capture
-    if let Some(error) = state.error.lock().unwrap().as_ref() {
+    if let Some(error) = capture.error.lock().unwrap().as_ref() {
         return Err(error.clone());
     }
 
     // Get samples
-    let samples = state.samples.lock().unwrap().clone();
-    let sample_rate = *state.sample_rate.lock().unwrap();
-    let channels = *state.channels.lock().unwrap();
+    let samples = capture.samples.lock().unwrap().clone();
+    let sample_rate = *capture.sample_rate.lock().unwrap();
+    let channels = *capture.channels.lock().unwrap();
 
     if samples.is_empty() {
         return Err(
