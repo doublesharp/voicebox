@@ -751,6 +751,9 @@ async fn start_server(
                 return Err("Server startup timed out. Please retry; check Console.app if the problem persists.".to_string());
             }
         }
+        server_startup::Outcome::StreamError(error) => {
+            return Err(format!("Server startup output failed: {}", error));
+        }
         server_startup::Outcome::Exited => {
             server_process::take_process(&state.server_pid, &state.child, Some(process_pid));
             #[cfg(debug_assertions)]

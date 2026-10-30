@@ -182,6 +182,7 @@ impl<F: FnOnce()> Drop for StartupCleanup<F> {
 pub(crate) enum Outcome {
     Ready,
     Exited,
+    StreamError(String),
     TimedOut(Vec<String>),
 }
 
@@ -202,6 +203,7 @@ pub(crate) async fn wait_for_startup(
             CommandEvent::Stdout(bytes) => ("stdout", bytes),
             CommandEvent::Stderr(bytes) => ("stderr", bytes),
             CommandEvent::Terminated(_) => return Outcome::Exited,
+            CommandEvent::Error(error) => return Outcome::StreamError(error),
             _ => continue,
         };
         let line = String::from_utf8_lossy(&line);
@@ -1091,5 +1093,126 @@ mod startup_ownership_regression_tests {
             .await
             .unwrap();
         assert!(gate.try_begin().is_some());
+    }
+}
+
+#[cfg(test)]
+mod startup_stream_error_tests {
+    use super::*;
+    use tauri::async_runtime::channel;
+    use tauri_plugin_shell::process::TerminatedPayload;
+
+    #[tokio::test]
+    async fn reader_error_ends_startup_promptly_even_if_channel_stays_open() {
+        let (tx, mut rx) = channel(2);
+        tx.send(CommandEvent::Error("stdout reader failed".into()))
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            wait_for_startup(&mut rx, Duration::from_secs(5), |_, _| {}),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "reader error left startup waiting for its full timeout"
+        );
+        assert_eq!(
+            result.unwrap(),
+            Outcome::StreamError("stdout reader failed".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn reader_error_is_not_misreported_as_process_exit() {
+        let (tx, mut rx) = channel(2);
+        tx.send(CommandEvent::Error("reader failed".into()))
+            .await
+            .unwrap();
+        drop(tx);
+        let result = wait_for_startup(&mut rx, Duration::from_secs(1), |_, _| {}).await;
+        assert_eq!(result, Outcome::StreamError("reader failed".into()));
+    }
+
+    #[tokio::test]
+    async fn earlier_output_is_forwarded_before_a_reader_failure() {
+        let (tx, mut rx) = channel(3);
+        tx.send(CommandEvent::Stderr(b"loading model\n".to_vec()))
+            .await
+            .unwrap();
+        tx.send(CommandEvent::Error("pipe failed".into()))
+            .await
+            .unwrap();
+        let mut logs = Vec::new();
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            wait_for_startup(&mut rx, Duration::from_secs(5), |stream, line| {
+                logs.push((stream.to_owned(), line.to_owned()))
+            }),
+        )
+        .await;
+        assert_eq!(result.unwrap(), Outcome::StreamError("pipe failed".into()));
+        assert_eq!(logs, [("stderr".into(), "loading model".into())]);
+    }
+
+    #[tokio::test]
+    async fn reader_failure_runs_owned_startup_cleanup() {
+        let pid = std::sync::Mutex::new(Some(17));
+        let child = std::sync::Mutex::new(Some("child"));
+        let removed = std::sync::Mutex::new(None);
+        let (tx, mut rx) = channel(1);
+        tx.send(CommandEvent::Error("pipe failed".into()))
+            .await
+            .unwrap();
+        {
+            let _cleanup = StartupCleanup::new(|| {
+                *removed.lock().unwrap() =
+                    crate::server_process::take_process(&pid, &child, Some(17));
+            });
+            assert_eq!(
+                wait_for_startup(&mut rx, Duration::from_secs(1), |_, _| {}).await,
+                Outcome::StreamError("pipe failed".into())
+            );
+        }
+        assert_eq!(*removed.lock().unwrap(), Some((17, Some("child"))));
+        assert_eq!(*pid.lock().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn ready_event_leaves_later_reader_error_for_the_forwarder() {
+        let (tx, mut rx) = channel(2);
+        tx.send(CommandEvent::Stderr(
+            b"Uvicorn running on http://127.0.0.1\n".to_vec(),
+        ))
+        .await
+        .unwrap();
+        tx.send(CommandEvent::Error("later error".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            wait_for_startup(&mut rx, Duration::from_secs(1), |_, _| {}).await,
+            Outcome::Ready
+        );
+        assert!(
+            matches!(rx.recv().await, Some(CommandEvent::Error(error)) if error == "later error")
+        );
+    }
+
+    #[tokio::test]
+    async fn termination_before_reader_error_is_still_a_confirmed_exit() {
+        let (tx, mut rx) = channel(2);
+        tx.send(CommandEvent::Terminated(TerminatedPayload {
+            code: Some(1),
+            signal: None,
+        }))
+        .await
+        .unwrap();
+        tx.send(CommandEvent::Error("later error".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            wait_for_startup(&mut rx, Duration::from_secs(1), |_, _| {}).await,
+            Outcome::Exited
+        );
     }
 }
