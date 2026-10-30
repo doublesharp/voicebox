@@ -1,9 +1,25 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_STAGE: AtomicU64 = AtomicU64::new(0);
+
+struct StagedFile {
+    path: PathBuf,
+    file: Option<fs::File>,
+    published: bool,
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        // Windows cannot remove an open file. Close it before removing our stage.
+        drop(self.file.take());
+        if !self.published {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
 
 // The sibling is created exclusively, so it cannot truncate another file. A failed
 // copy, flush, sync or rename only removes our own staging file.
@@ -45,29 +61,31 @@ fn publish_using(
             Err(error) => return Err(error),
         }
     }
-    let (path, mut file) = stage.ok_or_else(|| {
+    let (path, file) = stage.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::AlreadyExists,
             "Could not allocate staging file",
         )
     })?;
-    let result = (|| {
-        write_and_sync(&mut file)?;
-        match fs::metadata(destination) {
-            Ok(metadata) => {
-                file.set_permissions(metadata.permissions())?;
-                file.sync_all()?;
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
+    let mut stage = StagedFile {
+        path,
+        file: Some(file),
+        published: false,
+    };
+    let file = stage.file.as_mut().unwrap();
+    write_and_sync(file)?;
+    match fs::metadata(destination) {
+        Ok(metadata) => {
+            file.set_permissions(metadata.permissions())?;
+            file.sync_all()?;
         }
-        drop(file);
-        fs::rename(&path, destination)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&path);
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
-    result
+    drop(stage.file.take());
+    fs::rename(&stage.path, destination)?;
+    stage.published = true;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -79,6 +97,32 @@ mod tests {
             Err(io::Error::new(io::ErrorKind::Other, "stream failed"))
         }
     }
+    struct PanicAfterBytes(bool);
+    impl Read for PanicAfterBytes {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if !self.0 {
+                self.0 = true;
+                output[..7].copy_from_slice(b"partial");
+                Ok(7)
+            } else {
+                panic!("stream panicked");
+            }
+        }
+    }
+
+    struct InterruptedOnce(bool);
+    impl Read for InterruptedOnce {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if !self.0 {
+                self.0 = true;
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "retry"));
+            }
+            output[..5].copy_from_slice(b"retry");
+            self.0 = false;
+            Ok(5)
+        }
+    }
+
     #[test]
     fn publication_preserves_existing_on_stream_and_rename_failure_and_replaces_on_success() {
         let dir =
@@ -88,6 +132,19 @@ mod tests {
         fs::write(&target, b"old").unwrap();
         assert!(publish(&target, Broken).is_err());
         assert_eq!(fs::read(&target).unwrap(), b"old");
+        let panic = std::panic::catch_unwind(|| publish(&target, PanicAfterBytes(false)));
+        assert!(panic.is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"old");
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            1,
+            "panicking reader leaked a staging file"
+        );
+        // An interrupted read must be retried without publishing a partial file.
+        let mut reader = InterruptedOnce(false).take(5);
+        publish(&target, &mut reader).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"retry");
+        fs::write(&target, b"old").unwrap();
         for failure in ["write", "flush", "sync"] {
             let result = publish_using(&target, |file| {
                 file.write_all(b"partial")?;
@@ -109,6 +166,22 @@ mod tests {
         assert!(blocked.is_dir());
         publish(&target, &b"new bytes"[..]).unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"new bytes");
+        // Simultaneous exports to one destination must result in one complete file.
+        let barrier = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for byte in 1_u8..=4 {
+                let target = &target;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    publish(target, vec![byte; 8192].as_slice()).unwrap();
+                });
+            }
+        });
+        let final_bytes = fs::read(&target).unwrap();
+        assert_eq!(final_bytes.len(), 8192);
+        assert!((1..=4).contains(&final_bytes[0]));
+        assert!(final_bytes.iter().all(|byte| *byte == final_bytes[0]));
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
         fs::remove_dir_all(dir).unwrap();
     }
