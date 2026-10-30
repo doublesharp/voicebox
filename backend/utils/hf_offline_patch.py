@@ -207,6 +207,7 @@ def force_offline_if_cached(is_cached: bool, model_label: str = ""):
 
 
 _mistral_regex_patched = False
+_cache_patch_lock = threading.Lock()
 
 
 def patch_transformers_mistral_regex():
@@ -262,36 +263,46 @@ def patch_huggingface_hub_offline():
     try:
         import huggingface_hub  # noqa: F401 -- need the package loaded
         from huggingface_hub import constants as hf_constants
-        from huggingface_hub.file_download import _try_to_load_from_cache
-
-        original_try_load = _try_to_load_from_cache
-
-        def _patched_try_to_load_from_cache(
-            repo_id: str,
-            filename: str,
-            cache_dir: Union[str, Path, None] = None,
-            revision: Optional[str] = None,
-            repo_type: Optional[str] = None,
-        ):
-            result = original_try_load(
-                repo_id=repo_id,
-                filename=filename,
-                cache_dir=cache_dir,
-                revision=revision,
-                repo_type=repo_type,
-            )
-
-            if result is None:
-                cache_path = Path(hf_constants.HF_HUB_CACHE) / f"models--{repo_id.replace('/', '--')}"
-                logger.debug("file not cached: %s/%s (expected at %s)", repo_id, filename, cache_path)
-            else:
-                logger.debug("cache hit: %s/%s", repo_id, filename)
-
-            return result
-
         import huggingface_hub.file_download as fd
 
-        fd._try_to_load_from_cache = _patched_try_to_load_from_cache
+        with _cache_patch_lock:
+            name = (
+                "_try_to_load_from_cache"
+                if hasattr(fd, "_try_to_load_from_cache")
+                else "try_to_load_from_cache"
+            )
+            original_try_load = getattr(fd, name, None)
+            if original_try_load is None:
+                logger.debug("huggingface_hub has no cache lookup to patch")
+                return
+            if getattr(original_try_load, "_voicebox_cache_patch", False):
+                return
+
+            def _patched_try_to_load_from_cache(
+                repo_id: str,
+                filename: str,
+                cache_dir: Union[str, Path, None] = None,
+                revision: Optional[str] = None,
+                repo_type: Optional[str] = None,
+            ):
+                result = original_try_load(
+                    repo_id=repo_id,
+                    filename=filename,
+                    cache_dir=cache_dir,
+                    revision=revision,
+                    repo_type=repo_type,
+                )
+
+                if result is None:
+                    cache_path = Path(hf_constants.HF_HUB_CACHE) / f"models--{repo_id.replace('/', '--')}"
+                    logger.debug("file not cached: %s/%s (expected at %s)", repo_id, filename, cache_path)
+                else:
+                    logger.debug("cache hit: %s/%s", repo_id, filename)
+
+                return result
+
+            _patched_try_to_load_from_cache._voicebox_cache_patch = True
+            setattr(fd, name, _patched_try_to_load_from_cache)
         logger.debug("huggingface_hub patched for offline mode")
 
     except ImportError:
