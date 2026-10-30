@@ -290,6 +290,32 @@ pub(crate) mod private_pasteboard_tests {
     }
 
     #[test]
+    fn native_string_conversion_preserves_unicode_and_embedded_nulls() {
+        let _board = PrivatePasteboard::new();
+        for text in [
+            "",
+            "public.utf8-plain-text",
+            "com.example.café.世界",
+            "first\0second",
+        ] {
+            let decoded = unsafe { ns_string_to_rust(ns_string(text)) };
+            assert_eq!(decoded.as_deref(), Some(text));
+        }
+        assert!(unsafe { ns_string_to_rust(std::ptr::null_mut()) }.is_none());
+    }
+
+    #[test]
+    fn rejected_format_identifier_does_not_replace_existing_clipboard() {
+        let board = PrivatePasteboard::new();
+        let count = board.write("original text");
+        let invalid = snapshot(vec![vec![("com.voicebox.test\0format", b"data")]]);
+        let error = unsafe { restore_clipboard_to(board.board, &invalid) }.unwrap_err();
+        assert!(error.contains("Failed to restore clipboard format"));
+        assert_eq!(board.change_count(), count);
+        assert_eq!(board.text().as_deref(), Some("original text"));
+    }
+
+    #[test]
     fn text_roundtrips_across_unicode_and_embedded_nulls() {
         let board = PrivatePasteboard::new();
         for text in [
@@ -595,10 +621,12 @@ unsafe fn ns_string_to_rust(s: Id) -> Option<String> {
     if bytes.is_null() {
         return None;
     }
-    std::ffi::CStr::from_ptr(bytes)
-        .to_str()
+    // NSString may contain embedded NULs, so use its UTF-8 byte length
+    // rather than treating UTF8String as a NUL-terminated C string.
+    let len: usize = msg_send![s, lengthOfBytesUsingEncoding: 4u64];
+    std::str::from_utf8(std::slice::from_raw_parts(bytes as *const u8, len))
         .ok()
-        .map(|x| x.to_owned())
+        .map(str::to_owned)
 }
 
 #[cfg(target_os = "macos")]
