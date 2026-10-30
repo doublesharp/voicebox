@@ -2483,6 +2483,7 @@ mod command_ipc_regression_tests {
                 start_server,
                 check_accessibility_permission,
                 check_input_monitoring_permission,
+                debug_capture_focus,
                 paste_final_text,
             ])
             .build(mock_context(noop_assets()))
@@ -2584,6 +2585,20 @@ mod command_ipc_regression_tests {
         assert_eq!(wav.samples::<i16>().map(Result::unwrap).collect::<Vec<_>>(), [16383, -16383, 32767, -32767]);
         *state.error.lock().unwrap() = Some("capture interrupted".into());
         assert!(stop().unwrap_err().as_str().unwrap().contains("capture interrupted"));
+    }
+
+    #[test]
+    fn focus_capture_reports_a_snapshot_or_a_meaningful_native_error_over_ipc() {
+        let (_app, window) = setup();
+        let result = invoke(&window, "debug_capture_focus", InvokeBody::Json(serde_json::json!({})), None);
+        match result {
+            Ok(snapshot) => {
+                assert!(snapshot["pid"].as_i64().is_some_and(|pid| pid > 0));
+                assert!(snapshot["bundle_id"].is_null() || snapshot["bundle_id"].is_string());
+                assert!(snapshot["role"].is_null() || snapshot["role"].is_string());
+            }
+            Err(error) => assert!(error.as_str().is_some_and(|message| !message.is_empty())),
+        }
     }
 
     #[test]
