@@ -629,6 +629,30 @@ where
         .map_err(|error| format!("Unable to open output stream: {error}"))
 }
 
+fn prepare_output_pcm(
+    samples: &Arc<[f32]>,
+    rate: u32,
+    channels: usize,
+    key: (u32, u16),
+    prepared: &mut HashMap<(u32, u16), Arc<[f32]>>,
+) -> Result<Arc<[f32]>, String> {
+    if let Some(pcm) = prepared.get(&key) {
+        return Ok(pcm.clone());
+    }
+    let pcm: Arc<[f32]> = if key == (rate, channels as u16) {
+        samples.clone()
+    } else {
+        convert_channels(
+            &resample_interleaved(samples, rate, key.0, channels)?,
+            channels,
+            key.1 as usize,
+        )?
+        .into()
+    };
+    prepared.insert(key, pcm.clone());
+    Ok(pcm)
+}
+
 fn run_session(
     app: &tauri::AppHandle,
     id: &str,
@@ -670,22 +694,7 @@ fn run_session(
             .map_err(|error| format!("Unable to configure output: {error}"))?;
         let config: StreamConfig = supported.clone().into();
         let key = (config.sample_rate.0, config.channels);
-        let pcm = if let Some(pcm) = prepared.get(&key) {
-            pcm.clone()
-        } else {
-            let pcm: Arc<[f32]> = if key == (rate, channels as u16) {
-                samples.clone()
-            } else {
-                convert_channels(
-                    &resample_interleaved(&samples, rate, key.0, channels)?,
-                    channels,
-                    key.1 as usize,
-                )?
-                .into()
-            };
-            prepared.insert(key, pcm.clone());
-            pcm
-        };
+        let pcm = prepare_output_pcm(&samples, rate, channels, key, &mut prepared)?;
         let frames = pcm.len() / config.channels as usize;
         let position = Arc::new(RenderPosition::default());
         let stream = match supported.sample_format() {
@@ -2192,5 +2201,75 @@ mod state_lifecycle_tests {
             .append_pcm_stream("current", vec![0, 0])
             .await
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod output_preparation_tests {
+    use super::*;
+
+    #[test]
+    fn matching_devices_share_original_pcm_without_copying() {
+        let samples: Arc<[f32]> = vec![0.1, -0.2, 0.3, -0.4].into();
+        let mut cache = HashMap::new();
+        let first = prepare_output_pcm(&samples, 48000, 2, (48000, 2), &mut cache).unwrap();
+        let second = prepare_output_pcm(&samples, 48000, 2, (48000, 2), &mut cache).unwrap();
+        assert!(Arc::ptr_eq(&first, &samples));
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(&*first, &[0.1, -0.2, 0.3, -0.4]);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn mono_is_replicated_for_stereo_outputs_and_cached() {
+        let samples: Arc<[f32]> = vec![0.25, -0.5, 1.0].into();
+        let mut cache = HashMap::new();
+        let first = prepare_output_pcm(&samples, 24000, 1, (24000, 2), &mut cache).unwrap();
+        let second = prepare_output_pcm(&samples, 24000, 1, (24000, 2), &mut cache).unwrap();
+        assert_eq!(&*first, &[0.25, 0.25, -0.5, -0.5, 1.0, 1.0]);
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&first, &samples));
+    }
+
+    #[test]
+    fn stereo_is_downmixed_per_frame_for_mono_output() {
+        let samples: Arc<[f32]> = vec![0.5, -0.5, 1.0, 0.5].into();
+        let pcm = prepare_output_pcm(&samples, 48000, 2, (48000, 1), &mut HashMap::new()).unwrap();
+        assert_eq!(&*pcm, &[0.0, 0.75]);
+    }
+
+    #[test]
+    fn different_rates_and_channel_counts_prepare_independent_formats() {
+        let samples: Arc<[f32]> = vec![0.25; 48].into();
+        let mut cache = HashMap::new();
+        let stereo_48 = prepare_output_pcm(&samples, 24000, 1, (48000, 2), &mut cache).unwrap();
+        let mono_48 = prepare_output_pcm(&samples, 24000, 1, (48000, 1), &mut cache).unwrap();
+        let stereo_24 = prepare_output_pcm(&samples, 24000, 1, (24000, 2), &mut cache).unwrap();
+        assert_eq!(
+            (stereo_48.len(), mono_48.len(), stereo_24.len()),
+            (192, 96, 96)
+        );
+        assert_eq!(cache.len(), 3);
+        assert!(stereo_48.chunks_exact(2).all(|pair| pair[0] == pair[1]));
+        assert!(stereo_48.iter().all(|sample| sample.is_finite()));
+    }
+
+    #[test]
+    fn invalid_device_config_does_not_pollute_the_cache() {
+        let samples: Arc<[f32]> = vec![0.5, -0.5].into();
+        let mut cache = HashMap::new();
+        for key in [(0, 1), (48000, 0)] {
+            assert!(prepare_output_pcm(&samples, 48000, 1, key, &mut cache).is_err());
+        }
+        assert!(cache.is_empty());
+        assert!(prepare_output_pcm(&samples, 48000, 1, (48000, 1), &mut cache).is_ok());
+    }
+
+    #[test]
+    fn incomplete_source_frames_are_rejected_when_conversion_is_needed() {
+        let samples: Arc<[f32]> = vec![0.5, -0.5, 0.1].into();
+        let mut cache = HashMap::new();
+        assert!(prepare_output_pcm(&samples, 48000, 2, (24000, 1), &mut cache).is_err());
+        assert!(cache.is_empty());
     }
 }
