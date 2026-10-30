@@ -36,7 +36,7 @@ pub(crate) async fn wait_for_startup(
         {
             errors.push(line.to_string());
         }
-        if line.contains("Uvicorn running") || line.contains("Application startup complete") {
+        if line.contains("Uvicorn running") {
             return Outcome::Ready;
         }
     }
@@ -76,7 +76,7 @@ mod tests {
     async fn startup_logs_are_forwarded_and_ready_signals_from_either_stream_are_recognized() {
         for (ready, stream) in [
             (
-                CommandEvent::Stdout(b"Application startup complete.\n".to_vec()),
+                CommandEvent::Stdout(b"Uvicorn running on http://127.0.0.1\n".to_vec()),
                 "stdout",
             ),
             (
@@ -102,10 +102,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn application_startup_message_does_not_hide_a_port_bind_failure() {
+        let (tx, mut rx) = channel(3);
+        tx.send(CommandEvent::Stderr(
+            b"INFO: Application startup complete.\n".to_vec(),
+        ))
+        .await
+        .unwrap();
+        tx.send(CommandEvent::Stderr(
+            b"ERROR: address already in use\n".to_vec(),
+        ))
+        .await
+        .unwrap();
+        tx.send(CommandEvent::Terminated(TerminatedPayload {
+            code: Some(1),
+            signal: None,
+        }))
+        .await
+        .unwrap();
+        let mut logs = Vec::new();
+        let outcome = wait_for_startup(&mut rx, Duration::from_secs(1), |_, line| {
+            logs.push(line.to_string())
+        })
+        .await;
+        assert_eq!(outcome, Outcome::Exited);
+        assert!(logs
+            .iter()
+            .any(|line| line.contains("address already in use")));
+    }
+
+    #[tokio::test]
+    async fn application_initialization_alone_times_out_if_no_listener_is_started() {
+        let (tx, mut rx) = channel(1);
+        tx.send(CommandEvent::Stderr(
+            b"INFO: Application startup complete.".to_vec(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            wait_for_startup(&mut rx, Duration::from_millis(30), |_, _| {}).await,
+            Outcome::TimedOut(vec![])
+        );
+    }
+
+    #[tokio::test]
+    async fn initialization_then_listening_reports_ready_and_forwards_both_logs() {
+        let (tx, mut rx) = channel(2);
+        tx.send(CommandEvent::Stderr(
+            b"INFO: Application startup complete.".to_vec(),
+        ))
+        .await
+        .unwrap();
+        tx.send(CommandEvent::Stderr(
+            b"INFO: Uvicorn running on http://127.0.0.1:17493".to_vec(),
+        ))
+        .await
+        .unwrap();
+        let mut logs = Vec::new();
+        assert_eq!(
+            wait_for_startup(&mut rx, Duration::from_secs(1), |_, line| logs
+                .push(line.to_string()))
+            .await,
+            Outcome::Ready
+        );
+        assert_eq!(logs.len(), 2);
+    }
+
+    #[tokio::test]
     async fn ready_leaves_later_events_for_the_log_forwarder() {
         let (tx, mut rx) = channel(3);
         tx.send(CommandEvent::Stderr(
-            b"Application startup complete".to_vec(),
+            b"Uvicorn running on http://127.0.0.1".to_vec(),
         ))
         .await
         .unwrap();
