@@ -22,6 +22,21 @@ export function sourceFrames(asset: StudioAsset, sampleRate = 48000) {
 export function clipFrames(clip: StudioClip, asset: StudioAsset, sampleRate = 48000) {
   return sourceFrames(asset, sampleRate) - clip.trim_start_sample - clip.trim_end_sample;
 }
+export function validClipFades(clip: StudioClip, length: number, sourceLength: number) {
+  for (const direction of ['in', 'out'] as const) {
+    const visible = clip[`fade_${direction}_samples`];
+    const total = clip[`fade_${direction}_total_samples`];
+    const offset = clip[`fade_${direction}_offset_samples`];
+    if (!Number.isSafeInteger(visible) || visible < 0 || visible > length) return false;
+    if (total === undefined && offset === undefined) continue;
+    if (
+      !Number.isSafeInteger(total) || !Number.isSafeInteger(offset) ||
+      total === undefined || offset === undefined || total <= 0 || total > sourceLength ||
+      offset < 0 || offset >= total || visible !== Math.min(length, total - offset)
+    ) return false;
+  }
+  return true;
+}
 export function timelineEnd(document: StudioDocument, assets: StudioAsset[]) {
   const byId = new Map(assets.map((asset) => [asset.id, asset]));
   return document.clips.reduce((end, clip) => {
@@ -130,7 +145,8 @@ export function preflight(document: StudioDocument, project: StudioProject, allo
       !Number.isInteger(clip.fade_in_samples) ||
       clip.fade_in_samples < 0 ||
       !Number.isInteger(clip.fade_out_samples) ||
-      clip.fade_out_samples < 0
+      clip.fade_out_samples < 0 ||
+      !validClipFades(clip, clipFrames(clip, asset, document.sample_rate), sourceFrames(asset, document.sample_rate))
     )
       errors.push(`Clip ${clip.id.slice(0, 8)} has invalid placement or gain.`);
     const passage = document.passages.find((p) => p.id === clip.passage_id);

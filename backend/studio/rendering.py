@@ -14,6 +14,7 @@ import numpy as np
 import soundfile as sf
 from scipy.signal import resample_poly
 
+from .fades import fade_envelopes
 from .processing import make_board, tail_frames, validate_chain
 from .timing import resampled_frames
 
@@ -202,8 +203,6 @@ def render_project(
         start = _integer(clip["start_sample"], "start")
         left = _integer(clip["trim_start_sample"], "trim start")
         right = _integer(clip["trim_end_sample"], "trim end")
-        fade_in = _integer(clip["fade_in_samples"], "fade in")
-        fade_out = _integer(clip["fade_out_samples"], "fade out")
         gain = _gain(clip["gain"]) * _gain(by_id[track_id].get("gain", 1))
         if processing == "processed":
             gain *= 10 ** (by_id[track_id].get("effect_gain_db", 0) / 20)
@@ -220,12 +219,11 @@ def render_project(
         duration = frames - left - right
         if duration <= 0:
             raise ValueError("trim removes source")
-        if fade_in > duration or fade_out > duration:
-            raise ValueError("fade exceeds clip")
+        (fade_in, in_offset), (fade_out, out_offset) = fade_envelopes(clip, duration, frames)
         if start + duration > rate * MAX_DURATION_SECONDS:
             raise ValueError("Render exceeds two-hour duration limit")
         if track_id in active:
-            parts.append((track_id, start, duration, left, gain, fade_in, fade_out, path, info))
+            parts.append((track_id, start, duration, left, gain, fade_in, in_offset, fade_out, out_offset, path, info))
             length = max(length, start + duration)
     arrangement_length = length
     tail_truncated = False
@@ -270,7 +268,7 @@ def render_project(
                     mixed = np.zeros((end - offset, channels), dtype=np.float64)
                     for target_tid in target_tracks:
                         track_block = np.zeros_like(mixed)
-                        for tid, start, duration, left, gain, fade_in, fade_out, path, info in parts:
+                        for tid, start, duration, left, gain, fade_in, in_offset, fade_out, out_offset, path, info in parts:
                             if tid != target_tid:
                                 continue
                             lo, hi = max(offset, start), min(end, start + duration)
@@ -285,9 +283,9 @@ def render_project(
                             scale = np.full(hi - lo, gain)
                             positions = np.arange(local, local + hi - lo)
                             if fade_in:
-                                scale *= np.minimum(positions / fade_in, 1.0)
+                                scale *= np.minimum((positions + in_offset) / fade_in, 1.0)
                             if fade_out:
-                                scale *= np.minimum((duration - positions) / fade_out, 1.0)
+                                scale *= np.minimum((duration - positions + out_offset) / fade_out, 1.0)
                             track_block[lo - offset : hi - offset] += data * scale[:, None]
                         board = boards.get(target_tid)
                         if board is not None:

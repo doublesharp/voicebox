@@ -12,6 +12,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .fades import fade_envelopes, set_segment_fade
 from .timing import nearest_sample, resampled_frames
 
 UNDO_MAX_STATES = 100
@@ -527,6 +528,9 @@ class StudioStore:
                         clip["take_id"] = take["id"]
                         clip["asset_id"] = take["asset_id"]
                         clip["track_id"] = self._voice_track(db, project_id, doc, take, p)["id"]
+                        for direction in ("in", "out"):
+                            clip.pop(f"fade_{direction}_total_samples", None)
+                            clip.pop(f"fade_{direction}_offset_samples", None)
                         if payload.get("reset_trims"):
                             clip["trim_start_sample"] = clip["trim_end_sample"] = 0
                             length = self._clip_length(db, project_id, doc, clip)
@@ -571,6 +575,15 @@ class StudioStore:
             elif kind == "duplicate_clip":
                 clips.append({**clip, "id": uid()})
             elif kind == "update_clip":
+                trim_changed = any(
+                    key in payload and payload[key] != clip[key]
+                    for key in ("trim_start_sample", "trim_end_sample")
+                )
+                for direction in ("in", "out"):
+                    fade_key = f"fade_{direction}_samples"
+                    if trim_changed or (fade_key in payload and payload[fade_key] != clip[fade_key]):
+                        clip.pop(f"fade_{direction}_total_samples", None)
+                        clip.pop(f"fade_{direction}_offset_samples", None)
                 for key in (
                     "start_sample",
                     "trim_start_sample",
@@ -590,17 +603,19 @@ class StudioStore:
                     raise ValueError("Split outside clip")
                 left = at - clip["start_sample"]
                 right = length - left
+                source_frames = length + clip["trim_start_sample"] + clip["trim_end_sample"]
+                (fade_in, in_offset), (fade_out, out_offset) = fade_envelopes(clip, length, source_frames)
                 other = {
                     **clip,
                     "id": uid(),
                     "start_sample": at,
                     "trim_start_sample": clip["trim_start_sample"] + left,
-                    "fade_in_samples": 0,
-                    "fade_out_samples": min(clip["fade_out_samples"], right),
                 }
                 clip["trim_end_sample"] += right
-                clip["fade_in_samples"] = min(clip["fade_in_samples"], left)
-                clip["fade_out_samples"] = 0
+                set_segment_fade(clip, "in", left, fade_in, in_offset)
+                set_segment_fade(clip, "out", left, fade_out, out_offset + right)
+                set_segment_fade(other, "in", right, fade_in, in_offset + left)
+                set_segment_fade(other, "out", right, fade_out, out_offset)
                 clips.append(other)
         elif kind == "insert_asset":
             asset_id = payload.get("asset_id")
@@ -722,13 +737,10 @@ class StudioStore:
             if type(clip[key]) is not int or clip[key] < 0:
                 raise ValueError("Invalid clip position")
         length = self._clip_length(db, project_id, doc, clip)
-        if (
-            length <= 0
-            or clip["fade_in_samples"] > length
-            or clip["fade_out_samples"] > length
-            or not _gain(clip["gain"])
-        ):
+        if length <= 0 or not _gain(clip["gain"]):
             raise ValueError("Invalid clip range or gain")
+        source_frames = length + clip["trim_start_sample"] + clip["trim_end_sample"]
+        fade_envelopes(clip, length, source_frames)
 
     def checkpoint(self, project_id, operation_id, expected_revision, name, *, compact=False):
         request = dict(action="checkpoint", expected_revision=expected_revision, name=name)

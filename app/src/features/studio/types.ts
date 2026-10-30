@@ -41,6 +41,10 @@ export interface StudioClip {
   gain: number;
   fade_in_samples: number;
   fade_out_samples: number;
+  fade_in_total_samples?: number;
+  fade_in_offset_samples?: number;
+  fade_out_total_samples?: number;
+  fade_out_offset_samples?: number;
 }
 export interface StudioDocument {
   schema_version: 1;

@@ -163,8 +163,11 @@ def _validate_document(doc, assets, takes):
         asset = assets[asset_id]
         frames = resampled_frames(asset["frames"], asset["sample_rate"], rate)
         length = frames - values["trim_start_sample"] - values["trim_end_sample"]
-        if length <= 0 or values["fade_in_samples"] > length or values["fade_out_samples"] > length:
+        if length <= 0:
             raise ValueError("invalid clip source range")
+        from .fades import fade_envelopes
+
+        fade_envelopes(clip, length, frames)
         _finite(clip.get("gain"), "clip gain", 0)
     for track in tracks.values():
         _finite(track.get("effect_gain_db", 0), "track gain effect", -40, 40)

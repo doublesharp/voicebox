@@ -174,6 +174,13 @@ def source_fingerprint(doc, assets, takes):
                         "fade_in_samples",
                         "fade_out_samples",
                     )
+                } | {
+                    key: clip[key]
+                    for key in (
+                        "fade_in_total_samples", "fade_in_offset_samples",
+                        "fade_out_total_samples", "fade_out_offset_samples",
+                    )
+                    if key in clip
                 },
                 "source_text": take.get("text") if take else None,
                 "script_text": passage.get("text") if passage else None,

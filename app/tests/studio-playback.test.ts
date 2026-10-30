@@ -156,6 +156,21 @@ describe('studio exclusive playback boundary', () => {
     expect(context.closed).toBe(true);
     expect(context.sources[0].stopped).toBe(true);
   });
+  test('a split fade resumes at its original level in timeline preview', async () => {
+    const player = setup();
+    const clip = {
+      ...document.clips[0],
+      fade_in_samples: 2400,
+      fade_in_total_samples: 4800,
+      fade_in_offset_samples: 2400,
+      fade_out_samples: 0,
+    };
+    await player.timeline({ ...document, clips: [clip] }, assets, (id) => `/source/${id}`, 0);
+    const envelope = FakeContext.instances[0].envelopes[0];
+    expect(envelope[0]).toBeCloseTo(0.2, 6);
+    expect(Math.max(...envelope)).toBeCloseTo(0.4, 6);
+  });
+
   test('stop during decoding prevents a late timeline start', async () => {
     const player = setup();
     let release!: () => void;

@@ -1,5 +1,5 @@
 import { registerStudioPlaybackStop } from '@/lib/audio/playbackOwnership';
-import { clipFrames, timelineEnd } from './domain';
+import { clipFrames, sourceFrames, timelineEnd, validClipFades } from './domain';
 import { AudioMeter } from './meters';
 import type { StudioAsset, StudioDocument } from './types';
 
@@ -211,6 +211,8 @@ export class StudioPlayback {
         const asset = assets.find((a) => a.id === clip.asset_id);
         if (!track || !asset || track.mute || (solo && !track.solo)) return [];
         const duration = clipFrames(clip, asset, document.sample_rate);
+        if (!validClipFades(clip, duration, sourceFrames(asset, document.sample_rate)))
+          throw new Error('Invalid clip fade.');
         return clip.start_sample + duration > Math.round(fromSeconds * document.sample_rate)
           ? [{ clip, track, duration }]
           : [];
@@ -279,8 +281,12 @@ export class StudioPlayback {
             return (
               clip.gain *
               track.gain *
-              (clip.fade_in_samples ? Math.min(1, pos / clip.fade_in_samples) : 1) *
-              (clip.fade_out_samples ? Math.min(1, (duration - pos) / clip.fade_out_samples) : 1)
+              (clip.fade_in_samples
+                ? Math.min(1, (pos + (clip.fade_in_offset_samples ?? 0)) / (clip.fade_in_total_samples ?? clip.fade_in_samples))
+                : 1) *
+              (clip.fade_out_samples
+                ? Math.min(1, (duration - pos + (clip.fade_out_offset_samples ?? 0)) / (clip.fade_out_total_samples ?? clip.fade_out_samples))
+                : 1)
             );
           });
           gain.gain.setValueCurveAtTime(values, when, seconds);
