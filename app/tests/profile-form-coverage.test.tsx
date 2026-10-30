@@ -941,3 +941,156 @@ test('sample and rollback failures are both reported while keeping the draft', a
   expect(useUIStore.getState().profileDialogOpen).toBe(true);
   expect(input('profileForm.fields.namePlaceholder').props.value).toBe('Clone');
 });
+
+const originalFileReader = globalThis.FileReader;
+class ControlledFileReader {
+  static pending: ControlledFileReader[] = [];
+  result: string | null = null;
+  onload: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  readAsDataURL(_file: File) { ControlledFileReader.pending.push(this); }
+  succeed(data: string) { this.result = data; this.onload?.(); }
+  fail() { this.onerror?.(); }
+}
+function controlFileReads() {
+  ControlledFileReader.pending = [];
+  globalThis.FileReader = ControlledFileReader as unknown as typeof FileReader;
+}
+function cancelProfile() {
+  return view.root.findAllByType('button').find((n) => n.children.includes('common.cancel'))!.props.onClick() as Promise<void>;
+}
+afterEach(() => { globalThis.FileReader = originalFileReader; ControlledFileReader.pending = []; });
+
+test('closing and reopening a clone draft preserves its audio bytes and reference text', async () => {
+  controlFileReads();
+  await mount();
+  await name('Narrator');
+  await upload(new File(['voice'], 'voice.wav', { type: 'audio/wav' }));
+  await type('profileForm.fields.referenceTextPlaceholder', 'referenceText', 'Hello there');
+  let closing!: Promise<void>;
+  await act(async () => { closing = cancelProfile(); await Promise.resolve(); });
+  await act(async () => { ControlledFileReader.pending[0].succeed('data:audio/wav;base64,dm9pY2U='); await closing; });
+  await act(async () => { useUIStore.getState().setProfileDialogOpen(true); });
+  expect(input('profileForm.fields.namePlaceholder').props.value).toBe('Narrator');
+  expect(input('profileForm.fields.referenceTextPlaceholder').props.value).toBe('Hello there');
+  const restored = view.root.findByType('audio-upload' as never).props.file as File;
+  expect(restored.name).toBe('voice.wav');
+  expect(restored.type).toBe('audio/wav');
+  expect(await restored.text()).toBe('voice');
+});
+
+test('a file without a declared MIME type survives a draft round trip', async () => {
+  controlFileReads();
+  await mount();
+  await name('Narrator');
+  await upload(new File(['voice'], 'voice.wav'));
+  let closing!: Promise<void>;
+  await act(async () => { closing = cancelProfile(); await Promise.resolve(); });
+  await act(async () => { ControlledFileReader.pending[0].succeed('data:;base64,dm9pY2U='); await closing; });
+  await act(async () => { useUIStore.getState().setProfileDialogOpen(true); });
+  const restored = view.root.findByType('audio-upload' as never).props.file as File;
+  expect(restored?.name).toBe('voice.wav');
+  expect(await restored.text()).toBe('voice');
+});
+
+test('a failed audio draft conversion keeps the other form fields', async () => {
+  controlFileReads();
+  await mount();
+  await name('Narrator');
+  await upload(new File(['voice'], 'voice.wav', { type: 'audio/wav' }));
+  await type('profileForm.fields.referenceTextPlaceholder', 'referenceText', 'Words');
+  let closing!: Promise<void>;
+  await act(async () => { closing = cancelProfile(); await Promise.resolve(); });
+  await act(async () => { ControlledFileReader.pending[0].fail(); await closing; });
+  await act(async () => { useUIStore.getState().setProfileDialogOpen(true); });
+  expect(input('profileForm.fields.namePlaceholder').props.value).toBe('Narrator');
+  expect(input('profileForm.fields.referenceTextPlaceholder').props.value).toBe('Words');
+  expect(view.root.findByType('audio-upload' as never).props.file).toBeUndefined();
+});
+
+test('an older draft conversion cannot overwrite or close a reopened newer draft', async () => {
+  controlFileReads();
+  await mount();
+  await name('First');
+  await upload(new File(['first'], 'first.wav', { type: 'audio/wav' }));
+  let first!: Promise<void>, second!: Promise<void>;
+  await act(async () => { first = cancelProfile(); await Promise.resolve(); });
+  await name('Second');
+  await upload(new File(['second'], 'second.wav', { type: 'audio/wav' }));
+  await act(async () => { second = cancelProfile(); await Promise.resolve(); });
+  await act(async () => { ControlledFileReader.pending[1].succeed('data:audio/wav;base64,c2Vjb25k'); await second; });
+  await act(async () => { useUIStore.getState().setProfileDialogOpen(true); });
+  await name('New edits');
+  await act(async () => { ControlledFileReader.pending[0].succeed('data:audio/wav;base64,Zmlyc3Q='); await first; });
+  expect(useUIStore.getState().profileDialogOpen).toBe(true);
+  expect(input('profileForm.fields.namePlaceholder').props.value).toBe('New edits');
+  expect(useUIStore.getState().profileFormDraft?.sampleFileName).toBe('second.wav');
+});
+
+test('editing a draft while its audio is being saved does not discard the newer edits', async () => {
+  controlFileReads();
+  await mount();
+  await name('Before');
+  await upload(new File(['voice'], 'voice.wav', { type: 'audio/wav' }));
+  let closing!: Promise<void>;
+  await act(async () => { closing = cancelProfile(); await Promise.resolve(); });
+  await name('After');
+  await act(async () => { ControlledFileReader.pending[0].succeed('data:audio/wav;base64,dm9pY2U='); await closing; });
+  expect(useUIStore.getState().profileDialogOpen).toBe(true);
+  expect(input('profileForm.fields.namePlaceholder').props.value).toBe('After');
+});
+
+test('a corrupt saved audio draft does not prevent restoring its text fields', async () => {
+  await mount();
+  await act(async () => { useUIStore.setState({ profileFormDraft: {
+    name: 'Saved voice', description: '', language: 'en', personality: '', referenceText: 'Words',
+    sampleMode: 'upload', sampleFileName: 'voice.wav', sampleFileType: 'audio/wav', sampleFileData: 'data:audio/wav;base64,%%%'
+  }}); });
+  expect(input('profileForm.fields.namePlaceholder').props.value).toBe('Saved voice');
+  expect(input('profileForm.fields.referenceTextPlaceholder').props.value).toBe('Words');
+  expect(view.root.findByType('audio-upload' as never).props.file).toBeUndefined();
+});
+
+test('a pending draft close cannot affect a different server', async () => {
+  controlFileReads();
+  await mount();
+  await name('Original');
+  await upload(new File(['voice'], 'voice.wav', { type: 'audio/wav' }));
+  let closing!: Promise<void>;
+  await act(async () => { closing = cancelProfile(); await Promise.resolve(); });
+  switchVoiceServer();
+  await name('New server edits');
+  await act(async () => { ControlledFileReader.pending[0].succeed('data:audio/wav;base64,dm9pY2U='); await closing; });
+  expect(useUIStore.getState().profileDialogOpen).toBe(true);
+  expect(input('profileForm.fields.namePlaceholder').props.value).toBe('New server edits');
+  expect(useUIStore.getState().profileFormDraft).toBeNull();
+});
+
+test('changing the voice source while audio is saved keeps the current form open', async () => {
+  controlFileReads();
+  await mount();
+  await name('Original');
+  await upload(new File(['voice'], 'voice.wav', { type: 'audio/wav' }));
+  let closing!: Promise<void>;
+  await act(async () => { closing = cancelProfile(); await Promise.resolve(); });
+  click('profileForm.source.design');
+  await type('profileForm.design.placeholder', '', 'Warm and clear');
+  await act(async () => { ControlledFileReader.pending[0].succeed('data:audio/wav;base64,dm9pY2U='); await closing; });
+  expect(useUIStore.getState().profileDialogOpen).toBe(true);
+  expect(input('profileForm.design.placeholder').props.value).toBe('Warm and clear');
+});
+
+test('an old file read failure cannot overwrite a later successful close', async () => {
+  controlFileReads();
+  await mount();
+  await name('First');
+  await upload(new File(['first'], 'first.wav', { type: 'audio/wav' }));
+  let first!: Promise<void>, second!: Promise<void>;
+  await act(async () => { first = cancelProfile(); await Promise.resolve(); });
+  await name('Second');
+  await upload(new File(['second'], 'second.wav', { type: 'audio/wav' }));
+  await act(async () => { second = cancelProfile(); await Promise.resolve(); });
+  await act(async () => { ControlledFileReader.pending[1].succeed('data:audio/wav;base64,c2Vjb25k'); await second; });
+  await act(async () => { ControlledFileReader.pending[0].fail(); await first; });
+  expect(useUIStore.getState().profileFormDraft).toMatchObject({ name: 'Second', sampleFileName: 'second.wav' });
+});

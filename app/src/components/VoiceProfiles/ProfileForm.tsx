@@ -171,6 +171,9 @@ export function ProfileForm() {
   const savingRef = useRef<number | null>(null);
   const nextSaveRef = useRef(0);
   const transcriptionRequestRef = useRef(0);
+  const draftCloseRequestRef = useRef(0);
+  const draftModeRef = useRef({ sampleMode, voiceSource, designPrompt });
+  draftModeRef.current = { sampleMode, voiceSource, designPrompt };
   useEffect(() => () => {
     transcriptionRequestRef.current += 1;
   }, [open, editingProfileId]);
@@ -183,6 +186,7 @@ export function ProfileForm() {
   const isCreating = !editingProfileId;
   const serverUrl = useServerStore((state) => state.serverUrl);
   const serverRevision = useServerStore((state) => state.serverRevision);
+  useEffect(() => () => { draftCloseRequestRef.current += 1; }, [open, editingProfileId, serverUrl, serverRevision]);
   useEffect(() => {
     setIsSaving(false);
     return () => { savingRef.current = null; };
@@ -401,15 +405,18 @@ export function ProfileForm() {
       // Restore the file if we have it saved
       if (
         profileFormDraft.sampleFileData &&
-        profileFormDraft.sampleFileName &&
-        profileFormDraft.sampleFileType
+        profileFormDraft.sampleFileName
       ) {
-        const file = base64ToFile(
-          profileFormDraft.sampleFileData,
-          profileFormDraft.sampleFileName,
-          profileFormDraft.sampleFileType,
-        );
-        form.setValue('sampleFile', file);
+        try {
+          const file = base64ToFile(
+            profileFormDraft.sampleFileData,
+            profileFormDraft.sampleFileName,
+            profileFormDraft.sampleFileType ?? '',
+          );
+          form.setValue('sampleFile', file);
+        } catch {
+          // Keep the remaining draft fields if persisted audio is invalid.
+        }
       }
     } else if (!open) {
       // Only reset to defaults when modal is closed and no draft
@@ -932,6 +939,7 @@ export function ProfileForm() {
   }
 
   async function handleOpenChange(newOpen: boolean) {
+    const closeRequest = ++draftCloseRequestRef.current;
     if (!newOpen) {
       savingRef.current = null;
       setIsSaving(false);
@@ -970,6 +978,22 @@ export function ProfileForm() {
           }
         }
 
+        // A later close, a different dialog/server, or edits made while the
+        // file was being read must not be replaced by this older snapshot.
+        const current = form.getValues();
+        const currentMode = draftModeRef.current;
+        const server = useServerStore.getState();
+        if (
+          draftCloseRequestRef.current !== closeRequest ||
+          !useUIStore.getState().profileDialogOpen ||
+          useUIStore.getState().editingProfileId !== editingProfileId ||
+          server.serverUrl !== serverUrl || server.serverRevision !== serverRevision ||
+          current.name !== values.name || current.description !== values.description ||
+          current.language !== values.language || current.personality !== values.personality ||
+          current.referenceText !== values.referenceText || current.sampleFile !== values.sampleFile ||
+          current.avatarFile !== values.avatarFile || currentMode.sampleMode !== sampleMode ||
+          currentMode.voiceSource !== voiceSource || currentMode.designPrompt !== designPrompt
+        ) return;
         setProfileFormDraft(draft);
       }
     }
