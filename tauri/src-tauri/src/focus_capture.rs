@@ -184,6 +184,42 @@ unsafe fn role_from_value_with(
     convert(value as CFStringRef)
 }
 
+#[cfg(target_os = "macos")]
+trait CaptureApi {
+    unsafe fn system_wide(&self) -> ffi::AXUIElementRef;
+    unsafe fn copy_attribute(
+        &self,
+        element: ffi::AXUIElementRef,
+        attr: CFStringRef,
+        value: *mut core_foundation_sys::base::CFTypeRef,
+    ) -> ffi::AXError;
+    unsafe fn pid(&self, element: ffi::AXUIElementRef, pid: *mut ffi::Pid) -> ffi::AXError;
+    unsafe fn bundle_id(&self, pid: i32) -> Option<String>;
+}
+
+#[cfg(target_os = "macos")]
+struct NativeCapture;
+#[cfg(target_os = "macos")]
+impl CaptureApi for NativeCapture {
+    unsafe fn system_wide(&self) -> ffi::AXUIElementRef {
+        ffi::AXUIElementCreateSystemWide()
+    }
+    unsafe fn copy_attribute(
+        &self,
+        element: ffi::AXUIElementRef,
+        attr: CFStringRef,
+        value: *mut core_foundation_sys::base::CFTypeRef,
+    ) -> ffi::AXError {
+        ffi::AXUIElementCopyAttributeValue(element, attr, value)
+    }
+    unsafe fn pid(&self, element: ffi::AXUIElementRef, pid: *mut ffi::Pid) -> ffi::AXError {
+        ffi::AXUIElementGetPid(element, pid)
+    }
+    unsafe fn bundle_id(&self, pid: i32) -> Option<String> {
+        bundle_id_for_pid(pid)
+    }
+}
+
 /// Read the system-wide focused UI element's PID, bundle id, and AX role.
 ///
 /// Returns an error when no element is focused (e.g. Dock has focus) or
@@ -191,9 +227,14 @@ unsafe fn role_from_value_with(
 /// returns `-25204 kAXErrorAPIDisabled` in that case.
 #[cfg(target_os = "macos")]
 pub fn capture_focus() -> Result<FocusSnapshot, String> {
+    capture_focus_with(&NativeCapture)
+}
+
+#[cfg(target_os = "macos")]
+fn capture_focus_with(api: &impl CaptureApi) -> Result<FocusSnapshot, String> {
     use ffi::*;
     unsafe {
-        let system_wide = AXUIElementCreateSystemWide();
+        let system_wide = api.system_wide();
         if system_wide.is_null() {
             return Err("AXUIElementCreateSystemWide returned null".into());
         }
@@ -206,7 +247,7 @@ pub fn capture_focus() -> Result<FocusSnapshot, String> {
             scopeguard::guard(focused_attr, |s| CFRelease(s as *const std::ffi::c_void));
 
         let mut focused: *const std::ffi::c_void = std::ptr::null();
-        let err = AXUIElementCopyAttributeValue(system_wide, focused_attr, &mut focused as *mut _);
+        let err = api.copy_attribute(system_wide, focused_attr, &mut focused as *mut _);
         if err != AX_ERROR_SUCCESS || focused.is_null() {
             return Err(format!(
                 "No focused element (AXError {}). Verify Accessibility permission is granted and a focused text field exists.",
@@ -218,9 +259,15 @@ pub fn capture_focus() -> Result<FocusSnapshot, String> {
         let focused_elem = focused_element_from_value(focused)?;
 
         let mut pid: Pid = 0;
-        let err = AXUIElementGetPid(focused_elem, &mut pid);
+        let err = api.pid(focused_elem, &mut pid);
         if err != AX_ERROR_SUCCESS {
             return Err(format!("AXUIElementGetPid failed (AXError {})", err));
+        }
+        if pid <= 0 {
+            return Err(format!(
+                "Focused accessibility element has invalid PID {}",
+                pid
+            ));
         }
 
         let role = {
@@ -230,11 +277,8 @@ pub fn capture_focus() -> Result<FocusSnapshot, String> {
                     let _role_attr_guard =
                         scopeguard::guard(role_attr, |s| CFRelease(s as *const std::ffi::c_void));
                     let mut role_value: *const std::ffi::c_void = std::ptr::null();
-                    let err = AXUIElementCopyAttributeValue(
-                        focused_elem,
-                        role_attr,
-                        &mut role_value as *mut _,
-                    );
+                    let err =
+                        api.copy_attribute(focused_elem, role_attr, &mut role_value as *mut _);
                     if err == AX_ERROR_SUCCESS && !role_value.is_null() {
                         let _role_guard = scopeguard::guard(role_value, |e| CFRelease(e));
                         role_from_value_with(role_value, |value| cfstring_to_rust(value))
@@ -246,7 +290,7 @@ pub fn capture_focus() -> Result<FocusSnapshot, String> {
             }
         };
 
-        let bundle_id = bundle_id_for_pid(pid);
+        let bundle_id = api.bundle_id(pid);
 
         Ok(FocusSnapshot {
             pid,
@@ -814,5 +858,204 @@ mod accessibility_value_type_tests {
             })
         }
         .is_none());
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod focus_capture_flow_tests {
+    use super::*;
+    use core_foundation_sys::base::CFTypeRef;
+    use std::cell::Cell;
+    use std::ffi::c_void;
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        fn AXUIElementCreateApplication(pid: i32) -> ffi::AXUIElementRef;
+    }
+
+    struct Fake {
+        system_missing: bool,
+        focus_error: i32,
+        focus_missing: bool,
+        wrong_focus_type: bool,
+        pid_error: i32,
+        pid_value: i32,
+        role_error: i32,
+        wrong_role_type: bool,
+        role_missing: bool,
+        bundle_missing: bool,
+        calls: Cell<usize>,
+    }
+    impl Default for Fake {
+        fn default() -> Self {
+            Self {
+                system_missing: false,
+                focus_error: 0,
+                focus_missing: false,
+                wrong_focus_type: false,
+                pid_error: 0,
+                pid_value: 42,
+                role_error: 0,
+                wrong_role_type: false,
+                role_missing: false,
+                bundle_missing: false,
+                calls: Cell::new(0),
+            }
+        }
+    }
+    impl CaptureApi for Fake {
+        unsafe fn system_wide(&self) -> ffi::AXUIElementRef {
+            if self.system_missing {
+                std::ptr::null()
+            } else {
+                AXUIElementCreateApplication(std::process::id() as i32)
+            }
+        }
+        unsafe fn copy_attribute(
+            &self,
+            _: ffi::AXUIElementRef,
+            attr: CFStringRef,
+            value: *mut CFTypeRef,
+        ) -> ffi::AXError {
+            self.calls.set(self.calls.get() + 1);
+            match cfstring_to_rust(attr).as_deref() {
+                Some("AXFocusedUIElement") => {
+                    if self.focus_error != 0 {
+                        return self.focus_error;
+                    }
+                    if !self.focus_missing {
+                        *value = if self.wrong_focus_type {
+                            cf_string_const("not an element").unwrap() as *const c_void
+                        } else {
+                            AXUIElementCreateApplication(std::process::id() as i32)
+                        };
+                    }
+                    0
+                }
+                Some("AXRole") => {
+                    if self.role_error != 0 {
+                        return self.role_error;
+                    }
+                    if self.role_missing {
+                        return 0;
+                    }
+                    *value = if self.wrong_role_type {
+                        AXUIElementCreateApplication(std::process::id() as i32)
+                    } else {
+                        cf_string_const("AXTextField").unwrap() as *const c_void
+                    };
+                    0
+                }
+                _ => panic!("unexpected attribute"),
+            }
+        }
+        unsafe fn pid(&self, _: ffi::AXUIElementRef, pid: *mut ffi::Pid) -> ffi::AXError {
+            *pid = self.pid_value;
+            self.pid_error
+        }
+        unsafe fn bundle_id(&self, pid: i32) -> Option<String> {
+            if self.bundle_missing {
+                None
+            } else {
+                Some(format!("app.{pid}"))
+            }
+        }
+    }
+
+    #[test]
+    fn captures_pid_bundle_and_role_from_focused_element() {
+        let fake = Fake::default();
+        let result = capture_focus_with(&fake).unwrap();
+        assert_eq!(result.pid, 42);
+        assert_eq!(result.bundle_id.as_deref(), Some("app.42"));
+        assert_eq!(result.role.as_deref(), Some("AXTextField"));
+        assert_eq!(fake.calls.get(), 2);
+    }
+
+    #[test]
+    fn missing_system_or_focused_element_returns_error_without_role_lookup() {
+        for fake in [
+            Fake {
+                system_missing: true,
+                ..Default::default()
+            },
+            Fake {
+                focus_missing: true,
+                ..Default::default()
+            },
+            Fake {
+                focus_error: -25204,
+                ..Default::default()
+            },
+        ] {
+            assert!(capture_focus_with(&fake).is_err());
+            assert!(fake.calls.get() <= 1);
+        }
+    }
+
+    #[test]
+    fn wrong_focused_value_and_pid_failure_do_not_produce_a_snapshot() {
+        for fake in [
+            Fake {
+                wrong_focus_type: true,
+                ..Default::default()
+            },
+            Fake {
+                pid_error: -25202,
+                ..Default::default()
+            },
+        ] {
+            assert!(capture_focus_with(&fake).is_err());
+            assert_eq!(fake.calls.get(), 1);
+        }
+    }
+
+    #[test]
+    fn inaccessible_or_wrong_type_role_is_optional() {
+        for fake in [
+            Fake {
+                role_error: -25202,
+                ..Default::default()
+            },
+            Fake {
+                wrong_role_type: true,
+                ..Default::default()
+            },
+            Fake {
+                role_missing: true,
+                ..Default::default()
+            },
+        ] {
+            let result = capture_focus_with(&fake).unwrap();
+            assert_eq!(result.pid, 42);
+            assert!(result.role.is_none());
+        }
+    }
+
+    #[test]
+    fn application_without_a_bundle_identifier_keeps_the_focus_target() {
+        let fake = Fake {
+            bundle_missing: true,
+            ..Default::default()
+        };
+        let snapshot = capture_focus_with(&fake).unwrap();
+        assert_eq!(snapshot.pid, 42);
+        assert_eq!(snapshot.bundle_id, None);
+        assert_eq!(snapshot.role.as_deref(), Some("AXTextField"));
+    }
+
+    #[test]
+    fn no_valid_process_id_must_not_be_used_as_a_focus_target() {
+        for pid_value in [0, -1] {
+            let fake = Fake {
+                pid_value,
+                ..Default::default()
+            };
+            assert!(
+                capture_focus_with(&fake).is_err(),
+                "invalid PID {pid_value} must not be captured"
+            );
+            assert_eq!(fake.calls.get(), 1);
+        }
     }
 }
