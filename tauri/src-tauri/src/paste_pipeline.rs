@@ -140,6 +140,9 @@ async fn paste_with<B: PasteBackend, F: Future<Output = ()>>(
         after_write,
         armed: true,
     };
+    if backend.change_count()? != after_write {
+        return Err("Clipboard changed before dictation paste; paste cancelled".into());
+    }
     let paste_result = backend.send();
     sleep(Duration::from_millis(crate::PASTE_CONSUME_MS)).await;
     restore.restore_if_unchanged()?;
@@ -298,7 +301,11 @@ mod tests {
         }
         fn change_count(&self) -> Result<i64, String> {
             self.call("count")?;
-            self.count.ok_or("unknown".into())
+            if !self.calls.borrow().iter().any(|call| call == "send") {
+                Ok(10)
+            } else {
+                self.count.ok_or("unknown".into())
+            }
         }
         fn restore(&self, snapshot: &Self::Snapshot, _expected: i64) -> Result<(), String> {
             assert_eq!(*snapshot, "original");
@@ -325,7 +332,7 @@ mod tests {
         assert_eq!(run(&fake, &focus(Some("other.app"))).await, Ok(true));
         assert_eq!(
             calls(&fake),
-            ["trusted", "activate", "save", "write", "send", "count", "restore"]
+            ["trusted", "activate", "save", "write", "count", "send", "count", "restore"]
         );
     }
     #[tokio::test]
@@ -389,7 +396,7 @@ mod tests {
         assert_eq!(run(&fake, &focus(None)).await.unwrap_err(), "send failed");
         assert_eq!(
             calls(&fake),
-            ["trusted", "activate", "save", "write", "send", "count", "restore"]
+            ["trusted", "activate", "save", "write", "count", "send", "count", "restore"]
         );
     }
     #[tokio::test]
@@ -400,7 +407,7 @@ mod tests {
             assert_eq!(run(&fake, &focus(None)).await, Ok(true));
             assert_eq!(
                 calls(&fake),
-                ["trusted", "activate", "save", "write", "send", "count"]
+                ["trusted", "activate", "save", "write", "count", "send", "count"]
             );
         }
     }
@@ -1298,5 +1305,121 @@ mod private_pasteboard_transaction_tests {
                 Some(if external { "newer" } else { "original" })
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod pre_paste_clipboard_regression_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    struct Clipboard {
+        content: RefCell<String>,
+        revision: Cell<i64>,
+        replacement: Option<&'static str>,
+        count_unavailable: bool,
+        failures_remaining: Cell<usize>,
+        pasted: RefCell<Vec<String>>,
+    }
+
+    impl PasteBackend for Clipboard {
+        type Snapshot = String;
+        fn trusted(&self) -> bool {
+            true
+        }
+        fn activate(&self, _: i32) -> Result<(), String> {
+            Ok(())
+        }
+        fn save(&self) -> Result<String, String> {
+            Ok(self.content.borrow().clone())
+        }
+        fn write(&self, text: &str, _: &String) -> Result<i64, clipboard::ClipboardWriteFailure> {
+            *self.content.borrow_mut() = text.into();
+            self.revision.set(1);
+            if let Some(other) = self.replacement {
+                *self.content.borrow_mut() = other.into();
+                self.revision.set(2);
+            }
+            Ok(1)
+        }
+        fn send(&self) -> Result<(), String> {
+            self.pasted.borrow_mut().push(self.content.borrow().clone());
+            Ok(())
+        }
+        fn change_count(&self) -> Result<i64, String> {
+            if self.failures_remaining.get() > 0 {
+                self.failures_remaining
+                    .set(self.failures_remaining.get() - 1);
+                return Err("clipboard unavailable".into());
+            }
+            if self.count_unavailable {
+                Err("clipboard unavailable".into())
+            } else {
+                Ok(self.revision.get())
+            }
+        }
+        fn restore(&self, snapshot: &String, expected: i64) -> Result<(), String> {
+            assert_eq!(self.revision.get(), expected);
+            *self.content.borrow_mut() = snapshot.clone();
+            self.revision.set(expected + 1);
+            Ok(())
+        }
+    }
+
+    fn clipboard(replacement: Option<&'static str>, count_unavailable: bool) -> Clipboard {
+        Clipboard {
+            content: RefCell::new("original".into()),
+            revision: Cell::new(0),
+            replacement,
+            count_unavailable,
+            failures_remaining: Cell::new(0),
+            pasted: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn target() -> focus_capture::FocusSnapshot {
+        focus_capture::FocusSnapshot {
+            pid: 42,
+            bundle_id: None,
+            role: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn external_change_after_staging_is_not_pasted_or_overwritten() {
+        let cb = clipboard(Some("private clipboard"), false);
+        let result = paste_with("dictation", &target(), &cb, |_| async {}).await;
+        assert!(result.is_err(), "must report that the clipboard changed");
+        assert!(cb.pasted.borrow().is_empty());
+        assert_eq!(*cb.content.borrow(), "private clipboard");
+    }
+
+    #[tokio::test]
+    async fn unavailable_clipboard_revision_prevents_paste() {
+        let cb = clipboard(None, true);
+        let result = paste_with("dictation", &target(), &cb, |_| async {}).await;
+        assert!(result.is_err());
+        assert!(cb.pasted.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn transient_revision_failure_cancels_paste_and_restores_owned_clipboard() {
+        let cb = clipboard(None, false);
+        cb.failures_remaining.set(1);
+        let result = paste_with("dictation", &target(), &cb, |_| async {}).await;
+        assert!(result.is_err());
+        assert!(cb.pasted.borrow().is_empty());
+        assert_eq!(*cb.content.borrow(), "original");
+    }
+
+    #[tokio::test]
+    async fn unchanged_clipboard_pastes_dictation_then_restores_original() {
+        let cb = clipboard(None, false);
+        assert_eq!(
+            paste_with("dictation", &target(), &cb, |_| async {}).await,
+            Ok(true)
+        );
+        assert_eq!(*cb.pasted.borrow(), ["dictation"]);
+        assert_eq!(*cb.content.borrow(), "original");
     }
 }
