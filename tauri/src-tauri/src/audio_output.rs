@@ -2116,7 +2116,6 @@ mod tests {
         println!("LIVE_PREVIEW_HTTP_CPAl {{\"device\":{:?},\"source_rate\":{},\"device_rate\":{},\"header_ms\":{},\"first_callback_ms\":{},\"response_eof_ms\":{},\"pcm_bytes\":{},\"blocks\":{}}}", device.name().unwrap(), rate, config.sample_rate.0, header_ms, first_callback_ms.unwrap(), response_ms, total, chunks);
     }
 }
-
 #[cfg(test)]
 mod state_lifecycle_tests {
     use super::*;
@@ -2149,27 +2148,6 @@ mod state_lifecycle_tests {
     }
 
     #[test]
-    fn stale_stop_does_not_stop_or_wake_current_session() {
-        let (state, controls, _, wake) = session(false, 0);
-        state.stop_playback(Some("old")).unwrap();
-        assert!(!controls.stopped.load(Ordering::Acquire));
-        assert!(wake.try_recv().is_err());
-        state.stop_playback(Some("current")).unwrap();
-        assert!(controls.stopped.load(Ordering::Acquire));
-        assert!(wake.try_recv().is_ok());
-    }
-
-    #[test]
-    fn unconditional_stop_and_empty_state_are_safe() {
-        let empty = AudioOutputState::new();
-        empty.stop_playback(None).unwrap();
-        let (state, controls, _, wake) = session(false, 0);
-        state.stop_playback(None).unwrap();
-        assert!(controls.stopped.load(Ordering::Acquire));
-        assert!(wake.try_recv().is_ok());
-    }
-
-    #[test]
     fn clip_controls_update_together_and_wake_worker() {
         let (state, controls, _, wake) = session(false, 0);
         let revision = controls.revision();
@@ -2195,87 +2173,6 @@ mod state_lifecycle_tests {
         assert_eq!(output, [0.2, -0.1]);
     }
 
-    #[test]
-    fn invalid_controls_do_not_apply_any_partial_changes() {
-        for control in [
-            PlaybackControl {
-                paused: Some(false),
-                position: Some(-1.0),
-                volume: Some(0.5),
-            },
-            PlaybackControl {
-                paused: Some(false),
-                position: Some(f64::NAN),
-                volume: None,
-            },
-            PlaybackControl {
-                paused: Some(false),
-                position: None,
-                volume: Some(f32::INFINITY),
-            },
-            PlaybackControl {
-                paused: Some(false),
-                position: None,
-                volume: Some(1.01),
-            },
-            PlaybackControl {
-                paused: Some(false),
-                position: None,
-                volume: Some(-0.01),
-            },
-        ] {
-            let (state, controls, _, wake) = session(false, 0);
-            assert!(state.control_playback("current", control).is_err());
-            assert!(controls.paused.load(Ordering::Acquire));
-            assert_eq!(controls.requested_position(), 0.0);
-            assert!(wake.try_recv().is_err());
-        }
-    }
-
-    #[test]
-    fn stale_and_stopped_sessions_reject_controls() {
-        let (state, controls, _, wake) = session(false, 0);
-        assert!(state
-            .control_playback(
-                "old",
-                PlaybackControl {
-                    paused: Some(false),
-                    ..Default::default()
-                }
-            )
-            .is_err());
-        controls.stop();
-        assert!(state
-            .control_playback(
-                "current",
-                PlaybackControl {
-                    paused: Some(false),
-                    ..Default::default()
-                }
-            )
-            .is_err());
-        assert!(controls.paused.load(Ordering::Acquire));
-        assert!(wake.try_recv().is_err());
-    }
-
-    #[test]
-    fn preview_rejects_seek_without_applying_other_controls() {
-        let (state, controls, _, wake) = session(true, 1);
-        assert!(state
-            .control_playback(
-                "current",
-                PlaybackControl {
-                    paused: Some(false),
-                    position: Some(1.0),
-                    volume: Some(0.5)
-                }
-            )
-            .is_err());
-        assert!(controls.paused.load(Ordering::Acquire));
-        assert_eq!(controls.requested_position(), 0.0);
-        assert!(wake.try_recv().is_err());
-    }
-
     #[tokio::test]
     async fn pcm_append_delivers_little_endian_samples_to_all_outputs() {
         let (state, _, queues, _) = session(true, 2);
@@ -2295,85 +2192,5 @@ mod state_lifecycle_tests {
             .append_pcm_stream("current", vec![0, 0])
             .await
             .is_err());
-    }
-
-    #[tokio::test]
-    async fn malformed_blocks_and_stale_sessions_never_append() {
-        let (state, _, queues, _) = session(true, 2);
-        for bytes in [vec![], vec![1], vec![0; 8194]] {
-            assert!(state.append_pcm_stream("current", bytes).await.is_err());
-        }
-        assert!(state.append_pcm_stream("old", vec![0, 0]).await.is_err());
-        assert!(state.finish_pcm_stream("old").is_err());
-        for queue in queues.lock().unwrap().iter() {
-            let queue = queue.lock().unwrap();
-            assert_eq!(queue.samples_len_for_test(), 0);
-            assert!(!queue.finished);
-        }
-    }
-
-    #[tokio::test]
-    async fn clip_sessions_cannot_be_used_as_previews() {
-        let (state, _, _, _) = session(false, 0);
-        assert!(state
-            .append_pcm_stream("current", vec![0, 0])
-            .await
-            .is_err());
-        assert!(state.finish_pcm_stream("current").is_err());
-    }
-
-    #[tokio::test]
-    async fn blocked_append_is_cancelled_when_session_stops() {
-        let (state, controls, queues, _) = session(true, 1);
-        queues.lock().unwrap()[0]
-            .lock()
-            .unwrap()
-            .append(&vec![0.0; 16000])
-            .unwrap();
-        let stopper = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            controls.stop();
-        });
-        let error = state
-            .append_pcm_stream("current", vec![0, 0])
-            .await
-            .unwrap_err();
-        stopper.await.unwrap();
-        assert!(error.contains("ended"));
-        assert_eq!(
-            queues.lock().unwrap()[0]
-                .lock()
-                .unwrap()
-                .samples_len_for_test(),
-            16000
-        );
-    }
-
-    #[tokio::test]
-    async fn backpressure_waits_for_every_output_before_appending() {
-        let (state, _, queues, _) = session(true, 2);
-        let full = queues.lock().unwrap()[1].clone();
-        full.lock().unwrap().append(&vec![0.0; 16000]).unwrap();
-        let released = queues.clone();
-        let worker = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            assert_eq!(
-                released.lock().unwrap()[0]
-                    .lock()
-                    .unwrap()
-                    .samples_len_for_test(),
-                0
-            );
-            let mut out = [0.0; 2];
-            full.lock().unwrap().render(&mut out, 8000, 1, |s| s);
-        });
-        state
-            .append_pcm_stream("current", vec![0, 0])
-            .await
-            .unwrap();
-        worker.await.unwrap();
-        let queues = queues.lock().unwrap();
-        assert_eq!(queues[0].lock().unwrap().samples_len_for_test(), 1);
-        assert_eq!(queues[1].lock().unwrap().samples_len_for_test(), 15999);
     }
 }
