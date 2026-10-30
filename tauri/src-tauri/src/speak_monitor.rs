@@ -171,12 +171,9 @@ async fn stream_once_with(
             }
         };
         let previous_frames = buf.completed_frames();
-        let events = buf.push(&chunk)?;
+        buf.push_with(&chunk, |(event, data)| on_event(&event, &data))?;
         if buf.completed_frames() != previous_frames {
             deadline = tokio::time::Instant::now() + idle_timeout;
-        }
-        for (event, data) in events {
-            on_event(&event, &data);
         }
     }
 }
@@ -652,6 +649,35 @@ mod event_delivery_integration_tests {
             socket.write_all(body).await.unwrap();
         });
         (url, task)
+    }
+
+    #[tokio::test]
+    async fn complete_speech_events_are_delivered_before_a_later_invalid_frame() {
+        for body in [
+            b"event: speak-start\ndata: first\n\nevent: speak-end\ndata: \xff\n\n".as_slice(),
+            b": ping\n\nevent: speak-end\ndata: second\n\nevent: other\ndata: \xff\n\n".as_slice(),
+        ] {
+            let app = tauri::test::mock_app();
+            let events = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+            for name in ["dictate:speak-start", "dictate:speak-end"] {
+                let events = events.clone();
+                app.listen(name, move |event| {
+                    let payload: String = serde_json::from_str(event.payload()).unwrap();
+                    events.lock().unwrap().push((name.into(), payload));
+                });
+            }
+            let (url, server) = serve(body, "200 OK").await;
+            assert!(stream_once(&monitor_client().unwrap(), &url, app.handle())
+                .await
+                .is_err());
+            server.await.unwrap();
+            let expected = if body.starts_with(b": ping") {
+                ("dictate:speak-end".to_string(), "second".to_string())
+            } else {
+                ("dictate:speak-start".to_string(), "first".to_string())
+            };
+            assert_eq!(*events.lock().unwrap(), [expected]);
+        }
     }
 
     #[tokio::test]

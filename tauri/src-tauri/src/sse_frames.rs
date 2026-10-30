@@ -12,8 +12,18 @@ pub(crate) struct FrameBuffer {
 }
 
 impl FrameBuffer {
-    pub(crate) fn push(&mut self, chunk: &[u8]) -> Result<Vec<(String, String)>, std::io::Error> {
+    #[cfg(test)]
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<(String, String)>, std::io::Error> {
         let mut result = Vec::new();
+        self.push_with(chunk, |event| result.push(event))?;
+        Ok(result)
+    }
+
+    pub(crate) fn push_with(
+        &mut self,
+        chunk: &[u8],
+        mut on_event: impl FnMut((String, String)),
+    ) -> Result<(), std::io::Error> {
         for &byte in chunk {
             if self.skip_lf {
                 self.skip_lf = false;
@@ -30,7 +40,7 @@ impl FrameBuffer {
                         self.completed_frames = self.completed_frames.saturating_add(1);
                     }
                     if let Some(event) = parse_frame(frame) {
-                        result.push(event);
+                        on_event(event);
                     }
                     self.buf.clear();
                     self.line_start = 0;
@@ -43,7 +53,7 @@ impl FrameBuffer {
                 self.push_byte(byte)?;
             }
         }
-        Ok(result)
+        Ok(())
     }
 
     pub(crate) fn has_complete_frame(&self) -> bool {
@@ -88,6 +98,56 @@ fn parse_frame(frame: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::FrameBuffer;
+
+    #[test]
+    fn completed_events_survive_a_later_invalid_frame_at_every_chunk_boundary() {
+        for bytes in [
+            b"event: speak-start\ndata: hello\n\nevent: speak-end\ndata: \xff\n\n".as_slice(),
+            b"event: speak-start\r\ndata: hello\r\n\r\nevent: speak-end\r\ndata: \xff\r\n\r\n"
+                .as_slice(),
+        ] {
+            for split in 0..=bytes.len() {
+                let mut buffer = FrameBuffer::default();
+                let mut events = Vec::new();
+                let first = buffer.push_with(&bytes[..split], |event| events.push(event));
+                let failed = if first.is_err() {
+                    true
+                } else {
+                    buffer
+                        .push_with(&bytes[split..], |event| events.push(event))
+                        .is_err()
+                };
+                assert!(failed, "invalid frame accepted at split {split}");
+                assert_eq!(
+                    events,
+                    [("speak-start".into(), "hello".into())],
+                    "split {split}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn earlier_events_are_delivered_before_an_oversized_frame_is_rejected() {
+        let mut input = b"event: speak-end\ndata: done\n\n".to_vec();
+        input.extend(std::iter::repeat_n(b'x', super::MAX_FRAME_BYTES + 1));
+        let mut events = Vec::new();
+        let error = FrameBuffer::default()
+            .push_with(&input, |event| events.push(event))
+            .unwrap_err();
+        assert!(error.to_string().contains("maximum frame size"));
+        assert_eq!(events, [("speak-end".into(), "done".into())]);
+    }
+
+    #[test]
+    fn malformed_frame_stops_dispatch_of_following_events() {
+        let mut events = Vec::new();
+        let input = b"event: speak-start\ndata: \xff\n\nevent: speak-end\ndata: later\n\n";
+        assert!(FrameBuffer::default()
+            .push_with(input, |event| events.push(event))
+            .is_err());
+        assert!(events.is_empty());
+    }
 
     #[test]
     fn frame_progress_counts_only_complete_nonempty_frames() {
