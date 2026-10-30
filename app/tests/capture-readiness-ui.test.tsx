@@ -38,11 +38,13 @@ mock.module('react-i18next', () => ({
   useTranslation: () => ({ t: (key: string) => key }),
 }));
 const { CapturesTab } = await import('../src/components/CapturesTab/CapturesTab');
+const { profileListKey } = await import('../src/lib/hooks/useProfiles');
+const { currentServerScope } = await import('../src/lib/serverScope');
 afterAll(() => mock.restore());
 test('missing setup is actionable even with the global shortcut disabled', async () => {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   client.setQueryData(['captures'], { items: [] });
-  client.setQueryData(['profiles'], []);
+  client.setQueryData(profileListKey(currentServerScope()), []);
   let view!: ReturnType<typeof create>;
   const tree = () => (
     <QueryClientProvider client={client}>

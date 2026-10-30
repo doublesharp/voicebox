@@ -1,3 +1,4 @@
+import { useProfiles } from '@/lib/hooks/useProfiles';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Check, CheckCircle2, Edit, Plus, Speaker, Trash2 } from 'lucide-react';
 import { useRef, useState } from 'react';
@@ -72,10 +73,7 @@ export function AudioTab() {
     enabled: platform.metadata.isTauri,
   });
 
-  const { data: profiles } = useQuery({
-    queryKey: ['profiles'],
-    queryFn: () => apiClient.listProfiles(),
-  });
+  const { data: profiles } = useProfiles();
 
   const createChannel = useMutation({
     mutationFn: (data: { name: string; device_ids: string[] }) => apiClient.createChannel(data),
@@ -453,10 +451,7 @@ function ChannelVoicesList({ channelId }: { channelId: string }) {
     queryFn: () => apiClient.getChannelVoices(channelId),
   });
 
-  const { data: profiles } = useQuery({
-    queryKey: ['profiles'],
-    queryFn: () => apiClient.listProfiles(),
-  });
+  const { data: profiles } = useProfiles();
 
   const voiceNames =
     voices?.profile_ids.map((id) => profiles?.find((p) => p.id === id)?.name).filter(Boolean) || [];

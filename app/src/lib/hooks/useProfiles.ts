@@ -5,17 +5,28 @@ import type { EffectConfig, VoiceProfileCreate, VoiceProfileResponse } from '@/l
 import { usePlatform } from '@/platform/PlatformContext';
 import { useServerStore } from '@/stores/serverStore';
 
+export const profileListKey = (scope: ServerScope) => ['profiles', { kind: 'list', ...scope }] as const;
+export const profileDetailKey = (profileId: string, scope: ServerScope) => ['profiles', profileId, 'detail', scope] as const;
+
+function useProfileServerScope(): ServerScope {
+  const serverUrl = useServerStore((state) => state.serverUrl);
+  const serverRevision = useServerStore((state) => state.serverRevision);
+  return { serverUrl, serverRevision };
+}
+
 export function useProfiles() {
+  const scope = useProfileServerScope();
   return useQuery({
-    queryKey: ['profiles'],
-    queryFn: () => apiClient.listProfiles(),
+    queryKey: profileListKey(scope),
+    queryFn: () => { requireCurrentServer(scope); return apiClient.listProfiles(); },
   });
 }
 
 export function useProfile(profileId: string) {
+  const scope = useProfileServerScope();
   return useQuery({
-    queryKey: ['profiles', profileId],
-    queryFn: () => apiClient.getProfile(profileId),
+    queryKey: profileDetailKey(profileId, scope),
+    queryFn: () => { requireCurrentServer(scope); return apiClient.getProfile(profileId); },
     enabled: !!profileId,
   });
 }
@@ -91,8 +102,9 @@ export function useUpdateProfileEffects() {
       // requests before publishing the effects acknowledgement to both views.
       await queryClient.cancelQueries({ queryKey: ['profiles'] });
       if (variables._serverScope && !isCurrentServer(variables._serverScope)) return;
-      queryClient.setQueryData(['profiles', profile.id], profile);
-      queryClient.setQueryData<VoiceProfileResponse[]>(['profiles'], (previous) =>
+      const scope = variables._serverScope ?? currentServerScope();
+      queryClient.setQueryData(profileDetailKey(profile.id, scope), profile);
+      queryClient.setQueryData<VoiceProfileResponse[]>(profileListKey(scope), (previous) =>
         previous?.map((item) => (item.id === profile.id ? profile : item)),
       );
     },
@@ -100,11 +112,9 @@ export function useUpdateProfileEffects() {
 }
 
 export function useProfileSamples(profileId: string) {
-  const serverUrl = useServerStore((state) => state.serverUrl);
-  const serverRevision = useServerStore((state) => state.serverRevision);
-  const scope = { serverUrl, serverRevision };
+  const scope = useProfileServerScope();
   return useQuery({
-    queryKey: ['profiles', profileId, 'samples', serverUrl, serverRevision],
+    queryKey: ['profiles', profileId, 'samples', scope.serverUrl, scope.serverRevision],
     queryFn: () => {
       requireCurrentServer(scope);
       return apiClient.listProfileSamples(profileId);

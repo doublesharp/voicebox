@@ -2,6 +2,8 @@ import { afterAll, afterEach, expect, test } from 'bun:test';
 import { notifyManager, QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import {
+  profileDetailKey,
+  profileListKey,
   useDeleteProfile,
   useProfile,
   useProfiles,
@@ -13,6 +15,7 @@ import {
   useStories,
   useStory,
 } from '../src/lib/hooks/useStories';
+import { currentServerScope } from '../src/lib/serverScope';
 import { useStoryStore } from '../src/stores/storyStore';
 
 notifyManager.setScheduler((callback) => queueMicrotask(callback));
@@ -74,7 +77,7 @@ test('empty detail identifiers do not fetch and enabled queries use distinct key
   });
   expect(urls.map((url) => new URL(url).pathname)).toContain('/profiles/p');
   expect(urls.map((url) => new URL(url).pathname)).toContain('/stories/s');
-  expect(client.getQueryData(['profiles', 'p'])).toEqual([]);
+  expect(client.getQueryData(profileDetailKey('p', currentServerScope()))).toEqual([]);
   expect(client.getQueryData(['stories', 's'])).toEqual([]);
 });
 
@@ -84,12 +87,12 @@ test('effects acknowledgement replaces both caches and cancels an older fetch', 
   globalThis.fetch = (async (_url, init) =>
     Response.json(init?.method === 'PUT' ? updated : [old])) as typeof fetch;
   await mount();
-  client.setQueryData(['profiles'], [old, { id: 'other' }]);
-  client.setQueryData(['profiles', 'p'], old);
+  client.setQueryData(profileListKey(currentServerScope()), [old, { id: 'other' }]);
+  client.setQueryData(profileDetailKey('p', currentServerScope()), old);
   let finish!: (value: typeof old) => void;
   const pending = client
     .fetchQuery({
-      queryKey: ['profiles', 'p'],
+      queryKey: profileDetailKey('p', currentServerScope()),
       staleTime: 0,
       queryFn: () =>
         new Promise<typeof old>((resolve) => {
@@ -105,8 +108,8 @@ test('effects acknowledgement replaces both caches and cancels an older fetch', 
   });
   finish(old);
   await pending;
-  expect(client.getQueryData(['profiles', 'p'])).toEqual(updated);
-  expect(client.getQueryData(['profiles'])).toEqual([updated, { id: 'other' }]);
+  expect(client.getQueryData(profileDetailKey('p', currentServerScope()))).toEqual(updated);
+  expect(client.getQueryData(profileListKey(currentServerScope()))).toEqual([updated, { id: 'other' }]);
 });
 
 test('deletion invalidates dependent caches only after success', async () => {

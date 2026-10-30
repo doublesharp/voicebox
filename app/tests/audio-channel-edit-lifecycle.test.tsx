@@ -75,6 +75,8 @@ mock.module('../src/components/ui/select', () => {
   };
 });
 const { AudioTab } = await import('../src/components/AudioTab/AudioTab');
+const { profileListKey } = await import('../src/lib/hooks/useProfiles');
+const { currentServerScope } = await import('../src/lib/serverScope');
 afterAll(() => mock.restore());
 
 test('editing waits for existing voice assignments before allowing a save', async () => {
@@ -86,7 +88,7 @@ test('editing waits for existing voice assignments before allowing a save', asyn
     [{ id: 'channel', name: 'Narration', is_default: false, device_ids: [] }],
   );
   queryClient.setQueryData(['audio-devices'], []);
-  queryClient.setQueryData(['profiles'], [{ id: 'voice', name: 'Existing voice' }]);
+  queryClient.setQueryData(profileListKey(currentServerScope()), [{ id: 'voice', name: 'Existing voice' }]);
   let view!: ReturnType<typeof create>;
   try {
     await act(async () => {
@@ -138,7 +140,7 @@ test('a failed voice assignment save keeps the editor open for retry', async () 
     [{ id: 'channel', name: 'Narration', is_default: false, device_ids: [] }],
   );
   queryClient.setQueryData(['audio-devices'], []);
-  queryClient.setQueryData(['profiles'], [{ id: 'voice', name: 'Existing voice' }]);
+  queryClient.setQueryData(profileListKey(currentServerScope()), [{ id: 'voice', name: 'Existing voice' }]);
   queryClient.setQueryData(['channel-voices', 'channel'], { profile_ids: ['voice'] });
   let view!: ReturnType<typeof create>;
   try {
@@ -200,7 +202,7 @@ test('a failed assignment load does not allow an empty save', async () => {
     [{ id: 'channel', name: 'Narration', is_default: false, device_ids: [] }],
   );
   queryClient.setQueryData(['audio-devices'], []);
-  queryClient.setQueryData(['profiles'], [{ id: 'voice', name: 'Existing voice' }]);
+  queryClient.setQueryData(profileListKey(currentServerScope()), [{ id: 'voice', name: 'Existing voice' }]);
   let view!: ReturnType<typeof create>;
   try {
     await act(async () => {
@@ -250,7 +252,7 @@ test('pending channel save blocks edits and duplicate submissions', async () => 
     [{ id: 'channel', name: 'Narration', is_default: false, device_ids: [] }],
   );
   queryClient.setQueryData(['audio-devices'], []);
-  queryClient.setQueryData(['profiles'], [{ id: 'voice', name: 'Existing voice' }]);
+  queryClient.setQueryData(profileListKey(currentServerScope()), [{ id: 'voice', name: 'Existing voice' }]);
   queryClient.setQueryData(['channel-voices', 'channel'], { profile_ids: ['voice'] });
   let view!: ReturnType<typeof create>;
   try {
@@ -319,7 +321,7 @@ test('device toggles cannot send overlapping updates based on stale assignments'
       { id: 'two', name: 'Speakers', is_default: false },
     ],
   );
-  queryClient.setQueryData(['profiles'], []);
+  queryClient.setQueryData(profileListKey(currentServerScope()), []);
   queryClient.setQueryData(['channel-voices', 'channel'], { profile_ids: [] });
   let view!: ReturnType<typeof create>;
   try {
@@ -389,7 +391,7 @@ test('device toggles stay disabled when refreshing channel assignments fails', a
       { id: 'two', name: 'Speakers', is_default: false },
     ],
   );
-  queryClient.setQueryData(['profiles'], []);
+  queryClient.setQueryData(profileListKey(currentServerScope()), []);
   queryClient.setQueryData(['channel-voices', 'channel'], { profile_ids: [] });
   let view!: ReturnType<typeof create>;
   try {

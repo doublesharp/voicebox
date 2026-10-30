@@ -91,6 +91,8 @@ mock.module('react-i18next', () => ({
   useTranslation: () => ({ t: (key: string) => key }),
 }));
 const { CapturesTab } = await import('../src/components/CapturesTab/CapturesTab');
+const { profileListKey } = await import('../src/lib/hooks/useProfiles');
+const { currentServerScope } = await import('../src/lib/serverScope');
 const originalNavigator = globalThis.navigator;
 afterAll(() => {
   globalThis.navigator = originalNavigator;
@@ -103,7 +105,7 @@ async function setup() {
     defaultOptions: { queries: { retry: false, staleTime: Infinity }, mutations: { retry: false } },
   });
   client.setQueryData(['captures'], { items: rows, total: rows.length });
-  client.setQueryData(['profiles'], []);
+  client.setQueryData(profileListKey(currentServerScope()), []);
   let view!: ReturnType<typeof create>;
   await act(async () => {
     view = create(

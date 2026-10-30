@@ -1,3 +1,4 @@
+import { useProfiles } from '@/lib/hooks/useProfiles';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link } from '@tanstack/react-router';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
@@ -176,10 +177,7 @@ export function CapturesTab() {
     queryFn: () => apiClient.listCaptures(200, 0),
   });
 
-  const { data: profiles } = useQuery({
-    queryKey: ['profiles'],
-    queryFn: () => apiClient.listProfiles(),
-  });
+  const { data: profiles } = useProfiles();
 
   const captures = capturesData?.items ?? [];
 

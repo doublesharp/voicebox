@@ -78,10 +78,10 @@ test('a previous server effects response cannot replace the current server cache
   });
   act(() => {
     useServerStore.setState({ serverUrl: 'http://server-b', serverRevision: 1 });
-    client.setQueryData(['profiles', 'voice'], { id: 'voice', name: 'New server' });
-    client.setQueryData(['profiles'], [{ id: 'voice', name: 'New server' }]);
+    client.setQueryData(profiles.profileDetailKey('voice', currentServerScope()), { id: 'voice', name: 'New server' });
+    client.setQueryData(profiles.profileListKey(currentServerScope()), [{ id: 'voice', name: 'New server' }]);
   });
   await act(async () => { resolve({ id: 'voice', name: 'Old server' }); await outcome; });
-  expect(client.getQueryData(['profiles', 'voice'])).toEqual({ id: 'voice', name: 'New server' });
-  expect(client.getQueryData(['profiles'])).toEqual([{ id: 'voice', name: 'New server' }]);
+  expect(client.getQueryData(profiles.profileDetailKey('voice', currentServerScope()))).toEqual({ id: 'voice', name: 'New server' });
+  expect(client.getQueryData(profiles.profileListKey(currentServerScope()))).toEqual([{ id: 'voice', name: 'New server' }]);
 });

@@ -42,12 +42,14 @@ mock.module('../src/components/ui/select', () =>
 );
 mock.module('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 const { VoiceInspector } = await import('../src/components/VoicesTab/VoiceInspector');
+const { profileListKey, profileDetailKey } = await import('../src/lib/hooks/useProfiles');
+const { currentServerScope } = await import('../src/lib/serverScope');
 afterAll(() => mock.restore());
 
 test('effects acknowledgement refreshes detail and library after the metadata refetch has completed', async () => {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  client.setQueryData(['profiles', 'a'], { ...profile });
-  client.setQueryData(['profiles'], [{ ...profile }]);
+  client.setQueryData(profileDetailKey('a', currentServerScope()), { ...profile });
+  client.setQueryData(profileListKey(currentServerScope()), [{ ...profile }]);
   let view!: ReturnType<typeof create>;
   await act(async () => {
     view = create(
@@ -63,13 +65,13 @@ test('effects acknowledgement refreshes detail and library after the metadata re
     pending = view.root.findByType('form').props.onSubmit({ preventDefault() {}, persist() {} });
     await Bun.sleep(20);
   });
-  expect(client.getQueryData(['profiles', 'a'])).toMatchObject({ effects_chain: [] });
+  expect(client.getQueryData(profileDetailKey('a', currentServerScope()))).toMatchObject({ effects_chain: [] });
   await act(async () => {
     finishEffects();
     await pending;
   });
-  expect(client.getQueryData(['profiles', 'a'])).toMatchObject({ effects_chain: effects });
-  expect(client.getQueryData(['profiles'])).toMatchObject([{ effects_chain: effects }]);
+  expect(client.getQueryData(profileDetailKey('a', currentServerScope()))).toMatchObject({ effects_chain: effects });
+  expect(client.getQueryData(profileListKey(currentServerScope()))).toMatchObject([{ effects_chain: effects }]);
   act(() => view.unmount());
   client.clear();
 });
