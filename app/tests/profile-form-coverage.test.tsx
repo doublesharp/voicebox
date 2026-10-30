@@ -448,3 +448,106 @@ test('a current transcription failure is reported', async () => {
   await act(async () => { await view.root.findByType('audio-upload' as never).props.onTranscribe(); });
   expect(calls.toast.at(-1)).toEqual(expect.objectContaining({ title: 'profileForm.toast.transcribeFailed', description: 'transcription unavailable' }));
 });
+
+async function mountSample(open = true, profileId = 'p') {
+  await act(async () => { view = create(<SampleUpload profileId={profileId} open={open} onOpenChange={() => {}} />); });
+}
+const sampleText = () => input('Enter the exact text spoken in the audio...');
+const editSampleText = (value: string) => type('Enter the exact text spoken in the audio...', 'referenceText', value);
+
+test('sample upload ignores a transcript for a replaced audio file', async () => {
+  let resolve!: (value: { text: string }) => void;
+  transcribeHandler = () => new Promise((r) => { resolve = r; });
+  await mountSample();
+  await upload(new File(['a'], 'first.wav', { type: 'audio/wav' }));
+  await act(async () => { view.root.findByType('audio-upload' as never).props.onTranscribe(); });
+  await upload(new File(['b'], 'second.wav', { type: 'audio/wav' }));
+  await editSampleText('Second sample');
+  await act(async () => { resolve({ text: 'First transcript' }); });
+  expect(sampleText().props.value).toBe('Second sample');
+});
+
+test('sample upload does not overwrite a correction made during transcription', async () => {
+  let resolve!: (value: { text: string }) => void;
+  transcribeHandler = () => new Promise((r) => { resolve = r; });
+  await mountSample();
+  await upload(new File(['a'], 'voice.wav', { type: 'audio/wav' }));
+  await act(async () => { view.root.findByType('audio-upload' as never).props.onTranscribe(); });
+  await editSampleText('My correction');
+  await act(async () => { resolve({ text: 'Old transcript' }); });
+  expect(sampleText().props.value).toBe('My correction');
+});
+
+test('only the newest sample-upload transcription is applied', async () => {
+  const pending: Array<(value: { text: string }) => void> = [];
+  transcribeHandler = () => new Promise((resolve) => { pending.push(resolve); });
+  await mountSample();
+  await upload(new File(['a'], 'voice.wav', { type: 'audio/wav' }));
+  await act(async () => { view.root.findByType('audio-upload' as never).props.onTranscribe(); });
+  await act(async () => { view.root.findByType('audio-upload' as never).props.onTranscribe(); });
+  await act(async () => { pending[0]({ text: 'Old' }); });
+  expect(sampleText().props.value).toBe('');
+  await act(async () => { pending[1]({ text: 'New' }); });
+  expect(sampleText().props.value).toBe('New');
+});
+
+test('closing and reopening sample upload invalidates a pending transcript', async () => {
+  let resolve!: (value: { text: string }) => void;
+  transcribeHandler = () => new Promise((r) => { resolve = r; });
+  await mountSample();
+  await upload(new File(['a'], 'voice.wav', { type: 'audio/wav' }));
+  await act(async () => { view.root.findByType('audio-upload' as never).props.onTranscribe(); });
+  await act(async () => { view.update(<SampleUpload profileId="p" open={false} onOpenChange={() => {}} />); });
+  await act(async () => { view.update(<SampleUpload profileId="p" open onOpenChange={() => {}} />); });
+  await act(async () => { resolve({ text: 'Old transcript' }); });
+  expect(sampleText().props.value).toBe('');
+});
+
+test('sample upload applies the current transcription and reports current failures', async () => {
+  await mountSample();
+  const file = new File(['a'], 'voice.wav', { type: 'audio/wav' });
+  await upload(file);
+  let received: any;
+  transcribeHandler = async (arg) => { received = arg; return { text: 'Recognized speech' }; };
+  await act(async () => { await view.root.findByType('audio-upload' as never).props.onTranscribe(); });
+  expect(received.file).toBe(file);
+  expect(sampleText().props.value).toBe('Recognized speech');
+  transcribeHandler = async () => { throw new Error('recognizer unavailable'); };
+  await act(async () => { await view.root.findByType('audio-upload' as never).props.onTranscribe(); });
+  expect(calls.toast.at(-1)).toEqual(expect.objectContaining({ title: 'Transcription failed', description: 'recognizer unavailable' }));
+});
+
+test('sample upload ignores a stale transcription failure for a replacement', async () => {
+  let reject!: (error: Error) => void;
+  transcribeHandler = () => new Promise((_resolve, r) => { reject = r; });
+  await mountSample();
+  await upload(new File(['a'], 'first.wav', { type: 'audio/wav' }));
+  await act(async () => { view.root.findByType('audio-upload' as never).props.onTranscribe(); });
+  await upload(new File(['b'], 'second.wav', { type: 'audio/wav' }));
+  await act(async () => { reject(new Error('old request failed')); });
+  expect(calls.toast.some((entry) => entry.title === 'Transcription failed')).toBe(false);
+});
+
+test('sample upload ignores a transcript after switching profiles', async () => {
+  let resolve!: (value: { text: string }) => void;
+  transcribeHandler = () => new Promise((r) => { resolve = r; });
+  await mountSample();
+  await upload(new File(['a'], 'voice.wav', { type: 'audio/wav' }));
+  await act(async () => { view.root.findByType('audio-upload' as never).props.onTranscribe(); });
+  await act(async () => { view.update(<SampleUpload profileId="other" open onOpenChange={() => {}} />); });
+  await act(async () => { resolve({ text: 'Old profile transcript' }); });
+  expect(sampleText().props.value).toBe('');
+});
+
+test('sample upload ignores a transcript after the profile language changes', async () => {
+  let resolve!: (value: { text: string }) => void;
+  transcribeHandler = () => new Promise((r) => { resolve = r; });
+  profile = { language: 'en' };
+  await mountSample();
+  await upload(new File(['a'], 'voice.wav', { type: 'audio/wav' }));
+  await act(async () => { view.root.findByType('audio-upload' as never).props.onTranscribe(); });
+  profile = { language: 'fr' };
+  await act(async () => { view.update(<SampleUpload profileId="p" open onOpenChange={() => {}} />); });
+  await act(async () => { resolve({ text: 'English transcript' }); });
+  expect(sampleText().props.value).toBe('');
+});

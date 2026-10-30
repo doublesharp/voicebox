@@ -1,6 +1,6 @@
 import { zodResolver } from '@hookform/resolvers/zod';
 import { Mic, Monitor, Upload } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useForm } from 'react-hook-form';
 import * as z from 'zod';
 import { Button } from '@/components/ui/button';
@@ -55,6 +55,13 @@ export function SampleUpload({ profileId, open, onOpenChange }: SampleUploadProp
   const addSample = useAddSample();
   const transcribe = useTranscription();
   const { data: profile } = useProfile(profileId);
+  const transcriptionRevision = useRef(0);
+  const currentContext = useRef({ open, profileId, language: profile?.language });
+  currentContext.current = { open, profileId, language: profile?.language };
+  useEffect(() => {
+    transcriptionRevision.current += 1;
+    return () => { transcriptionRevision.current += 1; };
+  }, [open, profileId]);
   const { toast } = useToast();
   const [mode, setMode] = useState<'upload' | 'record' | 'system'>('upload');
   const { isPlaying, playPause, cleanup: cleanupAudio } = useAudioPlayer();
@@ -159,12 +166,22 @@ export function SampleUpload({ profileId, open, onOpenChange }: SampleUploadProp
       return;
     }
 
+    const language = profile?.language as 'en' | 'zh' | undefined;
+    const referenceText = form.getValues('referenceText');
+    const revision = ++transcriptionRevision.current;
+    const isCurrent = () =>
+      transcriptionRevision.current === revision &&
+      currentContext.current.open &&
+      currentContext.current.profileId === profileId &&
+      currentContext.current.language === language &&
+      form.getValues('file') === file &&
+      form.getValues('referenceText') === referenceText;
     try {
-      const language = profile?.language as 'en' | 'zh' | undefined;
       const result = await transcribe.mutateAsync({ file, language });
-
+      if (!isCurrent()) return;
       form.setValue('referenceText', result.text, { shouldValidate: true });
     } catch (error) {
+      if (!isCurrent()) return;
       toast({
         title: 'Transcription failed',
         description: error instanceof Error ? error.message : 'Failed to transcribe audio',
@@ -198,6 +215,7 @@ export function SampleUpload({ profileId, open, onOpenChange }: SampleUploadProp
 
   function handleOpenChange(newOpen: boolean) {
     if (!newOpen) {
+      transcriptionRevision.current += 1;
       form.reset();
       setMode('upload');
       if (isRecording || isStarting) {
