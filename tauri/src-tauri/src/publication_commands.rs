@@ -479,6 +479,50 @@ mod export_flow_tests {
         assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 1);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_saves_through_selected_symlink_and_reports_selected_path() {
+        use std::os::unix::fs::symlink;
+        let fixture = Fixture::new();
+        let target = fixture.0.join("actual.wav");
+        let link = fixture.target();
+        std::fs::write(&target, b"old audio").unwrap();
+        symlink("actual.wav", &link).unwrap();
+        let selected = link.clone();
+        let result = run_on_worker(move || Ok(Some(selected)), || Ok(input(b"new audio")))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"new audio");
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            serde_json::to_value(result).unwrap(),
+            serde_json::json!({"status":"saved", "path":link.to_str().unwrap()})
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_reports_dangling_symlink_without_replacing_it() {
+        use std::os::unix::fs::symlink;
+        let fixture = Fixture::new();
+        let link = fixture.target();
+        symlink("missing.wav", &link).unwrap();
+        let selected = link.clone();
+        let error = run_on_worker(move || Ok(Some(selected)), || Ok(input(b"audio")))
+            .await
+            .err()
+            .unwrap();
+        assert!(error.contains("Could not save"));
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(!fixture.0.join("missing.wav").exists());
+    }
+
     #[test]
     fn cancelled_dialog_does_not_read_or_create_a_file() {
         let called = Cell::new(false);

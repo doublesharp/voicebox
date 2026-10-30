@@ -35,6 +35,15 @@ fn publish_using(
     destination: &Path,
     write_and_sync: impl FnOnce(&mut fs::File) -> io::Result<()>,
 ) -> io::Result<()> {
+    // Atomic rename must replace the selected file, not a symbolic link to it.
+    // Canonicalizing also rejects dangling links without destroying them.
+    let resolved = match fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(destination)?,
+        Ok(_) => destination.to_path_buf(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => destination.to_path_buf(),
+        Err(error) => return Err(error),
+    };
+    let destination = resolved.as_path();
     let parent = destination
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Destination has no parent"))?;
@@ -218,5 +227,128 @@ mod tests {
             staging_mode, 0o600,
             "unpublished staging content was not private"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod symlink_export_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "voicebox-symlink-export-{}-{}",
+                std::process::id(),
+                NEXT_STAGE.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&root).unwrap();
+            Self(root)
+        }
+        fn path(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct Interrupted(bool);
+    impl Read for Interrupted {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if !self.0 {
+                self.0 = true;
+                output[..3].copy_from_slice(b"new");
+                Ok(3)
+            } else {
+                Err(io::Error::new(io::ErrorKind::Other, "reader failed"))
+            }
+        }
+    }
+
+    #[test]
+    fn export_updates_target_without_replacing_the_selected_symlink() {
+        let fixture = Fixture::new();
+        let target = fixture.path("target.wav");
+        let link = fixture.path("selected.wav");
+        fs::write(&target, b"old").unwrap();
+        symlink("target.wav", &link).unwrap();
+        publish(&link, &b"new audio"[..]).unwrap();
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_link(&link).unwrap(), PathBuf::from("target.wav"));
+        assert_eq!(fs::read(&target).unwrap(), b"new audio");
+        assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn export_follows_link_chain_to_a_target_in_another_directory() {
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.path("output")).unwrap();
+        let target = fixture.path("output/target.wav");
+        let middle = fixture.path("middle.wav");
+        let link = fixture.path("selected.wav");
+        fs::write(&target, b"old").unwrap();
+        symlink("output/target.wav", &middle).unwrap();
+        symlink("middle.wav", &link).unwrap();
+        publish(&link, &b"replacement"[..]).unwrap();
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(fs::symlink_metadata(&middle)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&target).unwrap(), b"replacement");
+        assert_eq!(fs::read_dir(fixture.path("output")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn dangling_symlink_is_not_destroyed_or_replaced() {
+        let fixture = Fixture::new();
+        let link = fixture.path("selected.wav");
+        symlink("missing.wav", &link).unwrap();
+        assert!(publish(&link, &b"replacement"[..]).is_err());
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(!fixture.path("missing.wav").exists());
+        assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn cyclic_symlinks_return_an_error_without_modifying_either_link() {
+        let fixture = Fixture::new();
+        let first = fixture.path("first.wav");
+        let second = fixture.path("second.wav");
+        symlink("second.wav", &first).unwrap();
+        symlink("first.wav", &second).unwrap();
+        assert!(publish(&first, &b"audio"[..]).is_err());
+        assert_eq!(fs::read_link(&first).unwrap(), PathBuf::from("second.wav"));
+        assert_eq!(fs::read_link(&second).unwrap(), PathBuf::from("first.wav"));
+        assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn failed_export_through_symlink_preserves_link_and_target() {
+        let fixture = Fixture::new();
+        let target = fixture.path("target.wav");
+        let link = fixture.path("selected.wav");
+        fs::write(&target, b"original").unwrap();
+        symlink("target.wav", &link).unwrap();
+        assert!(publish(&link, Interrupted(false)).is_err());
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&target).unwrap(), b"original");
+        assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 2);
     }
 }
