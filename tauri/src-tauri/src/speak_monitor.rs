@@ -49,7 +49,7 @@ pub fn spawn_speak_monitor(app: AppHandle) {
 
 async fn run(app: AppHandle) {
     let url = format!("http://127.0.0.1:{}/events/speak", SERVER_PORT);
-    let client = match reqwest::Client::builder().build() {
+    let client = match monitor_client() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("speak_monitor: failed to build HTTP client: {e}");
@@ -57,32 +57,58 @@ async fn run(app: AppHandle) {
         }
     };
 
-    let mut backoff = INITIAL_BACKOFF;
-    let mut attempt: u32 = 0;
+    let mut retry = Retry::default();
 
     loop {
         let stream_result = stream_once(&client, &url, &app).await;
         let had_success = matches!(stream_result, Ok(true));
+        let (delay, attempt) = retry.after_round(had_success);
 
-        if had_success {
-            backoff = INITIAL_BACKOFF;
-            attempt = 0;
-        } else {
-            attempt += 1;
+        if !had_success {
             let reason = match stream_result {
                 Ok(_) => "stream closed without data".to_string(),
                 Err(e) => format!("stream err: {e}"),
             };
             eprintln!(
                 "speak_monitor: {reason} (attempt {attempt}, retry in {:?})",
-                backoff
+                delay
             );
         }
 
-        tokio::time::sleep(backoff).await;
-        if !had_success {
-            backoff = (backoff * 2).min(MAX_BACKOFF);
+        tokio::time::sleep(delay).await;
+    }
+}
+
+fn monitor_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
+struct Retry {
+    backoff: Duration,
+    attempts: u32,
+}
+
+impl Default for Retry {
+    fn default() -> Self {
+        Self {
+            backoff: INITIAL_BACKOFF,
+            attempts: 0,
         }
+    }
+}
+
+impl Retry {
+    fn after_round(&mut self, productive: bool) -> (Duration, u32) {
+        if productive {
+            *self = Self::default();
+            return (self.backoff, self.attempts);
+        }
+        self.attempts = self.attempts.saturating_add(1);
+        let delay = self.backoff;
+        self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
+        (delay, self.attempts)
     }
 }
 
@@ -168,6 +194,57 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn retry_backoff_caps_and_resets_after_productive_stream() {
+        let mut retry = Retry::default();
+        for (attempt, milliseconds) in [500, 1000, 2000, 4000, 8000, 16000, 30000, 30000]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                retry.after_round(false),
+                (Duration::from_millis(milliseconds), attempt as u32 + 1)
+            );
+        }
+        assert_eq!(retry.after_round(true), (INITIAL_BACKOFF, 0));
+        assert_eq!(retry.after_round(false), (INITIAL_BACKOFF, 1));
+        retry.attempts = u32::MAX;
+        assert_eq!(retry.after_round(false).1, u32::MAX);
+    }
+
+    #[tokio::test]
+    async fn redirect_cannot_supply_events_from_a_different_server() {
+        let (target, target_task) = serve(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\nevent: speak-start\ndata: wrong server\n\n",
+            Duration::ZERO,
+        ).await;
+        let source = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/events/speak", source.local_addr().unwrap());
+        let source_task = tokio::spawn(async move {
+            let (mut stream, _) = source.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).await;
+            let response = format!("HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let mut events = Vec::new();
+        let result = stream_once_with(
+            &monitor_client().unwrap(),
+            &url,
+            Duration::from_secs(1),
+            |event, data| events.push((event.to_string(), data.to_string())),
+        )
+        .await;
+        source_task.await.unwrap();
+        // The target may never be contacted when redirects are disabled.
+        target_task.abort();
+        assert!(
+            result.is_err(),
+            "a redirect must not be accepted as the backend stream"
+        );
+        assert!(events.is_empty());
+    }
 
     async fn serve(
         response: &'static [u8],
