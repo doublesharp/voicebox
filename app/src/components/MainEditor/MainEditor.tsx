@@ -1,5 +1,5 @@
 import { Sparkles, Upload } from 'lucide-react';
-import { useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { DoubleSharpMark } from '@/components/Branding';
 import { FloatingGenerateBox } from '@/components/Generation/FloatingGenerateBox';
@@ -17,6 +17,8 @@ import { useToast } from '@/components/ui/use-toast';
 import { ProfileForm } from '@/components/VoiceProfiles/ProfileForm';
 
 import { useImportProfile, useProfiles } from '@/lib/hooks/useProfiles';
+import { currentServerScope, isCurrentServer, type ServerScope } from '@/lib/serverScope';
+import { useServerStore } from '@/stores/serverStore';
 import { useUIStore } from '@/stores/uiStore';
 
 export function MainEditor() {
@@ -26,8 +28,33 @@ export function MainEditor() {
   const importProfile = useImportProfile();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [importDialogOpen, setImportDialogOpen] = useState(false);
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [selection, setSelection] = useState<{ file: File; scope: ServerScope; id: number } | null>(
+    null,
+  );
+  const selectionId = useRef(0);
+  const pendingId = useRef<number | null>(null);
+  const [pendingSelectionId, setPendingSelectionId] = useState<number | null>(null);
+  const serverUrl = useServerStore((state) => state.serverUrl);
+  const serverRevision = useServerStore((state) => state.serverRevision);
   const { toast } = useToast();
+
+  const clearSelection = useCallback(() => {
+    selectionId.current += 1;
+    pendingId.current = null;
+    setPendingSelectionId(null);
+    setImportDialogOpen(false);
+    setSelection(null);
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  }, []);
+
+  useEffect(() => {
+    if (
+      selection &&
+      (selection.scope.serverUrl !== serverUrl || selection.scope.serverRevision !== serverRevision)
+    ) {
+      clearSelection();
+    }
+  }, [selection, serverUrl, serverRevision, clearSelection]);
 
   const handleImportClick = () => {
     fileInputRef.current?.click();
@@ -44,34 +71,48 @@ export function MainEditor() {
         });
         return;
       }
-      setSelectedFile(file);
+      const id = ++selectionId.current;
+      setSelection({ file, scope: currentServerScope(), id });
       setImportDialogOpen(true);
     }
   };
 
   const handleImportConfirm = () => {
-    if (selectedFile) {
-      importProfile.mutate(selectedFile, {
+    if (!selection || !isCurrentServer(selection.scope) || pendingId.current === selection.id)
+      return;
+    const { file, scope, id } = selection;
+    pendingId.current = id;
+    setPendingSelectionId(id);
+    const isCurrent = () => isCurrentServer(scope) && selectionId.current === id;
+    const release = () => {
+      if (pendingId.current === id) {
+        pendingId.current = null;
+        setPendingSelectionId(null);
+      }
+    };
+    importProfile.mutate(
+      { file, _serverScope: scope },
+      {
         onSuccess: () => {
-          setImportDialogOpen(false);
-          setSelectedFile(null);
-          if (fileInputRef.current) {
-            fileInputRef.current.value = '';
-          }
+          release();
+          if (!isCurrent()) return;
+          clearSelection();
           toast({
             title: t('main.import.successTitle'),
             description: t('main.import.successDescription'),
           });
         },
         onError: (error) => {
+          release();
+          if (!isCurrent()) return;
           toast({
             title: t('main.import.failedTitle'),
             description: error.message,
             variant: 'destructive',
           });
         },
-      });
-    }
+      },
+    );
   };
 
   return (
@@ -140,32 +181,30 @@ export function MainEditor() {
       </div>
       <ProfileForm />
 
-      <Dialog open={importDialogOpen} onOpenChange={setImportDialogOpen}>
+      <Dialog
+        open={importDialogOpen}
+        onOpenChange={(open) => {
+          if (!open) clearSelection();
+        }}
+      >
         <DialogContent>
           <DialogHeader>
             <DialogTitle>{t('main.import.dialogTitle')}</DialogTitle>
             <DialogDescription>
-              {t('main.import.dialogDescription', { name: selectedFile?.name })}
+              {t('main.import.dialogDescription', { name: selection?.file.name })}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => {
-                setImportDialogOpen(false);
-                setSelectedFile(null);
-                if (fileInputRef.current) {
-                  fileInputRef.current.value = '';
-                }
-              }}
-            >
+            <Button variant="outline" onClick={clearSelection}>
               {t('common.cancel')}
             </Button>
             <Button
               onClick={handleImportConfirm}
-              disabled={importProfile.isPending || !selectedFile}
+              disabled={!selection || pendingSelectionId === selection.id}
             >
-              {importProfile.isPending ? t('main.import.importing') : t('main.import.action')}
+              {selection && pendingSelectionId === selection.id
+                ? t('main.import.importing')
+                : t('main.import.action')}
             </Button>
           </DialogFooter>
         </DialogContent>

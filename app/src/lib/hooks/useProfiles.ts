@@ -250,8 +250,13 @@ export function useImportProfile() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: (file: File) => apiClient.importProfile(file),
-    onSuccess: () => {
+    mutationFn: (input: File | { file: File; _serverScope: ServerScope }) => {
+      if (input instanceof File) return apiClient.importProfile(input);
+      requireCurrentServer(input._serverScope);
+      return apiClient.importProfile(input.file);
+    },
+    onSuccess: (_data, input) => {
+      if (!(input instanceof File) && !isCurrentServer(input._serverScope)) return;
       queryClient.invalidateQueries({ queryKey: ['profiles'] });
     },
   });
