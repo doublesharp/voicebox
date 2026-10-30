@@ -209,6 +209,32 @@ fn check_health(port: u16) -> bool {
     }
 }
 
+#[cfg(debug_assertions)]
+async fn manual_server_available(port: u16) -> bool {
+    tokio::task::spawn_blocking(move || check_health(port))
+        .await
+        .unwrap_or(false)
+}
+
+fn eligible_gpu_backends(
+    pin: Option<&str>,
+    rocm: Option<std::path::PathBuf>,
+    cuda: Option<std::path::PathBuf>,
+) -> (Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
+    let pin_cuda = pin == Some("cuda") && cuda.is_some();
+    let pin_rocm = pin == Some("rocm") && rocm.is_some();
+    (if pin_cuda { None } else { rocm }, if pin_rocm { None } else { cuda })
+}
+
+fn server_arguments(data_dir: &str, port: u16, parent_pid: u32, remote: bool) -> Vec<String> {
+    let mut args = vec![
+        "--data-dir".into(), data_dir.into(), "--port".into(), port.to_string(),
+        "--parent-pid".into(), parent_pid.to_string(),
+    ];
+    if remote { args.extend(["--host".into(), "0.0.0.0".into()]); }
+    args
+}
+
 struct ServerState {
     child: Mutex<Option<tauri_plugin_shell::process::CommandChild>>,
     server_pid: Mutex<Option<u32>>,
@@ -523,11 +549,7 @@ async fn start_server(
                 eprintln!("Dev mode: Checking if server is already running on port {}...", SERVER_PORT);
 
                 // Try to connect to the server port
-                use std::net::TcpStream;
-                if TcpStream::connect_timeout(
-                    &format!("127.0.0.1:{}", SERVER_PORT).parse().unwrap(),
-                    std::time::Duration::from_secs(1),
-                ).is_ok() {
+                if manual_server_available(SERVER_PORT).await {
                     println!("Found server already running on port {}", SERVER_PORT);
                     return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
                 }
@@ -570,9 +592,7 @@ async fn start_server(
         .to_str()
         .ok_or_else(|| "Invalid data dir path".to_string())?
         .to_string();
-    let port_str = SERVER_PORT.to_string();
-    let parent_pid_str = std::process::id().to_string();
-    let is_remote = remote.unwrap_or(false);
+    let server_args = server_arguments(&data_dir_str, SERVER_PORT, std::process::id(), remote.unwrap_or(false));
 
     // Resolve the custom models directory from the parameter or stored state
     let effective_models_dir = models_dir.or_else(|| state.models_dir.lock().unwrap().clone());
@@ -592,11 +612,9 @@ async fn start_server(
     // pinned variant is actually installed, so a stale pin to a deleted backend
     // self-heals to the default order instead of forcing CPU. With no pin, both
     // stay eligible and the launch order below prefers ROCm, then CUDA.
-    let pin = backend_override.as_deref();
-    let pin_cuda = pin == Some("cuda") && cuda_binary.is_some();
-    let pin_rocm = pin == Some("rocm") && rocm_binary.is_some();
-    let rocm_binary = if pin_cuda { None } else { rocm_binary };
-    let cuda_binary = if pin_rocm { None } else { cuda_binary };
+    let (rocm_binary, cuda_binary) = eligible_gpu_backends(
+        backend_override.as_deref(), rocm_binary, cuda_binary,
+    );
 
     // If ROCm binary exists, launch it from the onedir directory.
     // If CUDA binary exists, launch it from the onedir directory.
@@ -610,8 +628,7 @@ async fn start_server(
             println!("Launching ROCm backend: {:?} (cwd: {:?})", rocm_path, rocm_dir);
             let mut cmd = app.shell().command(rocm_path.to_str().unwrap());
             cmd = cmd.current_dir(rocm_dir);
-            cmd = cmd.args(["--data-dir", &data_dir_str, "--port", &port_str, "--parent-pid", &parent_pid_str]);
-            if is_remote { cmd = cmd.args(["--host", "0.0.0.0"]); }
+            cmd = cmd.args(&server_args);
             if let Some(ref dir) = effective_models_dir { cmd = cmd.env("VOICEBOX_MODELS_DIR", dir); }
             match cmd.spawn() {
                 Ok(r) => { gpu_spawn = Some(Ok(r)); }
@@ -625,8 +642,7 @@ async fn start_server(
                 println!("Launching CUDA backend: {:?} (cwd: {:?})", cuda_path, cuda_dir);
                 let mut cmd = app.shell().command(cuda_path.to_str().unwrap());
                 cmd = cmd.current_dir(cuda_dir);
-                cmd = cmd.args(["--data-dir", &data_dir_str, "--port", &port_str, "--parent-pid", &parent_pid_str]);
-                if is_remote { cmd = cmd.args(["--host", "0.0.0.0"]); }
+                cmd = cmd.args(&server_args);
                 if let Some(ref dir) = effective_models_dir { cmd = cmd.env("VOICEBOX_MODELS_DIR", dir); }
                 match cmd.spawn() {
                     Ok(r) => { gpu_spawn = Some(Ok(r)); }
@@ -639,8 +655,7 @@ async fn start_server(
             result
         } else {
             // Fall back to bundled CPU sidecar
-            sidecar = sidecar.args(["--data-dir", &data_dir_str, "--port", &port_str, "--parent-pid", &parent_pid_str]);
-            if is_remote { sidecar = sidecar.args(["--host", "0.0.0.0"]); }
+            sidecar = sidecar.args(&server_args);
             if let Some(ref dir) = effective_models_dir { sidecar = sidecar.env("VOICEBOX_MODELS_DIR", dir); }
             println!("Spawning bundled CPU server process...");
             sidecar.spawn()
@@ -648,10 +663,7 @@ async fn start_server(
     } else {
         // Override forces CPU — use bundled sidecar, GPU binary stays on disk
         println!("Backend override=cpu: using bundled CPU sidecar");
-        sidecar = sidecar.args(["--data-dir", &data_dir_str, "--port", &port_str, "--parent-pid", &parent_pid_str]);
-        if is_remote {
-            sidecar = sidecar.args(["--host", "0.0.0.0"]);
-        }
+        sidecar = sidecar.args(&server_args);
         if let Some(ref dir) = effective_models_dir {
             sidecar = sidecar.env("VOICEBOX_MODELS_DIR", dir);
         }
@@ -666,11 +678,7 @@ async fn start_server(
             // In dev mode, check if a manually-started server is available
             #[cfg(debug_assertions)]
             {
-                use std::net::TcpStream;
-                if TcpStream::connect_timeout(
-                    &format!("127.0.0.1:{}", SERVER_PORT).parse().unwrap(),
-                    std::time::Duration::from_secs(1),
-                ).is_ok() {
+                if manual_server_available(SERVER_PORT).await {
                     println!("Found manually-started server on port {}", SERVER_PORT);
                     return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
                 }
@@ -729,11 +737,7 @@ async fn start_server(
             // In dev mode, check if a manual server came up during the wait
             #[cfg(debug_assertions)]
             {
-                use std::net::TcpStream;
-                if TcpStream::connect_timeout(
-                    &format!("127.0.0.1:{}", SERVER_PORT).parse().unwrap(),
-                    std::time::Duration::from_secs(1),
-                ).is_ok() {
+                if manual_server_available(SERVER_PORT).await {
                     // Kill the placeholder process
                     let _ = state.child.lock().unwrap().take();
                     println!("Found manually-started server on port {}", SERVER_PORT);
@@ -789,14 +793,10 @@ async fn start_server(
                 // In dev mode, this is expected when using the placeholder binary
                 #[cfg(debug_assertions)]
                 {
-                    use std::net::TcpStream;
                     eprintln!("Server process ended (dev mode placeholder detected)");
 
                     // Check if a manually-started server is available
-                    if TcpStream::connect_timeout(
-                        &format!("127.0.0.1:{}", SERVER_PORT).parse().unwrap(),
-                        std::time::Duration::from_secs(1),
-                    ).is_ok() {
+                    if manual_server_available(SERVER_PORT).await {
                         // Clean up state
                         let _ = state.child.lock().unwrap().take();
                         let _ = state.server_pid.lock().unwrap().take();
@@ -1957,5 +1957,96 @@ mod backend_override_tests {
         write_persisted_backend_override(&dir, None);
         assert_eq!(read_persisted_backend_override(&dir), None);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+mod manual_server_tests {
+    use super::manual_server_available;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn serve(status: &str, body: &str) -> (u16, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let response = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+            let mut request = [0; 1024];
+            if stream.read(&mut request).unwrap_or(0) > 0 {
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (port, server)
+    }
+
+    #[tokio::test]
+    async fn only_a_healthy_voicebox_server_is_a_usable_manual_server() {
+        for (status, body, expected) in [
+            ("200 OK", r#"{"status":"healthy","model_loaded":false,"gpu_available":true}"#, true),
+            ("200 OK", "unrelated service", false),
+            ("200 OK", r#"{"status":"healthy"}"#, false),
+            ("503 Service Unavailable", r#"{"status":"healthy","model_loaded":true,"gpu_available":true}"#, false),
+        ] {
+            let (port, server) = serve(status, body);
+            assert_eq!(manual_server_available(port).await, expected, "{status}: {body}");
+            server.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_listener_is_not_a_usable_manual_server() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        assert!(!manual_server_available(port).await);
+    }
+}
+
+#[cfg(test)]
+mod backend_selection_tests {
+    use super::eligible_gpu_backends;
+    use std::path::PathBuf;
+
+    #[test]
+    fn installed_and_pinned_backends_keep_the_expected_fallbacks() {
+        for (pin, rocm, cuda, expected) in [
+            (None, true, true, (true, true)),
+            (None, true, false, (true, false)),
+            (None, false, true, (false, true)),
+            (None, false, false, (false, false)),
+            (Some("cuda"), true, true, (false, true)),
+            (Some("rocm"), true, true, (true, false)),
+            (Some("cuda"), true, false, (true, false)),
+            (Some("rocm"), false, true, (false, true)),
+            (Some("cuda"), false, false, (false, false)),
+            (Some("rocm"), false, false, (false, false)),
+            (Some("cpu"), true, true, (true, true)),
+            (Some("unknown"), true, true, (true, true)),
+        ] {
+            let actual = eligible_gpu_backends(pin, rocm.then(|| PathBuf::from("rocm")), cuda.then(|| PathBuf::from("cuda")));
+            assert_eq!((actual.0.is_some(), actual.1.is_some()), expected, "pin={pin:?}, rocm={rocm}, cuda={cuda}");
+            if let Some(path) = actual.0 { assert_eq!(path, PathBuf::from("rocm")); }
+            if let Some(path) = actual.1 { assert_eq!(path, PathBuf::from("cuda")); }
+        }
+    }
+}
+
+#[cfg(test)]
+mod server_arguments_tests {
+    use super::server_arguments;
+
+    #[test]
+    fn local_launch_preserves_data_path_as_one_argument_and_uses_loopback_default() {
+        assert_eq!(server_arguments("/data/voice box", 17493, 123, false),
+            ["--data-dir", "/data/voice box", "--port", "17493", "--parent-pid", "123"]);
+    }
+
+    #[test]
+    fn remote_launch_adds_public_host_without_changing_other_arguments() {
+        assert_eq!(server_arguments("/data/voice box", 17493, 123, true),
+            ["--data-dir", "/data/voice box", "--port", "17493", "--parent-pid", "123", "--host", "0.0.0.0"]);
     }
 }
