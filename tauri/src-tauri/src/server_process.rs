@@ -56,6 +56,12 @@ pub(crate) enum ListenerDecision {
 }
 
 #[cfg(unix)]
+fn has_listener_header(output: &str) -> bool {
+    let mut fields = output.lines().next().unwrap_or_default().split_whitespace();
+    fields.next() == Some("COMMAND") && fields.next() == Some("PID")
+}
+
+#[cfg(unix)]
 fn listeners(output: &str) -> impl Iterator<Item = (&str, Option<u32>)> {
     output.lines().skip(1).filter_map(|line| {
         let mut fields = line.split_whitespace();
@@ -69,6 +75,9 @@ fn listeners(output: &str) -> impl Iterator<Item = (&str, Option<u32>)> {
 
 #[cfg(unix)]
 pub(crate) fn classify_listener(output: &str, healthy: bool) -> ListenerDecision {
+    if !output.trim().is_empty() && !has_listener_header(output) {
+        return ListenerDecision::Conflict("unrecognized listener output".into());
+    }
     let rows: Vec<_> = listeners(output).collect();
     let Some((name, pid)) = rows.first().copied() else {
         return ListenerDecision::Unoccupied;
@@ -118,7 +127,7 @@ pub(crate) fn linux_server_executable(pid: u32) -> bool {
 
 #[cfg(unix)]
 pub(crate) fn legacy_pids(output: &str, healthy: bool) -> Vec<u32> {
-    if !healthy {
+    if !healthy || !has_listener_header(output) {
         return Vec::new();
     }
     let rows: Vec<_> = listeners(output).collect();
@@ -574,6 +583,70 @@ mod windows_listener_ownership_tests {
         assert_eq!(
             windows_listener_pid("123\n123", |_| Some(rows.clone())),
             Some(123)
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod truncated_discovery_tests {
+    use super::{classify_listener, legacy_pids, ListenerDecision};
+
+    #[test]
+    fn headerless_single_listener_is_not_treated_as_an_empty_port() {
+        for row in [
+            "voicebox-server 123 user 9u IPv4 1 TCP localhost:17493 (LISTEN)\n",
+            "python 456 user 9u IPv4 1 TCP localhost:17493 (LISTEN)\n",
+        ] {
+            assert!(
+                matches!(classify_listener(row, false), ListenerDecision::Conflict(_)),
+                "{row}"
+            );
+            assert!(
+                matches!(classify_listener(row, true), ListenerDecision::Conflict(_)),
+                "{row}"
+            );
+            assert!(legacy_pids(row, true).is_empty());
+        }
+    }
+
+    #[test]
+    fn headerless_mixed_listeners_cannot_claim_or_terminate_the_second_pid() {
+        let output = "python 456 user 9u IPv4 1 TCP localhost:17493 (LISTEN)\nvoicebox-server 123 user 9u IPv4 1 TCP localhost:17493 (LISTEN)\n";
+        assert!(matches!(
+            classify_listener(output, true),
+            ListenerDecision::Conflict(_)
+        ));
+        assert!(legacy_pids(output, true).is_empty());
+    }
+
+    #[test]
+    fn malformed_headers_are_not_assumed_to_be_listener_headers() {
+        for output in [
+            "unexpected\nvoicebox-server 123 user\n",
+            "COMMAND OTHER\nvoicebox-server 123 user\n",
+            "\nvoicebox-server 123 user\n",
+        ] {
+            assert!(
+                matches!(
+                    classify_listener(output, true),
+                    ListenerDecision::Conflict(_)
+                ),
+                "{output:?}"
+            );
+            assert!(legacy_pids(output, true).is_empty());
+        }
+    }
+
+    #[test]
+    fn normal_header_and_empty_output_remain_supported() {
+        assert_eq!(classify_listener("", false), ListenerDecision::Unoccupied);
+        assert_eq!(
+            classify_listener("COMMAND PID USER\n", false),
+            ListenerDecision::Unoccupied
+        );
+        assert_eq!(
+            classify_listener("COMMAND PID USER\nvoicebox-server 123 user\n", true),
+            ListenerDecision::ReuseOwned(123)
         );
     }
 }

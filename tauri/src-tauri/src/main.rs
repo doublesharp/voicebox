@@ -3393,6 +3393,22 @@ mod server_start_flow_tests {
             .unwrap()
     }
 
+    #[tokio::test]
+    async fn headerless_listener_output_never_launches_a_second_sidecar() {
+        let fixture = Fixture::new("touch \"$2/sidecar-started\"\nprintf 'INFO: Uvicorn running on http://127.0.0.1:%s\\n' \"$4\" >&2\nexec /bin/sleep 5");
+        let probe = fixture.dir.join("lsof-truncated");
+        std::fs::write(&probe, "#!/bin/sh\nprintf 'python 123 user 9u IPv4 1 TCP localhost:17493 (LISTEN)\\n'\n").unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut config = fixture.config();
+        config.discover_listener = true;
+        config.listener_executable = Some(probe);
+        let app = app();
+        let result = tokio::time::timeout(Duration::from_secs(5), start_server_with(app.handle().clone(), app.state(), None, None, config)).await.unwrap();
+        stop_server_if_owned(app.state(), None).await.unwrap();
+        assert!(result.is_err(), "truncated discovery unexpectedly allowed startup: {result:?}");
+        assert!(!fixture.dir.join("data/sidecar-started").exists());
+    }
+
     #[test]
     fn production_defaults_keep_fixed_ports_and_packaged_paths() {
         let config = ServerStartupConfig::default();
