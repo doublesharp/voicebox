@@ -796,7 +796,7 @@ async fn start_server_with<R: tauri::Runtime>(
     println!("Server process spawned, waiting for ready signal...");
     println!("=================================================================");
 
-    let startup = _start_permit.until_cancelled(server_startup::wait_for_startup(&mut rx, config.startup_timeout, |stream, line| {
+    let startup = _start_permit.until_cancelled(server_startup::wait_for_startup(&mut rx, config.startup_timeout, Some((if is_remote { "0.0.0.0" } else { "127.0.0.1" }, config.port)), |stream, line| {
         if stream == "stderr" { eprintln!("Server: {line}"); } else { println!("Server output: {line}"); }
         let _ = app.emit("server-log", serde_json::json!({ "stream": stream, "line": line }));
     })).await.ok_or("Server startup cancelled")?;
@@ -2989,7 +2989,7 @@ mod server_start_flow_tests {
     #[tokio::test]
     async fn isolated_sidecar_starts_reports_logs_and_stops() {
         let fixture = Fixture::new(
-            "printf '%s\\n' \"$VOICEBOX_MODELS_DIR\" \"$@\" > \"$2/invocation\"\nprintf 'INFO: Uvicorn running on http://127.0.0.1:1\\n' >&2\nexec /bin/sleep 5",
+            "printf '%s\\n' \"$VOICEBOX_MODELS_DIR\" \"$@\" > \"$2/invocation\"\nprintf 'INFO: Uvicorn running on http://127.0.0.1:%s\\n' \"$4\" >&2\nexec /bin/sleep 5",
         );
         let app = app();
         let logs = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -3202,7 +3202,7 @@ mod server_start_flow_tests {
         } else {
             ":"
         };
-        let script = format!("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf probed > probe\n  printf 'voicebox-server {version}\\n'\n  {chmod}\n  exit 0\nfi\nprintf '{kind}\\n%s\\n%s\\n' \"$VOICEBOX_MODELS_DIR\" \"$PWD\" > \"$2/selected\"\nprintf 'INFO: Uvicorn running on http://127.0.0.1:1\\n' >&2\nexec /bin/sleep 5\n");
+        let script = format!("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf probed > probe\n  printf 'voicebox-server {version}\\n'\n  {chmod}\n  exit 0\nfi\nprintf '{kind}\\n%s\\n%s\\n' \"$VOICEBOX_MODELS_DIR\" \"$PWD\" > \"$2/selected\"\nprintf 'INFO: Uvicorn running on http://127.0.0.1:%s\\n' \"$4\" >&2\nexec /bin/sleep 5\n");
         std::fs::write(&executable, script).unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         directory
@@ -3218,7 +3218,7 @@ mod server_start_flow_tests {
             (None, "0.6.0", true, "cuda", (true, true)),
             (Some("rocm"), "0.6.0", true, "cpu", (true, true)),
         ] {
-            let fixture = Fixture::new("printf 'cpu\\n%s\\n' \"$VOICEBOX_MODELS_DIR\" > \"$2/selected\"\nprintf 'INFO: Uvicorn running on http://127.0.0.1:1\\n' >&2\nexec /bin/sleep 5");
+            let fixture = Fixture::new("printf 'cpu\\n%s\\n' \"$VOICEBOX_MODELS_DIR\" > \"$2/selected\"\nprintf 'INFO: Uvicorn running on http://127.0.0.1:%s\\n' \"$4\" >&2\nexec /bin/sleep 5");
             let rocm = install_gpu(&fixture, "rocm", rocm_version, remove_execute);
             let cuda = install_gpu(&fixture, "cuda", "0.6.0", false);
             let app = app();
@@ -3378,7 +3378,7 @@ mod server_start_flow_tests {
 
     #[tokio::test]
     async fn ready_sidecar_exit_is_forwarded_and_releases_ownership() {
-        let fixture = Fixture::new("printf 'INFO: Uvicorn running on http://127.0.0.1:1\\nINFO: after readiness\\n' >&2\nexec /bin/sleep 1");
+        let fixture = Fixture::new("printf 'INFO: Uvicorn running on http://127.0.0.1:%s\\nINFO: after readiness\\n' \"$4\" >&2\nexec /bin/sleep 1");
         let app = app();
         let logs = Arc::new(Mutex::new(Vec::<String>::new()));
         let observed = logs.clone();
@@ -3515,7 +3515,7 @@ mod server_start_flow_tests {
     async fn missing_or_failing_listener_probe_preserves_sidecar_fallback() {
         for legacy in [false, true] {
             for missing in [false, true] {
-                let fixture = Fixture::new("printf 'INFO: Uvicorn running on http://127.0.0.1:1\\n' >&2\nexec /bin/sleep 5");
+                let fixture = Fixture::new("printf 'INFO: Uvicorn running on http://127.0.0.1:%s\\n' \"$4\" >&2\nexec /bin/sleep 5");
                 let probe = fixture.dir.join("lsof-fixture");
                 if !missing {
                     std::fs::write(&probe, "#!/bin/sh\nexit 1\n").unwrap();
@@ -3612,5 +3612,54 @@ mod server_start_flow_tests {
                 .unwrap()
                 .is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn sidecar_listening_on_wrong_port_is_not_reported_ready() {
+        let fixture = Fixture::new(
+            "printf 'INFO: Uvicorn running on http://127.0.0.1:1\\n' >&2\nexec /bin/sleep 5",
+        );
+        let app = app();
+        let mut config = fixture.config();
+        config.startup_timeout = Duration::from_millis(500);
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            start_server_with(app.handle().clone(), app.state(), None, None, config),
+        )
+        .await
+        .unwrap();
+        // Ensure the unfixed implementation does not leave the stand-in process running.
+        stop_server_if_owned(app.state(), None).await.unwrap();
+        assert!(
+            result.is_err(),
+            "sidecar on port 1 was accepted for port {}",
+            fixture.port
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_reports_ready_on_public_bind_address() {
+        let fixture = Fixture::new("printf '%s\\n' \"$@\" > \"$2/invocation\"\nprintf 'INFO: Uvicorn running on http://0.0.0.0:%s\\n' \"$4\" >&2\nexec /bin/sleep 5");
+        let app = app();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            start_server_with(
+                app.handle().clone(),
+                app.state(),
+                Some(true),
+                None,
+                fixture.config(),
+            ),
+        )
+        .await
+        .unwrap();
+        let invocation = std::fs::read_to_string(fixture.dir.join("data/invocation")).unwrap();
+        let args: Vec<_> = invocation.lines().collect();
+        stop_server_if_owned(app.state(), None).await.unwrap();
+        assert_eq!(
+            result.unwrap(),
+            format!("http://127.0.0.1:{}", fixture.port)
+        );
+        assert!(args.windows(2).any(|pair| pair == ["--host", "0.0.0.0"]));
     }
 }

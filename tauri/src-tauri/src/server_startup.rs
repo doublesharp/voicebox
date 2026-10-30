@@ -189,6 +189,7 @@ pub(crate) enum Outcome {
 pub(crate) async fn wait_for_startup(
     rx: &mut Receiver<CommandEvent>,
     timeout: Duration,
+    expected_endpoint: Option<(&str, u16)>,
     mut log: impl FnMut(&str, &str),
 ) -> Outcome {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -231,10 +232,24 @@ pub(crate) async fn wait_for_startup(
             .strip_prefix("INFO:")
             .map(str::trim_start)
             .unwrap_or(message);
-        if message.starts_with("Uvicorn running on http://")
-            || message.starts_with("Uvicorn running on https://")
-        {
-            return Outcome::Ready;
+        if let Some(address) = message.strip_prefix("Uvicorn running on ") {
+            let address = address.split_whitespace().next().unwrap_or("");
+            let matches = match expected_endpoint {
+                None => address.starts_with("http://") || address.starts_with("https://"),
+                Some((host, port)) => reqwest::Url::parse(address).ok().is_some_and(|url| {
+                    url.scheme() == "http"
+                        && url.host_str() == Some(host)
+                        && url.port_or_known_default() == Some(port)
+                        && url.username().is_empty()
+                        && url.password().is_none()
+                        && url.path() == "/"
+                        && url.query().is_none()
+                        && url.fragment().is_none()
+                }),
+            };
+            if matches {
+                return Outcome::Ready;
+            }
         }
     }
 }
@@ -287,7 +302,7 @@ mod tests {
                 .unwrap();
             tx.send(ready).await.unwrap();
             let mut logs = Vec::new();
-            let result = wait_for_startup(&mut rx, Duration::from_secs(1), |source, line| {
+            let result = wait_for_startup(&mut rx, Duration::from_secs(1), None, |source, line| {
                 logs.push((source.to_string(), line.to_string()))
             })
             .await;
@@ -318,7 +333,7 @@ mod tests {
         .await
         .unwrap();
         let mut logs = Vec::new();
-        let outcome = wait_for_startup(&mut rx, Duration::from_secs(1), |_, line| {
+        let outcome = wait_for_startup(&mut rx, Duration::from_secs(1), None, |_, line| {
             logs.push(line.to_string())
         })
         .await;
@@ -337,7 +352,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            wait_for_startup(&mut rx, Duration::from_millis(30), |_, _| {}).await,
+            wait_for_startup(&mut rx, Duration::from_millis(30), None, |_, _| {}).await,
             Outcome::TimedOut(vec![])
         );
     }
@@ -357,7 +372,7 @@ mod tests {
         .unwrap();
         let mut logs = Vec::new();
         assert_eq!(
-            wait_for_startup(&mut rx, Duration::from_secs(1), |_, line| logs
+            wait_for_startup(&mut rx, Duration::from_secs(1), None, |_, line| logs
                 .push(line.to_string()))
             .await,
             Outcome::Ready
@@ -377,7 +392,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            wait_for_startup(&mut rx, Duration::from_secs(1), |_, _| {}).await,
+            wait_for_startup(&mut rx, Duration::from_secs(1), None, |_, _| {}).await,
             Outcome::Ready
         );
         assert!(
@@ -401,7 +416,7 @@ mod tests {
             }
         });
         assert_eq!(
-            wait_for_startup(&mut rx, Duration::from_millis(30), |_, _| {}).await,
+            wait_for_startup(&mut rx, Duration::from_millis(30), None, |_, _| {}).await,
             Outcome::TimedOut(vec![])
         );
         drop(rx);
@@ -413,7 +428,7 @@ mod tests {
         let (tx, mut rx) = channel(1);
         drop(tx);
         assert_eq!(
-            wait_for_startup(&mut rx, Duration::from_secs(1), |_, _| {}).await,
+            wait_for_startup(&mut rx, Duration::from_secs(1), None, |_, _| {}).await,
             Outcome::Exited
         );
     }
@@ -428,7 +443,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            wait_for_startup(&mut rx, Duration::from_millis(30), |_, _| {}).await,
+            wait_for_startup(&mut rx, Duration::from_millis(30), None, |_, _| {}).await,
             Outcome::Exited
         );
     }
@@ -448,7 +463,7 @@ mod tests {
             .await
             .unwrap();
         let mut logs = Vec::new();
-        let result = wait_for_startup(&mut rx, Duration::from_millis(30), |source, line| {
+        let result = wait_for_startup(&mut rx, Duration::from_millis(30), None, |source, line| {
             logs.push((source.to_string(), line.to_string()))
         })
         .await;
@@ -465,7 +480,7 @@ mod tests {
         drop(tx);
         let mut logs = Vec::new();
         assert_eq!(
-            wait_for_startup(&mut rx, Duration::from_secs(1), |_, line| logs
+            wait_for_startup(&mut rx, Duration::from_secs(1), None, |_, line| logs
                 .push(line.to_string()))
             .await,
             Outcome::Exited
@@ -1130,7 +1145,7 @@ mod startup_stream_error_tests {
             .unwrap();
         let result = tokio::time::timeout(
             Duration::from_millis(200),
-            wait_for_startup(&mut rx, Duration::from_secs(5), |_, _| {}),
+            wait_for_startup(&mut rx, Duration::from_secs(5), None, |_, _| {}),
         )
         .await;
         assert!(
@@ -1150,7 +1165,7 @@ mod startup_stream_error_tests {
             .await
             .unwrap();
         drop(tx);
-        let result = wait_for_startup(&mut rx, Duration::from_secs(1), |_, _| {}).await;
+        let result = wait_for_startup(&mut rx, Duration::from_secs(1), None, |_, _| {}).await;
         assert_eq!(result, Outcome::StreamError("reader failed".into()));
     }
 
@@ -1166,7 +1181,7 @@ mod startup_stream_error_tests {
         let mut logs = Vec::new();
         let result = tokio::time::timeout(
             Duration::from_millis(200),
-            wait_for_startup(&mut rx, Duration::from_secs(5), |stream, line| {
+            wait_for_startup(&mut rx, Duration::from_secs(5), None, |stream, line| {
                 logs.push((stream.to_owned(), line.to_owned()))
             }),
         )
@@ -1190,7 +1205,7 @@ mod startup_stream_error_tests {
                     crate::server_process::take_process(&pid, &child, Some(17));
             });
             assert_eq!(
-                wait_for_startup(&mut rx, Duration::from_secs(1), |_, _| {}).await,
+                wait_for_startup(&mut rx, Duration::from_secs(1), None, |_, _| {}).await,
                 Outcome::StreamError("pipe failed".into())
             );
         }
@@ -1210,7 +1225,7 @@ mod startup_stream_error_tests {
             .await
             .unwrap();
         assert_eq!(
-            wait_for_startup(&mut rx, Duration::from_secs(1), |_, _| {}).await,
+            wait_for_startup(&mut rx, Duration::from_secs(1), None, |_, _| {}).await,
             Outcome::Ready
         );
         assert!(
@@ -1231,7 +1246,7 @@ mod startup_stream_error_tests {
             .await
             .unwrap();
         assert_eq!(
-            wait_for_startup(&mut rx, Duration::from_secs(1), |_, _| {}).await,
+            wait_for_startup(&mut rx, Duration::from_secs(1), None, |_, _| {}).await,
             Outcome::Exited
         );
     }
@@ -1262,7 +1277,7 @@ mod startup_log_regression_tests {
             .await
             .unwrap();
             assert_eq!(
-                wait_for_startup(&mut rx, Duration::from_secs(1), |_, _| {}).await,
+                wait_for_startup(&mut rx, Duration::from_secs(1), None, |_, _| {}).await,
                 Outcome::Exited,
                 "{line}"
             );
@@ -1285,7 +1300,7 @@ mod startup_log_regression_tests {
                 };
                 tx.send(event).await.unwrap();
                 assert_eq!(
-                    wait_for_startup(&mut rx, Duration::from_secs(1), |_, _| {}).await,
+                    wait_for_startup(&mut rx, Duration::from_secs(1), None, |_, _| {}).await,
                     Outcome::Ready
                 );
             }
@@ -1303,8 +1318,10 @@ mod startup_log_regression_tests {
             .unwrap();
         }
         let mut forwarded = 0;
-        let outcome =
-            wait_for_startup(&mut rx, Duration::from_millis(50), |_, _| forwarded += 1).await;
+        let outcome = wait_for_startup(&mut rx, Duration::from_millis(50), None, |_, _| {
+            forwarded += 1
+        })
+        .await;
         let Outcome::TimedOut(errors) = outcome else {
             panic!("expected timeout");
         };
@@ -1325,7 +1342,7 @@ mod startup_log_regression_tests {
         ))
         .await
         .unwrap();
-        let outcome = wait_for_startup(&mut rx, Duration::from_millis(50), |_, _| {}).await;
+        let outcome = wait_for_startup(&mut rx, Duration::from_millis(50), None, |_, _| {}).await;
         let Outcome::TimedOut(errors) = outcome else {
             panic!("expected timeout");
         };
@@ -1341,9 +1358,77 @@ mod startup_log_regression_tests {
             .await
             .unwrap();
         assert_eq!(
-            wait_for_startup(&mut rx, Duration::from_millis(50), |_, _| {}).await,
+            wait_for_startup(&mut rx, Duration::from_millis(50), None, |_, _| {}).await,
             Outcome::TimedOut(vec!["ERROR model not found\n".into()])
         );
+    }
+
+    #[tokio::test]
+    async fn readiness_requires_the_expected_bind_address_and_port() {
+        for line in [
+            "INFO: Uvicorn running on http://127.0.0.1:17494",
+            "INFO: Uvicorn running on http://0.0.0.0:17493",
+            "INFO: Uvicorn running on http://example.com:17493",
+            "INFO: Uvicorn running on https://127.0.0.1:17493",
+            "INFO: Uvicorn running on http://user@127.0.0.1:17493",
+            "INFO: Uvicorn running on http://127.0.0.1:17493/other",
+            "INFO: Uvicorn running on http://127.0.0.1:17493/?query=1",
+        ] {
+            let (tx, mut rx) = channel(2);
+            tx.send(CommandEvent::Stderr(line.as_bytes().to_vec()))
+                .await
+                .unwrap();
+            tx.send(CommandEvent::Terminated(TerminatedPayload {
+                code: Some(1),
+                signal: None,
+            }))
+            .await
+            .unwrap();
+            assert_eq!(
+                wait_for_startup(
+                    &mut rx,
+                    Duration::from_secs(1),
+                    Some(("127.0.0.1", 17493)),
+                    |_, _| {}
+                )
+                .await,
+                Outcome::Exited,
+                "{line}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn readiness_accepts_the_configured_local_or_remote_bind_address() {
+        for (host, port, line) in [
+            (
+                "127.0.0.1",
+                17493,
+                "INFO: Uvicorn running on http://127.0.0.1:17493 (Press CTRL+C to quit)",
+            ),
+            (
+                "0.0.0.0",
+                17493,
+                "INFO: Uvicorn running on http://0.0.0.0:17493 (Press CTRL+C to quit)",
+            ),
+            ("127.0.0.1", 0, "Uvicorn running on http://127.0.0.1:0"),
+        ] {
+            let (tx, mut rx) = channel(1);
+            tx.send(CommandEvent::Stderr(line.as_bytes().to_vec()))
+                .await
+                .unwrap();
+            assert_eq!(
+                wait_for_startup(
+                    &mut rx,
+                    Duration::from_secs(1),
+                    Some((host, port)),
+                    |_, _| {}
+                )
+                .await,
+                Outcome::Ready,
+                "{line}"
+            );
+        }
     }
 }
 
@@ -1388,7 +1473,7 @@ uvicorn.run(app, host='127.0.0.1', port=int(__import__('sys').argv[1]), log_leve
             }
         });
         let mut logs = Vec::new();
-        let outcome = wait_for_startup(&mut rx, Duration::from_secs(10), |_, line| {
+        let outcome = wait_for_startup(&mut rx, Duration::from_secs(10), None, |_, line| {
             logs.push(line.to_owned());
         })
         .await;
@@ -1449,8 +1534,9 @@ mod shell_process_integration_tests {
             .unwrap();
         let mut startup_logs = Vec::new();
         assert_eq!(
-            wait_for_startup(&mut rx, Duration::from_secs(5), |stream, line| startup_logs
-                .push((stream.to_owned(), line.to_owned())))
+            wait_for_startup(&mut rx, Duration::from_secs(5), None, |stream, line| {
+                startup_logs.push((stream.to_owned(), line.to_owned()))
+            })
             .await,
             Outcome::Ready
         );
@@ -1488,7 +1574,7 @@ mod shell_process_integration_tests {
             .spawn()
             .unwrap();
         assert_eq!(
-            wait_for_startup(&mut rx, Duration::from_secs(5), |_, _| {}).await,
+            wait_for_startup(&mut rx, Duration::from_secs(5), None, |_, _| {}).await,
             Outcome::Exited
         );
     }
@@ -1498,20 +1584,26 @@ mod shell_process_integration_tests {
     async fn actual_uvicorn_readiness_arrives_through_tauri_shell() {
         let app = app();
         let python = std::env::var("VOICEBOX_TEST_PYTHON").expect("set VOICEBOX_TEST_PYTHON");
-        let script = "import uvicorn\nasync def app(scope, receive, send): pass\nuvicorn.run(app, host='127.0.0.1', port=0, log_level='info')";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let script = "import sys, uvicorn\nasync def app(scope, receive, send): pass\nuvicorn.run(app, host='127.0.0.1', port=int(sys.argv[1]), log_level='info')";
         let (mut rx, child) = app
             .shell()
             .command(python)
-            .args(["-u", "-c", script])
+            .args(["-u", "-c", script, &port.to_string()])
             .env("PYTHONDONTWRITEBYTECODE", "1")
             .spawn()
             .unwrap();
         let mut logs = Vec::new();
-        let outcome = wait_for_startup(&mut rx, Duration::from_secs(10), |_, line| {
-            logs.push(line.to_owned())
-        })
+        let outcome = wait_for_startup(
+            &mut rx,
+            Duration::from_secs(10),
+            Some(("127.0.0.1", port)),
+            |_, line| logs.push(line.to_owned()),
+        )
         .await;
-        child.kill().unwrap();
+        let _ = child.kill();
         assert_eq!(outcome, Outcome::Ready, "logs: {logs:?}");
         assert!(logs
             .iter()
