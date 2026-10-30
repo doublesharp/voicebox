@@ -587,7 +587,7 @@ test('desktop preview speaks the current script without saving or clearing the d
   await act(async () => {
     renderer.root
       .findAllByType('button')
-      .find((button) => button.children.includes('Preview speech'))!
+      .find((button) => button.props['aria-label'] === 'Preview speech')!
       .props.onClick();
     await Promise.resolve();
   });
@@ -610,7 +610,7 @@ test('desktop preview speaks the current script without saving or clearing the d
   await act(async () => {
     renderer.root
       .findAllByType('button')
-      .find((button) => button.children.includes('Stop preview'))!
+      .find((button) => button.props['aria-label'] === 'Stop preview')!
       .props.onClick();
   });
   expect(previewStops).toBe(1);
@@ -651,4 +651,39 @@ test('server switch while stopping preview cannot submit to the new server', asy
   expect(statusCalls).toBe(0);
   expect(requests).toHaveLength(0);
   expect(renderer.root.findByType('textarea').props.value).toBe('Keep this draft');
+});
+
+test('preview and generation remain grouped when preview changes state', () => {
+  previewAvailable = true;
+  mount();
+  const actionGroup = () => renderer.root.findByProps({ 'data-generation-actions': true });
+  const previewButton = () =>
+    actionGroup()
+      .findAllByType('button')
+      .find((button) => button.props.type === 'button');
+  const generateButton = () =>
+    actionGroup()
+      .findAllByType('button')
+      .find((button) => button.props.type === 'submit');
+  expect(previewButton()).toBeDefined();
+  expect(generateButton()).toBeDefined();
+  const reservedPreview = previewButton()!.findAllByProps({ 'aria-hidden': 'true' });
+  const reservedGenerate = generateButton()!.findAllByProps({ 'aria-hidden': 'true' });
+  expect(reservedPreview.map((label) => label.children.join(''))).toEqual(['Preview speech', 'Stop preview']);
+  expect(reservedGenerate.map((label) => label.children.join(''))).toEqual([
+    'generation.button.generate', 'generation.button.generating',
+  ]);
+  const initialGenerate = generateButton();
+  previewActive = true;
+  rerender();
+  expect(previewButton()?.props['aria-label']).toBe('Stop preview');
+  expect(generateButton()).toBe(initialGenerate);
+  act(() => useGenerationDraftStore.setState({ submitting: true }));
+  expect(generateButton()?.props.disabled).toBe(true);
+  expect(generateButton()?.props['aria-label']).toBe('generation.button.generating');
+  expect(previewButton()?.props.disabled).toBe(false);
+  previewAvailable = false;
+  rerender();
+  expect(previewButton()).toBeUndefined();
+  expect(generateButton()).toBe(initialGenerate);
 });

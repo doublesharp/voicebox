@@ -582,162 +582,196 @@ export function FloatingGenerateBox({
                 )}
               />
             )}
-            <div className="flex flex-wrap items-center gap-2">
-              <SpeechSettings form={form} />
-              {selectedProfile?.personality?.trim() && (
-                <>
-                  <Hint content={t('generation.compose.tooltip')}>
+            <div className="flex flex-col gap-3">
+              <div className="flex min-w-0 flex-wrap items-center gap-2">
+                <SpeechSettings form={form} />
+                {selectedProfile?.personality?.trim() && (
+                  <>
+                    <Hint content={t('generation.compose.tooltip')}>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="icon"
+                        className="h-8 w-8 rounded-lg"
+                        disabled={composeMutation.isPending || !selectedProfileId}
+                        aria-label={t('generation.compose.ariaLabel')}
+                        onClick={async () => {
+                          if (!selectedProfileId) return;
+                          const profileRevision = profileIdentity.current.revision;
+                          const textRevision = useGenerationDraftStore.getState().textRevision;
+                          const scope = currentServerScope();
+                          try {
+                            const result = await composeMutation.mutateAsync({
+                              profileId: selectedProfileId,
+                              scope,
+                            });
+                            if (
+                              !mountedRef.current ||
+                              !isCurrentServer(scope) ||
+                              profileIdentity.current.revision !== profileRevision ||
+                              useGenerationDraftStore.getState().textRevision !== textRevision
+                            )
+                              return;
+                            form.setValue('text', result.text, { shouldDirty: true });
+                            setIsExpanded(true);
+                          } catch {
+                            /* The mutation reports the failure. */
+                          }
+                        }}
+                      >
+                        {composeMutation.isPending ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <Dices className="h-4 w-4" />
+                        )}
+                      </Button>
+                    </Hint>
+                    <FormField
+                      control={form.control}
+                      name="personality"
+                      render={({ field }) => (
+                        <FormItem className="space-y-0">
+                          <FormControl>
+                            <Hint
+                              content={
+                                field.value
+                                  ? t('generation.persona.tooltipActive')
+                                  : t('generation.persona.tooltipInactive')
+                              }
+                            >
+                              <Button
+                                type="button"
+                                variant={field.value ? 'secondary' : 'outline'}
+                                size="icon"
+                                className="h-8 w-8 rounded-lg"
+                                onClick={() => field.onChange(!field.value)}
+                                aria-label={
+                                  field.value
+                                    ? t('generation.persona.ariaLabelActive')
+                                    : t('generation.persona.ariaLabelInactive')
+                                }
+                                aria-pressed={!!field.value}
+                              >
+                                <Wand2 className="h-4 w-4" />
+                              </Button>
+                            </Hint>
+                          </FormControl>
+                        </FormItem>
+                      )}
+                    />
+                  </>
+                )}
+                {engineSupportsInstruct(engine) && (
+                  <Hint content={t('generation.instruct.tooltip')}>
+                    <Button
+                      type="button"
+                      variant={isInstructExpanded ? 'secondary' : 'outline'}
+                      size="icon"
+                      className="h-8 w-8 rounded-lg"
+                      onClick={() => setIsInstructExpanded((prev) => !prev)}
+                      aria-label={
+                        isInstructExpanded
+                          ? t('generation.instruct.hide')
+                          : t('generation.instruct.show')
+                      }
+                      aria-pressed={isInstructExpanded}
+                    >
+                      <SlidersHorizontal className="h-4 w-4" />
+                    </Button>
+                  </Hint>
+                )}
+              </div>
+              <div
+                data-generation-actions
+                className="flex max-w-full flex-wrap items-center justify-end gap-2 self-end"
+              >
+                {preview.available && (
+                  <Hint content="Listen to your script at normal speed without effects or loudness normalization. Preview is not saved; Generate creates the finished audio.">
                     <Button
                       type="button"
                       variant="outline"
-                      size="icon"
-                      className="h-8 w-8 rounded-lg"
-                      disabled={composeMutation.isPending || !selectedProfileId}
-                      aria-label={t('generation.compose.ariaLabel')}
-                      onClick={async () => {
-                        if (!selectedProfileId) return;
-                        const profileRevision = profileIdentity.current.revision;
-                        const textRevision = useGenerationDraftStore.getState().textRevision;
-                        const scope = currentServerScope();
-                        try {
-                          const result = await composeMutation.mutateAsync({ profileId: selectedProfileId, scope });
-                          if (
-                            !mountedRef.current ||
-                            !isCurrentServer(scope) ||
-                            profileIdentity.current.revision !== profileRevision ||
-                            useGenerationDraftStore.getState().textRevision !== textRevision
-                          )
-                            return;
-                          form.setValue('text', result.text, { shouldDirty: true });
-                          setIsExpanded(true);
-                        } catch {
-                          /* The mutation reports the failure. */
+                      className="h-9 rounded-lg"
+                      aria-label={preview.active ? 'Stop preview' : 'Preview speech'}
+                      disabled={
+                        !selectedProfileId || (!preview.active && (!script.trim() || isPending))
+                      }
+                      onClick={() => {
+                        if (preview.active) {
+                          void preview.stop();
+                          return;
                         }
+                        void form.handleSubmit(async (values) => {
+                          if (!selectedProfileId) return;
+                          const previewEngine = values.engine || 'qwen';
+                          await preview.start({
+                            profile_id: selectedProfileId,
+                            text: values.text,
+                            language: values.language,
+                            engine: previewEngine,
+                            model_size: ['qwen', 'qwen_custom_voice', 'tada'].includes(
+                              previewEngine,
+                            )
+                              ? values.modelSize
+                              : undefined,
+                            seed: values.seed,
+                            instruct: engineSupportsInstruct(previewEngine)
+                              ? values.instruct || undefined
+                              : undefined,
+                            normalize: false,
+                            effects_chain: [],
+                            speed: 1,
+                          });
+                        })();
                       }}
                     >
-                      {composeMutation.isPending ? (
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                      ) : (
-                        <Dices className="h-4 w-4" />
-                      )}
+                      <span className="grid">
+                        <span aria-hidden="true" className="invisible col-start-1 row-start-1">
+                          Preview speech
+                        </span>
+                        <span aria-hidden="true" className="invisible col-start-1 row-start-1">
+                          Stop preview
+                        </span>
+                        <span className="col-start-1 row-start-1">
+                          {preview.active ? 'Stop preview' : 'Preview speech'}
+                        </span>
+                      </span>
                     </Button>
                   </Hint>
-                  <FormField
-                    control={form.control}
-                    name="personality"
-                    render={({ field }) => (
-                      <FormItem className="space-y-0">
-                        <FormControl>
-                          <Hint
-                            content={
-                              field.value
-                                ? t('generation.persona.tooltipActive')
-                                : t('generation.persona.tooltipInactive')
-                            }
-                          >
-                            <Button
-                              type="button"
-                              variant={field.value ? 'secondary' : 'outline'}
-                              size="icon"
-                              className="h-8 w-8 rounded-lg"
-                              onClick={() => field.onChange(!field.value)}
-                              aria-label={
-                                field.value
-                                  ? t('generation.persona.ariaLabelActive')
-                                  : t('generation.persona.ariaLabelInactive')
-                              }
-                              aria-pressed={!!field.value}
-                            >
-                              <Wand2 className="h-4 w-4" />
-                            </Button>
-                          </Hint>
-                        </FormControl>
-                      </FormItem>
-                    )}
-                  />
-                </>
-              )}
-              {engineSupportsInstruct(engine) && (
-                <Hint content={t('generation.instruct.tooltip')}>
+                )}
+                <Hint content="Command or Control + Enter">
                   <Button
-                    type="button"
-                    variant={isInstructExpanded ? 'secondary' : 'outline'}
-                    size="icon"
-                    className="h-8 w-8 rounded-lg"
-                    onClick={() => setIsInstructExpanded((prev) => !prev)}
+                    type="submit"
+                    disabled={isPending || !selectedProfileId}
+                    className="h-9 gap-2 rounded-lg"
                     aria-label={
-                      isInstructExpanded
-                        ? t('generation.instruct.hide')
-                        : t('generation.instruct.show')
+                      isPending
+                        ? t('generation.button.generating')
+                        : !selectedProfileId
+                          ? t('generation.button.selectFirst')
+                          : t('generation.button.generate')
                     }
-                    aria-pressed={isInstructExpanded}
                   >
-                    <SlidersHorizontal className="h-4 w-4" />
+                    {isPending ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Sparkles className="h-4 w-4" />
+                    )}{' '}
+                    <span className="grid">
+                      <span aria-hidden="true" className="invisible col-start-1 row-start-1">
+                        {t('generation.button.generate')}
+                      </span>
+                      <span aria-hidden="true" className="invisible col-start-1 row-start-1">
+                        {t('generation.button.generating')}
+                      </span>
+                      <span className="col-start-1 row-start-1">
+                        {isPending
+                          ? t('generation.button.generating')
+                          : t('generation.button.generate')}
+                      </span>
+                    </span>
                   </Button>
                 </Hint>
-              )}
-              <span className="flex-1" />
-              {preview.available && (
-                <Hint content="Listen to your script at normal speed without effects or loudness normalization. Preview is not saved; Generate creates the finished audio.">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    className="h-9 rounded-lg"
-                    disabled={
-                      !selectedProfileId || (!preview.active && (!script.trim() || isPending))
-                    }
-                    onClick={() => {
-                      if (preview.active) {
-                        void preview.stop();
-                        return;
-                      }
-                      void form.handleSubmit(async (values) => {
-                        if (!selectedProfileId) return;
-                        const previewEngine = values.engine || 'qwen';
-                        await preview.start({
-                          profile_id: selectedProfileId,
-                          text: values.text,
-                          language: values.language,
-                          engine: previewEngine,
-                          model_size: ['qwen', 'qwen_custom_voice', 'tada'].includes(previewEngine)
-                            ? values.modelSize
-                            : undefined,
-                          seed: values.seed,
-                          instruct: engineSupportsInstruct(previewEngine)
-                            ? values.instruct || undefined
-                            : undefined,
-                          normalize: false,
-                          effects_chain: [],
-                          speed: 1,
-                        });
-                      })();
-                    }}
-                  >
-                    {preview.active ? 'Stop preview' : 'Preview speech'}
-                  </Button>
-                </Hint>
-              )}
-              <Hint content="Command or Control + Enter">
-                <Button
-                  type="submit"
-                  disabled={isPending || !selectedProfileId}
-                  className="h-9 gap-2 rounded-lg"
-                  aria-label={
-                    isPending
-                      ? t('generation.button.generating')
-                      : !selectedProfileId
-                        ? t('generation.button.selectFirst')
-                        : t('generation.button.generate')
-                  }
-                >
-                  {isPending ? (
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  ) : (
-                    <Sparkles className="h-4 w-4" />
-                  )}{' '}
-                  {isPending ? t('generation.button.generating') : t('generation.button.generate')}
-                </Button>
-              </Hint>
+              </div>
             </div>
           </form>
         </Form>
