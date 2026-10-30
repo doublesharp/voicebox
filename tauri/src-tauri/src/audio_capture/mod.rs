@@ -1,16 +1,16 @@
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
-#[cfg(target_os = "linux")]
-mod linux;
 
+#[cfg(target_os = "linux")]
+pub use linux::*;
 #[cfg(target_os = "macos")]
 pub use macos::*;
 #[cfg(target_os = "windows")]
 pub use windows::*;
-#[cfg(target_os = "linux")]
-pub use linux::*;
 
 use std::sync::{Arc, Mutex};
 
@@ -25,6 +25,8 @@ pub struct AudioCaptureState {
     pub error: Arc<Mutex<Option<String>>>,
     #[cfg(target_os = "macos")]
     pub stream: Arc<Mutex<Option<SCStream>>>,
+    #[cfg(target_os = "macos")]
+    pub(crate) lifecycle: macos::CaptureLifecycle,
 }
 
 impl AudioCaptureState {
@@ -37,6 +39,8 @@ impl AudioCaptureState {
             error: Arc::new(Mutex::new(None)),
             #[cfg(target_os = "macos")]
             stream: Arc::new(Mutex::new(None)),
+            #[cfg(target_os = "macos")]
+            lifecycle: macos::CaptureLifecycle::default(),
         }
     }
 

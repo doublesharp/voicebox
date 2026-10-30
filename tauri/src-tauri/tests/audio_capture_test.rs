@@ -4,8 +4,8 @@
 //   2. Run: cargo test --test audio_capture_test -- --nocapture
 //   3. The test will capture audio for 5 seconds and verify the output
 
-use voicebox::audio_capture::{AudioCaptureState, start_capture, stop_capture};
 use base64::Engine;
+use voicebox::audio_capture::{start_capture, stop_capture, AudioCaptureState};
 
 #[tokio::test]
 async fn test_system_audio_capture() {
@@ -21,6 +21,12 @@ async fn test_system_audio_capture() {
         panic!("Failed to start capture: {}", e);
     }
 
+    #[cfg(target_os = "macos")]
+    assert!(
+        start_capture(&state, 5).await.is_err(),
+        "a second capture must not replace an active capture"
+    );
+
     println!("Capture started, waiting 5 seconds...");
 
     // Wait 5 seconds for capture to complete
@@ -29,6 +35,17 @@ async fn test_system_audio_capture() {
     println!("Stopping capture...");
 
     // Stop capture and get the result
+    #[cfg(target_os = "macos")]
+    let (audio_data, overlap) = tokio::join!(stop_capture(&state), async {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        start_capture(&state, 5).await
+    });
+    #[cfg(target_os = "macos")]
+    assert!(
+        overlap.is_err(),
+        "a new capture must wait until stop collects the recording"
+    );
+    #[cfg(not(target_os = "macos"))]
     let audio_data = stop_capture(&state).await;
 
     match audio_data {

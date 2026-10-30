@@ -14,6 +14,69 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
+#[derive(Default)]
+pub(super) struct CaptureLifecycle(Mutex<CapturePhase>);
+
+#[derive(Default, PartialEq, Eq)]
+enum CapturePhase {
+    #[default]
+    Idle,
+    Starting,
+    Active,
+    Stopping,
+}
+
+struct StartGuard<'a> {
+    lifecycle: &'a CaptureLifecycle,
+    committed: bool,
+}
+
+struct StopGuard<'a>(&'a CaptureLifecycle);
+
+impl CaptureLifecycle {
+    fn begin_start(&self) -> Result<StartGuard<'_>, String> {
+        let mut phase = self.0.lock().map_err(|_| "Capture state unavailable")?;
+        if *phase != CapturePhase::Idle {
+            return Err("System audio capture is already active or stopping".into());
+        }
+        *phase = CapturePhase::Starting;
+        Ok(StartGuard {
+            lifecycle: self,
+            committed: false,
+        })
+    }
+
+    fn begin_stop(&self) -> Result<StopGuard<'_>, String> {
+        let mut phase = self.0.lock().map_err(|_| "Capture state unavailable")?;
+        if matches!(*phase, CapturePhase::Starting | CapturePhase::Stopping) {
+            return Err("System audio capture is starting or stopping".into());
+        }
+        *phase = CapturePhase::Stopping;
+        Ok(StopGuard(self))
+    }
+}
+
+impl StartGuard<'_> {
+    fn commit(mut self) {
+        *self.lifecycle.0.lock().unwrap() = CapturePhase::Active;
+        self.committed = true;
+    }
+}
+
+impl Drop for StartGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            *self.lifecycle.0.lock().unwrap() = CapturePhase::Idle;
+        }
+    }
+}
+
+impl Drop for StopGuard<'_> {
+    fn drop(&mut self) {
+        *self.0 .0.lock().unwrap() = CapturePhase::Idle;
+    }
+}
+
 pub async fn start_capture(
     state: &AudioCaptureState,
     max_duration_secs: u32,
@@ -22,7 +85,8 @@ pub async fn start_capture(
         return Err("System audio capture requires macOS 12.3 or newer.".to_string());
     }
 
-    // Reset previous samples
+    let start = state.lifecycle.begin_start()?;
+    // Reset previous samples only after this call owns the capture lifecycle.
     state.reset();
 
     // Get shareable content
@@ -51,7 +115,6 @@ pub async fn start_capture(
 
     // Create stream using builder
     let (tx, mut rx) = mpsc::channel::<()>(1);
-    *state.stop_tx.lock().unwrap() = Some(tx);
 
     let samples = state.samples.clone();
     let sample_rate = state.sample_rate.clone();
@@ -87,34 +150,34 @@ pub async fn start_capture(
     // Add output handler for audio (order: handler, then output_type)
     stream.add_output_handler(handler, SCStreamOutputType::Audio);
 
-    // Store stream reference
-    *state.stream.lock().unwrap() = Some(stream.clone());
-
     stream
         .start_capture()
         .map_err(|e| format!("Failed to start capture: {}", e))?;
+    *state.stop_tx.lock().unwrap() = Some(tx);
+    *state.stream.lock().unwrap() = Some(stream.clone());
 
     // Spawn task to stop after max duration
     let stream_clone = stream.clone();
     tokio::spawn(async move {
         tokio::select! {
             _ = tokio::time::sleep(tokio::time::Duration::from_secs(max_duration_secs as u64)) => {
-                // Timeout reached
+                let _ = stream_clone.stop_capture();
             }
             _ = rx.recv() => {
-                // Manual stop
+                // Manual stop owns stopping the stream.
             }
         }
-        let _ = stream_clone.stop_capture();
     });
 
+    start.commit();
     Ok(())
 }
 
 pub async fn stop_capture(state: &AudioCaptureState) -> Result<String, String> {
+    let _stopping = state.lifecycle.begin_stop()?;
     // Signal stop
     if let Some(tx) = state.stop_tx.lock().unwrap().take() {
-        let _ = tx.send(());
+        let _ = tx.try_send(());
     }
 
     // Stop stream if still active
@@ -320,5 +383,66 @@ mod capture_buffer_regression_tests {
             interleave_capture_buffers(&[&first, &[], &third]).unwrap(),
             [1.0, 0.0, 3.0, 2.0, 0.0, 0.0]
         );
+    }
+}
+
+#[cfg(test)]
+mod capture_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn active_capture_rejects_another_start_until_stopped() {
+        let gate = CaptureLifecycle::default();
+        gate.begin_start().unwrap().commit();
+        assert!(gate.begin_start().is_err());
+        drop(gate.begin_stop().unwrap());
+        assert!(gate.begin_start().is_ok());
+    }
+
+    #[test]
+    fn failed_start_releases_ownership_for_retry() {
+        let gate = CaptureLifecycle::default();
+        let start = gate.begin_start().unwrap();
+        assert!(gate.begin_start().is_err());
+        assert!(gate.begin_stop().is_err());
+        drop(start);
+        assert!(gate.begin_start().is_ok());
+    }
+
+    #[test]
+    fn stop_blocks_new_start_and_another_stop_until_result_is_collected() {
+        let gate = CaptureLifecycle::default();
+        gate.begin_start().unwrap().commit();
+        let stop = gate.begin_stop().unwrap();
+        assert!(gate.begin_start().is_err());
+        assert!(gate.begin_stop().is_err());
+        drop(stop);
+        assert!(gate.begin_start().is_ok());
+    }
+
+    #[test]
+    fn abandoned_stop_releases_ownership() {
+        let gate = CaptureLifecycle::default();
+        gate.begin_start().unwrap().commit();
+        let stop = gate.begin_stop().unwrap();
+        drop(stop);
+        assert!(gate.begin_start().is_ok());
+    }
+
+    #[test]
+    fn stopping_an_idle_capture_still_serializes_new_starts() {
+        let gate = CaptureLifecycle::default();
+        let stop = gate.begin_stop().unwrap();
+        assert!(gate.begin_start().is_err());
+        drop(stop);
+        assert!(gate.begin_start().is_ok());
+    }
+
+    #[test]
+    fn separate_capture_states_are_independent() {
+        let first = CaptureLifecycle::default();
+        let second = CaptureLifecycle::default();
+        let _first = first.begin_start().unwrap();
+        assert!(second.begin_start().is_ok());
     }
 }
