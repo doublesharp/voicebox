@@ -154,7 +154,7 @@ def _start_parent_watchdog(parent_pid, data_dir=None):
     forcefully kill the server (which spawns console windows on Windows),
     the server monitors its parent and shuts itself down gracefully.
 
-    The Tauri app writes a .keep-running sentinel file to data_dir before
+    The Tauri app writes a parent-specific .keep-running sentinel to data_dir before
     exiting when "remain running after close" is enabled. This is a reliable
     fallback for the HTTP /watchdog/disable request, which can race with
     process exit on Windows.
@@ -251,14 +251,19 @@ def _start_parent_watchdog(parent_pid, data_dir=None):
                 # This catches the case where the HTTP disable request
                 # didn't arrive before the parent process died (common
                 # on Windows where process teardown is fast).
-                sentinel = os.path.join(data_dir, ".keep-running") if data_dir else None
-                if sentinel and os.path.exists(sentinel):
-                    watchdog_logger.info("Found .keep-running sentinel file, keeping server alive")
-                    try:
-                        os.remove(sentinel)
-                    except OSError:
-                        pass
-                    return
+                sentinels = (
+                    [os.path.join(data_dir, f".keep-running-{parent_pid}"),
+                     os.path.join(data_dir, ".keep-running")]
+                    if data_dir else []
+                )
+                for sentinel in sentinels:
+                    if os.path.exists(sentinel):
+                        watchdog_logger.info("Found keep-running sentinel file, keeping server alive")
+                        try:
+                            os.remove(sentinel)
+                        except OSError:
+                            pass
+                        return
                 watchdog_logger.info("Watchdog still enabled after grace period, shutting down server...")
                 if sys.platform == "win32":
                     # sys.exit triggers SystemExit, allowing uvicorn to run

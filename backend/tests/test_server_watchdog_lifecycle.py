@@ -249,3 +249,49 @@ def test_server_output_flush_survives_disconnected_desktop_pipe(server):
     stream.flush()
     assert stream.write('still usable') == len('still usable')
     stream._stream.close()
+
+
+@pytest.mark.parametrize('sentinel_owner,keeps_running', [(123, True), (456, False)])
+def test_watchdog_distinguishes_current_exit_from_stale_sentinel(
+    server, monkeypatch, tmp_path, sentinel_owner, keeps_running
+):
+    import os
+    import signal
+    import threading
+    import time
+
+    if sys.platform == 'win32':
+        pytest.skip('Unix process probing')
+    monkeypatch.setattr(server.watchdog_state, 'disabled', False)
+    targets = []
+    calls = []
+    probes = 0
+
+    class DeferredThread:
+        def __init__(self, target, daemon):
+            assert daemon
+            targets.append(target)
+        def start(self):
+            pass
+
+    def kill(pid, sig):
+        nonlocal probes
+        calls.append((pid, sig))
+        if sig == 0:
+            probes += 1
+            if probes > 1:
+                raise ProcessLookupError('parent exited')
+
+    monkeypatch.setattr(threading, 'Thread', DeferredThread)
+    monkeypatch.setattr(os, 'kill', kill)
+    monkeypatch.setattr(time, 'sleep', lambda seconds: None)
+    server._start_parent_watchdog(123, str(tmp_path))
+    # The desktop exits after the watchdog is scheduled but before its
+    # thread starts running, so the signal must not be mistaken for stale.
+    sentinel = tmp_path / f'.keep-running-{sentinel_owner}'
+    sentinel.write_text('1')
+    targets[0]()
+
+    assert calls[:2] == [(123, 0), (123, 0)]
+    assert calls[2:] == ([] if keeps_running else [(os.getpid(), signal.SIGTERM)])
+    assert sentinel.exists() is (not keeps_running)

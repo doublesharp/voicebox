@@ -659,6 +659,15 @@ async fn start_server_with<R: tauri::Runtime>(
     // Ensure data directory exists
     std::fs::create_dir_all(&data_dir)
         .map_err(|e| format!("Failed to create data dir: {}", e))?;
+    // Clear a signal left by a previous process with the same recycled PID.
+    // This happens before the new child is recorded as owned, so an exit
+    // request for this child cannot race with the removal.
+    let sentinel = data_dir.join(format!(".keep-running-{}", std::process::id()));
+    match std::fs::remove_file(sentinel) {
+        Ok(()) => {},
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+        Err(e) => return Err(format!("Failed to clear old keep-running signal: {e}")),
+    }
 
     println!("=================================================================");
     println!("Starting voicebox-server sidecar");
@@ -1643,7 +1652,7 @@ fn handle_server_exit_with(
 fn keep_server_running_on_exit(data_dir: Option<&std::path::Path>, port: u16) {
     println!("Keep server running: disabling watchdog...");
     if let Some(data_dir) = data_dir {
-        let sentinel = data_dir.join(".keep-running");
+        let sentinel = data_dir.join(format!(".keep-running-{}", std::process::id()));
         if let Err(e) = std::fs::write(&sentinel, b"1") {
             eprintln!("Failed to write keep-running sentinel: {}", e);
         } else {
@@ -3023,7 +3032,7 @@ mod exit_ownership_regression_tests {
         std::fs::create_dir(&dir).unwrap();
         let state = state(true, None);
         handle_server_exit_with(&state, || keep_server_running_on_exit(Some(&dir), port), |_| panic!("unexpected stop"));
-        assert!(!dir.join(".keep-running").exists());
+        assert!(!dir.join(format!(".keep-running-{}", std::process::id())).exists());
         assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -3053,7 +3062,7 @@ mod exit_ownership_regression_tests {
         handle_server_exit_with(&state, || keep_server_running_on_exit(Some(&dir), port), |_| panic!("unexpected stop"));
         let request = server.join().unwrap();
         assert!(request.starts_with(b"POST /watchdog/disable "));
-        assert_eq!(std::fs::read(dir.join(".keep-running")).unwrap(), b"1");
+        assert_eq!(std::fs::read(dir.join(format!(".keep-running-{}", std::process::id()))).unwrap(), b"1");
         assert_eq!(*state.server_pid.lock().unwrap(), Some(42));
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -3403,6 +3412,10 @@ mod server_start_flow_tests {
         let fixture = Fixture::new(
             "printf '%s\\n' \"$VOICEBOX_MODELS_DIR\" \"$@\" > \"$2/invocation\"\nprintf 'INFO: Uvicorn running on http://127.0.0.1:%s\\n' \"$4\" >&2\nexec /bin/sleep 5",
         );
+        let data_dir = fixture.dir.join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let stale = data_dir.join(format!(".keep-running-{}", std::process::id()));
+        std::fs::write(&stale, b"1").unwrap();
         let app = app();
         let logs = Arc::new(Mutex::new(Vec::<String>::new()));
         let observed = logs.clone();
@@ -3423,6 +3436,7 @@ mod server_start_flow_tests {
         .unwrap()
         .unwrap();
         assert_eq!(result, format!("http://127.0.0.1:{}", fixture.port));
+        assert!(!stale.exists(), "stale signal must be removed before launching a child");
         let invocation = std::fs::read_to_string(fixture.dir.join("data/invocation")).unwrap();
         let args: Vec<&str> = invocation.lines().collect();
         assert_eq!(args[0], "custom models");
@@ -3449,6 +3463,18 @@ mod server_start_flow_tests {
             .lock()
             .unwrap()
             .is_none());
+        assert!(app.state::<ServerState>().child.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn startup_fails_before_spawn_if_stale_keep_running_signal_cannot_be_cleared() {
+        let fixture = Fixture::new("exit 42");
+        let data_dir = fixture.dir.join("data");
+        std::fs::create_dir_all(data_dir.join(format!(".keep-running-{}", std::process::id()))).unwrap();
+        let app = app();
+        let error = start_server_with(app.handle().clone(), app.state(), None, None, fixture.config()).await.unwrap_err();
+        assert!(error.contains("Failed to clear old keep-running signal"));
+        assert!(app.state::<ServerState>().server_pid.lock().unwrap().is_none());
         assert!(app.state::<ServerState>().child.lock().unwrap().is_none());
     }
 
