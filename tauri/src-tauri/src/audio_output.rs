@@ -3797,6 +3797,102 @@ mod public_lifecycle_tests {
     }
 
     #[tokio::test]
+    async fn public_clip_missing_output_reports_error_and_allows_retry() {
+        let app = tauri::test::mock_app();
+        let (tx, rx) = mpsc::channel();
+        app.listen("native-audio-playback", move |event| {
+            let _ = tx.send(event.payload().to_owned());
+        });
+        let state = AudioOutputState::new();
+        for expected_id in ["native-1", "native-2"] {
+            // IDs always begin with `device_`, so this cannot select real hardware.
+            let error = state
+                .play_audio_to_devices(
+                    app.handle().clone(),
+                    silent_wav(),
+                    vec!["impossible-output-id".into()],
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                error.contains("unavailable") || error.contains("Unable to list outputs"),
+                "{error}"
+            );
+            wait_inactive(&state).await;
+            let event: serde_json::Value =
+                serde_json::from_str(&rx.recv_timeout(Duration::from_secs(2)).unwrap()).unwrap();
+            assert_eq!(event["session_id"], expected_id);
+            assert_eq!(event["state"], "error");
+            assert_eq!(event["error"], error);
+            assert!(state
+                .control_playback(expected_id, PlaybackControl::default())
+                .is_err());
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn public_clip_missing_output_replaces_prior_and_cannot_be_stopped_as_prior() {
+        let app = tauri::test::mock_app();
+        let state = AudioOutputState::new();
+        let prior = install_prior_session(&state);
+        let error = state
+            .play_audio_to_devices(
+                app.handle().clone(),
+                silent_wav(),
+                vec!["impossible-output-id".into()],
+                Some(PlaybackOptions {
+                    start_time: 0.5,
+                    volume: 0.5,
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("unavailable") || error.contains("Unable to list outputs"),
+            "{error}"
+        );
+        wait_inactive(&state).await;
+        assert!(prior.stopped.load(Ordering::Acquire));
+        assert!(state.stop_playback(Some("prior")).is_ok());
+        assert!(state
+            .control_playback("native-1", PlaybackControl::default())
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn public_clip_rejects_truncated_wave_before_opening_any_output() {
+        let app = tauri::test::mock_app();
+        let (tx, rx) = mpsc::channel();
+        app.listen("native-audio-playback", move |event| {
+            let _ = tx.send(event.payload().to_owned());
+        });
+        let state = AudioOutputState::new();
+        let full = silent_wav();
+        for missing in [1, 2, 100, 1000] {
+            let mut truncated = full.clone();
+            truncated.truncate(truncated.len() - missing);
+            let error = state
+                .play_audio_to_devices(
+                    app.handle().clone(),
+                    truncated,
+                    vec!["impossible-output-id".into()],
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(error.contains("truncated"), "{error}");
+            wait_inactive(&state).await;
+            let event: serde_json::Value =
+                serde_json::from_str(&rx.recv_timeout(Duration::from_secs(2)).unwrap()).unwrap();
+            assert_eq!(event["state"], "error");
+            assert_eq!(event["error"], error);
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
     #[ignore = "requires a working native output device; emits silence"]
     async fn native_silent_public_replacement_stops_old_preview() {
         let app = tauri::test::mock_app();
