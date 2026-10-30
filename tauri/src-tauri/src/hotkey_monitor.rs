@@ -106,7 +106,7 @@ impl HotkeyMonitor {
         // ChordMatcher stops keytap's chord-worker thread and the
         // underlying Tap.
         if let Some(active) = self.active.take() {
-            active.shutdown.store(true, Ordering::Relaxed);
+            active.shutdown.store(true, Ordering::Release);
             let _ = active.dispatcher.join();
         }
 
@@ -142,7 +142,7 @@ impl HotkeyMonitor {
 impl Drop for HotkeyMonitor {
     fn drop(&mut self) {
         if let Some(active) = self.active.take() {
-            active.shutdown.store(true, Ordering::Relaxed);
+            active.shutdown.store(true, Ordering::Release);
             let _ = active.dispatcher.join();
         }
     }
@@ -169,9 +169,25 @@ fn build_matcher(bindings: &Bindings) -> Result<ChordMatcher<ChordAction>, keyta
 }
 
 fn dispatcher_loop(app: AppHandle, matcher: ChordMatcher<ChordAction>, shutdown: Arc<AtomicBool>) {
-    while !shutdown.load(Ordering::Relaxed) {
-        match matcher.recv_timeout(Duration::from_millis(100)) {
-            Ok(event) => process_event(&app, &matcher, event),
+    run_dispatcher(
+        &shutdown,
+        || matcher.recv_timeout(Duration::from_millis(100)),
+        |event| process_event(&app, &matcher, &shutdown, event),
+    );
+}
+
+fn run_dispatcher(
+    shutdown: &AtomicBool,
+    mut receive: impl FnMut() -> Result<ChordEvent<ChordAction>, RecvTimeoutError>,
+    mut process: impl FnMut(ChordEvent<ChordAction>),
+) {
+    while !shutdown.load(Ordering::Acquire) {
+        match receive() {
+            Ok(event) => {
+                if !shutdown.load(Ordering::Acquire) {
+                    process(event);
+                }
+            }
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
         }
@@ -185,12 +201,37 @@ fn dispatcher_loop(app: AppHandle, matcher: ChordMatcher<ChordAction>, shutdown:
 fn process_event(
     app: &AppHandle,
     matcher: &ChordMatcher<ChordAction>,
+    shutdown: &AtomicBool,
     event: ChordEvent<ChordAction>,
 ) {
-    process_events(
+    process_events_with_shutdown(
+        shutdown,
         event,
         || matcher.recv_timeout(Duration::from_millis(5)).ok(),
         |effect| apply_effect(app, effect),
+    );
+}
+
+fn process_events_with_shutdown(
+    shutdown: &AtomicBool,
+    event: ChordEvent<ChordAction>,
+    mut next: impl FnMut() -> Option<ChordEvent<ChordAction>>,
+    mut emit: impl FnMut(Effect),
+) {
+    process_events(
+        event,
+        || {
+            if shutdown.load(Ordering::Acquire) {
+                None
+            } else {
+                next()
+            }
+        },
+        |effect| {
+            if !shutdown.load(Ordering::Acquire) {
+                emit(effect);
+            }
+        },
     );
 }
 
@@ -385,5 +426,151 @@ fn apply_effect(app: &AppHandle, effect: Effect) {
                 let _ = window.emit("dictate:restart", ());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn start() -> ChordEvent<ChordAction> {
+        ChordEvent::Start {
+            id: ChordAction::PushToTalk,
+            time: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn shutdown_during_receive_does_not_process_a_late_hotkey() {
+        let shutdown = AtomicBool::new(false);
+        let mut processed = 0;
+        run_dispatcher(
+            &shutdown,
+            || {
+                shutdown.store(true, Ordering::Release);
+                Ok(start())
+            },
+            |_| processed += 1,
+        );
+        assert_eq!(processed, 0);
+    }
+
+    #[test]
+    fn shutdown_during_upgrade_lookahead_does_not_emit_restart() {
+        let shutdown = AtomicBool::new(false);
+        let time = Instant::now();
+        let first = ChordEvent::End {
+            id: ChordAction::PushToTalk,
+            time,
+        };
+        let mut effects = Vec::new();
+        process_events_with_shutdown(
+            &shutdown,
+            first,
+            || {
+                shutdown.store(true, Ordering::Release);
+                Some(ChordEvent::Start {
+                    id: ChordAction::ToggleToTalk,
+                    time,
+                })
+            },
+            |effect| effects.push(effect),
+        );
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn shutdown_does_not_wait_for_further_lookahead() {
+        let shutdown = AtomicBool::new(true);
+        process_events_with_shutdown(
+            &shutdown,
+            ChordEvent::End {
+                id: ChordAction::PushToTalk,
+                time: Instant::now(),
+            },
+            || panic!("lookahead polled after shutdown"),
+            |_| panic!("effect emitted after shutdown"),
+        );
+    }
+
+    #[test]
+    fn shutdown_before_receive_never_polls_the_matcher() {
+        let shutdown = AtomicBool::new(true);
+        run_dispatcher(
+            &shutdown,
+            || panic!("matcher polled after shutdown"),
+            |_| panic!("event processed"),
+        );
+    }
+
+    #[test]
+    fn timeouts_are_retried_and_disconnect_stops_the_dispatcher() {
+        let shutdown = AtomicBool::new(false);
+        let mut polls = 0;
+        let mut count = 0;
+        run_dispatcher(
+            &shutdown,
+            || {
+                polls += 1;
+                match polls {
+                    1 => Err(RecvTimeoutError::Timeout),
+                    2 => Ok(start()),
+                    _ => Err(RecvTimeoutError::Disconnected),
+                }
+            },
+            |_| count += 1,
+        );
+        assert_eq!((polls, count), (3, 1));
+    }
+
+    #[test]
+    fn active_upgrade_still_emits_a_single_restart() {
+        let shutdown = AtomicBool::new(false);
+        let time = Instant::now();
+        let mut effects = Vec::new();
+        process_events_with_shutdown(
+            &shutdown,
+            ChordEvent::End {
+                id: ChordAction::PushToTalk,
+                time,
+            },
+            || {
+                Some(ChordEvent::Start {
+                    id: ChordAction::ToggleToTalk,
+                    time,
+                })
+            },
+            |effect| effects.push(effect),
+        );
+        assert_eq!(
+            effects,
+            [Effect::RestartRecording(ChordAction::ToggleToTalk)]
+        );
+    }
+
+    #[test]
+    fn shutdown_between_unrelated_effects_suppresses_the_followup_start() {
+        let shutdown = AtomicBool::new(false);
+        let time = Instant::now();
+        let mut effects = Vec::new();
+        process_events_with_shutdown(
+            &shutdown,
+            ChordEvent::End {
+                id: ChordAction::PushToTalk,
+                time,
+            },
+            || {
+                Some(ChordEvent::Start {
+                    id: ChordAction::ToggleToTalk,
+                    time: time + Duration::from_millis(1),
+                })
+            },
+            |effect| {
+                effects.push(effect);
+                shutdown.store(true, Ordering::Release);
+            },
+        );
+        assert_eq!(effects, [Effect::StopRecording(ChordAction::PushToTalk)]);
     }
 }
