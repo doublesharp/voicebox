@@ -135,6 +135,12 @@ fn download(url: &str, timeout: std::time::Duration) -> Result<Box<dyn Read>, St
     if response.status() != reqwest::StatusCode::OK {
         return Err(format!("Download failed: HTTP {}", response.status()));
     }
+    if response
+        .headers()
+        .contains_key(reqwest::header::CONTENT_RANGE)
+    {
+        return Err("Download failed: unexpected partial-content response".into());
+    }
     Ok(Box::new(response))
 }
 
@@ -167,6 +173,76 @@ mod tests {
             let _ = stream.write_all(tail);
         });
         (url, handle)
+    }
+
+    #[test]
+    fn export_http_regression_rejects_partial_content_headers_even_with_success_status() {
+        for response in [
+            b"HTTP/1.1 200 OK\r\nContent-Range: bytes 0-3/8\r\nContent-Length: 4\r\nConnection: close\r\n\r\npart".as_slice(),
+            b"HTTP/1.1 200 OK\r\ncontent-range: bytes 0-3/4\r\nContent-Length: 4\r\nConnection: close\r\n\r\npart".as_slice(),
+        ] {
+            let (url, server) = serve(response, Duration::ZERO, b"");
+            assert!(download(&url, Duration::from_secs(2)).is_err());
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn export_http_regression_accepts_complete_chunked_download() {
+        let (url, server) = serve(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n",
+            Duration::ZERO, b"",
+        );
+        let mut result = Vec::new();
+        download(&url, Duration::from_secs(2))
+            .unwrap()
+            .read_to_end(&mut result)
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(result, b"abcde");
+    }
+
+    #[test]
+    fn export_http_regression_rejects_incomplete_chunked_body() {
+        let (url, server) = serve(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n6\r\nabc",
+            Duration::ZERO,
+            b"",
+        );
+        let mut result = Vec::new();
+        assert!(download(&url, Duration::from_secs(2))
+            .unwrap()
+            .read_to_end(&mut result)
+            .is_err());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn export_http_regression_progressing_transfer_can_exceed_the_idle_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/file", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            for byte in b"abcdef" {
+                stream.write_all(&[*byte]).unwrap();
+                thread::sleep(Duration::from_millis(60));
+            }
+        });
+        let mut result = Vec::new();
+        download(&url, Duration::from_millis(250))
+            .unwrap()
+            .read_to_end(&mut result)
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(result, b"abcdef");
     }
 
     #[test]
@@ -402,7 +478,24 @@ mod export_flow_tests {
         .unwrap();
         server.join().unwrap();
         assert_eq!(result.status, "saved");
-        assert_eq!(std::fs::read(target).unwrap(), b"hello");
+        assert_eq!(std::fs::read(&target).unwrap(), b"hello");
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/audio", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Range: bytes 0-3/8\r\nContent-Length: 4\r\nConnection: close\r\n\r\npart");
+        });
+        let result = run_with(
+            || Ok(Some(target.clone())),
+            || download(&url, std::time::Duration::from_secs(2)),
+        );
+        server.join().unwrap();
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"hello");
+        assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 1);
     }
 
     #[test]
