@@ -398,8 +398,8 @@ where
 }
 
 #[command]
-async fn start_server(
-    app: tauri::AppHandle,
+async fn start_server<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, ServerState>,
     remote: Option<bool>,
     models_dir: Option<String>,
@@ -2319,6 +2319,7 @@ mod command_ipc_regression_tests {
                 update_chord_bindings,
                 set_keep_server_running,
                 stop_server,
+                start_server,
             ])
             .build(mock_context(noop_assets()))
             .unwrap();
@@ -2513,6 +2514,20 @@ mod command_ipc_regression_tests {
                 break;
             }
         }
+    }
+
+    #[test]
+    fn startup_ipc_refuses_overlapping_attempt_without_changing_settings() {
+        let (app, window) = setup();
+        let state = app.state::<ServerState>();
+        let permit = state.start_gate.try_begin().unwrap();
+        let body = InvokeBody::Json(serde_json::json!({"remote":true, "modelsDir":"unexpected"}));
+        let error = invoke(&window, "start_server", body, None).unwrap_err();
+        assert!(error.as_str().unwrap().contains("starting or stopping"));
+        assert!(!*state.remote.lock().unwrap());
+        assert!(state.models_dir.lock().unwrap().is_none());
+        assert!(state.server_pid.lock().unwrap().is_none());
+        drop(permit);
     }
 
     #[test]

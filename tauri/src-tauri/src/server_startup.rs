@@ -1422,3 +1422,107 @@ uvicorn.run(app, host='127.0.0.1', port=int(__import__('sys').argv[1]), log_leve
         );
     }
 }
+
+#[cfg(all(test, unix))]
+mod shell_process_integration_tests {
+    use super::*;
+    use tauri_plugin_shell::ShellExt;
+
+    fn app() -> tauri::App<tauri::test::MockRuntime> {
+        tauri::test::mock_builder()
+            .plugin(tauri_plugin_shell::init())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn real_shell_events_detect_ready_then_forward_output_and_exit() {
+        let app = app();
+        let (mut rx, _child) = app
+            .shell()
+            .command("/bin/sh")
+            .args([
+                "-c",
+                "printf 'INFO: Uvicorn running on http://127.0.0.1:1\\nINFO: later message\\n' >&2",
+            ])
+            .spawn()
+            .unwrap();
+        let mut startup_logs = Vec::new();
+        assert_eq!(
+            wait_for_startup(&mut rx, Duration::from_secs(5), |stream, line| startup_logs
+                .push((stream.to_owned(), line.to_owned())))
+            .await,
+            Outcome::Ready
+        );
+        assert!(startup_logs
+            .iter()
+            .any(|(stream, line)| stream == "stderr" && line.contains("Uvicorn running")));
+        let mut forwarded = Vec::new();
+        let mut terminated = false;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            forward_events(
+                &mut rx,
+                |stream, line| forwarded.push((stream.to_owned(), line.to_owned())),
+                || terminated = true,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(forwarded
+            .iter()
+            .any(|(stream, line)| stream == "stderr" && line.contains("later message")));
+        assert!(terminated);
+    }
+
+    #[tokio::test]
+    async fn real_shell_exit_after_misleading_error_is_not_ready() {
+        let app = app();
+        let (mut rx, _child) = app
+            .shell()
+            .command("/bin/sh")
+            .args([
+                "-c",
+                "printf 'ERROR: Uvicorn running on http://127.0.0.1:1 failed\\n' >&2; exit 1",
+            ])
+            .spawn()
+            .unwrap();
+        assert_eq!(
+            wait_for_startup(&mut rx, Duration::from_secs(5), |_, _| {}).await,
+            Outcome::Exited
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires VOICEBOX_TEST_PYTHON with uvicorn installed"]
+    async fn actual_uvicorn_readiness_arrives_through_tauri_shell() {
+        let app = app();
+        let python = std::env::var("VOICEBOX_TEST_PYTHON").expect("set VOICEBOX_TEST_PYTHON");
+        let script = "import uvicorn\nasync def app(scope, receive, send): pass\nuvicorn.run(app, host='127.0.0.1', port=0, log_level='info')";
+        let (mut rx, child) = app
+            .shell()
+            .command(python)
+            .args(["-u", "-c", script])
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .spawn()
+            .unwrap();
+        let mut logs = Vec::new();
+        let outcome = wait_for_startup(&mut rx, Duration::from_secs(10), |_, line| {
+            logs.push(line.to_owned())
+        })
+        .await;
+        child.kill().unwrap();
+        assert_eq!(outcome, Outcome::Ready, "logs: {logs:?}");
+        assert!(logs
+            .iter()
+            .any(|line| line.contains("Uvicorn running on http://127.0.0.1:")));
+        let mut terminated = false;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            forward_events(&mut rx, |_, _| {}, || terminated = true),
+        )
+        .await
+        .unwrap();
+        assert!(terminated);
+    }
+}
