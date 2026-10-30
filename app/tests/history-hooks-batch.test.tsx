@@ -1,6 +1,8 @@
 import { afterAll, afterEach, beforeEach, expect, mock, test } from 'bun:test';
 import { notifyManager, QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
+import { currentServerScope } from '../src/lib/serverScope';
+import { useServerStore } from '../src/stores/serverStore';
 
 const api = {
   listHistory: mock(async (_query?: any) => [{ id: 'g1' }]),
@@ -22,7 +24,7 @@ function Probe({ id }: { id: string }) { hooks = useAll(id); return null; }
 async function mount(id = '') { client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity }, mutations: { retry: false } } }); await act(async () => { view = create(<QueryClientProvider client={client}><Probe id={id} /></QueryClientProvider>); }); }
 async function flush() { await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); }); }
 beforeEach(() => { Object.values(api).forEach((m) => m.mockClear()); saveFile.mockClear(); });
-afterEach(() => { if (view) act(() => view?.unmount()); view = undefined; client?.clear(); });
+afterEach(() => { if (view) act(() => view?.unmount()); view = undefined; client?.clear(); useServerStore.setState({ serverUrl: 'http://server-a', serverRevision: 0 }); });
 afterAll(() => { mock.restore(); notifyManager.setScheduler((fn) => setTimeout(fn, 0)); });
 
 test('history passes filters and skips an empty detail id', async () => { await mount(); await flush(); expect(api.listHistory).toHaveBeenCalledWith({ profile_id: 'p' }); expect(api.getGeneration).not.toHaveBeenCalled(); expect(client.getQueryData(['history', { profile_id: 'p' }])).toEqual([{ id: 'g1' }]); });
@@ -42,3 +44,19 @@ test('package export uses safe text and stable id suffix', async () => { await m
 test.each(['wav', 'mp3'] as const)('audio export requests and saves %s', async (format) => { await mount(); let blob: Blob | undefined; await act(async () => { blob = await hooks.exportAudio.mutateAsync({ generationId: 'abcdefgh-1', text: 'A sample', format }); }); expect(api.exportGenerationAudio).toHaveBeenCalledWith('abcdefgh-1', format); expect(saveFile).toHaveBeenCalledWith(`a-sample-abcdefgh.${format}`, blob, [{ name: 'Audio File', extensions: [format] }]); });
 test('audio export defaults to wav and propagates save failures', async () => { await mount(); saveFile.mockImplementationOnce(async () => { throw new Error('save failed'); }); await act(async () => { await expect(hooks.exportAudio.mutateAsync({ generationId: 'abc', text: 'Sample' })).rejects.toThrow('save failed'); }); expect(api.exportGenerationAudio).toHaveBeenCalledWith('abc', 'wav'); });
 test('failed export never invokes the save adapter', async () => { await mount(); api.exportGeneration.mockImplementationOnce(async () => { throw new Error('server failed'); }); await act(async () => { await expect(hooks.exportPackage.mutateAsync({ generationId: 'g1', text: 'Sample' })).rejects.toThrow('server failed'); }); expect(saveFile).not.toHaveBeenCalled(); });
+
+test.each(['remove', 'clear'] as const)('queued %s cannot dispatch after a server change', async (kind) => {
+  useServerStore.setState({ serverUrl: 'http://server-a', serverRevision: 0 });
+  await mount();
+  const scope = currentServerScope();
+  let pending!: Promise<unknown>;
+  await act(async () => {
+    pending = kind === 'remove'
+      ? hooks.remove.mutateAsync({ generationId: 'g1', scope })
+      : hooks.clear.mutateAsync(scope);
+    useServerStore.setState({ serverUrl: 'http://server-b', serverRevision: 1 });
+    await expect(pending).rejects.toThrow('Server connection changed');
+  });
+  expect(api.deleteGeneration).not.toHaveBeenCalled();
+  expect(api.clearFailedGenerations).not.toHaveBeenCalled();
+});

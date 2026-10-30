@@ -60,10 +60,11 @@ import {
   useImportGeneration,
 } from '@/lib/hooks/useHistory';
 import { cn } from '@/lib/utils/cn';
-import { currentServerScope, isCurrentServer } from '@/lib/serverScope';
+import { currentServerScope, isCurrentServer, requireCurrentServer, type ServerScope } from '@/lib/serverScope';
 import { formatDate, formatDuration, formatEngineName } from '@/lib/utils/format';
 import { useGenerationStore } from '@/stores/generationStore';
 import { usePlayerStore } from '@/stores/playerStore';
+import { useServerStore } from '@/stores/serverStore';
 import { HistoryPlaybackState, useHistoryWindow } from './historyWindow';
 
 export function HistoryTable({ embedded = false }: { embedded?: boolean }) {
@@ -80,11 +81,12 @@ export function HistoryTable({ embedded = false }: { embedded?: boolean }) {
   const [importDialogOpen, setImportDialogOpen] = useState(false);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
-  const [generationToDelete, setGenerationToDelete] = useState<{ id: string; name: string } | null>(
+  const [generationToDelete, setGenerationToDelete] = useState<{ id: string; name: string; scope: ServerScope } | null>(
     null,
   );
   const [effectsDialogOpen, setEffectsDialogOpen] = useState(false);
   const [effectsTargetId, setEffectsTargetId] = useState<string | null>(null);
+  const [effectsTargetScope, setEffectsTargetScope] = useState<ServerScope | null>(null);
   const [effectsTargetVersions, setEffectsTargetVersions] = useState<GenerationVersionResponse[]>(
     [],
   );
@@ -92,13 +94,31 @@ export function HistoryTable({ embedded = false }: { embedded?: boolean }) {
   const [effectsChain, setEffectsChain] = useState<EffectConfig[]>([]);
   const [applyingEffects, setApplyingEffects] = useState(false);
   const [editingVersion, setEditingVersion] = useState<GenerationVersionResponse | null>(null);
-  const [versionToDelete, setVersionToDelete] = useState<GenerationVersionResponse | null>(null);
+  const [versionToDelete, setVersionToDelete] = useState<{ version: GenerationVersionResponse; scope: ServerScope } | null>(null);
   const [deletingVersion, setDeletingVersion] = useState(false);
-  const versionMutationRef = useRef(false);
+  const [clearFailedDialogOpen, setClearFailedDialogOpen] = useState(false);
+  const [clearFailedScope, setClearFailedScope] = useState<ServerScope | null>(null);
+  const versionMutationRef = useRef<number | null>(null);
+  const nextVersionMutationRef = useRef(0);
+  const serverUrl = useServerStore((state) => state.serverUrl);
+  const serverRevision = useServerStore((state) => state.serverRevision);
   const [expandedVersionsId, setExpandedVersionsId] = useState<string | null>(null);
   const limit = 20;
   const { toast } = useToast();
   const queryClient = useQueryClient();
+
+  useEffect(() => {
+    versionMutationRef.current = null;
+    setApplyingEffects(false);
+    setDeletingVersion(false);
+    setEffectsDialogOpen(false);
+    setEffectsTargetScope(null);
+    setVersionToDelete(null);
+    setDeleteDialogOpen(false);
+    setGenerationToDelete(null);
+    setClearFailedDialogOpen(false);
+    setClearFailedScope(null);
+  }, [serverUrl, serverRevision]);
 
   const {
     data: historyData,
@@ -113,20 +133,25 @@ export function HistoryTable({ embedded = false }: { embedded?: boolean }) {
 
   const deleteGeneration = useDeleteGeneration();
   const clearFailed = useClearFailedGenerations();
-  const [clearFailedDialogOpen, setClearFailedDialogOpen] = useState(false);
   const exportGeneration = useExportGeneration();
   const exportGenerationAudio = useExportGenerationAudio();
   const importGeneration = useImportGeneration();
   const cancelGeneration = useMutation({
-    mutationFn: (generationId: string) => apiClient.cancelGeneration(generationId),
-    onSuccess: async (data) => {
+    mutationFn: ({ generationId, scope }: { generationId: string; scope: ServerScope }) => {
+      requireCurrentServer(scope);
+      return apiClient.cancelGeneration(generationId);
+    },
+    onSuccess: async (data, { scope }) => {
+      if (!isCurrentServer(scope)) return;
       await queryClient.invalidateQueries({ queryKey: ['history'] });
+      if (!isCurrentServer(scope)) return;
       toast({
         title: 'Cancelling generation',
         description: data.message,
       });
     },
-    onError: (error) => {
+    onError: (error, { scope }) => {
+      if (!isCurrentServer(scope)) return;
       toast({
         title: 'Cancel failed',
         description: error instanceof Error ? error.message : 'Could not cancel generation',
@@ -266,13 +291,13 @@ export function HistoryTable({ embedded = false }: { embedded?: boolean }) {
   };
 
   const handleDeleteClick = (generationId: string, profileName: string) => {
-    setGenerationToDelete({ id: generationId, name: profileName });
+    setGenerationToDelete({ id: generationId, name: profileName, scope: currentServerScope() });
     setDeleteDialogOpen(true);
   };
 
   const handleDeleteConfirm = () => {
-    if (generationToDelete) {
-      deleteGeneration.mutate(generationToDelete.id);
+    if (generationToDelete && isCurrentServer(generationToDelete.scope)) {
+      deleteGeneration.mutate({ generationId: generationToDelete.id, scope: generationToDelete.scope });
       setDeleteDialogOpen(false);
       setGenerationToDelete(null);
     }
@@ -332,6 +357,7 @@ export function HistoryTable({ embedded = false }: { embedded?: boolean }) {
     const gen = allHistory.find((g) => g.id === generationId);
     const versions = gen?.versions ?? [];
     setEffectsTargetId(generationId);
+    setEffectsTargetScope(currentServerScope());
     setEffectsTargetVersions(versions);
     // Default to clean/original version (no effects chain)
     const cleanVersion = versions.find((v) => !v.effects_chain || v.effects_chain.length === 0);
@@ -343,6 +369,7 @@ export function HistoryTable({ embedded = false }: { embedded?: boolean }) {
 
   const handleEditVersion = (generationId: string, version: GenerationVersionResponse) => {
     setEffectsTargetId(generationId);
+    setEffectsTargetScope(currentServerScope());
     setEditingVersion(version);
     setEffectsChain(structuredClone(version.effects_chain ?? []));
     setEffectsDialogOpen(true);
@@ -365,9 +392,11 @@ export function HistoryTable({ embedded = false }: { embedded?: boolean }) {
 
   const handleDeleteVersionConfirm = async () => {
     if (!versionToDelete || versionMutationRef.current) return;
-    versionMutationRef.current = true;
+    const { version: target, scope } = versionToDelete;
+    if (!isCurrentServer(scope)) return;
+    const request = ++nextVersionMutationRef.current;
+    versionMutationRef.current = request;
     setDeletingVersion(true);
-    const target = versionToDelete;
     const player = usePlayerStore.getState();
     const wasSelected = player.audioId === target.generation_id;
     // Release the media file before deletion, particularly on Windows.
@@ -381,6 +410,7 @@ export function HistoryTable({ embedded = false }: { embedded?: boolean }) {
     };
     try {
       const versions = await apiClient.deleteGenerationVersion(target.generation_id, target.id);
+      if (!isCurrentServer(scope)) return;
       updateVersions(target.generation_id, versions);
       const active = versions.find((version) => version.is_default);
       if (active && mayRestorePlayer()) {
@@ -396,6 +426,7 @@ export function HistoryTable({ embedded = false }: { embedded?: boolean }) {
       setVersionToDelete(null);
       toast({ title: t('history.versions.deleted') });
     } catch (error) {
+      if (!isCurrentServer(scope)) return;
       if (player.audioUrl && mayRestorePlayer()) {
         usePlayerStore
           .getState()
@@ -412,19 +443,25 @@ export function HistoryTable({ embedded = false }: { embedded?: boolean }) {
         variant: 'destructive',
       });
     } finally {
-      versionMutationRef.current = false;
-      setDeletingVersion(false);
+      if (versionMutationRef.current === request) {
+        versionMutationRef.current = null;
+        setDeletingVersion(false);
+      }
     }
   };
 
   const handleApplyEffectsConfirm = async () => {
     if (
       !effectsTargetId ||
+      !effectsTargetScope ||
       (!editingVersion && effectsChain.length === 0) ||
       versionMutationRef.current
     )
       return;
-    versionMutationRef.current = true;
+    const scope = effectsTargetScope;
+    if (!isCurrentServer(scope)) return;
+    const request = ++nextVersionMutationRef.current;
+    versionMutationRef.current = request;
     setApplyingEffects(true);
     try {
       const newVersion = editingVersion
@@ -436,6 +473,7 @@ export function HistoryTable({ embedded = false }: { embedded?: boolean }) {
             source_version_id: effectsSourceVersionId ?? undefined,
             set_as_default: true,
           });
+      if (!isCurrentServer(scope)) return;
       const generation = allHistory.find((item) => item.id === effectsTargetId);
       const versions = generation?.versions ?? [];
       updateVersions(
@@ -466,20 +504,25 @@ export function HistoryTable({ embedded = false }: { embedded?: boolean }) {
         description: editingVersion ? undefined : 'A new version has been created.',
       });
     } catch (error) {
+      if (!isCurrentServer(scope)) return;
       toast({
         title: editingVersion ? t('history.versions.updateFailed') : 'Failed to apply effects',
         description: error instanceof Error ? error.message : 'Unknown error',
         variant: 'destructive',
       });
     } finally {
-      versionMutationRef.current = false;
-      setApplyingEffects(false);
+      if (versionMutationRef.current === request) {
+        versionMutationRef.current = null;
+        setApplyingEffects(false);
+      }
     }
   };
 
   const handleSwitchVersion = async (generationId: string, versionId: string) => {
+    const scope = currentServerScope();
     try {
       const active = await apiClient.setDefaultVersion(generationId, versionId);
+      if (!isCurrentServer(scope)) return;
       setAllHistory((previous) =>
         previous.map((generation) =>
           generation.id === generationId
@@ -496,6 +539,7 @@ export function HistoryTable({ embedded = false }: { embedded?: boolean }) {
       queryClient.invalidateQueries({ queryKey: ['history'] });
       queryClient.invalidateQueries({ queryKey: ['stories'] });
     } catch (error) {
+      if (!isCurrentServer(scope)) return;
       toast({
         title: 'Failed to switch version',
         description: error instanceof Error ? error.message : 'Unknown error',
@@ -561,8 +605,11 @@ export function HistoryTable({ embedded = false }: { embedded?: boolean }) {
   const failedCount = history.filter((g) => g.status === 'failed').length;
 
   const handleClearFailedConfirm = () => {
-    clearFailed.mutate(undefined, {
+    const scope = clearFailedScope;
+    if (!scope || !isCurrentServer(scope)) return;
+    clearFailed.mutate(scope, {
       onSuccess: (data) => {
+        if (!isCurrentServer(scope)) return;
         setClearFailedDialogOpen(false);
         toast({
           title: 'Cleared failed generations',
@@ -570,6 +617,7 @@ export function HistoryTable({ embedded = false }: { embedded?: boolean }) {
         });
       },
       onError: (error) => {
+        if (!isCurrentServer(scope)) return;
         setClearFailedDialogOpen(false);
         toast({
           title: 'Failed to clear',
@@ -602,7 +650,10 @@ export function HistoryTable({ embedded = false }: { embedded?: boolean }) {
                 variant="ghost"
                 size="sm"
                 className="h-7 text-xs text-muted-foreground"
-                onClick={() => setClearFailedDialogOpen(true)}
+                onClick={() => {
+                  setClearFailedScope(currentServerScope());
+                  setClearFailedDialogOpen(true);
+                }}
                 disabled={clearFailed.isPending}
               >
                 <Trash2 className="h-3 w-3 mr-1.5" />
@@ -628,7 +679,8 @@ export function HistoryTable({ embedded = false }: { embedded?: boolean }) {
                 const hasVersions = gen.versions && gen.versions.length > 1;
                 const isVersionsExpanded = expandedVersionsId === gen.id;
                 const isCancelling =
-                  cancelGeneration.isPending && cancelGeneration.variables === gen.id;
+                  cancelGeneration.isPending && cancelGeneration.variables?.generationId === gen.id &&
+                  isCurrentServer(cancelGeneration.variables.scope);
                 return (
                   <div
                     key={gen.id}
@@ -812,7 +864,7 @@ export function HistoryTable({ embedded = false }: { embedded?: boolean }) {
                                   className="h-8 w-8 text-muted-foreground hover:bg-muted"
                                   aria-label="Cancel generation"
                                   disabled={isCancelling}
-                                  onClick={() => cancelGeneration.mutate(gen.id)}
+                                  onClick={() => cancelGeneration.mutate({ generationId: gen.id, scope: currentServerScope() })}
                                 >
                                   {isCancelling ? (
                                     <Loader2 className="h-4 w-4 animate-spin" />
@@ -1001,7 +1053,7 @@ export function HistoryTable({ embedded = false }: { embedded?: boolean }) {
                                                     hasDerivedVersions ||
                                                     (gen.versions?.length ?? 0) <= 1
                                                   }
-                                                  onSelect={() => setVersionToDelete(v)}
+                                                  onSelect={() => setVersionToDelete({ version: v, scope: currentServerScope() })}
                                                 >
                                                   <Trash2 className="mr-2 h-4 w-4" />
                                                   {t('history.versions.delete')}
@@ -1144,7 +1196,7 @@ export function HistoryTable({ embedded = false }: { embedded?: boolean }) {
           <DialogHeader>
             <DialogTitle>{t('history.versions.delete')}</DialogTitle>
             <DialogDescription>
-              {t('history.versions.deleteBody', { name: versionToDelete?.label })}
+              {t('history.versions.deleteBody', { name: versionToDelete?.version.label })}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>

@@ -60,6 +60,7 @@ const toast = mock(() => {});
 const retryGeneration = mock(async (_id: string) => ({ id: 'retry-id' }));
 const regenerateGeneration = mock(async (_id: string) => ({}));
 const toggleFavorite = mock(async (_id: string) => ({}));
+const cancelGeneration = mock(async (_id: string) => ({ message: 'cancelling' }));
 
 mock.module('../src/lib/hooks/useHistory', () => ({
   useHistory: (query: { offset: number; cursor?: string; include_total?: boolean }) => {
@@ -87,6 +88,7 @@ mock.module('../src/lib/api/client', () => ({
     retryGeneration,
     regenerateGeneration,
     toggleFavorite,
+    cancelGeneration,
   },
 }));
 mock.module('react-i18next', () => ({
@@ -198,6 +200,7 @@ afterEach(() => {
   retryGeneration.mockReset(); retryGeneration.mockImplementation(async () => ({ id: 'retry-id' }));
   regenerateGeneration.mockReset(); regenerateGeneration.mockImplementation(async () => ({}));
   toggleFavorite.mockReset(); toggleFavorite.mockImplementation(async () => ({}));
+  cancelGeneration.mockReset(); cancelGeneration.mockImplementation(async () => ({ message: 'cancelling' }));
   useServerStore.setState({ serverUrl: 'http://server-a', serverRevision: 0 });
   useGenerationStore.getState().removePendingGeneration('retry-id');
   useGenerationStore.getState().removePendingGeneration('gen');
@@ -632,5 +635,142 @@ test('late regeneration failure is silent after switching servers', async () => 
   await act(async () => { button('history.actions.regenerate').props.onClick(); });
   act(() => useServerStore.setState({ serverUrl: 'http://server-b', serverRevision: 1 }));
   await act(async () => { reject(new Error('old regeneration failed')); });
+  expect(toast).not.toHaveBeenCalled();
+});
+
+test('a version deletion confirmed after a server switch cannot target the new server', async () => {
+  mount();
+  act(() => button('history.versions.delete').props.onClick());
+  const confirm = button('common.delete').props.onClick;
+  act(() => useServerStore.setState({ serverUrl: 'http://server-b', serverRevision: 1 }));
+  await act(async () => { await confirm(); });
+  expect(remove).not.toHaveBeenCalled();
+});
+
+test('an old-server version deletion cannot restore old audio or report success', async () => {
+  let resolve!: (versions: GenerationVersionResponse[]) => void;
+  remove.mockImplementationOnce(() => new Promise((done) => { resolve = done; }));
+  mount();
+  act(() => usePlayerStore.getState().setAudio('/audio/version/processed', 'gen', 'voice'));
+  act(() => button('history.versions.delete').props.onClick());
+  let pending!: Promise<void>;
+  await act(async () => { pending = button('common.delete').props.onClick(); await Promise.resolve(); });
+  act(() => useServerStore.setState({ serverUrl: 'http://server-b', serverRevision: 1 }));
+  await act(async () => { resolve([{ ...original, is_default: true }]); await pending; });
+  expect(usePlayerStore.getState().audioUrl).toBeNull();
+  expect(toast).not.toHaveBeenCalled();
+});
+
+test('an old-server version edit cannot replace current playback or report success', async () => {
+  let resolve!: (version: GenerationVersionResponse) => void;
+  update.mockImplementationOnce(() => new Promise((done) => { resolve = done; }));
+  mount();
+  act(() => button('history.versions.edit').props.onClick());
+  let pending!: Promise<void>;
+  await act(async () => { pending = button('common.save').props.onClick(); await Promise.resolve(); });
+  act(() => {
+    useServerStore.setState({ serverUrl: 'http://server-b', serverRevision: 1 });
+    usePlayerStore.getState().setAudio('/current-server-audio', 'gen', 'voice');
+  });
+  await act(async () => { resolve({ ...processed, audio_path: 'old-result.wav' }); await pending; });
+  expect(usePlayerStore.getState().audioUrl).toBe('/current-server-audio');
+  expect(toast).not.toHaveBeenCalled();
+});
+
+test('an old-server version switch failure is not shown on the new server', async () => {
+  let reject!: (error: Error) => void;
+  setDefault.mockImplementationOnce(() => new Promise((_resolve, fail) => { reject = fail; }));
+  mount();
+  const version = renderer.root.findAllByType('button').find((node) =>
+    node.findAllByType('span').some((span) => span.props.children === 'original'))!;
+  await act(async () => { version.props.onClick(); await Promise.resolve(); });
+  act(() => useServerStore.setState({ serverUrl: 'http://server-b', serverRevision: 1 }));
+  await act(async () => { reject(new Error('old server version failure')); await Promise.resolve(); });
+  expect(toast).not.toHaveBeenCalled();
+});
+
+test('an edit confirmed after a server switch cannot target the new server', async () => {
+  mount();
+  act(() => button('history.versions.edit').props.onClick());
+  const confirm = button('common.save').props.onClick;
+  act(() => useServerStore.setState({ serverUrl: 'http://server-b', serverRevision: 1 }));
+  await act(async () => { await confirm(); });
+  expect(update).not.toHaveBeenCalled();
+});
+
+test('an old-server deletion failure cannot restore audio or show an error', async () => {
+  let reject!: (error: Error) => void;
+  remove.mockImplementationOnce(() => new Promise((_resolve, fail) => { reject = fail; }));
+  mount();
+  act(() => usePlayerStore.getState().setAudio('/audio/version/processed', 'gen', 'voice'));
+  act(() => button('history.versions.delete').props.onClick());
+  let pending!: Promise<void>;
+  await act(async () => { pending = button('common.delete').props.onClick(); await Promise.resolve(); });
+  act(() => useServerStore.setState({ serverUrl: 'http://server-b', serverRevision: 1 }));
+  await act(async () => { reject(new Error('old deletion failed')); await pending; });
+  expect(usePlayerStore.getState().audioUrl).toBeNull();
+  expect(toast).not.toHaveBeenCalled();
+});
+
+test('an old version edit cannot unlock a newer server edit', async () => {
+  const pending: Array<(version: GenerationVersionResponse) => void> = [];
+  update.mockImplementationOnce(() => new Promise((resolve) => { pending.push(resolve); }));
+  update.mockImplementationOnce(() => new Promise((resolve) => { pending.push(resolve); }));
+  mount();
+  act(() => button('history.versions.edit').props.onClick());
+  let first!: Promise<void>;
+  await act(async () => { first = button('common.save').props.onClick(); await Promise.resolve(); });
+  act(() => useServerStore.setState({ serverUrl: 'http://server-b', serverRevision: 1 }));
+  act(() => button('history.versions.edit').props.onClick());
+  let second!: Promise<void>;
+  await act(async () => { second = button('common.save').props.onClick(); await Promise.resolve(); });
+  expect(update).toHaveBeenCalledTimes(2);
+  await act(async () => { pending[0]({ ...processed, audio_path: 'old.wav' }); await first; });
+  expect(button('history.effectsDialog.applying').props.disabled).toBe(true);
+  await act(async () => { pending[1]({ ...processed, audio_path: 'new.wav' }); await second; });
+  expect(toast).toHaveBeenCalledTimes(1);
+});
+
+test('a generation deletion confirmed after switching servers cannot delete on the new server', () => {
+  deleteMutation.mutate.mockClear();
+  mount([{ ...generation, status: 'failed', versions: [] }], 1, undefined, false);
+  act(() => renderer.root.findByProps({ 'aria-label': 'Delete generation' }).props.onClick());
+  const confirm = button('common.delete').props.onClick;
+  act(() => useServerStore.setState({ serverUrl: 'http://server-b', serverRevision: 1 }));
+  act(() => confirm());
+  expect(deleteMutation.mutate).not.toHaveBeenCalled();
+});
+
+test('clear failed confirmed after switching servers cannot clear the new server', () => {
+  clearMutation.mutate.mockClear();
+  mount([{ ...generation, status: 'failed', versions: [] }], 1, undefined, false);
+  act(() => button('Clear failed').props.onClick());
+  const confirm = button('history.clearFailedDialog.clearAll').props.onClick;
+  act(() => useServerStore.setState({ serverUrl: 'http://server-b', serverRevision: 1 }));
+  act(() => confirm());
+  expect(clearMutation.mutate).not.toHaveBeenCalled();
+});
+
+test('queued cancellation cannot dispatch to a newly selected server', async () => {
+  mount([{ ...generation, status: 'generating', versions: [] }], 1, undefined, false);
+  await act(async () => {
+    renderer.root.findByProps({ 'aria-label': 'Cancel generation' }).props.onClick();
+    useServerStore.setState({ serverUrl: 'http://server-b', serverRevision: 1 });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  });
+  expect(cancelGeneration).not.toHaveBeenCalled();
+  expect(toast).not.toHaveBeenCalled();
+});
+
+test('old-server cancellation completion does not notify the current server', async () => {
+  let resolve!: (value: { message: string }) => void;
+  cancelGeneration.mockImplementationOnce(() => new Promise((done) => { resolve = done; }));
+  mount([{ ...generation, status: 'generating', versions: [] }], 1, undefined, false);
+  await act(async () => {
+    renderer.root.findByProps({ 'aria-label': 'Cancel generation' }).props.onClick();
+    await new Promise((done) => setTimeout(done, 0));
+  });
+  act(() => useServerStore.setState({ serverUrl: 'http://server-b', serverRevision: 1 }));
+  await act(async () => { resolve({ message: 'old server cancelled' }); await Promise.resolve(); });
   expect(toast).not.toHaveBeenCalled();
 });

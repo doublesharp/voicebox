@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiClient } from '@/lib/api/client';
 import type { GenerationExportFormat, HistoryQuery } from '@/lib/api/types';
+import { isCurrentServer, requireCurrentServer, type ServerScope } from '@/lib/serverScope';
 import { usePlatform } from '@/platform/PlatformContext';
 
 export function useHistory(query?: HistoryQuery) {
@@ -22,8 +23,13 @@ export function useDeleteGeneration() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: (generationId: string) => apiClient.deleteGeneration(generationId),
-    onSuccess: () => {
+    mutationFn: (input: string | { generationId: string; scope: ServerScope }) => {
+      if (typeof input === 'string') return apiClient.deleteGeneration(input);
+      requireCurrentServer(input.scope);
+      return apiClient.deleteGeneration(input.generationId);
+    },
+    onSuccess: (_data, input) => {
+      if (typeof input !== 'string' && !isCurrentServer(input.scope)) return;
       queryClient.invalidateQueries({ queryKey: ['history'] });
     },
   });
@@ -33,8 +39,12 @@ export function useClearFailedGenerations() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: () => apiClient.clearFailedGenerations(),
-    onSuccess: () => {
+    mutationFn: (scope?: ServerScope) => {
+      requireCurrentServer(scope);
+      return apiClient.clearFailedGenerations();
+    },
+    onSuccess: (_data, scope) => {
+      if (scope && !isCurrentServer(scope)) return;
       queryClient.invalidateQueries({ queryKey: ['history'] });
     },
   });
