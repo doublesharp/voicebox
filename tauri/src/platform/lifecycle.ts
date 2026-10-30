@@ -64,7 +64,9 @@ class TauriLifecycle implements PlatformLifecycle {
   async setupWindowCloseHandler(): Promise<void> {
     try {
       // Listen for window close request from Rust
-      await listen<null>('window-close-requested', async () => {
+      await listen<string>('window-close-requested', async (event) => {
+        const requestId = event.payload;
+        if (typeof requestId !== 'string' || !/^[0-9]+$/.test(requestId)) return;
         // Import store here to avoid circular dependency
         const { useServerStore } = await import('@/stores/serverStore');
         const keepRunning = useServerStore.getState().keepServerRunningOnClose;
@@ -88,7 +90,7 @@ class TauriLifecycle implements PlatformLifecycle {
         }
 
         // Emit event back to Rust to allow close
-        await emit('window-close-allowed');
+        await emit('window-close-allowed', requestId);
       });
     } catch (error) {
       console.error('Failed to setup window close handler:', error);

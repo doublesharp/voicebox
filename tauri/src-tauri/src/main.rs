@@ -1509,11 +1509,14 @@ fn handle_window_event_with_timeout<R: tauri::Runtime>(
         let (tx, mut rx) = mpsc::unbounded_channel::<()>();
         let listener_id = match window_close::request_cleanup(
             || {
-                window.listen("window-close-allowed", move |_| {
-                    let _ = tx.send(());
+                let expected = ticket.to_string();
+                window.listen("window-close-allowed", move |event| {
+                    if serde_json::from_str::<String>(event.payload()).ok().as_deref() == Some(expected.as_str()) {
+                        let _ = tx.send(());
+                    }
                 })
             },
-            || app_handle.emit("window-close-requested", ()),
+            || app_handle.emit("window-close-requested", ticket.to_string()),
             |id| window.unlisten(id),
         ) {
             Ok(id) => id,
@@ -2823,9 +2826,10 @@ mod window_lifecycle_integration_tests {
         let requests = Arc::new(AtomicUsize::new(0));
         let observed = requests.clone();
         let handle = app.handle().clone();
-        app.listen("window-close-requested", move |_| {
+        app.listen("window-close-requested", move |event| {
             observed.fetch_add(1, Ordering::SeqCst);
-            handle.emit("window-close-allowed", ()).unwrap();
+            let ticket: String = serde_json::from_str(event.payload()).unwrap();
+            handle.emit("window-close-allowed", ticket).unwrap();
         });
         let (tx, rx) = std::sync::mpsc::channel();
         let event: WindowEvent =
@@ -2880,7 +2884,37 @@ mod window_lifecycle_integration_tests {
             );
         }
         assert_eq!(requests.load(Ordering::SeqCst), 1);
+        app.emit("window-close-allowed", closing.load(Ordering::SeqCst).to_string()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_acknowledgement_does_not_authorize_a_new_close() {
+        let app = tauri::test::mock_app();
+        let _webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
+        let window = app.get_window("main").unwrap();
+        let closing = Arc::new(AtomicU64::new(CLOSE_IDLE));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let first: WindowEvent = tauri_runtime::window::WindowEvent::CloseRequested { signal_tx: tx }.into();
+        handle_window_event_with_timeout(&window, &first, closing.clone(), std::time::Duration::from_secs(2));
+        assert_eq!(rx.try_recv(), Ok(true));
+        let old_ticket = closing.load(Ordering::SeqCst).to_string();
+        handle_window_event(&window, &WindowEvent::Destroyed, closing.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let second: WindowEvent = tauri_runtime::window::WindowEvent::CloseRequested { signal_tx: tx }.into();
+        handle_window_event_with_timeout(&window, &second, closing.clone(), std::time::Duration::from_secs(2));
+        assert_eq!(rx.try_recv(), Ok(true));
+        let current_ticket = closing.load(Ordering::SeqCst).to_string();
+        assert_ne!(old_ticket, current_ticket);
         app.emit("window-close-allowed", ()).unwrap();
+        app.emit("window-close-allowed", 5_u64).unwrap();
+        app.emit("window-close-allowed", "wrong").unwrap();
+        app.emit("window-close-allowed", old_ticket).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(closing.load(Ordering::SeqCst) & CLOSE_PHASE_MASK, CLOSE_CLEANUP, "stale acknowledgment bypassed the new cleanup");
+        app.emit("window-close-allowed", current_ticket).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while closing.load(Ordering::SeqCst) & CLOSE_PHASE_MASK != CLOSE_READY { tokio::time::sleep(std::time::Duration::from_millis(5)).await; }
+        }).await.expect("current acknowledgement did not allow close");
     }
 
     #[tokio::test]
@@ -2900,7 +2934,7 @@ mod window_lifecycle_integration_tests {
         assert_eq!(rx.try_recv(), Ok(true));
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert_eq!((closing.load(Ordering::SeqCst) & CLOSE_PHASE_MASK), CLOSE_CLEANUP, "old timeout bypassed the new cleanup");
-        app.emit("window-close-allowed", ()).unwrap();
+        app.emit("window-close-allowed", closing.load(Ordering::SeqCst).to_string()).unwrap();
     }
 
     #[tokio::test]
@@ -2928,8 +2962,9 @@ mod window_lifecycle_integration_tests {
         let first: WindowEvent = tauri_runtime::window::WindowEvent::CloseRequested { signal_tx: tx }.into();
         handle_window_event_with_timeout(&window, &first, closing.clone(), std::time::Duration::from_secs(2));
         assert_eq!(rx.try_recv(), Ok(true));
+        let old_ticket = closing.load(Ordering::SeqCst).to_string();
         handle_window_event(&window, &WindowEvent::Destroyed, closing.clone());
-        app.emit("window-close-allowed", ()).unwrap();
+        app.emit("window-close-allowed", old_ticket).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_eq!(closing.load(Ordering::SeqCst) & CLOSE_PHASE_MASK, CLOSE_IDLE);
     }
@@ -2973,7 +3008,7 @@ mod window_lifecycle_integration_tests {
             tauri_runtime::window::WindowEvent::CloseRequested { signal_tx: tx }.into();
         handle_window_event(&window, &first, closing.clone());
         assert_eq!(rx.try_recv(), Ok(true));
-        app.emit("window-close-allowed", ()).unwrap();
+        app.emit("window-close-allowed", closing.load(Ordering::SeqCst).to_string()).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while (closing.load(Ordering::SeqCst) & CLOSE_PHASE_MASK) != CLOSE_READY {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
