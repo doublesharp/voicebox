@@ -162,7 +162,8 @@ pub async fn start_capture(
         active.store(false, Ordering::Release);
         return Err(format!("Failed to start capture: {}", error));
     }
-    *state.capture_active.lock().unwrap() = Some(active.clone());
+    let stop_control = Arc::new(CaptureStop::new(active));
+    *state.capture_stop.lock().unwrap() = Some(stop_control.clone());
     *state.stop_tx.lock().unwrap() = Some(tx);
     *state.stream.lock().unwrap() = Some(stream.clone());
 
@@ -171,8 +172,7 @@ pub async fn start_capture(
     tokio::spawn(async move {
         tokio::select! {
             _ = tokio::time::sleep(tokio::time::Duration::from_secs(max_duration_secs as u64)) => {
-                active.store(false, Ordering::Release);
-                let _ = stream_clone.stop_capture();
+                let _ = stop_control.stop(|| stream_clone.stop_capture().map_err(|error| error.to_string()));
             }
             _ = rx.recv() => {
                 // Manual stop owns stopping the stream.
@@ -186,9 +186,7 @@ pub async fn start_capture(
 
 pub async fn stop_capture(state: &AudioCaptureState) -> Result<String, String> {
     let _stopping = state.lifecycle.begin_stop()?;
-    if let Some(active) = state.capture_active.lock().unwrap().take() {
-        active.store(false, Ordering::Release);
-    }
+    let stop_control = state.capture_stop.lock().unwrap().take();
     // Signal stop
     if let Some(tx) = state.stop_tx.lock().unwrap().take() {
         let _ = tx.try_send(());
@@ -196,7 +194,12 @@ pub async fn stop_capture(state: &AudioCaptureState) -> Result<String, String> {
 
     // Stop stream if still active
     if let Some(stream) = state.stream.lock().unwrap().take() {
-        let _ = stream.stop_capture();
+        let stop = || stream.stop_capture().map_err(|error| error.to_string());
+        let result = match stop_control {
+            Some(control) => control.stop(stop),
+            None => stop(),
+        };
+        result.map_err(|error| format!("Failed to stop system audio capture: {error}"))?;
     }
 
     // Wait a bit for capture to stop
@@ -642,5 +645,129 @@ mod capture_error_regression_tests {
         let reader = hound::WavReader::new(std::io::Cursor::new(bytes)).unwrap();
         assert_eq!(reader.spec().channels, 2);
         assert_eq!(reader.duration(), 1);
+    }
+}
+
+pub(super) struct CaptureStop {
+    active: Arc<AtomicBool>,
+    result: Mutex<Option<Result<(), String>>>,
+}
+
+impl CaptureStop {
+    fn new(active: Arc<AtomicBool>) -> Self {
+        Self {
+            active,
+            result: Mutex::new(None),
+        }
+    }
+
+    fn stop(&self, action: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+        self.active.store(false, Ordering::Release);
+        let mut result = self
+            .result
+            .lock()
+            .map_err(|_| "Capture stop state unavailable")?;
+        if let Some(result) = result.as_ref() {
+            return result.clone();
+        }
+        let completed = action();
+        *result = Some(completed.clone());
+        completed
+    }
+}
+
+#[cfg(test)]
+mod capture_stop_regression_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn timeout_then_manual_stop_only_stops_the_stream_once() {
+        let active = Arc::new(AtomicBool::new(true));
+        let stop = CaptureStop::new(active.clone());
+        let calls = AtomicUsize::new(0);
+        stop.stop(|| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        })
+        .unwrap();
+        stop.stop(|| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(!active.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn timeout_stop_failure_is_reported_again_to_the_manual_caller() {
+        let stop = CaptureStop::new(Arc::new(AtomicBool::new(true)));
+        assert_eq!(
+            stop.stop(|| Err("device stop failed".into())).unwrap_err(),
+            "device stop failed"
+        );
+        assert_eq!(stop.stop(|| Ok(())).unwrap_err(), "device stop failed");
+    }
+
+    #[test]
+    fn manual_stop_failure_is_not_silently_retried() {
+        let stop = CaptureStop::new(Arc::new(AtomicBool::new(true)));
+        assert!(stop.stop(|| Err("cannot stop".into())).is_err());
+        assert!(stop
+            .stop(|| panic!("a failed native stop must not run twice"))
+            .is_err());
+    }
+
+    #[test]
+    fn stop_disables_callbacks_before_stopping_the_stream() {
+        let active = Arc::new(AtomicBool::new(true));
+        let stop = CaptureStop::new(active.clone());
+        let samples = Mutex::new(Vec::new());
+        stop.stop(|| {
+            append_capture_samples(&samples, &active, &[0.8]);
+            Ok(())
+        })
+        .unwrap();
+        assert!(samples.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn concurrent_stop_waits_for_the_original_stop_result() {
+        let stop = Arc::new(CaptureStop::new(Arc::new(AtomicBool::new(true))));
+        let (started, waiting) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (second_action, second_seen) = std::sync::mpsc::channel();
+        let first_stop = stop.clone();
+        let first = std::thread::spawn(move || {
+            first_stop.stop(|| {
+                started.send(()).unwrap();
+                let _ = blocked.recv();
+                Err("native stop failed".into())
+            })
+        });
+        waiting.recv().unwrap();
+        let second_stop = stop.clone();
+        let second = std::thread::spawn(move || {
+            second_stop.stop(|| {
+                let _ = second_action.send(());
+                Ok(())
+            })
+        });
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let prematurely_ran = second_seen.try_recv().is_ok();
+        release.send(()).unwrap();
+        assert_eq!(first.join().unwrap().unwrap_err(), "native stop failed");
+        let second_result = second.join().unwrap();
+        assert!(!prematurely_ran, "a concurrent native stop was started");
+        assert_eq!(second_result.unwrap_err(), "native stop failed");
+    }
+
+    #[test]
+    fn separate_captures_have_independent_stop_ownership() {
+        let first = CaptureStop::new(Arc::new(AtomicBool::new(true)));
+        let second = CaptureStop::new(Arc::new(AtomicBool::new(true)));
+        first.stop(|| Err("first failed".into())).unwrap_err();
+        second.stop(|| Ok(())).unwrap();
     }
 }

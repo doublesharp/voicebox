@@ -28,7 +28,7 @@ pub struct AudioCaptureState {
     #[cfg(target_os = "macos")]
     pub(crate) lifecycle: macos::CaptureLifecycle,
     #[cfg(target_os = "macos")]
-    pub(crate) capture_active: Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>,
+    pub(crate) capture_stop: Mutex<Option<Arc<macos::CaptureStop>>>,
 }
 
 impl AudioCaptureState {
@@ -44,7 +44,7 @@ impl AudioCaptureState {
             #[cfg(target_os = "macos")]
             lifecycle: macos::CaptureLifecycle::default(),
             #[cfg(target_os = "macos")]
-            capture_active: Mutex::new(None),
+            capture_stop: Mutex::new(None),
         }
     }
 
