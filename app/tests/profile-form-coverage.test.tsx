@@ -17,13 +17,21 @@ let fail = '',
 let durationHandler: (file: File) => Promise<number> = async () => duration;
 let transcribeHandler: (arg: any) => Promise<{ text: string }> = async () => ({ text: 'transcribed' });
 let addHandler: (arg: any) => Promise<void> = async () => {};
+let createHandler: (arg: any) => Promise<any> = async () => ({ id: 'new' });
+let updateHandler: (arg: any) => Promise<void> = async () => {};
 const voices = [{ voice_id: 'v1', name: 'Voice One', gender: 'female', language: 'en' }];
 const mutation = (key: string, result?: unknown) => ({
   isPending: false,
   mutateAsync: async (arg: unknown) => {
-    calls[key].push(arg);
+    const visible = arg && typeof arg === 'object' ? (() => {
+      const { _serverScope, ...rest } = arg as Record<string, unknown>;
+      return key === 'delete' ? rest.profileId : rest;
+    })() : arg;
+    calls[key].push(visible);
     if (fail === key) throw new Error(`${key} failed`);
     if (key === 'add') await addHandler(arg);
+    if (key === 'create') return createHandler(arg);
+    if (key === 'update') await updateHandler(arg);
     return result;
   },
 });
@@ -105,6 +113,7 @@ mock.module('../src/components/VoiceProfiles/SampleList', () => ({ SampleList: (
 mock.module('../src/components/Effects/EffectsChainEditor', () => ({
   EffectsChainEditor: (props: any) => <chain-editor {...props} />,
 }));
+const { useServerStore } = await import('../src/stores/serverStore');
 const { ProfileForm } = await import('../src/components/VoiceProfiles/ProfileForm');
 const { SampleUpload } = await import('../src/components/VoiceProfiles/SampleUpload');
 let view: ReactTestRenderer;
@@ -144,6 +153,9 @@ afterEach(() => {
   durationHandler = async () => duration;
   transcribeHandler = async () => ({ text: 'transcribed' });
   addHandler = async () => {};
+  createHandler = async () => ({ id: 'new' });
+  updateHandler = async () => {};
+  useServerStore.setState({ serverUrl: 'http://server-a', serverRevision: 0 });
   profile = undefined;
   useUIStore.setState({ profileDialogOpen: false, editingProfileId: null, profileFormDraft: null });
 });
@@ -632,4 +644,132 @@ test('a current sample upload failure stays visible and retains form data', asyn
   expect(calls.toast.at(-1)).toEqual(expect.objectContaining({ title: 'Error', description: 'upload failed' }));
   expect(sampleText().props.value).toBe('Words');
   expect(view.root.findByType('audio-upload' as never).props.file.name).toBe('voice.wav');
+});
+
+function switchVoiceServer(url = 'http://server-b') {
+  act(() => useServerStore.setState((state) => ({ serverUrl: url, serverRevision: state.serverRevision + 1 })));
+}
+
+test('voice creation never uploads a sample to a newly selected server', async () => {
+  let resolve!: (value: any) => void;
+  createHandler = () => new Promise((r) => { resolve = r; });
+  await mount();
+  await name('Clone');
+  await upload(new File(['a'], 'voice.wav', { type: 'audio/wav' }));
+  await type('profileForm.fields.referenceTextPlaceholder', 'referenceText', 'Words');
+  await submitSampleWithoutWaiting();
+  expect(calls.create).toHaveLength(1);
+  switchVoiceServer();
+  await act(async () => { resolve({ id: 'new' }); });
+  expect(calls.add).toHaveLength(0);
+  expect(calls.delete).toHaveLength(0);
+  expect(useUIStore.getState().profileDialogOpen).toBe(true);
+});
+
+test('voice creation never rolls back on a different server after sample failure', async () => {
+  let reject!: (error: Error) => void;
+  addHandler = () => new Promise((_resolve, r) => { reject = r; });
+  await mount();
+  await name('Clone');
+  await upload(new File(['a'], 'voice.wav', { type: 'audio/wav' }));
+  await type('profileForm.fields.referenceTextPlaceholder', 'referenceText', 'Words');
+  await submitSampleWithoutWaiting();
+  expect(calls.add).toHaveLength(1);
+  switchVoiceServer();
+  await act(async () => { reject(new Error('upload failed')); });
+  expect(calls.delete).toHaveLength(0);
+  expect(useUIStore.getState().profileDialogOpen).toBe(true);
+});
+
+test('sample upload ignores a transcript from a previous server even after switching back', async () => {
+  let resolve!: (value: { text: string }) => void;
+  transcribeHandler = () => new Promise((r) => { resolve = r; });
+  await mountSample();
+  await upload(new File(['a'], 'voice.wav', { type: 'audio/wav' }));
+  await act(async () => { view.root.findByType('audio-upload' as never).props.onTranscribe(); });
+  switchVoiceServer();
+  switchVoiceServer('http://server-a');
+  await act(async () => { resolve({ text: 'Old server transcript' }); });
+  expect(sampleText().props.value).toBe('');
+});
+
+test('sample upload ignores completion after changing servers', async () => {
+  let resolve!: () => void;
+  addHandler = () => new Promise((r) => { resolve = r; });
+  await mountSample();
+  await upload(new File(['a'], 'voice.wav', { type: 'audio/wav' }));
+  await editSampleText('Words');
+  await submitSampleWithoutWaiting();
+  switchVoiceServer();
+  await act(async () => { resolve(); });
+  expect(sampleText().props.value).toBe('Words');
+  expect(calls.toast.some((item) => item.title === 'Sample added')).toBe(false);
+});
+
+test('voice creation stops before its first request if the server changes during validation', async () => {
+  let resolve!: (value: number) => void;
+  durationHandler = () => new Promise((r) => { resolve = r; });
+  await mount();
+  await name('Clone');
+  await upload(new File(['a'], 'voice.wav', { type: 'audio/wav' }));
+  await type('profileForm.fields.referenceTextPlaceholder', 'referenceText', 'Words');
+  await submitSampleWithoutWaiting();
+  switchVoiceServer();
+  await act(async () => { resolve(5); });
+  expect(calls.create).toHaveLength(0);
+  expect(calls.add).toHaveLength(0);
+});
+
+test('voice creation ignores a transcript from a previous server', async () => {
+  let resolve!: (value: { text: string }) => void;
+  transcribeHandler = () => new Promise((r) => { resolve = r; });
+  await mount();
+  await upload(new File(['a'], 'voice.wav', { type: 'audio/wav' }));
+  await act(async () => { view.root.findByType('audio-upload' as never).props.onTranscribe(); });
+  switchVoiceServer();
+  await act(async () => { resolve({ text: 'Old transcript' }); });
+  expect(input('profileForm.fields.referenceTextPlaceholder').props.value).toBe('');
+});
+
+test('switching servers during form validation cannot create a voice on the new server', async () => {
+  await mount();
+  await name('Clone');
+  await upload(new File(['a'], 'voice.wav', { type: 'audio/wav' }));
+  await type('profileForm.fields.referenceTextPlaceholder', 'referenceText', 'Words');
+  let submitted!: Promise<unknown>;
+  await act(async () => {
+    submitted = view.root.findByType('form').props.onSubmit({ preventDefault() {}, persist() {} });
+    useServerStore.setState((state) => ({ serverUrl: 'http://server-b', serverRevision: state.serverRevision + 1 }));
+    await submitted;
+  });
+  expect(calls.create).toHaveLength(0);
+  expect(calls.add).toHaveLength(0);
+});
+
+test('switching servers during sample validation cannot upload to the new server', async () => {
+  await mountSample();
+  await upload(new File(['a'], 'voice.wav', { type: 'audio/wav' }));
+  await editSampleText('Words');
+  let submitted!: Promise<unknown>;
+  await act(async () => {
+    submitted = view.root.findByType('form').props.onSubmit({ preventDefault() {}, persist() {} });
+    useServerStore.setState((state) => ({ serverUrl: 'http://server-b', serverRevision: state.serverRevision + 1 }));
+    await submitted;
+  });
+  expect(calls.add).toHaveLength(0);
+});
+
+test('editing a voice never sends follow-up effects to a different server', async () => {
+  let resolve!: () => void;
+  updateHandler = () => new Promise((r) => { resolve = r; });
+  profile = { id: 'p', name: 'Old', language: 'en', description: '', effects_chain: [] };
+  await mount('p');
+  await name('New');
+  act(() => view.root.findByType('chain-editor' as never).props.onChange([{ type: 'gain' }]));
+  await submitSampleWithoutWaiting();
+  expect(calls.update).toHaveLength(1);
+  switchVoiceServer();
+  await act(async () => { resolve(); });
+  expect(calls.effects).toHaveLength(0);
+  expect(useUIStore.getState().profileDialogOpen).toBe(true);
 });

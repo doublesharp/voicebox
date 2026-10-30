@@ -29,6 +29,8 @@ import { useSystemAudioCapture } from '@/lib/hooks/useSystemAudioCapture';
 import { useTranscription } from '@/lib/hooks/useTranscription';
 import { usePlatform } from '@/platform/PlatformContext';
 import { useMicrophoneStore } from '@/stores/microphoneStore';
+import { useServerStore } from '@/stores/serverStore';
+import { currentServerScope, isCurrentServer, type ServerScope } from '@/lib/serverScope';
 import { AudioSampleRecording } from './AudioSampleRecording';
 import { AudioSampleSystem } from './AudioSampleSystem';
 import { AudioSampleUpload } from './AudioSampleUpload';
@@ -55,6 +57,8 @@ export function SampleUpload({ profileId, open, onOpenChange }: SampleUploadProp
   const addSample = useAddSample();
   const transcribe = useTranscription();
   const { data: profile } = useProfile(profileId);
+  const serverUrl = useServerStore((state) => state.serverUrl);
+  const serverRevision = useServerStore((state) => state.serverRevision);
   const transcriptionRevision = useRef(0);
   const uploadRevision = useRef(0);
   const pendingUpload = useRef<symbol | null>(null);
@@ -69,7 +73,7 @@ export function SampleUpload({ profileId, open, onOpenChange }: SampleUploadProp
       uploadRevision.current += 1;
       pendingUpload.current = null;
     };
-  }, [open, profileId]);
+  }, [open, profileId, serverUrl, serverRevision]);
   const { toast } = useToast();
   const [mode, setMode] = useState<'upload' | 'record' | 'system'>('upload');
   const { isPlaying, playPause, cleanup: cleanupAudio } = useAudioPlayer();
@@ -175,17 +179,19 @@ export function SampleUpload({ profileId, open, onOpenChange }: SampleUploadProp
     }
 
     const language = profile?.language as 'en' | 'zh' | undefined;
+    const serverScope = currentServerScope();
     const referenceText = form.getValues('referenceText');
     const revision = ++transcriptionRevision.current;
     const isCurrent = () =>
       transcriptionRevision.current === revision &&
+      isCurrentServer(serverScope) &&
       currentContext.current.open &&
       currentContext.current.profileId === profileId &&
       currentContext.current.language === language &&
       form.getValues('file') === file &&
       form.getValues('referenceText') === referenceText;
     try {
-      const result = await transcribe.mutateAsync({ file, language });
+      const result = await transcribe.mutateAsync({ file, language, _serverScope: serverScope });
       if (!isCurrent()) return;
       form.setValue('referenceText', result.text, { shouldValidate: true });
     } catch (error) {
@@ -198,13 +204,18 @@ export function SampleUpload({ profileId, open, onOpenChange }: SampleUploadProp
     }
   }
 
-  async function onSubmit(data: SampleFormValues) {
+  async function onSubmit(data: SampleFormValues, serverScope: ServerScope) {
+    if (!isCurrentServer(serverScope)) {
+      toast({ title: 'Server connection changed', description: 'Please review the sample and try again.', variant: 'destructive' });
+      return;
+    }
     if (pendingUpload.current) return;
     const request = Symbol('sample upload');
     pendingUpload.current = request;
     const revision = uploadRevision.current;
     const isCurrent = () =>
       uploadRevision.current === revision &&
+      isCurrentServer(serverScope) &&
       currentContext.current.open &&
       currentContext.current.profileId === profileId &&
       form.getValues('file') === data.file &&
@@ -214,6 +225,7 @@ export function SampleUpload({ profileId, open, onOpenChange }: SampleUploadProp
         profileId,
         file: data.file,
         referenceText: data.referenceText,
+        _serverScope: serverScope,
       });
 
       if (!isCurrent()) return;
@@ -279,7 +291,10 @@ export function SampleUpload({ profileId, open, onOpenChange }: SampleUploadProp
         </DialogHeader>
 
         <Form {...form}>
-          <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
+          <form onSubmit={(event) => {
+            const scope = currentServerScope();
+            return form.handleSubmit((data) => onSubmit(data, scope))(event);
+          }} className="space-y-4">
             <Tabs
               value={mode}
               onValueChange={(v) => {

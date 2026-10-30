@@ -1,3 +1,4 @@
+import { isCurrentServer, requireCurrentServer, type ServerScope } from '@/lib/serverScope';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiClient } from '@/lib/api/client';
 import type { EffectConfig, VoiceProfileCreate, VoiceProfileResponse } from '@/lib/api/types';
@@ -22,7 +23,10 @@ export function useCreateProfile() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: (data: VoiceProfileCreate) => apiClient.createProfile(data),
+    mutationFn: ({ _serverScope, ...data }: VoiceProfileCreate & { _serverScope?: ServerScope }) => {
+      requireCurrentServer(_serverScope);
+      return apiClient.createProfile(data);
+    },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['profiles'] });
     },
@@ -33,8 +37,10 @@ export function useUpdateProfile() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: ({ profileId, data }: { profileId: string; data: VoiceProfileCreate }) =>
-      apiClient.updateProfile(profileId, data),
+    mutationFn: ({ profileId, data, _serverScope }: { profileId: string; data: VoiceProfileCreate; _serverScope?: ServerScope }) => {
+      requireCurrentServer(_serverScope);
+      return apiClient.updateProfile(profileId, data);
+    },
     onSuccess: (_, variables) => {
       queryClient.invalidateQueries({ queryKey: ['profiles'] });
       queryClient.invalidateQueries({
@@ -48,7 +54,11 @@ export function useDeleteProfile() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: (profileId: string) => apiClient.deleteProfile(profileId),
+    mutationFn: (value: string | { profileId: string; _serverScope: ServerScope }) => {
+      if (typeof value === 'string') return apiClient.deleteProfile(value);
+      requireCurrentServer(value._serverScope);
+      return apiClient.deleteProfile(value.profileId);
+    },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['profiles'] });
       // Deleting a profile also deletes its generations, which story items
@@ -65,14 +75,21 @@ export function useUpdateProfileEffects() {
     mutationFn: ({
       profileId,
       effectsChain,
+      _serverScope,
     }: {
       profileId: string;
       effectsChain: EffectConfig[] | null;
-    }) => apiClient.updateProfileEffects(profileId, effectsChain),
-    onSuccess: async (profile) => {
+      _serverScope?: ServerScope;
+    }) => {
+      requireCurrentServer(_serverScope);
+      return apiClient.updateProfileEffects(profileId, effectsChain);
+    },
+    onSuccess: async (profile, variables) => {
+      if (variables._serverScope && !isCurrentServer(variables._serverScope)) return;
       // A metadata save may already have refetched the old effects. Cancel older
       // requests before publishing the effects acknowledgement to both views.
       await queryClient.cancelQueries({ queryKey: ['profiles'] });
+      if (variables._serverScope && !isCurrentServer(variables._serverScope)) return;
       queryClient.setQueryData(['profiles', profile.id], profile);
       queryClient.setQueryData<VoiceProfileResponse[]>(['profiles'], (previous) =>
         previous?.map((item) => (item.id === profile.id ? profile : item)),
@@ -97,11 +114,16 @@ export function useAddSample() {
       profileId,
       file,
       referenceText,
+      _serverScope,
     }: {
       profileId: string;
       file: File;
       referenceText: string;
-    }) => apiClient.addProfileSample(profileId, file, referenceText),
+      _serverScope?: ServerScope;
+    }) => {
+      requireCurrentServer(_serverScope);
+      return apiClient.addProfileSample(profileId, file, referenceText);
+    },
     onSuccess: (_, variables) => {
       queryClient.invalidateQueries({
         queryKey: ['profiles', variables.profileId, 'samples'],
@@ -208,8 +230,10 @@ export function useUploadAvatar() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: ({ profileId, file }: { profileId: string; file: File }) =>
-      apiClient.uploadAvatar(profileId, file),
+    mutationFn: ({ profileId, file, _serverScope }: { profileId: string; file: File; _serverScope?: ServerScope }) => {
+      requireCurrentServer(_serverScope);
+      return apiClient.uploadAvatar(profileId, file);
+    },
     onSuccess: (_, variables) => {
       queryClient.invalidateQueries({ queryKey: ['profiles'] });
       queryClient.invalidateQueries({

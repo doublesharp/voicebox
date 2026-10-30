@@ -58,6 +58,7 @@ import { convertToWav, formatAudioDuration, getAudioDuration } from '@/lib/utils
 import { usePlatform } from '@/platform/PlatformContext';
 import { useMicrophoneStore } from '@/stores/microphoneStore';
 import { useServerStore } from '@/stores/serverStore';
+import { currentServerScope, isCurrentServer, type ServerScope } from '@/lib/serverScope';
 import { type ProfileFormDraft, useUIStore } from '@/stores/uiStore';
 import { AudioSampleRecording } from './AudioSampleRecording';
 import { AudioSampleSystem } from './AudioSampleSystem';
@@ -448,17 +449,19 @@ export function ProfileForm() {
     }
 
     const request = ++transcriptionRequestRef.current;
+    const serverScope = currentServerScope();
     const language = form.getValues('language');
     const referenceText = form.getValues('referenceText');
     const isCurrent = () =>
       request === transcriptionRequestRef.current &&
+      isCurrentServer(serverScope) &&
       useUIStore.getState().profileDialogOpen &&
       form.getValues('sampleFile') === file &&
       form.getValues('language') === language &&
       form.getValues('referenceText') === referenceText;
 
     try {
-      const result = await transcribe.mutateAsync({ file, language });
+      const result = await transcribe.mutateAsync({ file, language, _serverScope: serverScope });
       if (!isCurrent()) return;
       form.setValue('referenceText', result.text, { shouldValidate: true });
     } catch (error) {
@@ -533,15 +536,28 @@ export function ProfileForm() {
     }
   }
 
-  async function onSubmit(data: ProfileFormValues) {
+  async function onSubmit(data: ProfileFormValues, serverScope: ServerScope) {
     if (savingRef.current) return;
     savingRef.current = true;
     setIsSaving(true);
+    const ensureServer = () => {
+      if (isCurrentServer(serverScope)) return true;
+      toast({
+        title: t('profileForm.toast.serverChangedTitle', { defaultValue: 'Server connection changed' }),
+        description: t('profileForm.toast.serverChangedDescription', {
+          defaultValue: 'Check the previous server for any partially saved voice.',
+        }),
+        variant: 'destructive',
+      });
+      return false;
+    };
     try {
+      if (!ensureServer()) return;
       if (editingProfileId) {
         // Editing: update profile
         await updateProfile.mutateAsync({
           profileId: editingProfileId,
+          _serverScope: serverScope,
           data: {
             name: data.name,
             description: data.description,
@@ -551,14 +567,17 @@ export function ProfileForm() {
           },
         });
 
+        if (!ensureServer()) return;
         // Handle avatar upload/update if file changed
         if (data.avatarFile) {
           try {
             await uploadAvatar.mutateAsync({
               profileId: editingProfileId,
               file: data.avatarFile,
+              _serverScope: serverScope,
             });
           } catch (avatarError) {
+            if (!ensureServer()) return;
             toast({
               title: t('profileForm.toast.avatarUploadFailed'),
               description:
@@ -570,14 +589,17 @@ export function ProfileForm() {
           }
         }
 
+        if (!ensureServer()) return;
         // Save effects chain if changed
         if (effectsDirty) {
           try {
             await updateEffects.mutateAsync({
               profileId: editingProfileId,
               effectsChain: profileEffectsChain.length > 0 ? profileEffectsChain : null,
+              _serverScope: serverScope,
             });
           } catch (fxError) {
+            if (!ensureServer()) return;
             toast({
               title: t('profileForm.toast.effectsUpdateFailed'),
               description:
@@ -590,6 +612,7 @@ export function ProfileForm() {
           }
         }
 
+        if (!ensureServer()) return;
         toast({
           title: t('profileForm.toast.voiceUpdated'),
           description: t('profileForm.toast.voiceUpdatedDescription', { name: data.name }),
@@ -605,7 +628,9 @@ export function ProfileForm() {
           return;
         }
 
+        if (!ensureServer()) return;
         const profile = await createProfile.mutateAsync({
+          _serverScope: serverScope,
           name: data.name,
           description: data.description,
           language: data.language,
@@ -616,14 +641,17 @@ export function ProfileForm() {
           personality: data.personality?.trim() ? data.personality.trim() : undefined,
         });
 
+        if (!ensureServer()) return;
         // Handle avatar upload if provided
         if (data.avatarFile) {
           try {
             await uploadAvatar.mutateAsync({
               profileId: profile.id,
               file: data.avatarFile,
+              _serverScope: serverScope,
             });
           } catch (avatarError) {
+            if (!ensureServer()) return;
             toast({
               title: t('profileForm.toast.avatarUploadFailed'),
               description:
@@ -635,6 +663,7 @@ export function ProfileForm() {
           }
         }
 
+        if (!ensureServer()) return;
         toast({
           title: t('profileForm.toast.profileCreated'),
           description: t('profileForm.toast.profileCreatedBuiltin', { name: data.name }),
@@ -651,7 +680,9 @@ export function ProfileForm() {
           return;
         }
 
+        if (!ensureServer()) return;
         const profile = await createProfile.mutateAsync({
+          _serverScope: serverScope,
           name: data.name,
           description: data.description,
           language: data.language,
@@ -661,14 +692,17 @@ export function ProfileForm() {
           personality: data.personality?.trim() ? data.personality.trim() : undefined,
         });
 
+        if (!ensureServer()) return;
         // Handle avatar upload if provided
         if (data.avatarFile) {
           try {
             await uploadAvatar.mutateAsync({
               profileId: profile.id,
               file: data.avatarFile,
+              _serverScope: serverScope,
             });
           } catch (avatarError) {
+            if (!ensureServer()) return;
             toast({
               title: t('profileForm.toast.avatarUploadFailed'),
               description:
@@ -680,6 +714,7 @@ export function ProfileForm() {
           }
         }
 
+        if (!ensureServer()) return;
         toast({
           title: t('profileForm.toast.profileCreated'),
           description: t('profileForm.toast.profileCreatedDesigned', { name: data.name }),
@@ -757,7 +792,9 @@ export function ProfileForm() {
         }
 
         // Creating: create profile, then add sample
+        if (!ensureServer()) return;
         const profile = await createProfile.mutateAsync({
+          _serverScope: serverScope,
           name: data.name,
           description: data.description,
           language: data.language,
@@ -765,6 +802,7 @@ export function ProfileForm() {
           personality: data.personality?.trim() ? data.personality.trim() : undefined,
         });
 
+        if (!ensureServer()) return;
         // Convert non-WAV uploads to WAV so the backend can always use soundfile.
         // Recorded audio is already WAV (from useAudioRecording's convertToWav call).
         let fileToUpload: File = sampleFile;
@@ -778,21 +816,26 @@ export function ProfileForm() {
           }
         }
 
+        if (!ensureServer()) return;
         try {
           await addSample.mutateAsync({
             profileId: profile.id,
             file: fileToUpload,
             referenceText: referenceText,
+            _serverScope: serverScope,
           });
 
+          if (!ensureServer()) return;
           // Handle avatar upload if provided
           if (data.avatarFile) {
             try {
               await uploadAvatar.mutateAsync({
                 profileId: profile.id,
                 file: data.avatarFile,
+                _serverScope: serverScope,
               });
             } catch (avatarError) {
+              if (!ensureServer()) return;
               toast({
                 title: 'Avatar upload failed',
                 description:
@@ -802,16 +845,19 @@ export function ProfileForm() {
             }
           }
 
+          if (!ensureServer()) return;
           toast({
             title: t('profileForm.toast.profileCreated'),
             description: t('profileForm.toast.profileCreatedSample', { name: data.name }),
           });
         } catch (sampleError) {
+          if (!ensureServer()) return;
           let rollbackSucceeded = false;
           try {
-            await deleteProfile.mutateAsync(profile.id);
+            await deleteProfile.mutateAsync({ profileId: profile.id, _serverScope: serverScope });
             rollbackSucceeded = true;
           } catch (rollbackError) {
+            if (!ensureServer()) return;
             toast({
               title: t('profileForm.toast.rollbackFailed'),
               description:
@@ -822,6 +868,7 @@ export function ProfileForm() {
             });
           }
 
+          if (!ensureServer()) return;
           const rollbackSuffix = rollbackSucceeded
             ? ` ${t('profileForm.toast.profileRolledBack')}`
             : '';
@@ -839,6 +886,7 @@ export function ProfileForm() {
         }
       }
 
+      if (!ensureServer()) return;
       // Clear draft and reset form on success
       setProfileFormDraft(null);
       form.reset();
@@ -846,6 +894,7 @@ export function ProfileForm() {
       setEditingProfileId(null);
       setOpen(false);
     } catch (error) {
+      if (!ensureServer()) return;
       toast({
         title: t('common.error'),
         description: error instanceof Error ? error.message : t('profileForm.toast.saveFailed'),
@@ -956,7 +1005,10 @@ export function ProfileForm() {
           </DialogHeader>
 
           <Form {...form}>
-            <form onSubmit={form.handleSubmit(onSubmit)} className="flex-1 min-h-0 flex flex-col">
+            <form onSubmit={(event) => {
+              const scope = currentServerScope();
+              return form.handleSubmit((data) => onSubmit(data, scope))(event);
+            }} className="flex-1 min-h-0 flex flex-col">
               <div className="flex flex-col gap-6 min-[1100px]:grid min-[1100px]:grid-cols-2 flex-1 min-h-0 overflow-y-auto min-[1100px]:overflow-hidden p-6">
                 {/* Left column: Sample management */}
                 <div className="shrink-0 space-y-4 min-[1100px]:border-r min-[1100px]:border-border/60 min-[1100px]:pr-6 min-[1100px]:overflow-y-auto min-[1100px]:min-h-0">
