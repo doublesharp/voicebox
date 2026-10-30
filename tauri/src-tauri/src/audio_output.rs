@@ -999,6 +999,25 @@ fn render_preview<T: Copy>(
     });
 }
 
+// Keep the realtime callback nonblocking: a busy or poisoned producer queue
+// yields silence without consuming samples; a busy queue can resume later.
+fn render_preview_callback<T: Copy>(
+    output: &mut [T],
+    rate: u32,
+    channels: usize,
+    queue: &Mutex<crate::audio_stream::PcmQueue>,
+    controls: &PlaybackControls,
+    convert: impl Fn(f32) -> T,
+) {
+    output.fill(convert(0.0));
+    if controls.stopped.load(Ordering::Acquire) || controls.paused.load(Ordering::Acquire) {
+        return;
+    }
+    if let Ok(mut queue) = queue.try_lock() {
+        render_preview(output, rate, channels, &mut queue, controls, convert);
+    }
+}
+
 fn build_pcm_stream<T>(
     device: &Device,
     config: &StreamConfig,
@@ -1015,22 +1034,7 @@ where
         .build_output_stream(
             config,
             move |output: &mut [T], _: &cpal::OutputCallbackInfo| {
-                output.fill(T::from_sample(0.0));
-                if controls.stopped.load(Ordering::Acquire)
-                    || controls.paused.load(Ordering::Acquire)
-                {
-                    return;
-                }
-                if let Ok(mut queue) = queue.try_lock() {
-                    render_preview(
-                        output,
-                        rate,
-                        channels,
-                        &mut queue,
-                        &controls,
-                        T::from_sample,
-                    );
-                }
+                render_preview_callback(output, rate, channels, &queue, &controls, T::from_sample);
             },
             move |error| {
                 let _ = errors.send(error.to_string());
@@ -4916,5 +4920,154 @@ mod clip_host_integration_tests {
             .unwrap_err()
             .contains("device failed"));
         assert_eq!(host.0.lock().unwrap().dropped.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod preview_callback_tests {
+    use super::*;
+    use crate::audio_stream::PcmQueue;
+
+    fn queue() -> Mutex<PcmQueue> {
+        let mut queue = PcmQueue::new(8000).unwrap();
+        queue.append(&[0.5, -0.25, 0.75]).unwrap();
+        Mutex::new(queue)
+    }
+
+    fn controls() -> PlaybackControls {
+        let controls = PlaybackControls::new(0.0, 1.0);
+        controls.paused.store(false, Ordering::Release);
+        controls
+    }
+
+    #[test]
+    fn callback_replicates_mono_across_channels_and_applies_volume() {
+        let queue = queue();
+        let controls = controls();
+        controls.set_volume(0.5);
+        let mut output = [9.0; 4];
+        render_preview_callback(&mut output, 8000, 2, &queue, &controls, |sample| sample);
+        assert_eq!(output, [0.25, 0.25, -0.125, -0.125]);
+        assert_eq!(queue.lock().unwrap().samples_len_for_test(), 1);
+    }
+
+    #[test]
+    fn a_busy_queue_outputs_silence_then_resumes_without_losing_audio() {
+        let queue = queue();
+        let controls = controls();
+        let locked = queue.lock().unwrap();
+        let mut output = [9.0; 2];
+        render_preview_callback(&mut output, 8000, 1, &queue, &controls, |sample| sample);
+        assert_eq!(output, [0.0, 0.0]);
+        assert_eq!(locked.samples_len_for_test(), 3);
+        drop(locked);
+        render_preview_callback(&mut output, 8000, 1, &queue, &controls, |sample| sample);
+        assert_eq!(output, [0.5, -0.25]);
+    }
+
+    #[test]
+    fn pause_and_stop_silence_without_consuming_queue() {
+        let queue = queue();
+        let controls = controls();
+        controls.paused.store(true, Ordering::Release);
+        let mut output = [9.0; 2];
+        render_preview_callback(&mut output, 8000, 1, &queue, &controls, |sample| sample);
+        assert_eq!(output, [0.0, 0.0]);
+        controls.paused.store(false, Ordering::Release);
+        controls.stop();
+        render_preview_callback(&mut output, 8000, 1, &queue, &controls, |sample| sample);
+        assert_eq!(output, [0.0, 0.0]);
+        assert_eq!(queue.lock().unwrap().samples_len_for_test(), 3);
+    }
+
+    #[test]
+    fn empty_queue_is_silent_until_new_samples_arrive() {
+        let queue = Mutex::new(PcmQueue::new(8000).unwrap());
+        let controls = controls();
+        let mut output = [9.0; 2];
+        render_preview_callback(&mut output, 8000, 1, &queue, &controls, |sample| sample);
+        assert_eq!(output, [0.0, 0.0]);
+        queue.lock().unwrap().append(&[0.25, 0.5, 0.75]).unwrap();
+        render_preview_callback(&mut output, 8000, 1, &queue, &controls, |sample| sample);
+        assert_eq!(output, [0.25, 0.5]);
+    }
+
+    #[test]
+    fn finished_queue_renders_last_sample_then_silence() {
+        let queue = queue();
+        queue.lock().unwrap().finished = true;
+        let controls = controls();
+        let mut output = [9.0; 5];
+        render_preview_callback(&mut output, 8000, 1, &queue, &controls, |sample| sample);
+        assert_eq!(output, [0.5, -0.25, 0.75, 0.0, 0.0]);
+        assert!(queue.lock().unwrap().ended());
+    }
+
+    #[test]
+    fn poisoned_queue_silences_callback_instead_of_panicking() {
+        let queue = Arc::new(queue());
+        let poisoned = queue.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("simulate producer panic");
+        })
+        .join()
+        .is_err());
+        let mut output = [9.0; 2];
+        render_preview_callback(&mut output, 8000, 1, &queue, &controls(), |sample| sample);
+        assert_eq!(output, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn invalid_output_format_is_silent_and_preserves_samples() {
+        let queue = queue();
+        let controls = controls();
+        for (rate, channels) in [(0, 1), (8000, 0)] {
+            let mut output = [9.0; 2];
+            render_preview_callback(&mut output, rate, channels, &queue, &controls, |sample| {
+                sample
+            });
+            assert_eq!(output, [0.0, 0.0]);
+            assert_eq!(queue.lock().unwrap().samples_len_for_test(), 3);
+        }
+    }
+
+    #[test]
+    fn unsigned_callback_encodes_silence_at_the_format_midpoint() {
+        use cpal::Sample;
+        let queue = queue();
+        let controls = controls();
+        controls.paused.store(true, Ordering::Release);
+        let mut output = [0u16; 2];
+        render_preview_callback(&mut output, 8000, 1, &queue, &controls, u16::from_sample);
+        assert_eq!(output, [u16::from_sample(0.0); 2]);
+        assert_eq!(queue.lock().unwrap().samples_len_for_test(), 3);
+    }
+
+    #[test]
+    fn monitor_reports_poisoned_queue_as_an_error() {
+        let queue = Arc::new(queue());
+        let poisoned = queue.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("simulate producer panic");
+        })
+        .join()
+        .is_err());
+        let queues = Arc::new(Mutex::new(vec![queue]));
+        let (_wake_tx, wake) = mpsc::channel();
+        let (_error_tx, errors) = mpsc::channel();
+        let error = monitor_preview(
+            &controls(),
+            &queues,
+            &wake,
+            &errors,
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            || Ok(()),
+            |_, _, _| panic!("poisoned queue must not report playback"),
+        )
+        .unwrap_err();
+        assert_eq!(error, "Preview queue unavailable");
     }
 }
