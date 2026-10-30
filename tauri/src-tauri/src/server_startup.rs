@@ -1686,6 +1686,67 @@ uvicorn.run(app, host='127.0.0.1', port=int(sys.argv[1]), lifespan='off', log_le
         }
     }
 
+    fn spawn_health_variant(port: u16, mode: &str) -> (tauri::async_runtime::Receiver<CommandEvent>, KillChild) {
+        let app = app();
+        let python = std::env::var("VOICEBOX_TEST_PYTHON").expect("set VOICEBOX_TEST_PYTHON");
+        let script = r#"
+import sys, uvicorn
+mode = sys.argv[2]
+async def app(scope, receive, send):
+    healthy = b'{"status":"healthy","model_loaded":false,"gpu_available":true}'
+    cases = {
+        'healthy': (200, healthy),
+        'other_booleans': (200, b'{"status":"healthy","model_loaded":true,"gpu_available":false}'),
+        'missing': (200, b'{"status":"healthy"}'),
+        'wrong_model_type': (200, b'{"status":"healthy","model_loaded":0,"gpu_available":true}'),
+        'wrong_gpu_type': (200, b'{"status":"healthy","model_loaded":false,"gpu_available":null}'),
+        'unhealthy': (200, b'{"status":"unhealthy","model_loaded":false,"gpu_available":true}'),
+        'malformed': (200, b'{invalid json'),
+        'http_error': (503, healthy),
+    }
+    if mode == 'redirect' and scope['path'] == '/health':
+        await send({'type':'http.response.start', 'status':302, 'headers':[(b'location', b'/healthy')]})
+        await send({'type':'http.response.body', 'body':b''})
+        return
+    status, body = cases.get(mode, (200, healthy))
+    await send({'type':'http.response.start', 'status':status, 'headers':[(b'content-type', b'application/json')]})
+    await send({'type':'http.response.body', 'body':body})
+uvicorn.run(app, host='127.0.0.1', port=int(sys.argv[1]), lifespan='off', log_level='info')
+"#;
+        let (rx, child) = app.shell().command(python)
+            .args(["-u", "-c", script, &port.to_string(), mode])
+            .env("PYTHONDONTWRITEBYTECODE", "1").spawn().unwrap();
+        (rx, KillChild(Some(child)))
+    }
+
+    #[tokio::test]
+    #[ignore = "requires VOICEBOX_TEST_PYTHON with uvicorn installed"]
+    async fn real_uvicorn_health_requires_the_complete_voicebox_schema() {
+        for (mode, expected) in [
+            ("healthy", true), ("other_booleans", true), ("missing", false),
+            ("wrong_model_type", false), ("wrong_gpu_type", false),
+            ("unhealthy", false), ("malformed", false), ("http_error", false),
+        ] {
+            let port = free_port();
+            let (mut rx, _child) = spawn_health_variant(port, mode);
+            assert_eq!(wait_for_startup(&mut rx, Duration::from_secs(10), Some(("127.0.0.1", port)), |_, _| {}).await, Outcome::Ready, "{mode}");
+            let gate = StartGate::default();
+            let permit = gate.try_begin().unwrap();
+            assert_eq!(crate::startup_health_check(port, &permit).await.unwrap(), expected, "{mode}");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires VOICEBOX_TEST_PYTHON with uvicorn installed"]
+    async fn real_uvicorn_redirect_cannot_make_an_unrelated_health_endpoint_look_valid() {
+        let port = free_port();
+        let (mut rx, _child) = spawn_health_variant(port, "redirect");
+        assert_eq!(wait_for_startup(&mut rx, Duration::from_secs(10), Some(("127.0.0.1", port)), |_, _| {}).await, Outcome::Ready);
+        let gate = StartGate::default();
+        let permit = gate.try_begin().unwrap();
+        assert!(!crate::startup_health_check(port, &permit).await.unwrap());
+    }
+
     #[tokio::test]
     #[ignore = "requires VOICEBOX_TEST_PYTHON with uvicorn installed"]
     async fn actual_uvicorn_bind_failure_is_not_ready_through_tauri_shell() {
