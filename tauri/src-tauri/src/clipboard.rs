@@ -341,6 +341,119 @@ pub(crate) mod private_pasteboard_tests {
     }
 
     #[test]
+    fn failed_first_format_preserves_staged_clipboard_and_reports_error() {
+        let board = PrivatePasteboard::new();
+        board.write("staged dictation");
+        let original = snapshot(vec![vec![("com.voicebox.test.one", b"original")]]);
+        let result =
+            unsafe { restore_clipboard_to_with(board.board, &original, None, |_, _, _| false) };
+        assert!(
+            result.is_err(),
+            "a failed format must not be reported as restored"
+        );
+        assert_eq!(board.text().as_deref(), Some("staged dictation"));
+    }
+
+    #[test]
+    fn failed_later_format_does_not_publish_a_partial_snapshot() {
+        let board = PrivatePasteboard::new();
+        board.write("staged dictation");
+        let original = snapshot(vec![vec![
+            ("com.voicebox.test.one", b"first"),
+            ("com.voicebox.test.two", b"second"),
+            ("com.voicebox.test.three", b"third"),
+        ]]);
+        let mut calls = 0;
+        let result = unsafe {
+            restore_clipboard_to_with(board.board, &original, None, |item, data, kind| {
+                calls += 1;
+                if calls == 2 {
+                    false
+                } else {
+                    msg_send![item, setData: data forType: kind]
+                }
+            })
+        };
+        assert!(result.is_err());
+        assert_eq!(calls, 2, "rebuilding must stop at the first failure");
+        assert_eq!(board.text().as_deref(), Some("staged dictation"));
+    }
+
+    #[test]
+    fn clipboard_change_during_rebuild_preserves_newer_content() {
+        let board = PrivatePasteboard::new();
+        let expected = board.write("staged dictation");
+        let original = snapshot(vec![vec![("com.voicebox.test.one", b"original")]]);
+        let mut newer_count = 0;
+        let result = unsafe {
+            restore_clipboard_to_with(
+                board.board,
+                &original,
+                Some(expected),
+                |item, data, kind| {
+                    newer_count = board.write("newer clipboard");
+                    msg_send![item, setData: data forType: kind]
+                },
+            )
+        };
+        assert!(result.is_ok());
+        assert_eq!(board.text().as_deref(), Some("newer clipboard"));
+        assert_eq!(board.change_count(), newer_count);
+        assert_eq!(board.save().item_count(), 1);
+    }
+
+    #[test]
+    fn guarded_restore_format_failure_preserves_owned_staged_content() {
+        let board = PrivatePasteboard::new();
+        let expected = board.write("staged dictation");
+        let original = snapshot(vec![vec![("com.voicebox.test.one", b"original")]]);
+        let result = unsafe {
+            restore_clipboard_to_with(board.board, &original, Some(expected), |_, _, _| false)
+        };
+        assert!(result.unwrap_err().contains("com.voicebox.test.one"));
+        assert_eq!(board.change_count(), expected);
+        assert_eq!(board.text().as_deref(), Some("staged dictation"));
+    }
+
+    #[test]
+    fn stale_guard_never_clears_a_newer_clipboard_for_empty_snapshot() {
+        let board = PrivatePasteboard::new();
+        let expected = board.write("staged dictation");
+        let newer = board.write("newer");
+        let original = snapshot(vec![]);
+        unsafe {
+            restore_clipboard_to_with(board.board, &original, Some(expected), |_, _, _| {
+                panic!("an empty snapshot has no formats to rebuild")
+            })
+        }
+        .unwrap();
+        assert_eq!(board.change_count(), newer);
+        assert_eq!(board.text().as_deref(), Some("newer"));
+    }
+
+    #[test]
+    fn successful_rebuild_publishes_every_format() {
+        let board = PrivatePasteboard::new();
+        board.write("temporary");
+        let original = snapshot(vec![vec![
+            ("com.voicebox.test.one", b"first"),
+            ("com.voicebox.test.two", b"second"),
+        ]]);
+        let mut calls = 0;
+        unsafe {
+            restore_clipboard_to_with(board.board, &original, None, |item, data, kind| {
+                calls += 1;
+                msg_send![item, setData: data forType: kind]
+            })
+        }
+        .unwrap();
+        assert_eq!(calls, 2);
+        let restored = board.save();
+        assert_eq!(data(&restored, 0, "com.voicebox.test.one"), b"first");
+        assert_eq!(data(&restored, 0, "com.voicebox.test.two"), b"second");
+    }
+
+    #[test]
     fn separate_private_pasteboards_do_not_share_contents() {
         let first = PrivatePasteboard::new();
         let second = PrivatePasteboard::new();
@@ -642,17 +755,31 @@ unsafe fn restore_clipboard_to_if_unchanged(
     if current != expected {
         return Ok(());
     }
-    restore_clipboard_to(pb, snapshot)
+    restore_clipboard_to_with(
+        pb,
+        snapshot,
+        Some(expected),
+        |item, data, kind| msg_send![item, setData: data forType: kind],
+    )
 }
 
 #[cfg(target_os = "macos")]
 unsafe fn restore_clipboard_to(pb: Id, snapshot: &ClipboardSnapshot) -> Result<(), String> {
-    let _: i64 = msg_send![pb, clearContents];
+    restore_clipboard_to_with(
+        pb,
+        snapshot,
+        None,
+        |item, data, kind| msg_send![item, setData: data forType: kind],
+    )
+}
 
-    if snapshot.items.is_empty() {
-        return Ok(());
-    }
-
+#[cfg(target_os = "macos")]
+unsafe fn restore_clipboard_to_with(
+    pb: Id,
+    snapshot: &ClipboardSnapshot,
+    expected: Option<i64>,
+    mut set_data: impl FnMut(Id, Id, Id) -> bool,
+) -> Result<(), String> {
     let array: Id = msg_send![class!(NSMutableArray), array];
 
     for pairs in &snapshot.items {
@@ -667,12 +794,26 @@ unsafe fn restore_clipboard_to(pb: Id, snapshot: &ClipboardSnapshot) -> Result<(
                 dataWithBytes: bytes.as_ptr()
                 length: bytes.len()
             ];
-            let _ok: bool = msg_send![item, setData: data forType: ns_type];
+            if !set_data(item, data, ns_type) {
+                return Err(format!("Failed to restore clipboard format: {uti}"));
+            }
         }
 
         let _: () = msg_send![array, addObject: item];
     }
 
+    // Rebuilding can take time; check again just before clearing so a newer
+    // clipboard write during preparation is not replaced by this snapshot.
+    if let Some(expected) = expected {
+        let current: i64 = msg_send![pb, changeCount];
+        if current != expected {
+            return Ok(());
+        }
+    }
+    let _: i64 = msg_send![pb, clearContents];
+    if snapshot.items.is_empty() {
+        return Ok(());
+    }
     let ok: bool = msg_send![pb, writeObjects: array];
     if !ok {
         return Err("NSPasteboard writeObjects: returned NO".into());
