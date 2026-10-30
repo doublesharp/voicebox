@@ -250,35 +250,71 @@ pub fn capture_focus() -> Result<FocusSnapshot, String> {
 /// transcription, trust revoked, cooperative-activation refused) the
 /// caller aborts before clobbering the clipboard.
 #[cfg(target_os = "macos")]
+trait ActivationBackend {
+    type Target;
+    fn target(&self, pid: i32) -> Option<Self::Target>;
+    fn can_yield(&self) -> bool;
+    fn yield_to(&self, target: &Self::Target);
+    fn activate_modern(&self, target: &Self::Target) -> bool;
+    fn activate_legacy(&self, target: &Self::Target) -> bool;
+}
+
+#[cfg(target_os = "macos")]
+struct NativeActivation;
+#[cfg(target_os = "macos")]
+impl ActivationBackend for NativeActivation {
+    type Target = Id;
+    fn target(&self, pid: i32) -> Option<Id> {
+        unsafe {
+            let target: Id = msg_send![class!(NSRunningApplication), runningApplicationWithProcessIdentifier: pid];
+            (!target.is_null()).then_some(target)
+        }
+    }
+    fn can_yield(&self) -> bool {
+        can_yield_activation()
+    }
+    fn yield_to(&self, target: &Id) {
+        unsafe {
+            let current: Id = msg_send![class!(NSRunningApplication), currentApplication];
+            if !current.is_null() {
+                let _: () = msg_send![current, yieldActivationToApplication: *target];
+            }
+        }
+    }
+    fn activate_modern(&self, target: &Id) -> bool {
+        unsafe { msg_send![*target, activate] }
+    }
+    fn activate_legacy(&self, target: &Id) -> bool {
+        // NSApplicationActivateIgnoringOtherApps = 1 << 1 = 2.
+        unsafe { msg_send![*target, activateWithOptions: 2u64] }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn activate_with<B: ActivationBackend>(pid: i32, backend: &B) -> Result<(), String> {
+    let target = backend
+        .target(pid)
+        .ok_or_else(|| format!("No running application for PID {}", pid))?;
+    let activated = if backend.can_yield() {
+        backend.yield_to(&target);
+        backend.activate_modern(&target)
+    } else {
+        backend.activate_legacy(&target)
+    };
+    if !activated {
+        return Err(format!(
+            "NSRunningApplication activate returned false for PID {} — the target may have quit mid-transcription, Accessibility is no longer trusted, or the system refused cooperative activation.",
+            pid
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 pub fn activate_pid(pid: i32) -> Result<(), String> {
     unsafe {
         let _pool = AutoreleasePool::new();
-        let target: Id = msg_send![
-            class!(NSRunningApplication),
-            runningApplicationWithProcessIdentifier: pid
-        ];
-        if target.is_null() {
-            return Err(format!("No running application for PID {}", pid));
-        }
-
-        let activated: bool = if can_yield_activation() {
-            let current: Id = msg_send![class!(NSRunningApplication), currentApplication];
-            if !current.is_null() {
-                let _: () = msg_send![current, yieldActivationToApplication: target];
-            }
-            msg_send![target, activate]
-        } else {
-            // NSApplicationActivateIgnoringOtherApps = 1 << 1 = 2.
-            msg_send![target, activateWithOptions: 2u64]
-        };
-
-        if !activated {
-            return Err(format!(
-                "NSRunningApplication activate returned false for PID {} — the target may have quit mid-transcription, Accessibility is no longer trusted, or the system refused cooperative activation.",
-                pid
-            ));
-        }
-        Ok(())
+        activate_with(pid, &NativeActivation)
     }
 }
 
@@ -567,5 +603,104 @@ mod macos_string_tests {
     #[test]
     fn nonexistent_application_cannot_be_activated() {
         assert!(activate_pid(i32::MAX).is_err());
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod activation_decision_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    struct Backend {
+        target_exists: bool,
+        modern: bool,
+        succeeds: bool,
+        calls: RefCell<Vec<&'static str>>,
+    }
+    impl Backend {
+        fn new(target_exists: bool, modern: bool, succeeds: bool) -> Self {
+            Self {
+                target_exists,
+                modern,
+                succeeds,
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+    }
+    impl ActivationBackend for Backend {
+        type Target = i32;
+        fn target(&self, pid: i32) -> Option<i32> {
+            self.calls.borrow_mut().push("lookup");
+            self.target_exists.then_some(pid)
+        }
+        fn can_yield(&self) -> bool {
+            self.calls.borrow_mut().push("supports");
+            self.modern
+        }
+        fn yield_to(&self, target: &i32) {
+            assert_eq!(*target, 42);
+            self.calls.borrow_mut().push("yield");
+        }
+        fn activate_modern(&self, target: &i32) -> bool {
+            assert_eq!(*target, 42);
+            self.calls.borrow_mut().push("modern");
+            self.succeeds
+        }
+        fn activate_legacy(&self, target: &i32) -> bool {
+            assert_eq!(*target, 42);
+            self.calls.borrow_mut().push("legacy");
+            self.succeeds
+        }
+    }
+
+    #[test]
+    fn missing_target_does_not_attempt_activation() {
+        let backend = Backend::new(false, true, true);
+        assert!(activate_with(42, &backend)
+            .unwrap_err()
+            .contains("No running application for PID 42"));
+        assert_eq!(*backend.calls.borrow(), ["lookup"]);
+    }
+
+    #[test]
+    fn cooperative_activation_yields_before_activating() {
+        let backend = Backend::new(true, true, true);
+        assert_eq!(activate_with(42, &backend), Ok(()));
+        assert_eq!(
+            *backend.calls.borrow(),
+            ["lookup", "supports", "yield", "modern"]
+        );
+    }
+
+    #[test]
+    fn legacy_activation_does_not_use_cooperative_apis() {
+        let backend = Backend::new(true, false, true);
+        assert_eq!(activate_with(42, &backend), Ok(()));
+        assert_eq!(*backend.calls.borrow(), ["lookup", "supports", "legacy"]);
+    }
+
+    #[test]
+    fn refused_activation_is_an_error_on_both_paths() {
+        for modern in [false, true] {
+            let backend = Backend::new(true, modern, false);
+            let error = activate_with(42, &backend).unwrap_err();
+            assert!(error.contains("activate returned false for PID 42"));
+            assert_eq!(
+                backend.calls.borrow().last(),
+                Some(&if modern { "modern" } else { "legacy" })
+            );
+        }
+    }
+
+    #[test]
+    fn nonexistent_pid_has_no_bundle_identity() {
+        assert!(unsafe { bundle_id_for_pid(i32::MAX) }.is_none());
+    }
+
+    #[test]
+    fn cooperative_api_capability_is_stable_across_reads() {
+        let _pool = unsafe { AutoreleasePool::new() };
+        let first = can_yield_activation();
+        assert_eq!(can_yield_activation(), first);
     }
 }
