@@ -81,6 +81,7 @@ pub async fn start_capture(
     state: &AudioCaptureState,
     max_duration_secs: u32,
 ) -> Result<(), String> {
+    super::validate_capture_duration(max_duration_secs)?;
     if !is_supported() {
         return Err("System audio capture requires macOS 12.3 or newer.".to_string());
     }

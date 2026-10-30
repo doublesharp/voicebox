@@ -9,6 +9,7 @@ pub async fn start_capture(
     state: &AudioCaptureState,
     max_duration_secs: u32,
 ) -> Result<(), String> {
+    super::validate_capture_duration(max_duration_secs)?;
     let (capture, mut rx, timeout_tx, done_tx) = state.begin_portable_capture();
     let samples = capture.samples.clone();
     let sample_rate_arc = capture.sample_rate.clone();

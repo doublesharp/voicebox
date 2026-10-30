@@ -1072,7 +1072,22 @@ async fn start_system_audio_capture(
     state: State<'_, audio_capture::AudioCaptureState>,
     max_duration_secs: u32,
 ) -> Result<(), String> {
-    audio_capture::start_capture(&state, max_duration_secs).await
+    start_system_audio_capture_with(max_duration_secs, |duration| {
+        audio_capture::start_capture(&state, duration)
+    })
+    .await
+}
+
+async fn start_system_audio_capture_with<F, Fut>(
+    max_duration_secs: u32,
+    start: F,
+) -> Result<(), String>
+where
+    F: FnOnce(u32) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    audio_capture::validate_capture_duration(max_duration_secs)?;
+    start(max_duration_secs).await
 }
 
 #[command]
@@ -2547,6 +2562,47 @@ mod server_stop_worker_tests {
     }
 }
 
+#[cfg(test)]
+mod capture_duration_regression_tests {
+    use super::start_system_audio_capture_with;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn invalid_capture_durations_are_rejected_before_starting_the_worker() {
+        for duration in [0, 31, 300, u32::MAX] {
+            let calls = AtomicUsize::new(0);
+            let result = start_system_audio_capture_with(duration, |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Ok(()) }
+            }).await;
+            assert!(result.is_err(), "accepted duration {duration}");
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn platform_entry_rejects_invalid_duration_before_touching_capture_state() {
+        let state = super::audio_capture::AudioCaptureState::new();
+        *state.samples.lock().unwrap() = vec![0.25, -0.25];
+        for duration in [0, 31, 300, u32::MAX] {
+            let error = super::audio_capture::start_capture(&state, duration).await.unwrap_err();
+            assert!(error.contains("between 1 and 30"));
+            assert_eq!(*state.samples.lock().unwrap(), [0.25, -0.25]);
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_capture_durations_reach_the_worker_and_preserve_errors() {
+        for duration in [1, 29, 30] {
+            let result = start_system_audio_capture_with(duration, |actual| async move {
+                assert_eq!(actual, duration);
+                Err("worker failure".into())
+            }).await;
+            assert_eq!(result.unwrap_err(), "worker failure");
+        }
+    }
+}
+
 #[cfg(all(test, desktop))]
 mod command_ipc_regression_tests {
     use super::*;
@@ -2669,6 +2725,23 @@ mod command_ipc_regression_tests {
             assert!(invoke(&window, "start_system_audio_capture", InvokeBody::Json(payload), None).is_err());
         }
         assert!(app.state::<audio_capture::AudioCaptureState>().samples.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn out_of_range_capture_duration_is_rejected_over_ipc_before_recording() {
+        let (app, window) = setup();
+        let state = app.state::<audio_capture::AudioCaptureState>();
+        *state.samples.lock().unwrap() = vec![0.25, -0.25];
+        for duration in [0, 31, 300, u32::MAX] {
+            let error = invoke(
+                &window,
+                "start_system_audio_capture",
+                InvokeBody::Json(serde_json::json!({"maxDurationSecs": duration})),
+                None,
+            ).unwrap_err();
+            assert!(error.as_str().unwrap().contains("between 1 and 30"));
+            assert_eq!(*state.samples.lock().unwrap(), [0.25, -0.25]);
+        }
     }
 
     #[cfg(target_os = "macos")]

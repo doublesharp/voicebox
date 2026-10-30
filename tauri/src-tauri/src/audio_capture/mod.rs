@@ -20,6 +20,14 @@ pub use windows::*;
 
 use std::sync::{Arc, Mutex};
 
+/// Voice-profile reference recordings are limited to 30 seconds.
+pub(crate) fn validate_capture_duration(seconds: u32) -> Result<(), String> {
+    if !(1..=30).contains(&seconds) {
+        return Err("System audio capture duration must be between 1 and 30 seconds".into());
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 use screencapturekit::stream::sc_stream::SCStream;
 
