@@ -767,6 +767,28 @@ fn run_session(
     wake: mpsc::Receiver<()>,
     ready: &mut Option<tokio::sync::oneshot::Sender<Result<PlaybackSession, String>>>,
 ) -> Result<(), String> {
+    run_session_with(
+        id,
+        data,
+        ids,
+        controls,
+        wake,
+        ready,
+        |state, position, duration| {
+            emit(app, id, state, position, duration, None);
+        },
+    )
+}
+
+fn run_session_with(
+    id: &str,
+    data: Vec<u8>,
+    ids: Vec<String>,
+    controls: Arc<PlaybackControls>,
+    wake: mpsc::Receiver<()>,
+    ready: &mut Option<tokio::sync::oneshot::Sender<Result<PlaybackSession, String>>>,
+    mut report: impl FnMut(&'static str, f64, f64),
+) -> Result<(), String> {
     let (samples, rate, channels) = decode_audio(data)?;
     let duration = samples.len() as f64 / channels as f64 / rate as f64;
     let samples: Arc<[f32]> = samples.into();
@@ -854,7 +876,7 @@ fn run_session(
     ) {
         return Err("Playback cancelled".into());
     }
-    emit(app, id, "playing", start_position, duration, None);
+    report("playing", start_position, duration);
     monitor_playback(
         &controls,
         &positions,
@@ -862,7 +884,7 @@ fn run_session(
         &error_receiver,
         duration,
         |state, position| {
-            emit(app, id, state, position, duration, None);
+            report(state, position, duration);
         },
     )?;
     drop(streams);
@@ -3159,5 +3181,195 @@ mod pcm_validation_regression_tests {
             assert!(prepare_output_pcm(&samples, 48000, 2, key, &mut cache).is_err());
         }
         assert_eq!(cache.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod clip_session_regression_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn silent_wav(rate: u32, frames: u32) -> Vec<u8> {
+        let mut bytes = Cursor::new(Vec::new());
+        {
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: rate,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut writer = hound::WavWriter::new(&mut bytes, spec).unwrap();
+            for _ in 0..frames {
+                writer.write_sample(0_i16).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+        bytes.into_inner()
+    }
+
+    fn selected_output() -> (String, u32) {
+        let device = cpal::default_host()
+            .default_output_device()
+            .expect("native output device required");
+        (
+            device_id(&device.name().unwrap()),
+            device.default_output_config().unwrap().sample_rate().0,
+        )
+    }
+
+    #[test]
+    fn invalid_audio_fails_before_device_selection_or_ready() {
+        let controls = Arc::new(PlaybackControls::new(0.0, 1.0));
+        let (_wake_tx, wake) = mpsc::channel();
+        let (ready_tx, _ready_rx) = tokio::sync::oneshot::channel();
+        let mut ready = Some(ready_tx);
+        let result = run_session_with(
+            "test",
+            b"not audio".to_vec(),
+            vec!["missing".into()],
+            controls,
+            wake,
+            &mut ready,
+            |_, _, _| panic!("invalid audio reported playback"),
+        );
+        assert!(result.is_err());
+        assert!(ready.is_some());
+    }
+
+    struct Worker {
+        controls: Arc<PlaybackControls>,
+        wake: mpsc::Sender<()>,
+        thread: Option<std::thread::JoinHandle<Result<(), String>>>,
+    }
+    impl Drop for Worker {
+        fn drop(&mut self) {
+            self.controls.stop();
+            let _ = self.wake.send(());
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn launch(
+        data: Vec<u8>,
+        ids: Vec<String>,
+        controls: Arc<PlaybackControls>,
+        ready: tokio::sync::oneshot::Sender<Result<PlaybackSession, String>>,
+    ) -> (Worker, mpsc::Receiver<(&'static str, f64, f64)>) {
+        let (wake_tx, wake_rx) = mpsc::channel();
+        let (event_tx, events) = mpsc::channel();
+        let worker_controls = controls.clone();
+        let thread = std::thread::spawn(move || {
+            let mut ready = Some(ready);
+            run_session_with(
+                "test",
+                data,
+                ids,
+                worker_controls,
+                wake_rx,
+                &mut ready,
+                |state, position, duration| {
+                    let _ = event_tx.send((state, position, duration));
+                },
+            )
+        });
+        (
+            Worker {
+                controls,
+                wake: wake_tx,
+                thread: Some(thread),
+            },
+            events,
+        )
+    }
+
+    #[test]
+    #[ignore = "requires a working native output device; emits silence"]
+    fn native_silent_session_reports_ready_and_completion() {
+        let (id, rate) = selected_output();
+        let controls = Arc::new(PlaybackControls::new(0.0, 1.0));
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let (mut worker, events) = launch(silent_wav(rate, rate / 4), vec![id], controls, sender);
+        let first = events
+            .recv_timeout(Duration::from_secs(6))
+            .expect("playback did not start");
+        assert_eq!(first.0, "playing");
+        let session = receiver.blocking_recv().unwrap().unwrap();
+        assert_eq!(session.session_id, "test");
+        assert!((session.duration - 0.25).abs() < 0.001);
+        loop {
+            let event = events
+                .recv_timeout(Duration::from_secs(6))
+                .expect("playback did not finish");
+            if event.0 == "ended" {
+                assert!((event.1 - session.duration).abs() < 0.001);
+                break;
+            }
+        }
+        worker.thread.take().unwrap().join().unwrap().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires a working native output device; emits silence"]
+    fn native_silent_session_reports_manual_stop() {
+        let (id, rate) = selected_output();
+        let controls = Arc::new(PlaybackControls::new(0.0, 1.0));
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let (mut worker, events) = launch(silent_wav(rate, rate * 3), vec![id], controls, sender);
+        assert_eq!(
+            events.recv_timeout(Duration::from_secs(6)).unwrap().0,
+            "playing"
+        );
+        assert!(receiver.blocking_recv().unwrap().is_ok());
+        worker.controls.stop();
+        worker.wake.send(()).unwrap();
+        loop {
+            let event = events
+                .recv_timeout(Duration::from_secs(6))
+                .expect("stop was not reported");
+            assert_ne!(event.0, "ended");
+            if event.0 == "stopped" {
+                break;
+            }
+        }
+        worker.thread.take().unwrap().join().unwrap().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires a working native output device; emits silence"]
+    fn native_silent_session_abandoned_before_ready_is_cancelled() {
+        let (id, rate) = selected_output();
+        let controls = Arc::new(PlaybackControls::new(0.0, 1.0));
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        drop(receiver);
+        let (mut worker, events) = launch(
+            silent_wav(rate, rate / 4),
+            vec![id],
+            controls.clone(),
+            sender,
+        );
+        let result = worker.thread.take().unwrap().join().unwrap();
+        assert_eq!(result.unwrap_err(), "Playback cancelled");
+        assert!(controls.stopped.load(Ordering::Acquire));
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    #[ignore = "requires native audio device enumeration"]
+    fn native_silent_session_rejects_unavailable_output() {
+        let (_, rate) = selected_output();
+        let controls = Arc::new(PlaybackControls::new(0.0, 1.0));
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let (mut worker, events) = launch(
+            silent_wav(rate, rate / 4),
+            vec!["device_that_does_not_exist".into()],
+            controls,
+            sender,
+        );
+        let result = worker.thread.take().unwrap().join().unwrap();
+        assert!(result.unwrap_err().contains("unavailable"));
+        assert!(receiver.blocking_recv().is_err());
+        assert!(events.try_recv().is_err());
     }
 }
