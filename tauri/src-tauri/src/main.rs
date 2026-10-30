@@ -3802,6 +3802,43 @@ mod server_start_flow_tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn malformed_listener_row_prevents_claiming_healthy_external_server() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = socket.read(&mut chunk).unwrap();
+                assert!(count > 0 && request.len() < 16 * 1024);
+                request.extend_from_slice(&chunk[..count]);
+            }
+            assert!(request.starts_with(b"GET /health "));
+            let body = r#"{"status":"healthy","model_loaded":false,"gpu_available":false}"#;
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let fixture = Fixture::new("exit 42");
+        let probe = fixture.dir.join("listener-probe");
+        std::fs::write(&probe, "#!/bin/sh\nprintf 'COMMAND PID\\nvoicebox-server 123\\nmystery\\n'\n").unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut config = fixture.config();
+        config.port = port;
+        config.discover_listener = true;
+        config.listener_executable = Some(probe);
+        let app = app();
+        let result = tokio::time::timeout(Duration::from_secs(5),
+            start_server_with(app.handle().clone(), app.state(), None, None, config)).await.unwrap().unwrap();
+        assert_eq!(result, format!("http://127.0.0.1:{port}"));
+        assert!(app.state::<ServerState>().server_pid.lock().unwrap().is_none());
+        assert!(app.state::<ServerState>().child.lock().unwrap().is_none());
+        server.join().unwrap();
+    }
+
     fn install_gpu(
         fixture: &Fixture,
         kind: &str,

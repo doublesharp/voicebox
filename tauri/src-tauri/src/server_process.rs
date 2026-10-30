@@ -60,7 +60,9 @@ fn listeners(output: &str) -> impl Iterator<Item = (&str, Option<u32>)> {
     output.lines().skip(1).filter_map(|line| {
         let mut fields = line.split_whitespace();
         let name = fields.next()?;
-        let pid = fields.next()?.parse::<u32>().ok();
+        // Keep incomplete rows as unknown listeners. Dropping one would let a
+        // different row establish ownership despite ambiguous discovery output.
+        let pid = fields.next().and_then(|value| value.parse::<u32>().ok());
         Some((name, pid))
     })
 }
@@ -243,6 +245,45 @@ mod listener_tests {
             classify_listener("COMMAND PID\n\n", false),
             ListenerDecision::Unoccupied
         );
+    }
+
+    #[test]
+    fn incomplete_listener_rows_prevent_process_ownership_and_legacy_cleanup() {
+        let header = "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n";
+        let owned = "voicebox-server 123 user 9u IPv4 1 0t0 TCP localhost:17493 (LISTEN)\n";
+        for malformed in ["mystery\n", "voicebox-server\n", "python   \n"] {
+            for output in [
+                format!("{header}{malformed}{owned}"),
+                format!("{header}{owned}{malformed}"),
+            ] {
+                assert_eq!(
+                    classify_listener(&output, true),
+                    ListenerDecision::ReuseExternal,
+                    "{output:?}"
+                );
+                assert!(legacy_pids(&output, true).is_empty(), "{output:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn incomplete_row_without_health_is_a_conflict() {
+        assert_eq!(
+            classify_listener("COMMAND PID\nunknown\n", false),
+            ListenerDecision::Conflict("unknown".into())
+        );
+    }
+
+    #[test]
+    fn blank_lines_do_not_create_ambiguous_listeners() {
+        let output = format!("\n{}\n  \n", lsof(&[("voicebox-server", "123")]));
+        // lsof emits a header first, followed by blank or listener rows.
+        let output = output.trim_start_matches('\n');
+        assert_eq!(
+            classify_listener(output, true),
+            ListenerDecision::ReuseOwned(123)
+        );
+        assert_eq!(legacy_pids(output, true), vec![123]);
     }
 
     #[test]
