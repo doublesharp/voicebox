@@ -2286,3 +2286,185 @@ mod server_stop_worker_tests {
         assert!(gate.try_begin().is_some());
     }
 }
+
+#[cfg(all(test, desktop))]
+mod command_ipc_regression_tests {
+    use super::*;
+    use tauri::ipc::InvokeBody;
+    use tauri::test::MockRuntime;
+    use tauri::test::{get_ipc_response, mock_builder, mock_context, noop_assets, INVOKE_KEY};
+    use tauri::webview::InvokeRequest;
+
+    fn setup() -> (tauri::App<MockRuntime>, tauri::WebviewWindow<MockRuntime>) {
+        let app = mock_builder()
+            .manage(audio_output::AudioOutputState::new())
+            .manage(HotkeyState::default())
+            .manage(ServerState {
+                start_gate: Arc::new(server_startup::StartGate::default()),
+                child: Mutex::new(None),
+                server_pid: Mutex::new(None),
+                keep_running_on_close: Mutex::new(false),
+                remote: Mutex::new(false),
+                models_dir: Mutex::new(None),
+                backend_override: Mutex::new(None),
+            })
+            .invoke_handler(tauri::generate_handler![
+                append_audio_pcm_stream,
+                finish_audio_pcm_stream,
+                control_audio_playback,
+                stop_audio_playback,
+                disable_hotkey,
+                update_chord_bindings,
+                set_keep_server_running,
+            ])
+            .build(mock_context(noop_assets()))
+            .unwrap();
+        let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        (app, window)
+    }
+
+    fn invoke(
+        window: &tauri::WebviewWindow<MockRuntime>,
+        command: &str,
+        body: InvokeBody,
+        session: Option<&str>,
+    ) -> Result<serde_json::Value, serde_json::Value> {
+        let mut headers = tauri::http::HeaderMap::new();
+        if let Some(value) = session {
+            headers.insert("x-voicebox-session", value.parse().unwrap());
+        }
+        get_ipc_response(
+            window,
+            InvokeRequest {
+                cmd: command.into(),
+                callback: tauri::ipc::CallbackFn(0),
+                error: tauri::ipc::CallbackFn(1),
+                url: "http://tauri.localhost".parse().unwrap(),
+                body,
+                headers,
+                invoke_key: INVOKE_KEY.into(),
+            },
+        )
+        .map(|body| body.deserialize().unwrap())
+    }
+
+    #[test]
+    fn preview_ipc_validates_header_body_and_ended_session() {
+        let (_app, window) = setup();
+        let raw = || InvokeBody::Raw(vec![0, 0]);
+        assert_eq!(
+            invoke(&window, "append_audio_pcm_stream", raw(), None).unwrap_err(),
+            "Missing preview session"
+        );
+        assert_eq!(
+            invoke(
+                &window,
+                "append_audio_pcm_stream",
+                raw(),
+                Some(&"x".repeat(129))
+            )
+            .unwrap_err(),
+            "Missing preview session"
+        );
+        assert_eq!(
+            invoke(
+                &window,
+                "append_audio_pcm_stream",
+                InvokeBody::Json(serde_json::json!({})),
+                Some("old")
+            )
+            .unwrap_err(),
+            "Preview requires binary PCM"
+        );
+        assert_eq!(
+            invoke(&window, "append_audio_pcm_stream", raw(), Some("old")).unwrap_err(),
+            "Preview session has ended"
+        );
+        assert_eq!(
+            invoke(
+                &window,
+                "finish_audio_pcm_stream",
+                InvokeBody::Json(serde_json::json!({"sessionId":"old"})),
+                None
+            )
+            .unwrap_err(),
+            "Preview session has ended"
+        );
+    }
+
+    #[test]
+    fn playback_ipc_rejects_bad_controls_and_allows_idempotent_stop() {
+        let (_app, window) = setup();
+        for control in [
+            serde_json::json!({"volume": 2.0}),
+            serde_json::json!({"position": -1.0}),
+        ] {
+            let body = InvokeBody::Json(serde_json::json!({"sessionId":"old", "control":control}));
+            assert_eq!(
+                invoke(&window, "control_audio_playback", body, None).unwrap_err(),
+                "Invalid playback position or volume"
+            );
+        }
+        let body =
+            InvokeBody::Json(serde_json::json!({"sessionId":"old", "control":{"paused":true}}));
+        assert_eq!(
+            invoke(&window, "control_audio_playback", body, None).unwrap_err(),
+            "Playback session has ended"
+        );
+        assert!(invoke(
+            &window,
+            "stop_audio_playback",
+            InvokeBody::Json(serde_json::json!({"sessionId":"old"})),
+            None
+        )
+        .is_ok());
+        assert!(invoke(
+            &window,
+            "stop_audio_playback",
+            InvokeBody::Json(serde_json::json!({})),
+            None
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn settings_ipc_validates_hotkeys_and_updates_server_preference() {
+        let (app, window) = setup();
+        let body = InvokeBody::Json(serde_json::json!({"pushToTalk":[], "toggleToTalk":["KeyA"]}));
+        assert!(invoke(&window, "update_chord_bindings", body, None)
+            .unwrap_err()
+            .as_str()
+            .unwrap()
+            .contains("at least one key"));
+        let body =
+            InvokeBody::Json(serde_json::json!({"pushToTalk":["KeyA"], "toggleToTalk":["KeyA"]}));
+        assert!(invoke(&window, "update_chord_bindings", body, None)
+            .unwrap_err()
+            .as_str()
+            .unwrap()
+            .contains("must be different"));
+        let body =
+            InvokeBody::Json(serde_json::json!({"pushToTalk":["KeyA"], "toggleToTalk":["KeyB"]}));
+        assert!(invoke(&window, "update_chord_bindings", body, None).is_ok());
+        assert!(invoke(
+            &window,
+            "disable_hotkey",
+            InvokeBody::Json(serde_json::json!({})),
+            None
+        )
+        .is_ok());
+        for keep in [true, false] {
+            let body = InvokeBody::Json(serde_json::json!({"keepRunning":keep}));
+            assert!(invoke(&window, "set_keep_server_running", body, None).is_ok());
+            assert_eq!(
+                *app.state::<ServerState>()
+                    .keep_running_on_close
+                    .lock()
+                    .unwrap(),
+                keep
+            );
+        }
+    }
+}
