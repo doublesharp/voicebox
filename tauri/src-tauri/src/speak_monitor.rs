@@ -681,6 +681,45 @@ mod event_delivery_integration_tests {
     }
 
     #[tokio::test]
+    async fn backlog_delivers_completion_after_many_unrelated_events() {
+        let app = tauri::test::mock_app();
+        let completions = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured = completions.clone();
+        app.listen("dictate:speak-end", move |event| {
+            captured
+                .lock()
+                .unwrap()
+                .push(serde_json::from_str(event.payload()).unwrap());
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/events/speak", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            for _ in 0..64 {
+                socket.write_all(b"event: ping\ndata: {}\n\n").await.unwrap();
+            }
+            socket
+                .write_all(b"event: speak-end\ndata: {\"generation_id\":\"final\",\"status\":\"completed\"}\n\n")
+                .await
+                .unwrap();
+        });
+        assert!(stream_once(&monitor_client().unwrap(), &url, app.handle())
+            .await
+            .unwrap());
+        server.await.unwrap();
+        assert_eq!(
+            *completions.lock().unwrap(),
+            [r#"{"generation_id":"final","status":"completed"}"#.to_string()]
+        );
+    }
+
+    #[tokio::test]
     async fn monitor_reconnects_after_failure_and_delivers_later_events() {
         let app = tauri::test::mock_app();
         let events = Arc::new(Mutex::new(Vec::<(String, String)>::new()));

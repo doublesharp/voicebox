@@ -37,5 +37,6 @@ def publish(kind: str, payload: dict[str, Any]) -> None:
         try:
             queue.put_nowait(event)
         except asyncio.QueueFull:
-            # Slow subscriber — skip rather than block publishers.
-            pass
+            # Keep the newest state for a slow subscriber without blocking publishers.
+            queue.get_nowait()
+            queue.put_nowait(event)
