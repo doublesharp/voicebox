@@ -11,6 +11,7 @@ use screencapturekit::{
 };
 use std::io::Cursor;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -127,21 +128,23 @@ pub async fn start_capture(
     // Create output handler struct
     struct AudioHandler {
         samples: Arc<Mutex<Vec<f32>>>,
+        active: Arc<AtomicBool>,
     }
 
     impl SCStreamOutputTrait for AudioHandler {
         fn did_output_sample_buffer(&self, sample: CMSampleBuffer, _type: SCStreamOutputType) {
             if _type == SCStreamOutputType::Audio {
                 if let Ok(audio_samples) = extract_audio_samples(sample) {
-                    let mut samples_guard = self.samples.lock().unwrap();
-                    samples_guard.extend_from_slice(&audio_samples);
+                    append_capture_samples(&self.samples, &self.active, &audio_samples);
                 }
             }
         }
     }
 
+    let active = Arc::new(AtomicBool::new(true));
     let handler = AudioHandler {
         samples: samples.clone(),
+        active: active.clone(),
     };
 
     // Create stream
@@ -150,9 +153,11 @@ pub async fn start_capture(
     // Add output handler for audio (order: handler, then output_type)
     stream.add_output_handler(handler, SCStreamOutputType::Audio);
 
-    stream
-        .start_capture()
-        .map_err(|e| format!("Failed to start capture: {}", e))?;
+    if let Err(error) = stream.start_capture() {
+        active.store(false, Ordering::Release);
+        return Err(format!("Failed to start capture: {}", error));
+    }
+    *state.capture_active.lock().unwrap() = Some(active.clone());
     *state.stop_tx.lock().unwrap() = Some(tx);
     *state.stream.lock().unwrap() = Some(stream.clone());
 
@@ -161,6 +166,7 @@ pub async fn start_capture(
     tokio::spawn(async move {
         tokio::select! {
             _ = tokio::time::sleep(tokio::time::Duration::from_secs(max_duration_secs as u64)) => {
+                active.store(false, Ordering::Release);
                 let _ = stream_clone.stop_capture();
             }
             _ = rx.recv() => {
@@ -175,6 +181,9 @@ pub async fn start_capture(
 
 pub async fn stop_capture(state: &AudioCaptureState) -> Result<String, String> {
     let _stopping = state.lifecycle.begin_stop()?;
+    if let Some(active) = state.capture_active.lock().unwrap().take() {
+        active.store(false, Ordering::Release);
+    }
     // Signal stop
     if let Some(tx) = state.stop_tx.lock().unwrap().take() {
         let _ = tx.try_send(());
@@ -444,5 +453,76 @@ mod capture_lifecycle_tests {
         let second = CaptureLifecycle::default();
         let _first = first.begin_start().unwrap();
         assert!(second.begin_start().is_ok());
+    }
+}
+
+fn append_capture_samples(samples: &Mutex<Vec<f32>>, active: &AtomicBool, input: &[f32]) {
+    let mut samples = samples.lock().unwrap();
+    if active.load(Ordering::Acquire) {
+        samples.extend_from_slice(input);
+    }
+}
+
+#[cfg(test)]
+mod capture_callback_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn active_callback_appends_samples_in_order() {
+        let samples = Mutex::new(vec![0.1]);
+        let active = AtomicBool::new(true);
+        append_capture_samples(&samples, &active, &[0.2, 0.3]);
+        assert_eq!(*samples.lock().unwrap(), [0.1, 0.2, 0.3]);
+    }
+
+    #[test]
+    fn callback_after_stop_does_not_extend_the_recording() {
+        let samples = Mutex::new(vec![0.1]);
+        let active = AtomicBool::new(false);
+        append_capture_samples(&samples, &active, &[0.9]);
+        assert_eq!(*samples.lock().unwrap(), [0.1]);
+    }
+
+    #[test]
+    fn late_old_callback_cannot_contaminate_a_new_recording() {
+        let samples = Mutex::new(Vec::new());
+        let old = AtomicBool::new(false);
+        let new = AtomicBool::new(true);
+        append_capture_samples(&samples, &new, &[0.2]);
+        append_capture_samples(&samples, &old, &[0.9]);
+        append_capture_samples(&samples, &new, &[0.3]);
+        assert_eq!(*samples.lock().unwrap(), [0.2, 0.3]);
+    }
+
+    #[test]
+    fn stop_while_callback_waits_for_samples_discards_the_late_buffer() {
+        let samples = Arc::new(Mutex::new(vec![0.1]));
+        let active = Arc::new(AtomicBool::new(true));
+        let locked = samples.lock().unwrap();
+        let (started, waiting) = std::sync::mpsc::channel();
+        let worker_samples = samples.clone();
+        let worker_active = active.clone();
+        let worker = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            append_capture_samples(&worker_samples, &worker_active, &[0.9]);
+        });
+        waiting.recv().unwrap();
+        active.store(false, Ordering::Release);
+        drop(locked);
+        worker.join().unwrap();
+        assert_eq!(*samples.lock().unwrap(), [0.1]);
+    }
+
+    #[test]
+    fn independent_sessions_do_not_share_their_active_flags() {
+        let first = AtomicBool::new(false);
+        let second = AtomicBool::new(true);
+        let one = Mutex::new(Vec::new());
+        let two = Mutex::new(Vec::new());
+        append_capture_samples(&one, &first, &[1.0]);
+        append_capture_samples(&two, &second, &[2.0]);
+        assert!(one.lock().unwrap().is_empty());
+        assert_eq!(*two.lock().unwrap(), [2.0]);
     }
 }

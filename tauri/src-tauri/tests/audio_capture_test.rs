@@ -73,4 +73,18 @@ async fn test_system_audio_capture() {
             panic!("Failed to stop capture or get audio data: {}", e);
         }
     }
+    #[cfg(target_os = "macos")]
+    {
+        start_capture(&state, 2)
+            .await
+            .expect("capture should restart after stop");
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        let second = stop_capture(&state)
+            .await
+            .expect("restarted capture should stop");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(second)
+            .unwrap();
+        assert!(!decoded.is_empty());
+    }
 }
