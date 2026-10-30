@@ -3,6 +3,28 @@ use std::time::Duration;
 use tauri::async_runtime::Receiver;
 use tauri_plugin_shell::process::CommandEvent;
 
+/// Prevent overlapping attempts before a spawned child is registered.
+#[derive(Default)]
+pub(crate) struct StartGate(std::sync::atomic::AtomicBool);
+
+pub(crate) struct StartPermit<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl StartGate {
+    pub(crate) fn try_begin(&self) -> Option<StartPermit<'_>> {
+        use std::sync::atomic::Ordering;
+        self.0
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()?;
+        Some(StartPermit(&self.0))
+    }
+}
+
+impl Drop for StartPermit<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Outcome {
     Ready,
@@ -373,5 +395,88 @@ mod tests {
         let mut terminated = false;
         forward_events(&mut rx, |_, _| {}, || terminated = true).await;
         assert!(!terminated);
+    }
+}
+
+#[cfg(test)]
+mod start_gate_tests {
+    use super::StartGate;
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn overlapping_startup_is_rejected_until_the_first_attempt_ends() {
+        let gate = StartGate::default();
+        let first = gate.try_begin().unwrap();
+        assert!(gate.try_begin().is_none());
+        drop(first);
+        assert!(gate.try_begin().is_some());
+    }
+
+    #[test]
+    fn only_one_simultaneous_caller_can_enter() {
+        let gate = Arc::new(StartGate::default());
+        let ready = Arc::new(Barrier::new(3));
+        let finished = Arc::new(Barrier::new(3));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let gate = gate.clone();
+                let ready = ready.clone();
+                let finished = finished.clone();
+                std::thread::spawn(move || {
+                    ready.wait();
+                    let permit = gate.try_begin();
+                    let admitted = permit.is_some();
+                    finished.wait();
+                    admitted
+                })
+            })
+            .collect();
+        ready.wait();
+        finished.wait();
+        assert_eq!(
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .filter(|admitted| *admitted)
+                .count(),
+            1
+        );
+        assert!(gate.try_begin().is_some());
+    }
+
+    #[test]
+    fn failure_unwinds_and_allows_a_retry() {
+        fn failed(gate: &StartGate) -> Result<(), &'static str> {
+            let _permit = gate.try_begin().ok_or("busy")?;
+            Err("spawn failed")
+        }
+        let gate = StartGate::default();
+        assert_eq!(failed(&gate), Err("spawn failed"));
+        assert!(gate.try_begin().is_some());
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_inflight_start_releases_its_permit() {
+        let gate = Arc::new(StartGate::default());
+        let worker_gate = gate.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let worker = tokio::spawn(async move {
+            let _permit = worker_gate.try_begin().unwrap();
+            entered_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        entered_rx.await.unwrap();
+        assert!(gate.try_begin().is_none());
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+        assert!(gate.try_begin().is_some());
+    }
+
+    #[test]
+    fn independent_app_states_do_not_share_a_gate() {
+        let first = StartGate::default();
+        let second = StartGate::default();
+        let _permit = first.try_begin().unwrap();
+        assert!(second.try_begin().is_some());
     }
 }

@@ -274,6 +274,7 @@ fn update_models_dir(stored: &Mutex<Option<String>>, requested: Option<&str>) {
 }
 
 struct ServerState {
+    start_gate: server_startup::StartGate,
     child: Mutex<Option<tauri_plugin_shell::process::CommandChild>>,
     server_pid: Mutex<Option<u32>>,
     keep_running_on_close: Mutex<bool>,
@@ -359,6 +360,7 @@ async fn start_server(
     remote: Option<bool>,
     models_dir: Option<String>,
 ) -> Result<String, String> {
+    let _start_permit = state.start_gate.try_begin().ok_or("The bundled server is still starting. Please try again shortly.")?;
     let is_remote = resolve_remote_setting(&state.remote, remote);
     // Store models_dir for use on restart (empty string means reset to default)
     update_models_dir(&state.models_dir, models_dir.as_deref());
@@ -1408,6 +1410,7 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
         .manage(ServerState {
+            start_gate: server_startup::StartGate::default(),
             child: Mutex::new(None),
             server_pid: Mutex::new(None),
             keep_running_on_close: Mutex::new(false),
