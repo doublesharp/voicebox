@@ -86,3 +86,23 @@ test('hands-free restart replaces a pending microphone request without publishin
   expect(recorders[0].state).toBe('recording');
   expect(createCapture).not.toHaveBeenCalled();
 });
+
+test('a hotkey stop while microphone access is pending cannot begin recording later', async () => {
+  let resolve!: (stream: MediaStream) => void;
+  const pending = new Promise<MediaStream>((r) => { resolve = r; });
+  const track = { stop: mock(() => {}), getSettings: () => ({ deviceId: 'mic' }) };
+  Object.defineProperty(globalThis, 'navigator', { configurable: true, value: { mediaDevices: {
+    getUserMedia: () => pending,
+  } } });
+  client = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+  await act(async () => { tree = create(<QueryClientProvider client={client!}><DictateWindow /></QueryClientProvider>); });
+  await act(async () => { handlers.get('dictate:start')?.({ payload: { focus: null } }); });
+  await act(async () => { handlers.get('dictate:stop')?.({ payload: null }); });
+  await act(async () => {
+    resolve({ getTracks: () => [track], getAudioTracks: () => [track] } as unknown as MediaStream);
+    await Promise.resolve();
+  });
+  expect(track.stop).toHaveBeenCalledTimes(1);
+  expect(recorders).toHaveLength(0);
+  expect(createCapture).not.toHaveBeenCalled();
+});
