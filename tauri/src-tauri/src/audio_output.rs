@@ -906,6 +906,7 @@ fn run_session_on_host<H: ClipHost>(
     let selected = selected_device_indices(&names, &ids)?
         .into_iter()
         .collect::<HashSet<_>>();
+    let selected_names: Vec<String> = selected.iter().map(|&index| names[index].clone()).collect();
     let mut prepared: HashMap<(u32, u16), Arc<[f32]>> = HashMap::new();
     let mut streams = Vec::new();
     let mut positions = Vec::new();
@@ -956,27 +957,51 @@ fn run_session_on_host<H: ClipHost>(
         return Err("Playback cancelled".into());
     }
     report("playing", start_position, duration);
-    monitor_playback(
+    monitor_playback_with_devices(
         &controls,
         &positions,
         &wake,
         &error_receiver,
         duration,
+        || {
+            let available = host
+                .devices()?
+                .iter()
+                .filter_map(|device| host.name(device).ok())
+                .collect::<Vec<_>>();
+            validate_selected_output_routes(&selected_names, &available)
+        },
         |state, position| report(state, position, duration),
     )?;
     drop(streams);
     Ok(())
 }
 
+#[cfg(test)]
 fn monitor_playback(
     controls: &PlaybackControls,
     positions: &[(Arc<RenderPosition>, usize, u32)],
     wake: &mpsc::Receiver<()>,
     errors: &mpsc::Receiver<String>,
     duration: f64,
+    report: impl FnMut(&'static str, f64),
+) -> Result<(), String> {
+    monitor_playback_with_devices(
+        controls, positions, wake, errors, duration, || Ok(()), report,
+    )
+}
+
+fn monitor_playback_with_devices(
+    controls: &PlaybackControls,
+    positions: &[(Arc<RenderPosition>, usize, u32)],
+    wake: &mpsc::Receiver<()>,
+    errors: &mpsc::Receiver<String>,
+    duration: f64,
+    mut check_devices: impl FnMut() -> Result<(), String>,
     mut report: impl FnMut(&'static str, f64),
 ) -> Result<(), String> {
     let mut last_event = Instant::now();
+    let mut last_device_check = Instant::now();
     loop {
         let command = wake.recv_timeout(Duration::from_millis(20)).is_ok();
         let position = if positions[0].0.revision.load(Ordering::Acquire) == controls.revision() {
@@ -985,8 +1010,12 @@ fn monitor_playback(
             controls.requested_position().min(duration)
         };
         if controls.stopped.load(Ordering::Acquire) {
-            report("stopped", position);
+            report("stopped", position.min(duration));
             break;
+        }
+        if last_device_check.elapsed() >= Duration::from_secs(1) {
+            check_devices()?;
+            last_device_check = Instant::now();
         }
         if let Ok(error) = errors.try_recv() {
             return Err(format!("Audio output failed: {error}"));
@@ -1351,6 +1380,24 @@ mod monitor_tests {
         })
         .unwrap();
         assert_eq!(events, vec![("stopped", 0.25)]);
+    }
+
+    #[test]
+    fn clip_monitor_clamps_stopped_position_to_clip_duration() {
+        for frame in [101, 150, 1000] {
+            let controls = PlaybackControls::new(0.0, 1.0);
+            controls.stop();
+            let positions = vec![(position(frame, controls.revision()), frame + 1, 100)];
+            let (wake_tx, wake) = mpsc::channel();
+            let (_error_tx, errors) = mpsc::channel();
+            wake_tx.send(()).unwrap();
+            let mut events = Vec::new();
+            monitor_playback(&controls, &positions, &wake, &errors, 1.0, |state, time| {
+                events.push((state, time));
+            })
+            .unwrap();
+            assert_eq!(events, vec![("stopped", 1.0)]);
+        }
     }
 
     #[test]
@@ -4976,6 +5023,34 @@ mod clip_host_integration_tests {
             } else {
                 assert_eq!(state.started, ["A", "B"]);
             }
+        }
+    }
+
+    #[test]
+    fn clip_playback_stops_on_output_loss_ambiguity_or_enumeration_failure() {
+        for fault in ["missing", "ambiguous", "enumeration"] {
+            let host = Host::new(&["A", "B"]);
+            let (mut worker, ready, _events) = launch(host.clone());
+            wait_ready(ready);
+            {
+                let mut state = host.0.lock().unwrap();
+                match fault {
+                    "missing" => state.names.retain(|name| name != "B"),
+                    "ambiguous" => state.names.push("B".into()),
+                    _ => state.fail_enumeration = true,
+                }
+            }
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !worker.thread.as_ref().unwrap().is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                worker.thread.as_ref().unwrap().is_finished(),
+                "clip playback ignored {fault}"
+            );
+            let error = worker.thread.take().unwrap().join().unwrap().unwrap_err();
+            assert!(!error.is_empty());
+            assert_eq!(host.0.lock().unwrap().dropped.len(), 2);
         }
     }
 
