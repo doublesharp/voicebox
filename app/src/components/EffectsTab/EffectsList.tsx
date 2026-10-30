@@ -23,7 +23,7 @@ export function EffectsList() {
   const setIsCreatingNew = useEffectsStore((s) => s.setIsCreatingNew);
   const isCreatingNew = useEffectsStore((s) => s.isCreatingNew);
 
-  const { data: presets, isLoading } = useQuery({
+  const { data: presets, isLoading, error, refetch } = useQuery({
     queryKey: ['effect-presets'],
     queryFn: () => apiClient.listEffectPresets(),
     staleTime: 30_000,
@@ -46,6 +46,15 @@ export function EffectsList() {
     return (
       <div className="flex items-center justify-center h-full">
         <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+      </div>
+    );
+  }
+
+  if (error && !presets) {
+    return (
+      <div className="p-4 space-y-3">
+        <p role="alert" className="text-sm text-destructive">{error.message}</p>
+        <Button onClick={() => void refetch()}>{t('common.retry', { defaultValue: 'Retry' })}</Button>
       </div>
     );
   }
