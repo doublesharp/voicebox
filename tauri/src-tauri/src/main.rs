@@ -2916,6 +2916,8 @@ mod server_start_flow_tests {
         }
     }
     fn app() -> tauri::App<tauri::test::MockRuntime> {
+        let mut context = tauri::test::mock_context(tauri::test::noop_assets());
+        context.config_mut().version = Some("0.6.0".into());
         tauri::test::mock_builder()
             .plugin(tauri_plugin_shell::init())
             .manage(ServerState {
@@ -2927,7 +2929,7 @@ mod server_start_flow_tests {
                 models_dir: Mutex::new(None),
                 backend_override: Mutex::new(None),
             })
-            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .build(context)
             .unwrap()
     }
 
@@ -3088,7 +3090,10 @@ mod server_start_flow_tests {
                             let mut chunk = [0; 1024];
                             while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
                                 let count = socket.read(&mut chunk).unwrap();
-                                assert!(count > 0, "client closed before completing request headers");
+                                assert!(
+                                    count > 0,
+                                    "client closed before completing request headers"
+                                );
                                 request.extend_from_slice(&chunk[..count]);
                                 assert!(request.len() < 16 * 1024, "request headers too large");
                             }
@@ -3134,6 +3139,77 @@ mod server_start_flow_tests {
                 .is_none());
             assert!(app.state::<ServerState>().child.lock().unwrap().is_none());
             server.join().unwrap();
+        }
+    }
+
+    fn install_gpu(
+        fixture: &Fixture,
+        kind: &str,
+        version: &str,
+        remove_execute_after_probe: bool,
+    ) -> std::path::PathBuf {
+        let directory = fixture.dir.join("data/backends").join(kind);
+        std::fs::create_dir_all(&directory).unwrap();
+        let executable = directory.join(format!("voicebox-server-{kind}"));
+        let chmod = if remove_execute_after_probe {
+            "/bin/chmod 600 \"$0\""
+        } else {
+            ":"
+        };
+        let script = format!("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf probed > probe\n  printf 'voicebox-server {version}\\n'\n  {chmod}\n  exit 0\nfi\nprintf '{kind}\\n%s\\n%s\\n' \"$VOICEBOX_MODELS_DIR\" \"$PWD\" > \"$2/selected\"\nprintf 'INFO: Uvicorn running on http://127.0.0.1:1\\n' >&2\nexec /bin/sleep 5\n");
+        std::fs::write(&executable, script).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        directory
+    }
+
+    #[tokio::test]
+    async fn real_sidecar_selection_honors_pins_versions_and_spawn_fallback() {
+        for (pin, rocm_version, remove_execute, expected, probes) in [
+            (None, "0.6.0", false, "rocm", (true, true)),
+            (Some("cuda"), "0.6.0", false, "cuda", (true, true)),
+            (Some("cpu"), "0.6.0", false, "cpu", (false, false)),
+            (None, "0.5.0", false, "cuda", (true, true)),
+            (None, "0.6.0", true, "cuda", (true, true)),
+            (Some("rocm"), "0.6.0", true, "cpu", (true, true)),
+        ] {
+            let fixture = Fixture::new("printf 'cpu\\n%s\\n' \"$VOICEBOX_MODELS_DIR\" > \"$2/selected\"\nprintf 'INFO: Uvicorn running on http://127.0.0.1:1\\n' >&2\nexec /bin/sleep 5");
+            let rocm = install_gpu(&fixture, "rocm", rocm_version, remove_execute);
+            let cuda = install_gpu(&fixture, "cuda", "0.6.0", false);
+            let app = app();
+            *app.state::<ServerState>().backend_override.lock().unwrap() = pin.map(str::to_owned);
+            let result = tokio::time::timeout(
+                Duration::from_secs(8),
+                start_server_with(
+                    app.handle().clone(),
+                    app.state(),
+                    None,
+                    Some("custom models".into()),
+                    fixture.config(),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(result, format!("http://127.0.0.1:{}", fixture.port));
+            let selected = std::fs::read_to_string(fixture.dir.join("data/selected")).unwrap();
+            let values: Vec<_> = selected.lines().collect();
+            assert_eq!(values[0], expected, "pin={pin:?}, version={rocm_version}");
+            assert_eq!(values[1], "custom models");
+            if expected != "cpu" {
+                assert_eq!(
+                    values[2],
+                    if expected == "rocm" {
+                        rocm.to_str().unwrap()
+                    } else {
+                        cuda.to_str().unwrap()
+                    }
+                );
+            }
+            assert_eq!(
+                (rocm.join("probe").exists(), cuda.join("probe").exists()),
+                probes
+            );
+            stop_server_if_owned(app.state(), None).await.unwrap();
         }
     }
 }
