@@ -56,11 +56,19 @@ export function SampleUpload({ profileId, open, onOpenChange }: SampleUploadProp
   const transcribe = useTranscription();
   const { data: profile } = useProfile(profileId);
   const transcriptionRevision = useRef(0);
+  const uploadRevision = useRef(0);
+  const pendingUpload = useRef<symbol | null>(null);
   const currentContext = useRef({ open, profileId, language: profile?.language });
   currentContext.current = { open, profileId, language: profile?.language };
   useEffect(() => {
     transcriptionRevision.current += 1;
-    return () => { transcriptionRevision.current += 1; };
+    uploadRevision.current += 1;
+    pendingUpload.current = null;
+    return () => {
+      transcriptionRevision.current += 1;
+      uploadRevision.current += 1;
+      pendingUpload.current = null;
+    };
   }, [open, profileId]);
   const { toast } = useToast();
   const [mode, setMode] = useState<'upload' | 'record' | 'system'>('upload');
@@ -191,6 +199,16 @@ export function SampleUpload({ profileId, open, onOpenChange }: SampleUploadProp
   }
 
   async function onSubmit(data: SampleFormValues) {
+    if (pendingUpload.current) return;
+    const request = Symbol('sample upload');
+    pendingUpload.current = request;
+    const revision = uploadRevision.current;
+    const isCurrent = () =>
+      uploadRevision.current === revision &&
+      currentContext.current.open &&
+      currentContext.current.profileId === profileId &&
+      form.getValues('file') === data.file &&
+      form.getValues('referenceText') === data.referenceText;
     try {
       await addSample.mutateAsync({
         profileId,
@@ -198,6 +216,7 @@ export function SampleUpload({ profileId, open, onOpenChange }: SampleUploadProp
         referenceText: data.referenceText,
       });
 
+      if (!isCurrent()) return;
       toast({
         title: 'Sample added',
         description: 'Audio sample has been added successfully.',
@@ -205,17 +224,22 @@ export function SampleUpload({ profileId, open, onOpenChange }: SampleUploadProp
 
       handleOpenChange(false);
     } catch (error) {
+      if (!isCurrent()) return;
       toast({
         title: 'Error',
         description: error instanceof Error ? error.message : 'Failed to add sample',
         variant: 'destructive',
       });
+    } finally {
+      if (pendingUpload.current === request) pendingUpload.current = null;
     }
   }
 
   function handleOpenChange(newOpen: boolean) {
     if (!newOpen) {
       transcriptionRevision.current += 1;
+      uploadRevision.current += 1;
+      pendingUpload.current = null;
       form.reset();
       setMode('upload');
       if (isRecording || isStarting) {

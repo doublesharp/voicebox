@@ -16,12 +16,14 @@ let fail = '',
   profile: any;
 let durationHandler: (file: File) => Promise<number> = async () => duration;
 let transcribeHandler: (arg: any) => Promise<{ text: string }> = async () => ({ text: 'transcribed' });
+let addHandler: (arg: any) => Promise<void> = async () => {};
 const voices = [{ voice_id: 'v1', name: 'Voice One', gender: 'female', language: 'en' }];
 const mutation = (key: string, result?: unknown) => ({
   isPending: false,
   mutateAsync: async (arg: unknown) => {
     calls[key].push(arg);
     if (fail === key) throw new Error(`${key} failed`);
+    if (key === 'add') await addHandler(arg);
     return result;
   },
 });
@@ -141,6 +143,7 @@ afterEach(() => {
   duration = 5;
   durationHandler = async () => duration;
   transcribeHandler = async () => ({ text: 'transcribed' });
+  addHandler = async () => {};
   profile = undefined;
   useUIStore.setState({ profileDialogOpen: false, editingProfileId: null, profileFormDraft: null });
 });
@@ -550,4 +553,83 @@ test('sample upload ignores a transcript after the profile language changes', as
   await act(async () => { view.update(<SampleUpload profileId="p" open onOpenChange={() => {}} />); });
   await act(async () => { resolve({ text: 'English transcript' }); });
   expect(sampleText().props.value).toBe('');
+});
+
+async function submitSampleWithoutWaiting() {
+  await act(async () => {
+    void view.root.findByType('form').props.onSubmit({ preventDefault() {}, persist() {} });
+    await Promise.resolve();
+  });
+}
+
+test('a completed old sample upload cannot clear newer sample edits', async () => {
+  let resolve!: () => void;
+  addHandler = () => new Promise((r) => { resolve = r; });
+  await mountSample();
+  await upload(new File(['a'], 'first.wav', { type: 'audio/wav' }));
+  await editSampleText('First words');
+  await submitSampleWithoutWaiting();
+  expect(calls.add).toHaveLength(1);
+  await upload(new File(['b'], 'second.wav', { type: 'audio/wav' }));
+  await editSampleText('Second words');
+  await act(async () => { resolve(); });
+  expect(view.root.findByType('audio-upload' as never).props.file.name).toBe('second.wav');
+  expect(sampleText().props.value).toBe('Second words');
+});
+
+test('a failed old sample upload does not report an error in a reopened dialog', async () => {
+  let reject!: (error: Error) => void;
+  addHandler = () => new Promise((_resolve, r) => { reject = r; });
+  await mountSample();
+  await upload(new File(['a'], 'first.wav', { type: 'audio/wav' }));
+  await editSampleText('First words');
+  await submitSampleWithoutWaiting();
+  await act(async () => { view.update(<SampleUpload profileId="p" open={false} onOpenChange={() => {}} />); });
+  await act(async () => { view.update(<SampleUpload profileId="p" open onOpenChange={() => {}} />); });
+  await act(async () => { reject(new Error('old upload failed')); });
+  expect(calls.toast.some((item) => item.description === 'old upload failed')).toBe(false);
+});
+
+test('duplicate sample submits while an upload is pending issue one request', async () => {
+  let resolve!: () => void;
+  addHandler = () => new Promise((r) => { resolve = r; });
+  await mountSample();
+  await upload(new File(['a'], 'voice.wav', { type: 'audio/wav' }));
+  await editSampleText('Words');
+  await submitSampleWithoutWaiting();
+  await submitSampleWithoutWaiting();
+  expect(calls.add).toHaveLength(1);
+  await act(async () => { resolve(); });
+});
+
+test('old upload completion cannot unlock a newer dialog upload', async () => {
+  const pending: Array<() => void> = [];
+  addHandler = () => new Promise((resolve) => { pending.push(resolve); });
+  await mountSample();
+  await upload(new File(['a'], 'first.wav', { type: 'audio/wav' }));
+  await editSampleText('First');
+  await submitSampleWithoutWaiting();
+  await act(async () => { view.update(<SampleUpload profileId="p" open={false} onOpenChange={() => {}} />); });
+  await act(async () => { view.update(<SampleUpload profileId="p" open onOpenChange={() => {}} />); });
+  await upload(new File(['b'], 'second.wav', { type: 'audio/wav' }));
+  await editSampleText('Second');
+  await submitSampleWithoutWaiting();
+  expect(calls.add).toHaveLength(2);
+  await act(async () => { pending[0](); });
+  await submitSampleWithoutWaiting();
+  expect(calls.add).toHaveLength(2);
+  expect(sampleText().props.value).toBe('Second');
+  await act(async () => { pending[1](); });
+  expect(calls.toast.some((item) => item.title === 'Sample added')).toBe(true);
+});
+
+test('a current sample upload failure stays visible and retains form data', async () => {
+  addHandler = async () => { throw new Error('upload failed'); };
+  await mountSample();
+  await upload(new File(['a'], 'voice.wav', { type: 'audio/wav' }));
+  await editSampleText('Words');
+  await submit();
+  expect(calls.toast.at(-1)).toEqual(expect.objectContaining({ title: 'Error', description: 'upload failed' }));
+  expect(sampleText().props.value).toBe('Words');
+  expect(view.root.findByType('audio-upload' as never).props.file.name).toBe('voice.wav');
 });
