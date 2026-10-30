@@ -160,5 +160,54 @@ async def test_invalid_json_response_is_logged_without_corrupting_stdout(capsys)
     async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, content=b'not json', headers={'content-type': 'text/plain'}))) as client:
         await proxy._handle_request(client, 'http://voicebox/mcp/', '{"id":1}', {}, [None])
     output = capsys.readouterr()
-    assert output.out == ''
+    reply = json.loads(output.out)
+    assert reply['id'] == 1
+    assert reply['error']['code'] == -32000
     assert 'non-JSON response' in output.err
+
+
+@pytest.mark.asyncio
+async def test_accepted_request_receives_error_instead_of_hanging(capsys):
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(202))) as client:
+        await proxy._handle_request(client, 'http://voicebox/mcp/', '{"jsonrpc":"2.0","id":7,"method":"tools/call"}', {}, [None])
+    reply = json.loads(capsys.readouterr().out)
+    assert reply['id'] == 7
+    assert reply['error']['code'] == -32000
+
+
+@pytest.mark.asyncio
+async def test_failed_initialize_does_not_adopt_error_response_session(capsys):
+    responses = iter([
+        httpx.Response(503, headers={'mcp-session-id': 'invalid-session'}, text='unavailable'),
+        httpx.Response(200, headers={'mcp-session-id': 'valid-session'}, json={'jsonrpc': '2.0', 'id': 2, 'result': {}}),
+    ])
+    seen = []
+    def handler(request):
+        seen.append(request)
+        return next(responses)
+    session = [None]
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await proxy._handle_request(client, 'http://voicebox/mcp/', '{"id":1}', {}, session)
+        await proxy._handle_request(client, 'http://voicebox/mcp/', '{"id":2}', {}, session)
+    assert 'mcp-session-id' not in seen[1].headers
+    assert session == ['valid-session']
+    assert len(capsys.readouterr().out.splitlines()) == 2
+
+
+@pytest.mark.asyncio
+async def test_successful_notification_does_not_emit_an_unsolicited_reply(capsys):
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, json={'result': 'unexpected'}))) as client:
+        await proxy._handle_request(client, 'http://voicebox/mcp/', '{"method":"notifications/initialized"}', {}, [None])
+    assert capsys.readouterr().out == ''
+
+
+@pytest.mark.asyncio
+async def test_notification_does_not_wait_for_an_unexpected_stream_body(capsys):
+    class BlockingStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            raise AssertionError('notification body must not be consumed')
+            yield b''
+    response = httpx.Response(200, headers={'content-type': 'text/event-stream'}, stream=BlockingStream())
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: response)) as client:
+        await proxy._handle_request(client, 'http://voicebox/mcp/', '{"method":"notifications/initialized"}', {}, [None])
+    assert capsys.readouterr().out == ''

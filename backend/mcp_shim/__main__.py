@@ -99,14 +99,14 @@ async def _handle_request(
     async with client.stream(
         "POST", url, headers=req_headers, content=raw.encode("utf-8")
     ) as response:
-        # Capture session id on initialize.
-        if session_id[0] is None:
-            sid = response.headers.get(SESSION_HEADER)
-            if sid:
-                session_id[0] = sid
-
         if response.status_code == 202:
-            return  # notification acknowledged
+            if not is_notification:
+                _write_stdout({
+                    "jsonrpc": "2.0",
+                    "id": message.get("id") if isinstance(message, dict) else None,
+                    "error": {"code": -32000, "message": "Voicebox MCP proxy got HTTP 202 for a request"},
+                })
+            return
         if response.status_code >= 400:
             body = await response.aread()
             _err(
@@ -128,6 +128,15 @@ async def _handle_request(
                 }
             )
             return
+
+        if is_notification:
+            return
+
+        # Only a successful response can establish a session.
+        if session_id[0] is None:
+            sid = response.headers.get(SESSION_HEADER)
+            if sid:
+                session_id[0] = sid
 
         ctype = response.headers.get("content-type", "")
         if ctype.split(";", 1)[0].strip().lower() == "text/event-stream":
@@ -159,6 +168,11 @@ async def _handle_request(
                     f"non-JSON response ({ctype}): "
                     f"{body.decode('utf-8', errors='replace')[:200]}"
                 )
+                _write_stdout({
+                    "jsonrpc": "2.0",
+                    "id": message.get("id") if isinstance(message, dict) else None,
+                    "error": {"code": -32000, "message": "Voicebox MCP proxy received a non-JSON response"},
+                })
 
 
 async def _run() -> int:
