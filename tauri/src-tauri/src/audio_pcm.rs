@@ -115,7 +115,10 @@ pub fn mix_layout_to_stereo(
     if count == 0 || samples.len() % count != 0 {
         return Err("Invalid PCM channel layout".into());
     }
-    let side = std::f32::consts::FRAC_1_SQRT_2;
+    if samples.iter().any(|sample| !sample.is_finite()) {
+        return Err("Audio contains non-finite samples".into());
+    }
+    let side = std::f64::consts::FRAC_1_SQRT_2;
     let mut weights = Vec::with_capacity(count);
     for channel in layout.iter() {
         let pair = if channel == C::FRONT_LEFT {
@@ -172,10 +175,14 @@ pub fn mix_layout_to_stereo(
     for frame in samples.chunks_exact(count) {
         let (mut left, mut right) = (0.0, 0.0);
         for (&sample, &(left_gain, right_gain)) in frame.iter().zip(&weights) {
-            left += sample * left_gain;
-            right += sample * right_gain;
+            left += f64::from(sample) * left_gain;
+            right += f64::from(sample) * right_gain;
         }
-        output.extend([left, right]);
+        let bound = f64::from(f32::MAX);
+        output.extend([
+            left.clamp(-bound, bound) as f32,
+            right.clamp(-bound, bound) as f32,
+        ]);
     }
     Ok(output)
 }
@@ -478,5 +485,65 @@ mod tests {
             |value| value,
         );
         assert_eq!(output, [0.0, 0.0]);
+    }
+}
+
+#[cfg(test)]
+mod stereo_mix_numeric_regression_tests {
+    use super::mix_layout_to_stereo;
+    use symphonia::core::audio::Channels as C;
+
+    fn layout() -> C {
+        C::FRONT_LEFT | C::FRONT_RIGHT | C::FRONT_CENTRE | C::LFE1 | C::REAR_LEFT | C::REAR_RIGHT
+    }
+
+    #[test]
+    fn finite_large_channels_do_not_overflow_during_cancellation() {
+        let max = f32::MAX;
+        let output = mix_layout_to_stereo(&[max, 0.0, max, 0.0, -max, 0.0], layout()).unwrap();
+        assert!(
+            output.iter().all(|sample| sample.is_finite()),
+            "non-finite mix: {output:?}"
+        );
+        assert!(
+            (output[0] / max - 1.0).abs() < 0.00001,
+            "intermediate overflow lost cancellation: {output:?}"
+        );
+    }
+
+    #[test]
+    fn sums_outside_float_range_remain_finite_for_playback() {
+        for extreme in [f32::MAX, -f32::MAX] {
+            let output = mix_layout_to_stereo(
+                &[extreme, extreme, extreme, extreme, extreme, extreme],
+                layout(),
+            )
+            .unwrap();
+            assert!(
+                output.iter().all(|sample| sample.is_finite()),
+                "non-finite mix: {output:?}"
+            );
+            assert_eq!(output, [extreme, extreme]);
+        }
+    }
+
+    #[test]
+    fn nonfinite_input_is_rejected_before_reaching_output() {
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(mix_layout_to_stereo(&[0.0, 0.0, invalid, 0.0, 0.0, 0.0], layout()).is_err());
+        }
+    }
+
+    #[test]
+    fn normal_and_empty_frames_remain_supported() {
+        assert_eq!(
+            mix_layout_to_stereo(&[], layout()).unwrap(),
+            Vec::<f32>::new()
+        );
+        assert_eq!(
+            mix_layout_to_stereo(&[0.25, -0.5, 0.0, 0.0, 0.0, 0.0], layout()).unwrap(),
+            [0.25, -0.5]
+        );
+        assert!(mix_layout_to_stereo(&[0.0], layout()).is_err());
     }
 }

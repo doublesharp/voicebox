@@ -3473,6 +3473,33 @@ mod clip_session_regression_tests {
     }
 
     #[test]
+    #[ignore = "requires a stereo native output device; emits silence"]
+    fn native_silent_surround_clip_completes_on_stereo_output() {
+        let device = cpal::default_host().default_output_device().expect("native output device required");
+        let config = device.default_output_config().unwrap();
+        assert_eq!(config.channels(), 2, "this test requires a stereo output");
+        let rate = config.sample_rate().0;
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        {
+            let spec = hound::WavSpec { channels: 6, sample_rate: rate, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+            let mut writer = hound::WavWriter::new(&mut bytes, spec).unwrap();
+            for _ in 0..rate / 4 * 6 { writer.write_sample(0_i16).unwrap(); }
+            writer.finalize().unwrap();
+        }
+        let controls = Arc::new(PlaybackControls::new(0.0, 1.0));
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let (mut worker, events) = launch(bytes.into_inner(), vec![device_id(&device.name().unwrap())], controls, sender);
+        assert_eq!(events.recv_timeout(Duration::from_secs(6)).unwrap().0, "playing");
+        let session = receiver.blocking_recv().unwrap().unwrap();
+        assert!((session.duration - 0.25).abs() < 0.001);
+        loop {
+            let event = events.recv_timeout(Duration::from_secs(6)).expect("surround clip did not finish");
+            if event.0 == "ended" { assert!((event.1 - session.duration).abs() < 0.001); break; }
+        }
+        worker.thread.take().unwrap().join().unwrap().unwrap();
+    }
+
+    #[test]
     #[ignore = "requires a working native output device; emits silence"]
     fn native_silent_session_reports_ready_and_completion() {
         let (id, rate) = selected_output();
@@ -5460,6 +5487,21 @@ mod multichannel_stereo_regression_tests {
         let input: Arc<[f32]> = vec![0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.5].into();
         let output = prepare_output_pcm_with_layout(&input, 48000, layout, (48000, 2), &mut HashMap::new()).unwrap();
         assert!(output[0] > 0.0 && output[1] == 0.0 && output[2] == 0.0 && output[3] > 0.0, "{output:?}");
+    }
+
+    #[test]
+    fn finite_extreme_float_wave_remains_finite_after_stereo_preparation() {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        {
+            let spec = hound::WavSpec { channels: 6, sample_rate: 48000, bits_per_sample: 32, sample_format: hound::SampleFormat::Float };
+            let mut writer = hound::WavWriter::new(&mut bytes, spec).unwrap();
+            for sample in [f32::MAX, 0.0, f32::MAX, 0.0, -f32::MAX, 0.0] { writer.write_sample(sample).unwrap(); }
+            writer.finalize().unwrap();
+        }
+        let (samples, rate, layout) = decode_audio_with_layout(bytes.into_inner()).unwrap();
+        let output = prepare_output_pcm_with_layout(&samples.into(), rate, layout, (48000, 2), &mut HashMap::new()).unwrap();
+        assert!(output.iter().all(|sample| sample.is_finite()), "decoded mix was non-finite: {output:?}");
+        assert!((output[0] / f32::MAX - 1.0).abs() < 0.00001, "cancellation was lost: {output:?}");
     }
 
     #[test]
