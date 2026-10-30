@@ -580,6 +580,16 @@ fn validate_wave_frame_alignment(data: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_decoded_format(
+    expected: &symphonia::core::audio::SignalSpec,
+    actual: &symphonia::core::audio::SignalSpec,
+) -> Result<(), String> {
+    if expected != actual {
+        return Err("Audio format changes within the file".into());
+    }
+    Ok(())
+}
+
 fn decode_audio(mut data: Vec<u8>) -> Result<(Vec<f32>, u32, usize), String> {
     use symphonia::core::audio::SampleBuffer;
     use symphonia::core::errors::Error;
@@ -616,18 +626,12 @@ fn decode_audio(mut data: Vec<u8>) -> Result<(Vec<f32>, u32, usize), String> {
         .format;
     let track = format.default_track().ok_or("No audio track found")?;
     let track_id = track.id;
-    let rate = track
-        .codec_params
-        .sample_rate
-        .ok_or("Audio sample rate is missing")?;
-    let channels = track
-        .codec_params
-        .channels
-        .ok_or("Audio channel layout is missing")?
-        .count();
-    if rate == 0 || channels == 0 {
+    let rate_hint = track.codec_params.sample_rate;
+    let channel_hint = track.codec_params.channels;
+    if rate_hint == Some(0) || channel_hint.is_some_and(|channels| channels.count() == 0) {
         return Err("Invalid audio sample rate or channels".into());
     }
+    let mut expected_format = None;
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &Default::default())
         .map_err(|error| format!("Unable to decode audio: {error}"))?;
@@ -646,8 +650,19 @@ fn decode_audio(mut data: Vec<u8>) -> Result<(Vec<f32>, u32, usize), String> {
         let decoded = decoder
             .decode(&packet)
             .map_err(|error| format!("Unable to decode audio packet: {error}"))?;
-        if decoded.spec().rate != rate || decoded.spec().channels.count() != channels {
-            return Err("Audio format changes within the file".into());
+        let actual = *decoded.spec();
+        if actual.rate == 0 || actual.channels.count() == 0 {
+            return Err("Invalid audio sample rate or channels".into());
+        }
+        if let Some(expected) = expected_format {
+            validate_decoded_format(&expected, &actual)?;
+        } else {
+            if rate_hint.is_some_and(|rate| rate != actual.rate)
+                || channel_hint.is_some_and(|channels| channels != actual.channels)
+            {
+                return Err("Audio format changes within the file".into());
+            }
+            expected_format = Some(actual);
         }
         let mut buffer = SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
         buffer.copy_interleaved_ref(decoded);
@@ -656,7 +671,8 @@ fn decode_audio(mut data: Vec<u8>) -> Result<(Vec<f32>, u32, usize), String> {
     if samples.is_empty() || samples.iter().any(|sample| !sample.is_finite()) {
         return Err("Audio contains no playable samples".into());
     }
-    Ok((samples, rate, channels))
+    let format = expected_format.ok_or("Audio contains no playable samples")?;
+    Ok((samples, format.rate, format.channels.count()))
 }
 
 fn build_stream<T>(
@@ -5289,4 +5305,79 @@ mod multi_output_failure_tests {
             assert_eq!(guard.samples_len_for_test(), 0);
         }
     }
+}
+
+#[cfg(test)]
+mod decoded_layout_regression_tests {
+    use super::{decode_audio, validate_decoded_format};
+    use symphonia::core::audio::{Channels as C, SignalSpec};
+
+    #[test]
+    fn changing_speaker_positions_with_the_same_channel_count_is_rejected() {
+        for (before, after) in [
+            (C::FRONT_LEFT | C::FRONT_RIGHT, C::FRONT_LEFT | C::FRONT_CENTRE),
+            (C::FRONT_LEFT | C::FRONT_RIGHT, C::REAR_LEFT | C::REAR_RIGHT),
+            (C::FRONT_LEFT | C::FRONT_RIGHT | C::FRONT_CENTRE, C::FRONT_LEFT | C::FRONT_RIGHT | C::LFE1),
+        ] {
+            assert!(validate_decoded_format(&SignalSpec::new(48000, before), &SignalSpec::new(48000, after)).is_err());
+        }
+    }
+
+    #[test]
+    fn ordinary_wave_layouts_still_decode_with_channel_order_intact() {
+        for channels in [1_u16, 2, 3, 4, 6, 8] {
+            let mut output = std::io::Cursor::new(Vec::new());
+            let expected: Vec<i16> = (0..channels).map(|index| (index as i16 + 1) * 1000).collect();
+            {
+                let spec = hound::WavSpec { channels, sample_rate: 48000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+                let mut writer = hound::WavWriter::new(&mut output, spec).unwrap();
+                for sample in &expected { writer.write_sample(*sample).unwrap(); }
+                writer.finalize().unwrap();
+            }
+            let (samples, rate, decoded_channels) = decode_audio(output.into_inner()).unwrap();
+            assert_eq!((rate, decoded_channels), (48000, channels as usize));
+            assert_eq!(samples, expected.into_iter().map(|sample| sample as f32 / 32768.0).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn changing_rate_or_channel_count_is_rejected() {
+        let expected = SignalSpec::new(48000, C::FRONT_LEFT | C::FRONT_RIGHT);
+        for actual in [SignalSpec::new(44100, expected.channels), SignalSpec::new(48000, C::FRONT_LEFT)] {
+            assert!(validate_decoded_format(&expected, &actual).is_err());
+        }
+    }
+
+    #[test]
+    fn unchanged_mono_stereo_and_multichannel_layouts_are_accepted() {
+        for channels in [C::FRONT_LEFT, C::FRONT_LEFT | C::FRONT_RIGHT, C::FRONT_LEFT | C::FRONT_RIGHT | C::FRONT_CENTRE | C::LFE1 | C::REAR_LEFT | C::REAR_RIGHT] {
+            let spec = SignalSpec::new(48000, channels);
+            assert!(validate_decoded_format(&spec, &spec).is_ok());
+        }
+    }
+    #[test]
+    #[ignore = "requires ffmpeg to generate local audio fixtures"]
+    fn ffmpeg_encoded_mono_and_stereo_formats_remain_decodable() {
+        struct FixtureDir(std::path::PathBuf);
+        impl Drop for FixtureDir {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        let root = std::env::var_os("VOICEBOX_AUDIO_FIXTURE_DIR").expect("set VOICEBOX_AUDIO_FIXTURE_DIR to a task-owned Scratch directory");
+        let dir = FixtureDir(std::path::PathBuf::from(root).join(format!("voicebox-formats-{}", std::process::id())));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        for (codec, extension) in [("libmp3lame", "mp3"), ("flac", "flac"), ("vorbis", "ogg"), ("aac", "m4a")] {
+            for (layout, count) in [("mono", 1), ("stereo", 2)] {
+                if codec == "vorbis" && layout == "mono" { continue; }
+                let path = dir.0.join(format!("{codec}-{layout}.{extension}"));
+                let status = std::process::Command::new("ffmpeg")
+                    .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", &format!("anullsrc=r=48000:cl={layout}"), "-t", "0.1", "-strict", "-2", "-c:a", codec])
+                    .arg(&path).status().expect("ffmpeg is required for this opt-in test");
+                assert!(status.success(), "fixture encoding failed: {codec} {layout}");
+                let (samples, rate, channels) = decode_audio(std::fs::read(path).unwrap()).unwrap_or_else(|error| panic!("{codec} {layout}: {error}"));
+                assert_eq!((rate, channels), (48000, count), "{codec} {layout}");
+                assert!(!samples.is_empty() && samples.iter().all(|sample| sample.is_finite()));
+            }
+        }
+    }
+
 }
