@@ -4,6 +4,8 @@ import { useEffect, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { useToast } from '@/components/ui/use-toast';
 import { apiClient } from '@/lib/api/client';
+import { isCurrentServer, requireCurrentServer, type ServerScope } from '@/lib/serverScope';
+import { useServerStore } from '@/stores/serverStore';
 import { SettingRow, SettingSection } from './SettingRow';
 
 // "Log in with browser" device pairing. The backend opens the system browser
@@ -13,10 +15,15 @@ export function CloudSection() {
   const { toast } = useToast();
   const queryClient = useQueryClient();
   const [polling, setPolling] = useState(false);
+  const serverUrl = useServerStore((state) => state.serverUrl);
+  const serverRevision = useServerStore((state) => state.serverRevision);
+  const scope = { serverUrl, serverRevision };
+
+  useEffect(() => { setPolling(false); }, [serverUrl, serverRevision]);
 
   const { data: status } = useQuery({
-    queryKey: ['cloud-status'],
-    queryFn: () => apiClient.getCloudStatus(),
+    queryKey: ['cloud-status', serverUrl, serverRevision],
+    queryFn: () => { requireCurrentServer(scope); return apiClient.getCloudStatus(); },
     refetchInterval: polling ? 2000 : false,
   });
 
@@ -39,6 +46,7 @@ export function CloudSection() {
   useEffect(() => {
     if (!polling) return;
     const timeoutId = window.setTimeout(() => {
+      if (!isCurrentServer(scope)) return;
       setPolling(false);
       toast({
         title: 'Sign-in timed out',
@@ -47,28 +55,32 @@ export function CloudSection() {
       });
     }, 120_000);
     return () => window.clearTimeout(timeoutId);
-  }, [polling, toast]);
+  }, [polling, toast, serverUrl, serverRevision]);
 
   const startLogin = useMutation({
-    mutationFn: () => apiClient.startCloudLogin(),
-    onSuccess: () => {
+    mutationFn: (requestScope: ServerScope) => { requireCurrentServer(requestScope); return apiClient.startCloudLogin(); },
+    onSuccess: (_data, requestScope) => {
+      if (!isCurrentServer(requestScope)) return;
       setPolling(true);
       toast({
         title: 'Continue in your browser',
         description: 'Authorize this device, then return here.',
       });
     },
-    onError: (error: Error) =>
+    onError: (error: Error, requestScope) => {
+      if (!isCurrentServer(requestScope)) return;
       toast({
         title: 'Could not start sign-in',
         description: error.message,
         variant: 'destructive',
-      }),
+      });
+    },
   });
 
   const disconnect = useMutation({
-    mutationFn: () => apiClient.disconnectCloud(),
-    onSuccess: () => {
+    mutationFn: (requestScope: ServerScope) => { requireCurrentServer(requestScope); return apiClient.disconnectCloud(); },
+    onSuccess: (_data, requestScope) => {
+      if (!isCurrentServer(requestScope)) return;
       queryClient.invalidateQueries({ queryKey: ['cloud-status'] });
       toast({
         title: 'Disconnected',
@@ -76,8 +88,10 @@ export function CloudSection() {
           'This device is no longer linked. The key stays valid until revoked in your account.',
       });
     },
-    onError: (error: Error) =>
-      toast({ title: 'Could not disconnect', description: error.message, variant: 'destructive' }),
+    onError: (error: Error, requestScope) => {
+      if (!isCurrentServer(requestScope)) return;
+      toast({ title: 'Could not disconnect', description: error.message, variant: 'destructive' });
+    },
   });
 
   const busy = startLogin.isPending || polling;
@@ -100,7 +114,7 @@ export function CloudSection() {
           connected ? (
             <Button
               disabled={disconnect.isPending}
-              onClick={() => disconnect.mutate()}
+              onClick={() => disconnect.mutate(scope)}
               size="sm"
               variant="outline"
             >
@@ -114,7 +128,7 @@ export function CloudSection() {
               )}
             </Button>
           ) : (
-            <Button disabled={busy} onClick={() => startLogin.mutate()} size="sm">
+            <Button disabled={busy} onClick={() => startLogin.mutate(scope)} size="sm">
               {busy ? (
                 <>
                   <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />
