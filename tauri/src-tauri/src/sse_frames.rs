@@ -8,7 +8,7 @@ pub(crate) struct FrameBuffer {
     buf: Vec<u8>,
     line_start: usize,
     skip_lf: bool,
-    completed_frame: bool,
+    completed_frames: u64,
 }
 
 impl FrameBuffer {
@@ -27,7 +27,7 @@ impl FrameBuffer {
                         std::io::Error::new(std::io::ErrorKind::InvalidData, error)
                     })?;
                     if !self.buf.is_empty() {
-                        self.completed_frame = true;
+                        self.completed_frames = self.completed_frames.saturating_add(1);
                     }
                     if let Some(event) = parse_frame(frame) {
                         result.push(event);
@@ -47,7 +47,11 @@ impl FrameBuffer {
     }
 
     pub(crate) fn has_complete_frame(&self) -> bool {
-        self.completed_frame
+        self.completed_frames > 0
+    }
+
+    pub(crate) fn completed_frames(&self) -> u64 {
+        self.completed_frames
     }
 
     fn push_byte(&mut self, byte: u8) -> Result<(), std::io::Error> {
@@ -84,6 +88,24 @@ fn parse_frame(frame: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::FrameBuffer;
+
+    #[test]
+    fn frame_progress_counts_only_complete_nonempty_frames() {
+        let mut buffer = FrameBuffer::default();
+        assert_eq!(buffer.completed_frames(), 0);
+        buffer.push(b"\n\r\n").unwrap();
+        assert_eq!(buffer.completed_frames(), 0);
+        buffer.push(b": pi").unwrap();
+        assert_eq!(buffer.completed_frames(), 0);
+        buffer.push(b"ng\n\n").unwrap();
+        assert_eq!(buffer.completed_frames(), 1);
+        buffer
+            .push(b"event: speak-end\ndata: done\n\n: ping\n\n")
+            .unwrap();
+        assert_eq!(buffer.completed_frames(), 3);
+        buffer.push(b"event: speak-start\ndata: partial").unwrap();
+        assert_eq!(buffer.completed_frames(), 3);
+    }
 
     #[test]
     fn accepts_lf_and_crlf_frames_and_multiple_events() {

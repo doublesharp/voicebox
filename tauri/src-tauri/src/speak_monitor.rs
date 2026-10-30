@@ -23,8 +23,8 @@
 //! The idle timeout guards against the worst silent-failure mode: a
 //! backend that accepts the TCP connection but stops producing frames
 //! (deadlocked SSE endpoint, zombie process). Without a timeout the
-//! `chunk().await` blocks forever and the task never notices. The
-//! backend emits a `:ping` comment every 15 s, so 45 s without any data
+//! a read loop can wait forever and the task never notices. The
+//! backend emits a `:ping` comment every 15 s, so 45 s without a complete frame
 //! is a reliable signal the stream is dead.
 
 use std::time::Duration;
@@ -152,20 +152,24 @@ async fn stream_once_with(
         return Err("speak_monitor: backend did not return an event stream".into());
     }
     let mut buf = FrameBuffer::default();
+    let mut deadline = tokio::time::Instant::now() + idle_timeout;
     loop {
-        let chunk = match tokio::time::timeout(idle_timeout, resp.chunk()).await {
+        let chunk = match tokio::time::timeout_at(deadline, resp.chunk()).await {
             Ok(Ok(Some(chunk))) => chunk,
             Ok(Ok(None)) => return Ok(buf.has_complete_frame()),
             Ok(Err(e)) => return Err(Box::new(e)),
-            Err(_) => {
-                return Err(format!(
-                    "no data for {:?} (heartbeat should arrive every 15 s)",
-                    idle_timeout
-                )
-                .into())
-            }
+            Err(_) => return Err(format!(
+                "no data forming a complete frame for {:?} (heartbeat should arrive every 15 s)",
+                idle_timeout
+            )
+            .into()),
         };
-        for (event, data) in buf.push(&chunk)? {
+        let previous_frames = buf.completed_frames();
+        let events = buf.push(&chunk)?;
+        if buf.completed_frames() != previous_frames {
+            deadline = tokio::time::Instant::now() + idle_timeout;
+        }
+        for (event, data) in events {
             on_event(&event, &data);
         }
     }
@@ -429,8 +433,18 @@ mod tests {
                 let _ = stream.read(&mut request).await;
                 stream.write_all(payload.as_bytes()).await.unwrap();
             });
-            let productive = stream_once_with(&reqwest::Client::new(), &url, Duration::from_secs(1), |_, _| panic!("incomplete event dispatched")).await.unwrap();
-            assert!(!productive, "partial or empty frames must not reset retry backoff");
+            let productive = stream_once_with(
+                &reqwest::Client::new(),
+                &url,
+                Duration::from_secs(1),
+                |_, _| panic!("incomplete event dispatched"),
+            )
+            .await
+            .unwrap();
+            assert!(
+                !productive,
+                "partial or empty frames must not reset retry backoff"
+            );
             task.await.unwrap();
         }
     }
@@ -438,7 +452,14 @@ mod tests {
     #[tokio::test]
     async fn a_complete_heartbeat_is_a_productive_connection() {
         let (url, task) = serve(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n: ping\n\n", Duration::ZERO).await;
-        let productive = stream_once_with(&reqwest::Client::new(), &url, Duration::from_secs(1), |_, _| panic!("heartbeat dispatched")).await.unwrap();
+        let productive = stream_once_with(
+            &reqwest::Client::new(),
+            &url,
+            Duration::from_secs(1),
+            |_, _| panic!("heartbeat dispatched"),
+        )
+        .await
+        .unwrap();
         assert!(productive);
         task.await.unwrap();
     }
@@ -453,11 +474,27 @@ mod tests {
             let _ = stream.read(&mut request).await;
             stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: Text/Event-Stream; charset=utf-8\r\nConnection: close\r\n\r\nevent: speak-start\ndata: \xe2").await.unwrap();
             tokio::time::sleep(Duration::from_millis(5)).await;
-            stream.write_all(b"\x82\xac\n\nevent: speak-end\ndata: done\n\n").await.unwrap();
+            stream
+                .write_all(b"\x82\xac\n\nevent: speak-end\ndata: done\n\n")
+                .await
+                .unwrap();
         });
         let mut events = Vec::new();
-        assert!(stream_once_with(&reqwest::Client::new(), &url, Duration::from_secs(1), |event, data| events.push((event.to_string(), data.to_string()))).await.unwrap());
-        assert_eq!(events, [("speak-start".into(), "€".into()), ("speak-end".into(), "done".into())]);
+        assert!(stream_once_with(
+            &reqwest::Client::new(),
+            &url,
+            Duration::from_secs(1),
+            |event, data| events.push((event.to_string(), data.to_string()))
+        )
+        .await
+        .unwrap());
+        assert_eq!(
+            events,
+            [
+                ("speak-start".into(), "€".into()),
+                ("speak-end".into(), "done".into())
+            ]
+        );
         task.await.unwrap();
     }
 
@@ -465,8 +502,121 @@ mod tests {
     async fn event_followed_by_partial_frame_is_productive_without_dispatching_partial_data() {
         let (url, task) = serve(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\nevent: speak-end\ndata: done\n\nevent: speak-start\ndata: incomplete", Duration::ZERO).await;
         let mut events = Vec::new();
-        assert!(stream_once_with(&reqwest::Client::new(), &url, Duration::from_secs(1), |event, data| events.push((event.to_string(), data.to_string()))).await.unwrap());
+        assert!(stream_once_with(
+            &reqwest::Client::new(),
+            &url,
+            Duration::from_secs(1),
+            |event, data| events.push((event.to_string(), data.to_string()))
+        )
+        .await
+        .unwrap());
         assert_eq!(events, [("speak-end".into(), "done".into())]);
         task.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod progress_timeout_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn trickle(
+        parts: Vec<&'static [u8]>,
+        delay: Duration,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/events/speak", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).await;
+            if stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").await.is_err() { return; }
+            for part in parts {
+                if stream.write_all(part).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(delay).await;
+            }
+        });
+        (url, task)
+    }
+
+    #[tokio::test]
+    async fn partial_bytes_cannot_keep_a_dead_stream_alive() {
+        for part in [b"x".as_slice(), b"\n".as_slice()] {
+            let (url, task) = trickle(vec![part; 30], Duration::from_millis(30)).await;
+            let result = tokio::time::timeout(
+                Duration::from_millis(550),
+                stream_once_with(
+                    &reqwest::Client::new(),
+                    &url,
+                    Duration::from_millis(200),
+                    |_, _| panic!("incomplete frame dispatched"),
+                ),
+            )
+            .await;
+            task.abort();
+            let result =
+                result.expect("partial bytes kept the stream alive beyond the frame deadline");
+            assert!(result.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_heartbeats_extend_the_deadline_and_later_event_is_delivered() {
+        let mut parts = vec![b": ping\n\n".as_slice(); 8];
+        parts.push(b"event: speak-end\ndata: done\n\n");
+        let (url, task) = trickle(parts, Duration::from_millis(40)).await;
+        let mut events = Vec::new();
+        let result = stream_once_with(
+            &reqwest::Client::new(),
+            &url,
+            Duration::from_millis(200),
+            |event, data| events.push((event.to_owned(), data.to_owned())),
+        )
+        .await;
+        task.await.unwrap();
+        assert!(result.unwrap());
+        assert_eq!(events, [("speak-end".into(), "done".into())]);
+    }
+
+    #[tokio::test]
+    async fn partial_event_after_a_heartbeat_still_times_out() {
+        let mut parts = vec![b": ping\n\n".as_slice()];
+        parts.extend(vec![b"x".as_slice(); 30]);
+        let (url, task) = trickle(parts, Duration::from_millis(30)).await;
+        let result = tokio::time::timeout(
+            Duration::from_millis(550),
+            stream_once_with(
+                &reqwest::Client::new(),
+                &url,
+                Duration::from_millis(200),
+                |_, _| panic!("partial frame dispatched"),
+            ),
+        )
+        .await;
+        task.abort();
+        assert!(result.expect("trickle prevented timeout").is_err());
+    }
+
+    #[tokio::test]
+    async fn fragmented_event_completes_before_deadline() {
+        let (url, task) = trickle(
+            vec![b"event: speak-", b"start\ndata: ", b"hello\n\n"],
+            Duration::from_millis(25),
+        )
+        .await;
+        let mut events = Vec::new();
+        assert!(stream_once_with(
+            &reqwest::Client::new(),
+            &url,
+            Duration::from_millis(200),
+            |event, data| events.push((event.to_owned(), data.to_owned()))
+        )
+        .await
+        .unwrap());
+        task.await.unwrap();
+        assert_eq!(events, [("speak-start".into(), "hello".into())]);
     }
 }
