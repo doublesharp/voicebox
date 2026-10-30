@@ -3,11 +3,14 @@ import type { FileFilter, PlatformFilesystem, SaveFileResult } from '@/platform/
 export const tauriFilesystem: PlatformFilesystem = {
   async saveFile(filename: string, blob: Blob, filters?: FileFilter[]) {
     const { invoke } = await import('@tauri-apps/api/core');
-    const bytes = Array.from(new Uint8Array(await blob.arrayBuffer()));
-    return invoke<SaveFileResult>('publish_file_bytes', {
-      filename,
-      filters: filters || [],
-      bytes,
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    // Webview header transports require ASCII, including for Unicode names.
+    const metadata = JSON.stringify({ filename, filters: filters || [] }).replace(
+      /[\u007f-\uffff]/g,
+      (character) => `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`,
+    );
+    return invoke<SaveFileResult>('publish_file_bytes', bytes, {
+      headers: { 'x-voicebox-export': metadata },
     });
   },
 

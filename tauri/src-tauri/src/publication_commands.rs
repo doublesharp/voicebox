@@ -18,8 +18,8 @@ pub struct SaveResult {
     path: Option<String>,
 }
 
-fn choose(
-    app: &AppHandle,
+fn choose<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     filename: &str,
     filters: &[FileFilter],
 ) -> Result<Option<PathBuf>, String> {
@@ -85,13 +85,52 @@ async fn run_on_worker(
         .map_err(|e| e.to_string())?
 }
 
-#[tauri::command]
-pub async fn publish_file_bytes(
-    app: AppHandle,
+#[derive(Deserialize)]
+struct ExportMetadata {
+    filename: String,
+    filters: Vec<FileFilter>,
+}
+
+#[derive(Deserialize)]
+struct LegacyBytesRequest {
     filename: String,
     filters: Vec<FileFilter>,
     bytes: Vec<u8>,
+}
+
+fn read_export_bytes(
+    body: &tauri::ipc::InvokeBody,
+    metadata: Option<&str>,
+) -> Result<(String, Vec<FileFilter>, Vec<u8>), String> {
+    match body {
+        tauri::ipc::InvokeBody::Raw(bytes) => {
+            let metadata = metadata
+                .filter(|value| value.len() <= 16 * 1024)
+                .ok_or("Missing or oversized export metadata")?;
+            let metadata: ExportMetadata =
+                serde_json::from_str(metadata).map_err(|_| "Invalid export metadata")?;
+            Ok((metadata.filename, metadata.filters, bytes.clone()))
+        }
+        tauri::ipc::InvokeBody::Json(body) => {
+            let legacy: LegacyBytesRequest = serde_json::from_value(body.clone())
+                .map_err(|_| "Invalid legacy export request")?;
+            Ok((legacy.filename, legacy.filters, legacy.bytes))
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn publish_file_bytes<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    request: tauri::ipc::Request<'_>,
 ) -> Result<SaveResult, String> {
+    let (filename, filters, bytes) = read_export_bytes(
+        request.body(),
+        request
+            .headers()
+            .get("x-voicebox-export")
+            .and_then(|value| value.to_str().ok()),
+    )?;
     run_on_worker(
         move || choose(&app, &filename, &filters),
         move || Ok(Box::new(io::Cursor::new(bytes))),
@@ -100,8 +139,8 @@ pub async fn publish_file_bytes(
 }
 
 #[tauri::command]
-pub async fn publish_file_url(
-    app: AppHandle,
+pub async fn publish_file_url<R: tauri::Runtime>(
+    app: AppHandle<R>,
     filename: String,
     filters: Vec<FileFilter>,
     url: String,
@@ -671,5 +710,187 @@ mod export_flow_tests {
         }
         assert!(suggested_filename("", 123).is_err());
         assert!(suggested_filename("/", 123).is_err());
+    }
+}
+
+#[cfg(test)]
+mod binary_export_request_tests {
+    use super::*;
+    use tauri::ipc::InvokeBody;
+
+    #[test]
+    fn binary_request_preserves_bytes_and_unicode_metadata() {
+        let raw = InvokeBody::Raw(vec![0, 1, 127, 128, 255]);
+        let metadata = r#"{"filename":"caf\u00e9 \ud83c\udf99.wav","filters":[{"name":"\u97f3\u58f0","extensions":["wav"]}]}"#;
+        let (filename, filters, bytes) = read_export_bytes(&raw, Some(metadata)).unwrap();
+        assert_eq!(filename, "café 🎙.wav");
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].name, "音声");
+        assert_eq!(filters[0].extensions, ["wav"]);
+        assert_eq!(bytes, [0, 1, 127, 128, 255]);
+    }
+
+    #[test]
+    fn legacy_json_requests_remain_supported() {
+        let body = InvokeBody::Json(
+            serde_json::json!({"filename":"voice.wav","filters":[],"bytes":[0,255,42]}),
+        );
+        let (filename, filters, bytes) = read_export_bytes(&body, None).unwrap();
+        assert_eq!(filename, "voice.wav");
+        assert!(filters.is_empty());
+        assert_eq!(bytes, [0, 255, 42]);
+    }
+
+    #[test]
+    fn binary_request_rejects_missing_invalid_or_oversized_metadata() {
+        let body = InvokeBody::Raw(vec![1, 2]);
+        for metadata in [None, Some(""), Some("not json"), Some("{}"), Some("x")] {
+            assert!(read_export_bytes(&body, metadata).is_err());
+        }
+        assert!(read_export_bytes(&body, Some(&"x".repeat(16 * 1024 + 1))).is_err());
+    }
+
+    #[test]
+    fn malformed_legacy_requests_are_rejected() {
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"filename":"x","filters":[],"bytes":[256]}),
+            serde_json::json!({"filename":"x","filters":[],"bytes":"not bytes"}),
+        ] {
+            assert!(read_export_bytes(&InvokeBody::Json(value), None).is_err());
+        }
+    }
+
+    #[test]
+    fn empty_binary_file_and_no_filters_are_preserved() {
+        let body = InvokeBody::Raw(vec![]);
+        let (name, filters, bytes) =
+            read_export_bytes(&body, Some(r#"{"filename":"empty.txt","filters":[]}"#)).unwrap();
+        assert_eq!(name, "empty.txt");
+        assert!(filters.is_empty());
+        assert!(bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn binary_request_reaches_worker_and_publishes_exact_bytes() {
+        let directory =
+            std::env::temp_dir().join(format!("voicebox-binary-export-{}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let cleanup = Cleanup(directory.clone());
+        let target = directory.join("export.bin");
+        let bytes: Vec<u8> = (0..=255).cycle().take(1_048_576).collect();
+        let body = InvokeBody::Raw(bytes.clone());
+        let (_, _, parsed) =
+            read_export_bytes(&body, Some(r#"{"filename":"export.bin","filters":[]}"#)).unwrap();
+        let selected = target.clone();
+        let result = run_on_worker(
+            move || Ok(Some(selected)),
+            move || Ok(Box::new(io::Cursor::new(parsed))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.status, "saved");
+        assert_eq!(result.path.as_deref(), target.to_str());
+        assert_eq!(std::fs::read(&target).unwrap(), bytes);
+        drop(cleanup);
+    }
+
+    #[test]
+    fn production_command_rejects_invalid_ipc_before_opening_dialog() {
+        use tauri::test::{get_ipc_response, INVOKE_KEY};
+        use tauri::webview::InvokeRequest;
+        let app = tauri::test::mock_builder()
+            .invoke_handler(tauri::generate_handler![publish_file_bytes])
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        for body in [
+            InvokeBody::Raw(vec![1]),
+            InvokeBody::Json(serde_json::json!({"filename":"x"})),
+        ] {
+            let result = get_ipc_response(
+                &window,
+                InvokeRequest {
+                    cmd: "publish_file_bytes".into(),
+                    callback: tauri::ipc::CallbackFn(0),
+                    error: tauri::ipc::CallbackFn(1),
+                    url: "http://tauri.localhost".parse().unwrap(),
+                    body,
+                    headers: tauri::http::HeaderMap::new(),
+                    invoke_key: INVOKE_KEY.into(),
+                },
+            );
+            assert!(result.is_err());
+        }
+    }
+
+    #[tauri::command]
+    fn inspect_export_request(
+        request: tauri::ipc::Request<'_>,
+    ) -> Result<serde_json::Value, String> {
+        let (filename, filters, bytes) = read_export_bytes(
+            request.body(),
+            request
+                .headers()
+                .get("x-voicebox-export")
+                .and_then(|value| value.to_str().ok()),
+        )?;
+        Ok(serde_json::json!({"filename": filename, "filters": filters.len(), "bytes": bytes}))
+    }
+
+    #[test]
+    fn tauri_ipc_delivers_binary_headers_and_legacy_json_to_the_parser() {
+        use tauri::test::{get_ipc_response, INVOKE_KEY};
+        use tauri::webview::InvokeRequest;
+        let app = tauri::test::mock_builder()
+            .invoke_handler(tauri::generate_handler![inspect_export_request])
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        let invoke = |body, metadata: Option<&str>| {
+            let mut headers = tauri::http::HeaderMap::new();
+            if let Some(metadata) = metadata {
+                headers.insert("x-voicebox-export", metadata.parse().unwrap());
+            }
+            get_ipc_response(
+                &window,
+                InvokeRequest {
+                    cmd: "inspect_export_request".into(),
+                    callback: tauri::ipc::CallbackFn(0),
+                    error: tauri::ipc::CallbackFn(1),
+                    url: "http://tauri.localhost".parse().unwrap(),
+                    body,
+                    headers,
+                    invoke_key: INVOKE_KEY.into(),
+                },
+            )
+            .map(|body| body.deserialize::<serde_json::Value>().unwrap())
+        };
+        let metadata = r#"{"filename":"caf\u00e9.wav","filters":[]}"#;
+        assert_eq!(
+            invoke(InvokeBody::Raw(vec![0, 128, 255]), Some(metadata)).unwrap(),
+            serde_json::json!({"filename":"café.wav", "filters":0, "bytes":[0,128,255]})
+        );
+        assert_eq!(
+            invoke(
+                InvokeBody::Json(
+                    serde_json::json!({"filename":"old.wav","filters":[],"bytes":[42]})
+                ),
+                None
+            )
+            .unwrap(),
+            serde_json::json!({"filename":"old.wav", "filters":0, "bytes":[42]})
+        );
+        assert!(invoke(InvokeBody::Raw(vec![1]), None).is_err());
     }
 }
