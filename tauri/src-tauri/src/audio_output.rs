@@ -693,10 +693,19 @@ fn prepare_output_pcm(
     key: (u32, u16),
     prepared: &mut HashMap<(u32, u16), Arc<[f32]>>,
 ) -> Result<Arc<[f32]>, String> {
+    let source_channels = u16::try_from(channels).map_err(|_| "Invalid PCM channel count")?;
+    if rate == 0
+        || source_channels == 0
+        || key.0 == 0
+        || key.1 == 0
+        || samples.len() % channels != 0
+    {
+        return Err("Invalid PCM sample rate, channel count, or incomplete frame".into());
+    }
     if let Some(pcm) = prepared.get(&key) {
         return Ok(pcm.clone());
     }
-    let pcm: Arc<[f32]> = if key == (rate, channels as u16) {
+    let pcm: Arc<[f32]> = if key == (rate, source_channels) {
         samples.clone()
     } else {
         convert_channels(
@@ -3092,5 +3101,63 @@ mod native_silent_output_tests {
         assert!(errors.try_recv().is_err());
         controls.stop();
         drop(stream);
+    }
+}
+
+#[cfg(test)]
+mod pcm_validation_regression_tests {
+    use super::*;
+
+    #[test]
+    fn matching_stereo_format_rejects_incomplete_frames() {
+        let samples: Arc<[f32]> = vec![0.1, 0.2, 0.3].into();
+        let mut cache = HashMap::new();
+        assert!(prepare_output_pcm(&samples, 48000, 2, (48000, 2), &mut cache).is_err());
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn matching_zero_rate_is_rejected_without_caching() {
+        let samples: Arc<[f32]> = vec![0.1].into();
+        let mut cache = HashMap::new();
+        assert!(prepare_output_pcm(&samples, 0, 1, (0, 1), &mut cache).is_err());
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn matching_zero_channels_is_rejected_without_caching() {
+        let samples: Arc<[f32]> = vec![0.1].into();
+        let mut cache = HashMap::new();
+        assert!(prepare_output_pcm(&samples, 48000, 0, (48000, 0), &mut cache).is_err());
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn source_channel_count_cannot_wrap_into_a_different_output_layout() {
+        let samples: Arc<[f32]> = vec![0.1].into();
+        let mut cache = HashMap::new();
+        assert!(prepare_output_pcm(&samples, 48000, 65537, (48000, 1), &mut cache).is_err());
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn cached_output_does_not_mask_an_invalid_source_format() {
+        let valid: Arc<[f32]> = vec![0.1, 0.2].into();
+        let incomplete: Arc<[f32]> = vec![0.1].into();
+        let mut cache = HashMap::new();
+        prepare_output_pcm(&valid, 48000, 2, (48000, 2), &mut cache).unwrap();
+        assert!(prepare_output_pcm(&incomplete, 48000, 2, (48000, 2), &mut cache).is_err());
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn invalid_output_dimensions_fail_even_when_other_formats_are_cached() {
+        let samples: Arc<[f32]> = vec![0.1, 0.2].into();
+        let mut cache = HashMap::new();
+        prepare_output_pcm(&samples, 48000, 2, (48000, 2), &mut cache).unwrap();
+        for key in [(0, 2), (48000, 0)] {
+            assert!(prepare_output_pcm(&samples, 48000, 2, key, &mut cache).is_err());
+        }
+        assert_eq!(cache.len(), 1);
     }
 }
