@@ -139,7 +139,11 @@ export function useDeleteSample() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: (sampleId: string) => apiClient.deleteProfileSample(sampleId),
+    mutationFn: (value: string | { sampleId: string; _serverScope: ServerScope }) => {
+      if (typeof value === 'string') return apiClient.deleteProfileSample(value);
+      requireCurrentServer(value._serverScope);
+      return apiClient.deleteProfileSample(value.sampleId);
+    },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['profiles'] });
     },
@@ -150,8 +154,10 @@ export function useUpdateSample() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: ({ sampleId, referenceText }: { sampleId: string; referenceText: string }) =>
-      apiClient.updateProfileSample(sampleId, referenceText),
+    mutationFn: ({ sampleId, referenceText, _serverScope }: { sampleId: string; referenceText: string; _serverScope?: ServerScope }) => {
+      requireCurrentServer(_serverScope);
+      return apiClient.updateProfileSample(sampleId, referenceText);
+    },
     onSuccess: (data) => {
       queryClient.invalidateQueries({
         queryKey: ['profiles', data.profile_id, 'samples'],
@@ -172,11 +178,14 @@ export function useExportSampleAudio() {
       sampleId,
       referenceText,
       format,
+      _serverScope,
     }: {
       sampleId: string;
       referenceText: string;
       format: 'mp3' | 'wav';
+      _serverScope?: ServerScope;
     }) => {
+      requireCurrentServer(_serverScope);
       const blob = await apiClient.exportSampleAudio(sampleId, format);
       const safeText = referenceText
         .substring(0, 30)

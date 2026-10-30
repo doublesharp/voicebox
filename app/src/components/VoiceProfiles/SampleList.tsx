@@ -12,6 +12,8 @@ import {
 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { currentServerScope, isCurrentServer, type ServerScope } from '@/lib/serverScope';
+import { useServerStore } from '@/stores/serverStore';
 import { Button } from '@/components/ui/button';
 import { CircleButton } from '@/components/ui/circle-button';
 import {
@@ -184,6 +186,10 @@ export function SampleList({ profileId }: SampleListProps) {
   const [editedText, setEditedText] = useState<string>('');
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [sampleToDelete, setSampleToDelete] = useState<string | null>(null);
+  const serverUrl = useServerStore((state) => state.serverUrl);
+  const serverRevision = useServerStore((state) => state.serverRevision);
+  const deleteScope = useRef<ServerScope | null>(null);
+  const editScope = useRef<ServerScope | null>(null);
   const editEpoch = useRef(0);
   const currentProfile = useRef(profileId);
   const mounted = useRef(true);
@@ -198,24 +204,37 @@ export function SampleList({ profileId }: SampleListProps) {
       editEpoch.current++;
     };
   }, []);
-  // Reset profile-scoped dialogs and drafts on navigation.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: profileId is the reset trigger.
+  // Reset profile-scoped dialogs and drafts when the profile or server changes.
   useEffect(() => {
+    editEpoch.current++;
+    editScope.current = null;
+    deleteScope.current = null;
     setEditingSampleId(null);
     setEditedText('');
     setUploadOpen(false);
     setDeleteDialogOpen(false);
     setSampleToDelete(null);
-  }, [profileId]);
+  }, [profileId, serverUrl, serverRevision]);
 
   const handleDeleteClick = (sampleId: string) => {
+    deleteScope.current = currentServerScope();
     setSampleToDelete(sampleId);
     setDeleteDialogOpen(true);
   };
 
   const handleDeleteConfirm = () => {
-    if (sampleToDelete) {
-      deleteSample.mutate(sampleToDelete);
+    if (sampleToDelete && deleteScope.current) {
+      const scope = deleteScope.current;
+      deleteSample.mutate({ sampleId: sampleToDelete, _serverScope: scope }, {
+        onError: (error) => {
+          if (!isCurrentServer(scope)) return;
+          toast({
+            title: t('sampleList.toast.deleteFailed', { defaultValue: 'Could not delete sample' }),
+            description: error instanceof Error ? error.message : t('common.error'),
+            variant: 'destructive',
+          });
+        },
+      });
       setDeleteDialogOpen(false);
       setSampleToDelete(null);
     }
@@ -223,6 +242,7 @@ export function SampleList({ profileId }: SampleListProps) {
 
   const handleStartEdit = (sampleId: string, currentText: string) => {
     editEpoch.current++;
+    editScope.current = currentServerScope();
     setEditingSampleId(sampleId);
     setEditedText(currentText);
   };
@@ -244,9 +264,11 @@ export function SampleList({ profileId }: SampleListProps) {
     }
 
     const epoch = editEpoch.current;
+    const scope = editScope.current;
+    if (!scope || !isCurrentServer(scope)) return;
     try {
-      await updateSample.mutateAsync({ sampleId, referenceText: editedText.trim() });
-      if (!mounted.current || editEpoch.current !== epoch) return;
+      await updateSample.mutateAsync({ sampleId, referenceText: editedText.trim(), _serverScope: scope });
+      if (!mounted.current || editEpoch.current !== epoch || !isCurrentServer(scope)) return;
       toast({
         title: t('sampleList.toast.updated'),
         description: t('sampleList.toast.updatedDescription'),
@@ -254,7 +276,7 @@ export function SampleList({ profileId }: SampleListProps) {
       setEditingSampleId(null);
       setEditedText('');
     } catch (error) {
-      if (!mounted.current) return;
+      if (!mounted.current || editEpoch.current !== epoch || !isCurrentServer(scope)) return;
       toast({
         title: t('sampleList.toast.updateFailed'),
         description:
@@ -390,6 +412,7 @@ export function SampleList({ profileId }: SampleListProps) {
                                     sampleId: sample.id,
                                     referenceText: sample.reference_text,
                                     format,
+                                    _serverScope: currentServerScope(),
                                   },
                                   {
                                     onError: (error) =>
