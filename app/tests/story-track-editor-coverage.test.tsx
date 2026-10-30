@@ -2,6 +2,8 @@ import { afterEach, expect, mock, test } from 'bun:test';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import type { StoryItemDetail } from '../src/lib/api/types';
 import { useStoryStore } from '../src/stores/storyStore';
+import { useServerStore } from '../src/stores/serverStore';
+import { useGenerationStore } from '../src/stores/generationStore';
 
 const mutations = Object.fromEntries(
   ['move', 'trim', 'split', 'duplicate', 'remove', 'version', 'volume'].map((name) => [
@@ -103,7 +105,10 @@ afterEach(() => {
     mutation.isPending = false;
   }
   toast.mockClear();
-  regenerate.mockClear();
+  regenerate.mockReset();
+  regenerate.mockImplementation(async () => {});
+  useServerStore.setState({ serverUrl: 'http://server-a', serverRevision: 0 });
+  useGenerationStore.getState().removePendingGeneration('gen');
   listeners.clear();
   node.scrollLeft = 0;
 });
@@ -278,4 +283,85 @@ test('play starts clips in timeline order and pause and stop use playback state'
   click('Stop');
   expect(pause).toHaveBeenCalledTimes(1);
   expect(stop).toHaveBeenCalledTimes(1);
+});
+
+for (const action of ['split', 'remove'] as const) {
+  test(`a late ${action} acknowledgement preserves a newly selected clip`, async () => {
+    useStoryStore.setState({ playbackStoryId: 'story', currentTimeMs: 3500 });
+    await mount([item, { ...item, id: 'second', generation_id: 'other' }]);
+    select();
+    click(action === 'split' ? 'Split at playhead' : 'Delete clip');
+    const [, callbacks] = mutations[action].mutate.mock.calls[0] as any;
+    act(() => useStoryStore.getState().setSelectedClipId('second'));
+    act(() => callbacks.onSuccess());
+    expect(useStoryStore.getState().selectedClipId).toBe('second');
+  });
+}
+
+test('regenerating a selected clip tracks its generation', async () => {
+  await mount();
+  select();
+  await act(async () => { button('Regenerate clip').props.onClick(); await Promise.resolve(); });
+  expect(regenerate).toHaveBeenCalledWith('gen');
+  expect(useGenerationStore.getState().pendingGenerationIds.has('gen')).toBe(true);
+});
+
+test('a previous server regeneration cannot add a task to the new server', async () => {
+  let resolve!: () => void;
+  regenerate.mockImplementationOnce(() => new Promise((r) => { resolve = r; }));
+  await mount();
+  select();
+  await act(async () => { button('Regenerate clip').props.onClick(); });
+  act(() => useServerStore.setState({ serverUrl: 'http://server-b', serverRevision: 1 }));
+  await act(async () => { resolve(); });
+  expect(useGenerationStore.getState().pendingGenerationIds.has('gen')).toBe(false);
+});
+
+test('a previous server regeneration failure is silent after switching servers', async () => {
+  let reject!: (error: Error) => void;
+  regenerate.mockImplementationOnce(() => new Promise((_resolve, r) => { reject = r; }));
+  await mount();
+  select();
+  await act(async () => { button('Regenerate clip').props.onClick(); });
+  act(() => useServerStore.setState({ serverUrl: 'http://server-b', serverRevision: 1 }));
+  await act(async () => { reject(new Error('old server failure')); });
+  expect(toast).not.toHaveBeenCalled();
+});
+
+test('regeneration failure is visible and does not track a task', async () => {
+  regenerate.mockImplementationOnce(async () => { throw new Error('unavailable'); });
+  await mount();
+  select();
+  await act(async () => { button('Regenerate clip').props.onClick(); await Promise.resolve(); });
+  expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Failed to regenerate', description: 'unavailable' }));
+  expect(useGenerationStore.getState().pendingGenerationIds.has('gen')).toBe(false);
+});
+
+test('resizing the track editor clamps its height and stops after mouse release', async () => {
+  useStoryStore.setState({ trackEditorHeight: 250 });
+  await mount();
+  act(() => button('Resize track editor').props.onMouseDown({ clientY: 200, preventDefault() {} }));
+  emit('mousemove', { clientY: -1000 });
+  expect(useStoryStore.getState().trackEditorHeight).toBe(500);
+  emit('mousemove', { clientY: 1000 });
+  expect(useStoryStore.getState().trackEditorHeight).toBe(120);
+  emit('mouseup', {});
+  emit('mousemove', { clientY: 0 });
+  expect(useStoryStore.getState().trackEditorHeight).toBe(120);
+});
+
+test('zoom controls clamp the timeline scale to its supported range', async () => {
+  await mount();
+  for (let i = 0; i < 15; i++) click('Zoom in');
+  expect(renderer.root.findByProps({ 'aria-label': 'Zoom from left edge' }).props['aria-valuenow']).toBe(200);
+  for (let i = 0; i < 20; i++) click('Zoom out');
+  expect(renderer.root.findByProps({ 'aria-label': 'Zoom from left edge' }).props['aria-valuenow']).toBe(10);
+});
+
+test('unchanged trim does not submit a mutation', async () => {
+  await mount();
+  select();
+  act(() => button('Trim start').props.onMouseDown({ stopPropagation() {}, clientX: 100 }));
+  emit('mouseup', {});
+  expect(mutations.trim.mutate).not.toHaveBeenCalled();
 });

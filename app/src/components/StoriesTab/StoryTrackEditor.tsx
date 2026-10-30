@@ -38,6 +38,7 @@ import {
   useUpdateStoryItemVolume,
 } from '@/lib/hooks/useStories';
 import { cn } from '@/lib/utils/cn';
+import { currentServerScope, isCurrentServer } from '@/lib/serverScope';
 import { useGenerationStore } from '@/stores/generationStore';
 import { useStoryStore } from '@/stores/storyStore';
 import { CreateStudioCopyButton } from './CreateStudioCopyButton';
@@ -658,6 +659,8 @@ export const StoryTrackEditor = memo(function StoryTrackEditor({
 
   const handleSplit = useCallback(() => {
     if (!selectedClipId || splitItem.isPending) return;
+    const scope = currentServerScope();
+    const selectedStory = useStoryStore.getState().selectedStoryId;
 
     const item = items.find((i) => i.id === selectedClipId);
     if (!item) return;
@@ -685,9 +688,11 @@ export const StoryTrackEditor = memo(function StoryTrackEditor({
       },
       {
         onSuccess: () => {
-          setSelectedClipId(null);
+          const state = useStoryStore.getState();
+          if (isCurrentServer(scope) && state.selectedStoryId === selectedStory && state.selectedClipId === selectedClipId) setSelectedClipId(null);
         },
         onError: (error) => {
+          if (!isCurrentServer(scope)) return;
           toast({
             title: 'Failed to split clip',
             description: error instanceof Error ? error.message : String(error),
@@ -720,6 +725,8 @@ export const StoryTrackEditor = memo(function StoryTrackEditor({
 
   const handleDelete = useCallback(() => {
     if (!selectedClipId) return;
+    const scope = currentServerScope();
+    const selectedStory = useStoryStore.getState().selectedStoryId;
 
     removeItem.mutate(
       {
@@ -728,9 +735,11 @@ export const StoryTrackEditor = memo(function StoryTrackEditor({
       },
       {
         onSuccess: () => {
-          setSelectedClipId(null);
+          const state = useStoryStore.getState();
+          if (isCurrentServer(scope) && state.selectedStoryId === selectedStory && state.selectedClipId === selectedClipId) setSelectedClipId(null);
         },
         onError: (error) => {
+          if (!isCurrentServer(scope)) return;
           toast({
             title: 'Failed to delete clip',
             description: error instanceof Error ? error.message : String(error),
@@ -743,10 +752,13 @@ export const StoryTrackEditor = memo(function StoryTrackEditor({
 
   const handleRegenerate = useCallback(async () => {
     if (!selectedItem) return;
+    const scope = currentServerScope();
     try {
       await apiClient.regenerateGeneration(selectedItem.generation_id);
+      if (!isCurrentServer(scope)) return;
       addPendingGeneration(selectedItem.generation_id);
     } catch (error) {
+      if (!isCurrentServer(scope)) return;
       toast({
         title: 'Failed to regenerate',
         description: error instanceof Error ? error.message : String(error),
