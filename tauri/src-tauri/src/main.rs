@@ -524,7 +524,7 @@ async fn start_server(
             println!("Found ROCm backend at {:?}", rocm_dir);
 
             let app_version = app.config().version.clone().unwrap_or_default();
-            let binary_version = probe_binary_version(&exe_path, &rocm_dir).await;
+            let binary_version = _start_permit.until_cancelled(probe_binary_version(&exe_path, &rocm_dir)).await.ok_or("Server startup cancelled")?;
             let version_ok = if !app_version.is_empty()
                 && binary_version.as_deref() == Some(app_version.as_str())
             {
@@ -565,7 +565,7 @@ async fn start_server(
             // Version check: run --version from the onedir directory so
             // PyInstaller can find its support files for the fast --version path
             let app_version = app.config().version.clone().unwrap_or_default();
-            let binary_version = probe_binary_version(&exe_path, &cuda_dir).await;
+            let binary_version = _start_permit.until_cancelled(probe_binary_version(&exe_path, &cuda_dir)).await.ok_or("Server startup cancelled")?;
             let version_ok = if !app_version.is_empty()
                 && binary_version.as_deref() == Some(app_version.as_str())
             {
@@ -776,10 +776,10 @@ async fn start_server(
     println!("Server process spawned, waiting for ready signal...");
     println!("=================================================================");
 
-    let startup = server_startup::wait_for_startup(&mut rx, std::time::Duration::from_secs(120), |stream, line| {
+    let startup = _start_permit.until_cancelled(server_startup::wait_for_startup(&mut rx, std::time::Duration::from_secs(120), |stream, line| {
         if stream == "stderr" { eprintln!("Server: {line}"); } else { println!("Server output: {line}"); }
         let _ = app.emit("server-log", serde_json::json!({ "stream": stream, "line": line }));
-    }).await;
+    })).await.ok_or("Server startup cancelled")?;
     match startup {
         server_startup::Outcome::Ready => println!("Server is ready!"),
         server_startup::Outcome::TimedOut(errors) => {
@@ -894,6 +894,11 @@ async fn restart_server(
 
     // Stop the current server
     stop_server(state.clone()).await?;
+
+    // A cancelled preflight can still be unwinding; wait until its permit is released.
+    tokio::time::timeout(std::time::Duration::from_secs(30), state.start_gate.wait_until_idle())
+        .await
+        .map_err(|_| "Previous server startup did not stop in time".to_string())?;
 
     // Wait for port to be released
     println!("restart_server: waiting for port release...");

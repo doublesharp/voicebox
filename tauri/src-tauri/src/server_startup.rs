@@ -4,8 +4,20 @@ use tauri::async_runtime::Receiver;
 use tauri_plugin_shell::process::CommandEvent;
 
 /// Serialize startup attempts and coordinate stop with child registration.
-#[derive(Default)]
-pub(crate) struct StartGate(std::sync::Mutex<StartState>);
+pub(crate) struct StartGate {
+    state: std::sync::Mutex<StartState>,
+    changed: tokio::sync::watch::Sender<()>,
+}
+
+impl Default for StartGate {
+    fn default() -> Self {
+        let (changed, _) = tokio::sync::watch::channel(());
+        Self {
+            state: std::sync::Mutex::new(StartState::default()),
+            changed,
+        }
+    }
+}
 
 #[derive(Default)]
 struct StartState {
@@ -20,7 +32,7 @@ pub(crate) struct StartPermit<'a> {
 
 impl StartGate {
     pub(crate) fn try_begin(&self) -> Option<StartPermit<'_>> {
-        let mut state = self.0.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         if state.starting {
             return None;
         }
@@ -32,17 +44,30 @@ impl StartGate {
     }
 
     pub(crate) fn cancel_and<T>(&self, action: impl FnOnce() -> T) -> T {
-        let mut state = self.0.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         state.generation = state.generation.wrapping_add(1);
         let result = action();
         drop(state);
+        self.changed.send_replace(());
         result
+    }
+
+    pub(crate) async fn wait_until_idle(&self) {
+        let mut changed = self.changed.subscribe();
+        loop {
+            if !self.state.lock().unwrap().starting {
+                return;
+            }
+            if changed.changed().await.is_err() {
+                return;
+            }
+        }
     }
 }
 
 impl StartPermit<'_> {
     pub(crate) fn commit<T>(&self, action: impl FnOnce() -> T) -> Option<T> {
-        let state = self.gate.0.lock().unwrap();
+        let state = self.gate.state.lock().unwrap();
         if state.generation != self.generation {
             return None;
         }
@@ -52,9 +77,34 @@ impl StartPermit<'_> {
     }
 }
 
+impl StartPermit<'_> {
+    pub(crate) async fn until_cancelled<F: std::future::Future>(
+        &self,
+        work: F,
+    ) -> Option<F::Output> {
+        let mut changed = self.gate.changed.subscribe();
+        let cancelled = async {
+            loop {
+                if self.gate.state.lock().unwrap().generation != self.generation {
+                    return;
+                }
+                if changed.changed().await.is_err() {
+                    return;
+                }
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = cancelled => None,
+            result = work => Some(result),
+        }
+    }
+}
+
 impl Drop for StartPermit<'_> {
     fn drop(&mut self) {
-        self.gate.0.lock().unwrap().starting = false;
+        self.gate.state.lock().unwrap().starting = false;
+        self.gate.changed.send_replace(());
     }
 }
 
@@ -614,5 +664,164 @@ mod cancellation_tests {
         assert_eq!(stop_rx.recv().unwrap(), Some(99));
         worker.join().unwrap();
         stopper.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod restart_wait_tests {
+    use super::StartGate;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn restart_waits_until_the_cancelled_start_has_unwound() {
+        let gate = StartGate::default();
+        let permit = gate.try_begin().unwrap();
+        gate.cancel_and(|| ());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), gate.wait_until_idle())
+                .await
+                .is_err()
+        );
+        drop(permit);
+        tokio::time::timeout(Duration::from_secs(1), gate.wait_until_idle())
+            .await
+            .unwrap();
+        assert!(gate.try_begin().is_some());
+    }
+
+    #[tokio::test]
+    async fn cancelled_preflight_interrupts_pending_work() {
+        let gate = StartGate::default();
+        let permit = gate.try_begin().unwrap();
+        gate.cancel_and(|| ());
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            permit.until_cancelled(std::future::pending::<()>()),
+        )
+        .await;
+        assert_eq!(result.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn cancellation_wakes_a_probe_already_in_progress() {
+        let gate = StartGate::default();
+        let permit = gate.try_begin().unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let work = async {
+            entered_tx.send(()).unwrap();
+            std::future::pending::<()>().await
+        };
+        let waiting = permit.until_cancelled(work);
+        tokio::pin!(waiting);
+        tokio::select! {
+            _ = &mut waiting => panic!("probe ended before cancellation"),
+            _ = entered_rx => {}
+        }
+        gate.cancel_and(|| ());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), waiting)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_a_real_version_probe_terminates_its_child() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "voicebox-probe-cancel-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
+        let exe = dir.join("probe");
+        std::fs::write(&exe, "#!/bin/sh\necho $$ > child.pid\nexec /bin/sleep 30\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let gate = StartGate::default();
+        let permit = gate.try_begin().unwrap();
+        let waiting = permit.until_cancelled(crate::probe_binary_version(&exe, &dir));
+        tokio::pin!(waiting);
+        let pid = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if let Ok(contents) = std::fs::read_to_string(dir.join("child.pid")) {
+                    if let Ok(pid) = contents.trim().parse::<u32>() {
+                        break pid;
+                    }
+                }
+                tokio::select! {
+                    _ = &mut waiting => panic!("probe ended before cancellation"),
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        gate.cancel_and(|| ());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), waiting)
+                .await
+                .unwrap(),
+            None
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let status = std::process::Command::new("/bin/kill")
+                    .args(["-0", &pid.to_string()])
+                    .status()
+                    .unwrap();
+                if !status.success() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled probe process remained alive");
+    }
+
+    #[tokio::test]
+    async fn normal_work_completes_if_start_has_not_been_cancelled() {
+        let gate = StartGate::default();
+        let permit = gate.try_begin().unwrap();
+        assert_eq!(permit.until_cancelled(async { 42 }).await, Some(42));
+    }
+
+    #[tokio::test]
+    async fn all_waiters_are_woken_after_a_start_ends() {
+        let gate = Arc::new(StartGate::default());
+        let permit = gate.try_begin().unwrap();
+        let first_gate = gate.clone();
+        let second_gate = gate.clone();
+        let first = tokio::spawn(async move { first_gate.wait_until_idle().await });
+        let second = tokio::spawn(async move { second_gate.wait_until_idle().await });
+        tokio::task::yield_now().await;
+        assert!(!first.is_finished() && !second.is_finished());
+        drop(permit);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            first.await.unwrap();
+            second.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_gate_returns_without_waiting() {
+        let gate = StartGate::default();
+        tokio::time::timeout(Duration::from_millis(100), gate.wait_until_idle())
+            .await
+            .unwrap();
     }
 }
