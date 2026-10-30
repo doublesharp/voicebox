@@ -193,6 +193,15 @@ function AudioPlayerSession() {
         wavesurferRef.current = wavesurfer;
         const ownsSource = () =>
           !disposed && sourceIsCurrent() && wavesurferRef.current === wavesurfer;
+        const restartLoop = () => {
+          wavesurfer.seekTo(0);
+          wavesurfer.play().catch((error) => {
+            if (!ownsSource()) return;
+            debug.error('Loop play failed:', error);
+            setIsPlaying(false);
+            setError(`Playback error: ${error instanceof Error ? error.message : String(error)}`);
+          });
+        };
 
         const presentation = bindPlaybackPresentation(
           wavesurfer,
@@ -209,8 +218,7 @@ function AudioPlayerSession() {
             presentation.update(dur);
             const loop = usePlayerStore.getState().isLooping;
             if (loop) {
-              wavesurfer.seekTo(0);
-              wavesurfer.play().catch((err) => debug.error('Loop play failed:', err));
+              restartLoop();
             } else {
               wavesurfer.pause();
               setIsPlaying(false);
@@ -281,8 +289,7 @@ function AudioPlayerSession() {
           if (isUsingNativePlaybackRef.current) return;
           const loop = usePlayerStore.getState().isLooping;
           if (loop) {
-            wavesurfer.seekTo(0);
-            wavesurfer.play().catch((err) => debug.error('Loop play failed:', err));
+            restartLoop();
           } else {
             setIsPlaying(false);
             const onFinish = usePlayerStore.getState().onFinish;

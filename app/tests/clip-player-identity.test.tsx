@@ -71,6 +71,7 @@ function makeWave() {
     getDuration: () => duration,
     getPlaybackRate: () => 1,
     getCurrentTime: () => position,
+    getRenderer: () => ({ renderProgress: () => {} }),
     getMediaElement: () => ({
       getGainNode: () => ({ context }),
       removeAttribute: mock(() => {}),
@@ -377,4 +378,87 @@ test('seeded selection, version, stale-event, close and unmount sequences preser
     });
     waves.length = 0;
   }
+});
+
+test('looping restarts playback without advancing the queue', async () => {
+  const finish = mock(() => {});
+  usePlayerStore.getState().setAudio('/audio/a', 'a', null);
+  usePlayerStore.getState().setOnFinish(finish);
+  await mount();
+  await act(async () => waves[0].ready(3));
+  await act(async () => renderer.root.findByProps({ 'aria-label': 'Play' }).props.onClick());
+  act(() => renderer.root.findByProps({ 'aria-label': 'Loop' }).props.onClick());
+  await act(async () => waves[0].emit('finish'));
+  expect(waves[0].play).toHaveBeenCalledTimes(2);
+  expect(finish).not.toHaveBeenCalled();
+  expect(usePlayerStore.getState().isPlaying).toBe(true);
+});
+
+test('failed loop restart stops playback and shows an error', async () => {
+  usePlayerStore.getState().setAudio('/audio/a', 'a', null);
+  await mount();
+  await act(async () => waves[0].ready(3));
+  await act(async () => renderer.root.findByProps({ 'aria-label': 'Play' }).props.onClick());
+  act(() => renderer.root.findByProps({ 'aria-label': 'Loop' }).props.onClick());
+  waves[0].play.mockImplementationOnce(async () => { throw new Error('loop blocked'); });
+  await act(async () => { waves[0].emit('finish'); await Promise.resolve(); });
+  expect(usePlayerStore.getState().isPlaying).toBe(false);
+  expect(JSON.stringify(renderer.toJSON())).toContain('loop blocked');
+});
+
+test('seeking and volume controls update the active player, then close releases it', async () => {
+  usePlayerStore.getState().setAudio('/audio/a', 'a', null);
+  await mount();
+  await act(async () => waves[0].ready(10));
+  act(() => renderer.root.findByProps({ 'aria-label': 'Playback position' }).props.onValueChange([40]));
+  expect(waves[0].getCurrentTime()).toBe(4);
+  const volume = renderer.root.findByProps({ 'aria-valuetext': '100%' });
+  act(() => volume.props.onValueChange([35]));
+  expect(usePlayerStore.getState().volume).toBeCloseTo(0.35);
+  act(() => renderer.root.findByProps({ 'aria-label': 'Mute' }).props.onClick());
+  expect(usePlayerStore.getState().volume).toBe(0);
+  act(() => renderer.root.findByProps({ 'aria-label': 'Unmute' }).props.onClick());
+  expect(usePlayerStore.getState().volume).toBe(1);
+  await act(async () => renderer.root.findByProps({ 'aria-label': 'Close player' }).props.onClick());
+  expect(usePlayerStore.getState().audioUrl).toBeNull();
+  expect(waves[0].destroy).toHaveBeenCalledTimes(1);
+});
+
+test('a failed initial play reports an error and remains paused', async () => {
+  usePlayerStore.getState().setAudio('/audio/a', 'a', null);
+  await mount();
+  await act(async () => waves[0].ready(3));
+  waves[0].play.mockImplementationOnce(async () => { throw new Error('play blocked'); });
+  await act(async () => { await renderer.root.findByProps({ 'aria-label': 'Play' }).props.onClick(); });
+  expect(usePlayerStore.getState().isPlaying).toBe(false);
+  expect(JSON.stringify(renderer.toJSON())).toContain('play blocked');
+});
+
+test('loop restart failure at the playback boundary is visible', async () => {
+  usePlayerStore.getState().setAudio('/audio/a', 'a', null);
+  await mount();
+  await act(async () => waves[0].ready(3));
+  await act(async () => renderer.root.findByProps({ 'aria-label': 'Play' }).props.onClick());
+  act(() => renderer.root.findByProps({ 'aria-label': 'Loop' }).props.onClick());
+  waves[0].play.mockImplementationOnce(async () => { throw new Error('boundary blocked'); });
+  await act(async () => { waves[0].emit('timeupdate', 3); await Promise.resolve(); });
+  expect(usePlayerStore.getState().isPlaying).toBe(false);
+  expect(JSON.stringify(renderer.toJSON())).toContain('boundary blocked');
+});
+
+test('a late loop failure cannot interrupt a newly selected recording', async () => {
+  let reject!: (error: Error) => void;
+  usePlayerStore.getState().setAudio('/audio/a', 'a', null);
+  await mount();
+  const old = waves[0];
+  await act(async () => old.ready(3));
+  await act(async () => renderer.root.findByProps({ 'aria-label': 'Play' }).props.onClick());
+  act(() => renderer.root.findByProps({ 'aria-label': 'Loop' }).props.onClick());
+  old.play.mockImplementationOnce(() => new Promise((_resolve, fail) => { reject = fail; }));
+  await act(async () => old.emit('finish'));
+  await act(async () => usePlayerStore.getState().setAudioWithAutoPlay('/audio/b', 'b', null));
+  await act(async () => waves.at(-1)!.ready(5));
+  await act(async () => { reject(new Error('old loop failed')); });
+  expect(usePlayerStore.getState()).toMatchObject({ audioId: 'b', isPlaying: true });
+  expect(JSON.stringify(renderer.toJSON())).not.toContain('old loop failed');
 });
