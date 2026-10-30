@@ -153,13 +153,16 @@ fn find_voicebox_pid_on_port(port: u16) -> Option<u32> {
         let output_str = String::from_utf8_lossy(&output.stdout);
         for line in output_str.lines() {
             if let Ok(pid) = line.trim().parse::<u32>() {
+                if pid <= 1 {
+                    continue;
+                }
                 // Verify this PID is a voicebox process
                 if let Ok(tasklist_output) = Command::new("tasklist")
                     .args(["/FI", &format!("PID eq {}", pid), "/FO", "CSV", "/NH"])
                     .output()
                 {
                     let tasklist_str = String::from_utf8_lossy(&tasklist_output.stdout);
-                    if tasklist_str.to_lowercase().contains("voicebox") {
+                    if server_process::is_windows_server_image(&tasklist_str) {
                         return Some(pid);
                     }
                 }
@@ -187,7 +190,7 @@ fn check_health(port: u16) -> bool {
     {
         Ok(client) => match client.get(&url).send() {
             Ok(resp) => {
-                if !resp.status().is_success() {
+                if resp.status() != reqwest::StatusCode::OK {
                     return false;
                 }
                 // Parse as JSON and validate Voicebox-specific fields
@@ -317,37 +320,29 @@ async fn start_server(
     {
         use std::process::Command;
         if let Ok(output) = Command::new("lsof")
-            .args(["-i", &format!(":{}", SERVER_PORT), "-sTCP:LISTEN"])
+            .args(["+c", "0", "-i", &format!(":{}", SERVER_PORT), "-sTCP:LISTEN"])
             .output()
         {
             let output_str = String::from_utf8_lossy(&output.stdout);
-            for line in output_str.lines().skip(1) {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    let command = parts[0];
-                    let pid_str = parts[1];
-                    if command.contains("voicebox") {
-                        if let Ok(pid) = pid_str.parse::<u32>() {
-                            println!("Found existing voicebox-server on port {} (PID: {}), reusing it", SERVER_PORT, pid);
-                            // Store the PID so we can kill it on exit if needed
-                            *state.server_pid.lock().unwrap() = Some(pid);
-                            return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
-                        }
-                    } else {
-                        // Process name doesn't contain "voicebox" — could be an external
-                        // Python/uvicorn/Docker server. Verify via HTTP health check.
-                        println!("Port {} in use by '{}' (PID: {}), checking if it's a Voicebox server...", SERVER_PORT, command, pid_str);
-                        if check_health(SERVER_PORT) {
-                            println!("Health check passed — reusing external server on port {}", SERVER_PORT);
-                            return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
-                        }
-                        println!("Health check failed — port is occupied by a non-Voicebox process");
-                        return Err(format!(
-                            "Port {} is already in use by another application ({}). \
-                             Close it or change the Voicebox server port.",
-                            SERVER_PORT, command
-                        ));
-                    }
+            let healthy = output_str.lines().skip(1).any(|line| !line.trim().is_empty())
+                && check_health(SERVER_PORT);
+            match server_process::classify_listener(&output_str, healthy) {
+                server_process::ListenerDecision::Unoccupied => {}
+                server_process::ListenerDecision::ReuseOwned(pid) => {
+                    println!("Found healthy voicebox-server on port {} (PID: {}), reusing it", SERVER_PORT, pid);
+                    *state.server_pid.lock().unwrap() = Some(pid);
+                    return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
+                }
+                server_process::ListenerDecision::ReuseExternal => {
+                    println!("Health check passed — reusing external server on port {}", SERVER_PORT);
+                    return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
+                }
+                server_process::ListenerDecision::Conflict(command) => {
+                    return Err(format!(
+                        "Port {} is already in use by another application ({}). \
+                         Close it or change the Voicebox server port.",
+                        SERVER_PORT, command
+                    ));
                 }
             }
         }
@@ -360,17 +355,13 @@ async fn start_server(
             &format!("127.0.0.1:{}", SERVER_PORT).parse().unwrap(),
             std::time::Duration::from_secs(1),
         ).is_ok() {
-            // Port is in use — check if it's a voicebox process by name first
-            if let Some(pid) = find_voicebox_pid_on_port(SERVER_PORT) {
-                println!("Found existing voicebox-server on port {} (PID: {}), reusing it", SERVER_PORT, pid);
-                *state.server_pid.lock().unwrap() = Some(pid);
-                return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
-            }
-            // Process name doesn't match — could be an external Python/Docker server.
-            // Verify via HTTP health check before giving up.
-            println!("Port {} in use by unknown process, checking if it's a Voicebox server...", SERVER_PORT);
             if check_health(SERVER_PORT) {
-                println!("Health check passed — reusing external server on port {}", SERVER_PORT);
+                if let Some(pid) = find_voicebox_pid_on_port(SERVER_PORT) {
+                    println!("Found healthy voicebox-server on port {} (PID: {}), reusing it", SERVER_PORT, pid);
+                    *state.server_pid.lock().unwrap() = Some(pid);
+                } else {
+                    println!("Health check passed — reusing external server on port {}", SERVER_PORT);
+                }
                 return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
             }
             return Err(format!(
@@ -387,30 +378,20 @@ async fn start_server(
     {
         use std::process::Command;
         if let Ok(output) = Command::new("lsof")
-            .args(["-i", &format!(":{}", LEGACY_PORT), "-sTCP:LISTEN"])
+            .args(["+c", "0", "-i", &format!(":{}", LEGACY_PORT), "-sTCP:LISTEN"])
             .output()
         {
             let output_str = String::from_utf8_lossy(&output.stdout);
-            for line in output_str.lines().skip(1) {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    let command = parts[0];
-                    let pid_str = parts[1];
-                    
-                    if command.contains("voicebox") {
-                        if let Ok(pid) = pid_str.parse::<i32>() {
-                            println!("Found orphaned voicebox-server on legacy port {} (PID: {}, CMD: {}), killing it...", LEGACY_PORT, pid, command);
-                            let _ = Command::new("kill")
-                                .args(["-9", "--", &format!("-{}", pid)])
-                                .output();
-                            let _ = Command::new("kill")
-                                .args(["-9", &pid.to_string()])
-                                .output();
-                        }
-                    } else {
-                        println!("Legacy port {} is in use by non-voicebox process: {} (PID: {}), not killing", LEGACY_PORT, command, pid_str);
-                    }
-                }
+            let healthy = output_str.lines().skip(1).any(|line| !line.trim().is_empty())
+                && check_health(LEGACY_PORT);
+            for pid in server_process::legacy_pids(&output_str, healthy) {
+                println!("Found healthy voicebox-server on legacy port {} (PID: {}), stopping it...", LEGACY_PORT, pid);
+                let _ = Command::new("kill")
+                    .args(["-9", "--", &format!("-{}", pid)])
+                    .output();
+                let _ = Command::new("kill")
+                    .args(["-9", &pid.to_string()])
+                    .output();
             }
         }
     }
@@ -421,7 +402,7 @@ async fn start_server(
         if TcpStream::connect_timeout(
             &format!("127.0.0.1:{}", LEGACY_PORT).parse().unwrap(),
             std::time::Duration::from_secs(1),
-        ).is_ok() {
+        ).is_ok() && check_health(LEGACY_PORT) {
             if let Some(pid) = find_voicebox_pid_on_port(LEGACY_PORT) {
                 println!("Found orphaned voicebox-server on legacy port {} (PID: {}), killing it...", LEGACY_PORT, pid);
                 let _ = std::process::Command::new("taskkill")
@@ -1929,6 +1910,16 @@ mod server_health_tests {
         ] {
             let (port, handle) = serve(status, "", body);
             assert_eq!(check_health(port), expected, "{status}: {body}");
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn non_ok_success_statuses_do_not_identify_a_voicebox_server() {
+        let body = r#"{"status":"healthy","model_loaded":true,"gpu_available":false}"#;
+        for status in ["201 Created", "202 Accepted", "206 Partial Content"] {
+            let (port, handle) = serve(status, "", body);
+            assert!(!check_health(port), "unexpectedly accepted {status}");
             handle.join().unwrap();
         }
     }
