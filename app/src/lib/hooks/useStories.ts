@@ -13,6 +13,7 @@ import type {
   StoryItemVolumeUpdate,
   StoryResponse,
 } from '@/lib/api/types';
+import { isCurrentServer, requireCurrentServer, type ServerScope } from '@/lib/serverScope';
 import { usePlatform } from '@/platform/PlatformContext';
 import { useStoryStore } from '@/stores/storyStore';
 
@@ -82,9 +83,12 @@ export function useAddStoryItem() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: ({ storyId, data }: { storyId: string; data: StoryItemCreate }) =>
-      apiClient.addStoryItem(storyId, data),
+    mutationFn: ({ storyId, data, _serverScope }: { storyId: string; data: StoryItemCreate; _serverScope?: ServerScope }) => {
+      requireCurrentServer(_serverScope);
+      return apiClient.addStoryItem(storyId, data);
+    },
     onSuccess: (_, variables) => {
+      if (variables._serverScope && !isCurrentServer(variables._serverScope)) return;
       queryClient.invalidateQueries({ queryKey: ['stories'] });
       queryClient.invalidateQueries({ queryKey: ['stories', variables.storyId] });
     },

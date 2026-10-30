@@ -10,6 +10,7 @@ import {
   useUpdateProfileEffects,
 } from '../src/lib/hooks/useProfiles';
 import {
+  useAddStoryItem,
   useDeleteStory,
   useMoveStoryItem,
   useStories,
@@ -17,10 +18,12 @@ import {
 } from '../src/lib/hooks/useStories';
 import { currentServerScope } from '../src/lib/serverScope';
 import { useStoryStore } from '../src/stores/storyStore';
+import { useServerStore } from '../src/stores/serverStore';
 
 notifyManager.setScheduler((callback) => queueMicrotask(callback));
 afterAll(() => notifyManager.setScheduler((callback) => setTimeout(callback, 0)));
 const originalFetch = globalThis.fetch;
+const initialServer = useServerStore.getState();
 let view: ReactTestRenderer | undefined;
 let client: QueryClient;
 let hooks: ReturnType<typeof useAll>;
@@ -33,6 +36,7 @@ function useAll(profileId: string, storyId: string | null) {
     effects: useUpdateProfileEffects(),
     deleteProfile: useDeleteProfile(),
     deleteStory: useDeleteStory(),
+    addStoryItem: useAddStoryItem(),
     move: useMoveStoryItem(),
   };
 }
@@ -58,6 +62,7 @@ afterEach(() => {
   client?.clear();
   globalThis.fetch = originalFetch;
   useStoryStore.getState().setSelectedStoryId(null);
+  useServerStore.setState({ serverUrl: initialServer.serverUrl, serverRevision: initialServer.serverRevision });
 });
 
 test('empty detail identifiers do not fetch and enabled queries use distinct keys', async () => {
@@ -172,4 +177,31 @@ test('story item mutation sends its payload and invalidates inactive detail', as
   });
   expect(body).toEqual({ start_time: 3 });
   expect(client.getQueryState(['stories', 's'])?.isInvalidated).toBe(true);
+});
+
+test('story item mutation refuses a stale server scope before sending', async () => {
+  const requests: string[] = [];
+  globalThis.fetch = (async (url, init) => { if (init?.method === 'POST') requests.push(String(url)); return Response.json([]); }) as typeof fetch;
+  await mount();
+  const scope = currentServerScope();
+  useServerStore.setState({ serverUrl: 'http://different-server', serverRevision: scope.serverRevision + 1 });
+  await act(async () => {
+    await expect(hooks.addStoryItem.mutateAsync({ storyId: 'story', data: { generation_id: 'generation' }, _serverScope: scope })).rejects.toThrow('Server connection changed');
+  });
+  expect(requests).toEqual([]);
+});
+
+test('old story item acknowledgements do not invalidate the new server cache', async () => {
+  let finish!: () => void;
+  globalThis.fetch = (async (_url, init) => init?.method === 'POST'
+    ? new Promise<Response>((resolve) => { finish = () => resolve(Response.json({ id: 'item' })); })
+    : Response.json([])) as typeof fetch;
+  await mount();
+  const scope = currentServerScope();
+  client.setQueryData(['stories', 'story'], { id: 'story' });
+  let pending!: Promise<unknown>;
+  await act(async () => { pending = hooks.addStoryItem.mutateAsync({ storyId: 'story', data: { generation_id: 'generation' }, _serverScope: scope }); await Promise.resolve(); });
+  useServerStore.setState({ serverUrl: 'http://different-server', serverRevision: scope.serverRevision + 1 });
+  await act(async () => { finish(); await pending; });
+  expect(client.getQueryState(['stories', 'story'])?.isInvalidated).toBe(false);
 });

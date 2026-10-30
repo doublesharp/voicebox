@@ -42,6 +42,8 @@ import {
   useStory,
 } from '@/lib/hooks/useStories';
 import { useStoryPlayback } from '@/lib/hooks/useStoryPlayback';
+import { isCurrentServer } from '@/lib/serverScope';
+import { useServerStore } from '@/stores/serverStore';
 import { useGenerationStore } from '@/stores/generationStore';
 import { useStoryStore } from '@/stores/storyStore';
 import { SortableStoryChatItem } from './StoryChatItem';
@@ -61,6 +63,20 @@ export function StoryContent() {
   const addPendingGeneration = useGenerationStore((s) => s.addPendingGeneration);
   const [isDraggingFile, setIsDraggingFile] = useState(false);
   const [isImporting, setIsImporting] = useState(false);
+  const importBatchRef = useRef<number | null>(null);
+  const nextImportBatchRef = useRef(0);
+  const serverUrl = useServerStore((state) => state.serverUrl);
+  const serverRevision = useServerStore((state) => state.serverRevision);
+  useEffect(() => {
+    setIsImporting(false);
+    return () => { importBatchRef.current = null; };
+  }, [selectedStoryId, serverUrl, serverRevision]);
+  useEffect(() => useStoryStore.subscribe((state, previous) => {
+    if (state.selectedStoryId !== previous.selectedStoryId && importBatchRef.current !== null) {
+      importBatchRef.current = null;
+      setIsImporting(false);
+    }
+  }), []);
   const dragDepthRef = useRef(0);
 
   // Add generation popover state
@@ -243,30 +259,43 @@ export function StoryContent() {
     );
   };
 
-  const handleImportAudio = async (file: File) => {
-    if (!story) return;
+  const handleImportFiles = async (files: FileList | File[]) => {
+    const scope = { serverUrl, serverRevision };
+    if (!story || story.id !== useStoryStore.getState().selectedStoryId ||
+        !isCurrentServer(scope) || importBatchRef.current !== null) return;
+    const batch = ++nextImportBatchRef.current;
+    const storyId = story.id;
+    importBatchRef.current = batch;
+    const isCurrent = () => importBatchRef.current === batch && isCurrentServer(scope) &&
+      useStoryStore.getState().selectedStoryId === storyId;
     setIsImporting(true);
     try {
-      const generation = await apiClient.importAudio(file);
-      await addStoryItem.mutateAsync({
-        storyId: story.id,
-        data: { generation_id: generation.id },
-      });
-      setIsAddOpen(false);
-    } catch (error) {
-      toast({
-        title: t('storyContent.toast.importFailed'),
-        description: error instanceof Error ? error.message : String(error),
-        variant: 'destructive',
-      });
+      for (const file of Array.from(files)) {
+        if (!isCurrent()) break;
+        try {
+          const generation = await apiClient.importAudio(file);
+          if (!isCurrent()) break;
+          await addStoryItem.mutateAsync({
+            storyId,
+            data: { generation_id: generation.id },
+            _serverScope: scope,
+          });
+          if (!isCurrent()) break;
+          setIsAddOpen(false);
+        } catch (error) {
+          if (!isCurrent()) break;
+          toast({
+            title: t('storyContent.toast.importFailed'),
+            description: error instanceof Error ? error.message : String(error),
+            variant: 'destructive',
+          });
+        }
+      }
     } finally {
-      setIsImporting(false);
-    }
-  };
-
-  const handleImportFiles = async (files: FileList | File[]) => {
-    for (const file of Array.from(files)) {
-      await handleImportAudio(file);
+      if (isCurrent()) {
+        importBatchRef.current = null;
+        setIsImporting(false);
+      }
     }
   };
 

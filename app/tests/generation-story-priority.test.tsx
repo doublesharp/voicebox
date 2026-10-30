@@ -2,6 +2,7 @@ import { afterEach, expect, mock, test } from 'bun:test';
 import { Fragment, type ReactNode } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { useStoryStore } from '../src/stores/storyStore';
+import { useServerStore } from '../src/stores/serverStore';
 
 const wrap = ({ children }: { children: ReactNode }) => <div>{children}</div>;
 const dialog = ({ open, children }: any) => (open ? <div>{children}</div> : null);
@@ -93,7 +94,8 @@ mock.module('@/lib/hooks/useHistory', () => ({
 }));
 mock.module('@/lib/hooks/useStoryPlayback', () => ({ useStoryPlayback: () => {} }));
 const regenerate = mock(async (_id: string) => {});
-mock.module('@/lib/api/client', () => ({ apiClient: { regenerateGeneration: regenerate } }));
+const importAudio = mock(async (_file: File) => ({ id: 'imported' }));
+mock.module('@/lib/api/client', () => ({ apiClient: { regenerateGeneration: regenerate, importAudio } }));
 mock.module('@/components/StoriesTab/StoryChatItem', () => ({
   SortableStoryChatItem: (p: any) => (
     <div data-clip={p.item.generation_id}>
@@ -160,7 +162,10 @@ afterEach(() => {
     playbackStoryId: null,
     currentTimeMs: 0,
   });
-  for (const m of Object.values(mutations)) m.mutate.mockClear();
+  for (const m of Object.values(mutations)) { m.mutate.mockClear(); m.mutateAsync.mockReset(); m.mutateAsync.mockImplementation(async () => {}); }
+  importAudio.mockReset();
+  importAudio.mockImplementation(async () => ({ id: 'imported' }));
+  useServerStore.setState({ serverUrl: 'http://server-a', serverRevision: 0 });
   toast.mockClear();
   selected = { ...stories[0], items: clips };
   loading = false;
@@ -278,4 +283,121 @@ test('content handles selection, loading and missing story states', () => {
   selected = undefined;
   act(() => renderer.update(<StoryContent />));
   expect(JSON.stringify(renderer.toJSON())).toContain('storyContent.notFound.title');
+});
+
+function importFiles(files: File[]) {
+  const input = renderer.root.findAllByType('input').find((node) => node.props.type === 'file')!;
+  const target = { files, value: 'selection' };
+  act(() => input.props.onChange({ target }));
+  expect(target.value).toBe('');
+}
+function setupStoryImport() {
+  useStoryStore.setState({ selectedStoryId: 'a' });
+  mount(<StoryContent />);
+}
+
+test('story import uploads multiple files in order and links each to the selected story', async () => {
+  const first = new File(['a'], 'first.wav', { type: 'audio/wav' });
+  const second = new File(['b'], 'second.wav', { type: 'audio/wav' });
+  importAudio.mockImplementation(async (file) => ({ id: file.name }));
+  setupStoryImport();
+  await act(async () => { importFiles([first, second]); await new Promise((resolve) => setTimeout(resolve, 0)); });
+  expect(importAudio.mock.calls.map(([file]) => file.name)).toEqual(['first.wav', 'second.wav']);
+  expect(mutations.add.mutateAsync.mock.calls.map(([args]: any) => ({ storyId: args.storyId, data: args.data }))).toEqual([
+    { storyId: 'a', data: { generation_id: 'first.wav' } },
+    { storyId: 'a', data: { generation_id: 'second.wav' } },
+  ]);
+});
+
+test('a server change during audio import never links the result or starts the remaining files', async () => {
+  let finish!: (value: { id: string }) => void;
+  importAudio.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+  setupStoryImport();
+  importFiles([new File(['a'], 'first.wav'), new File(['b'], 'second.wav')]);
+  act(() => useServerStore.setState({ serverUrl: 'http://server-b', serverRevision: 1 }));
+  await act(async () => { finish({ id: 'old-generation' }); await Promise.resolve(); });
+  expect(mutations.add.mutateAsync).not.toHaveBeenCalled();
+  expect(importAudio).toHaveBeenCalledTimes(1);
+});
+
+test('changing selected story while audio uploads prevents linking it to the old story', async () => {
+  let finish!: (value: { id: string }) => void;
+  importAudio.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+  setupStoryImport();
+  importFiles([new File(['a'], 'first.wav')]);
+  act(() => useStoryStore.setState({ selectedStoryId: 'b' }));
+  await act(async () => { finish({ id: 'old-generation' }); await Promise.resolve(); });
+  expect(mutations.add.mutateAsync).not.toHaveBeenCalled();
+});
+
+test('multiple simultaneous file selections do not duplicate imports', async () => {
+  let finish!: (value: { id: string }) => void;
+  importAudio.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+  setupStoryImport();
+  importFiles([new File(['a'], 'first.wav')]);
+  importFiles([new File(['b'], 'second.wav')]);
+  expect(importAudio).toHaveBeenCalledTimes(1);
+  await act(async () => { finish({ id: 'first' }); await Promise.resolve(); });
+  expect(mutations.add.mutateAsync).toHaveBeenCalledTimes(1);
+});
+
+test('a stale import error is not reported in the next story', async () => {
+  let fail!: (error: Error) => void;
+  importAudio.mockImplementationOnce(() => new Promise((_resolve, reject) => { fail = reject; }));
+  setupStoryImport();
+  importFiles([new File(['a'], 'first.wav')]);
+  act(() => useStoryStore.setState({ selectedStoryId: 'b' }));
+  await act(async () => { fail(new Error('old import failed')); await Promise.resolve(); });
+  expect(toast).not.toHaveBeenCalled();
+});
+
+test('an import failure reports the file error and continues the current batch', async () => {
+  importAudio.mockImplementationOnce(async () => { throw new Error('bad audio'); });
+  setupStoryImport();
+  await act(async () => { importFiles([new File(['a'], 'bad.wav'), new File(['b'], 'good.wav')]); await new Promise((resolve) => setTimeout(resolve, 0)); });
+  expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'storyContent.toast.importFailed', description: 'bad audio' }));
+  expect(importAudio).toHaveBeenCalledTimes(2);
+  expect(mutations.add.mutateAsync).toHaveBeenCalledTimes(1);
+});
+
+test('an old story import cannot unlock a newer story import', async () => {
+  let finishOld!: (value: { id: string }) => void;
+  let finishNew!: (value: { id: string }) => void;
+  importAudio.mockImplementationOnce(() => new Promise((resolve) => { finishOld = resolve; }));
+  importAudio.mockImplementationOnce(() => new Promise((resolve) => { finishNew = resolve; }));
+  setupStoryImport();
+  importFiles([new File(['a'], 'old.wav')]);
+  selected = { ...stories[1], items: [] };
+  act(() => useStoryStore.setState({ selectedStoryId: 'b' }));
+  importFiles([new File(['b'], 'new.wav')]);
+  await act(async () => { finishOld({ id: 'old' }); await Promise.resolve(); });
+  expect(button('storyContent.importing').props.disabled).toBe(true);
+  importFiles([new File(['c'], 'duplicate.wav')]);
+  expect(importAudio).toHaveBeenCalledTimes(2);
+  await act(async () => { finishNew({ id: 'new' }); await Promise.resolve(); });
+  expect(mutations.add.mutateAsync.mock.calls.map(([arg]: any) => arg.storyId)).toEqual(['b']);
+});
+
+test('leaving and returning to a story invalidates an older import', async () => {
+  let finish!: (value: { id: string }) => void;
+  importAudio.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+  setupStoryImport();
+  importFiles([new File(['a'], 'old.wav')]);
+  act(() => useStoryStore.setState({ selectedStoryId: 'b' }));
+  act(() => useStoryStore.setState({ selectedStoryId: 'a' }));
+  await act(async () => { finish({ id: 'old' }); await Promise.resolve(); });
+  expect(mutations.add.mutateAsync).not.toHaveBeenCalled();
+});
+
+test('a batched switch away and back still invalidates the old story import', async () => {
+  let finish!: (value: { id: string }) => void;
+  importAudio.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+  setupStoryImport();
+  importFiles([new File(['a'], 'old.wav')]);
+  act(() => {
+    useStoryStore.setState({ selectedStoryId: 'b' });
+    useStoryStore.setState({ selectedStoryId: 'a' });
+  });
+  await act(async () => { finish({ id: 'old' }); await Promise.resolve(); });
+  expect(mutations.add.mutateAsync).not.toHaveBeenCalled();
 });
