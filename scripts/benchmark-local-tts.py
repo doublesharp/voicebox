@@ -431,7 +431,8 @@ async def benchmark(settings, output, *, factory=create_adapter, clock=time.perf
         stage = "adapter_init"
         with meter.stage(stage):
             adapter = factory(settings, report["model"], output)
-        report["adapter"] = {"class": type(adapter).__name__, "device": str(getattr(adapter, "device", settings.backend)),
+        report["adapter"] = {"class": type(adapter).__name__,
+                             "device": str(getattr(adapter, "device", None) or getattr(adapter, "_device", None) or settings.backend),
                              "source_sha256": getattr(adapter, "_benchmark_source_sha256", None)}
         if adapter.is_loaded():
             raise ValueError("cold load requires a fresh unloaded adapter")
