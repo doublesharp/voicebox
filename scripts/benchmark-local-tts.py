@@ -432,7 +432,6 @@ async def benchmark(settings, output, *, factory=create_adapter, clock=time.perf
         with meter.stage(stage):
             adapter = factory(settings, report["model"], output)
         report["adapter"] = {"class": type(adapter).__name__,
-                             "device": str(getattr(adapter, "device", None) or getattr(adapter, "_device", None) or settings.backend),
                              "source_sha256": getattr(adapter, "_benchmark_source_sha256", None)}
         if adapter.is_loaded():
             raise ValueError("cold load requires a fresh unloaded adapter")
@@ -440,6 +439,8 @@ async def benchmark(settings, output, *, factory=create_adapter, clock=time.perf
         with meter.stage(stage):
             await adapter.load_model(settings.model)
         stage = "residency"
+        # Turbo records its device only once loaded, as _device.
+        report["adapter"]["device"] = str(getattr(adapter, "device", None) or getattr(adapter, "_device", None) or settings.backend)
         if settings.backend == "pytorch":
             report["residency"] = verify_residency(spec.inference_roots(adapter), torch_device(settings))
         if spec.loaded_revision is not None:

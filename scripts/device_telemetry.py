@@ -50,6 +50,7 @@ class DeviceIdentity:
 class StageMeasurement:
     name: str
     wall_s: float
+    cpu_s: float
     rss_bytes: int | None
     peak_rss_bytes: int | None
     cuda_allocated_start_bytes: int | None
@@ -152,8 +153,8 @@ class StageMeter:
     """Per-stage wall time plus CUDA and process memory, synchronized at the
     stage's boundaries only."""
 
-    def __init__(self, device, *, cuda, process, clock=time.perf_counter_ns):
-        self.device, self.cuda, self.process, self.clock = device, cuda, process, clock
+    def __init__(self, device, *, cuda, process, clock=time.perf_counter_ns, cpu_clock=time.process_time):
+        self.device, self.cuda, self.process, self.clock, self.cpu_clock = device, cuda, process, clock, cpu_clock
         self.stages = {}
 
     @classmethod
@@ -181,15 +182,18 @@ class StageMeter:
             self.cuda.synchronize(self.device)
             self.cuda.reset_peak_memory_stats(self.device)
             start_allocated = self.cuda.memory_allocated(self.device)
-        start = self.clock()
+        start, cpu_start = self.clock(), self.cpu_clock()
         try:
             yield
         finally:
             if self.cuda is not None:
                 self.cuda.synchronize(self.device)
             wall_s = (self.clock() - start) / 1e9
+            # Process CPU time across all threads: close to wall_s means the host
+            # was busy submitting work, far below it means waiting on the device.
+            cpu_s = self.cpu_clock() - cpu_start
             rss, peak_rss = process_memory(self.process)
-            measurement = StageMeasurement(name, wall_s, rss, peak_rss, start_allocated, None, None, None, None)
+            measurement = StageMeasurement(name, wall_s, cpu_s, rss, peak_rss, start_allocated, None, None, None, None)
             if self.cuda is not None:
                 measurement = replace(
                     measurement,

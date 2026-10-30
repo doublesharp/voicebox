@@ -108,7 +108,9 @@ class FakeProcess:
 def test_stage_meter_syncs_only_at_boundaries_and_resets_peak_at_start():
     cuda, process = FakeCuda(), FakeProcess()
     ticks = iter([0, 2 * 10**9])
-    meter = telemetry.StageMeter("cuda:0", cuda=cuda, process=process, clock=lambda: next(ticks))
+    cpu_ticks = iter([1.0, 1.5])
+    meter = telemetry.StageMeter("cuda:0", cuda=cuda, process=process, clock=lambda: next(ticks),
+                                 cpu_clock=lambda: next(cpu_ticks))
     with meter.stage("load"):
         assert cuda.events == [("sync", "cuda:0"), ("reset", "cuda:0")]
         cuda.allocated, cuda.peak_allocated, cuda.reserved, cuda.peak_reserved = 30, 50, 40, 60
@@ -116,7 +118,7 @@ def test_stage_meter_syncs_only_at_boundaries_and_resets_peak_at_start():
     assert cuda.events == [("sync", "cuda:0"), ("reset", "cuda:0"), ("sync", "cuda:0")]
     stage = meter.stages["load"]
     assert stage == telemetry.StageMeasurement(
-        name="load", wall_s=2.0, rss_bytes=2000, peak_rss_bytes=2500,
+        name="load", wall_s=2.0, cpu_s=0.5, rss_bytes=2000, peak_rss_bytes=2500,
         cuda_allocated_start_bytes=10, cuda_allocated_bytes=30, cuda_allocated_peak_bytes=50,
         cuda_reserved_bytes=40, cuda_reserved_peak_bytes=60,
     )
