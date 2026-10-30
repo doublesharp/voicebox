@@ -105,6 +105,81 @@ pub fn convert_channels(
     Ok(output)
 }
 
+/// Mix a decoded speaker layout into stereo without discarding extra channels.
+pub fn mix_layout_to_stereo(
+    samples: &[f32],
+    layout: symphonia::core::audio::Channels,
+) -> Result<Vec<f32>, String> {
+    use symphonia::core::audio::Channels as C;
+    let count = layout.count();
+    if count == 0 || samples.len() % count != 0 {
+        return Err("Invalid PCM channel layout".into());
+    }
+    let side = std::f32::consts::FRAC_1_SQRT_2;
+    let mut weights = Vec::with_capacity(count);
+    for channel in layout.iter() {
+        let pair = if channel == C::FRONT_LEFT {
+            (1.0, 0.0)
+        } else if channel == C::FRONT_RIGHT {
+            (0.0, 1.0)
+        } else if [
+            C::FRONT_CENTRE,
+            C::TOP_CENTRE,
+            C::TOP_FRONT_CENTRE,
+            C::TOP_REAR_CENTRE,
+            C::FRONT_CENTRE_HIGH,
+        ]
+        .contains(&channel)
+        {
+            (side, side)
+        } else if [C::LFE1, C::LFE2, C::REAR_CENTRE].contains(&channel) {
+            (0.5, 0.5)
+        } else if [
+            C::REAR_LEFT,
+            C::SIDE_LEFT,
+            C::FRONT_LEFT_CENTRE,
+            C::TOP_FRONT_LEFT,
+            C::TOP_REAR_LEFT,
+            C::REAR_LEFT_CENTRE,
+            C::FRONT_LEFT_WIDE,
+            C::FRONT_LEFT_HIGH,
+        ]
+        .contains(&channel)
+        {
+            (side, 0.0)
+        } else if [
+            C::REAR_RIGHT,
+            C::SIDE_RIGHT,
+            C::FRONT_RIGHT_CENTRE,
+            C::TOP_FRONT_RIGHT,
+            C::TOP_REAR_RIGHT,
+            C::REAR_RIGHT_CENTRE,
+            C::FRONT_RIGHT_WIDE,
+            C::FRONT_RIGHT_HIGH,
+        ]
+        .contains(&channel)
+        {
+            (0.0, side)
+        } else {
+            return Err("Unsupported PCM speaker layout".into());
+        };
+        weights.push(pair);
+    }
+    let capacity = (samples.len() / count)
+        .checked_mul(2)
+        .ok_or("Audio is too large")?;
+    let mut output = Vec::with_capacity(capacity);
+    for frame in samples.chunks_exact(count) {
+        let (mut left, mut right) = (0.0, 0.0);
+        for (&sample, &(left_gain, right_gain)) in frame.iter().zip(&weights) {
+            left += sample * left_gain;
+            right += sample * right_gain;
+        }
+        output.extend([left, right]);
+    }
+    Ok(output)
+}
+
 /// Each playback gets its own permanently cancellable token. Replacing a
 /// session never resets the previous session's stop flag.
 pub struct PlaybackControls {

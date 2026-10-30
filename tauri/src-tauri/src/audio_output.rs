@@ -1,5 +1,5 @@
 use crate::audio_pcm::{
-    convert_channels, resample_interleaved, PlaybackControls, RenderCursor, RenderPosition,
+    convert_channels, mix_layout_to_stereo, resample_interleaved, PlaybackControls, RenderCursor, RenderPosition,
 };
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, StreamConfig};
@@ -590,7 +590,7 @@ fn validate_decoded_format(
     Ok(())
 }
 
-fn decode_audio(mut data: Vec<u8>) -> Result<(Vec<f32>, u32, usize), String> {
+fn decode_audio_with_layout(mut data: Vec<u8>) -> Result<(Vec<f32>, u32, symphonia::core::audio::Channels), String> {
     use symphonia::core::audio::SampleBuffer;
     use symphonia::core::errors::Error;
     use symphonia::core::io::MediaSourceStream;
@@ -672,7 +672,13 @@ fn decode_audio(mut data: Vec<u8>) -> Result<(Vec<f32>, u32, usize), String> {
         return Err("Audio contains no playable samples".into());
     }
     let format = expected_format.ok_or("Audio contains no playable samples")?;
-    Ok((samples, format.rate, format.channels.count()))
+    Ok((samples, format.rate, format.channels))
+}
+
+#[cfg(test)]
+fn decode_audio(data: Vec<u8>) -> Result<(Vec<f32>, u32, usize), String> {
+    let (samples, rate, layout) = decode_audio_with_layout(data)?;
+    Ok((samples, rate, layout.count()))
 }
 
 fn build_stream<T>(
@@ -711,34 +717,35 @@ where
         .map_err(|error| format!("Unable to open output stream: {error}"))
 }
 
+#[cfg(test)]
 fn prepare_output_pcm(
-    samples: &Arc<[f32]>,
-    rate: u32,
-    channels: usize,
-    key: (u32, u16),
+    samples: &Arc<[f32]>, rate: u32, channels: usize, key: (u32, u16),
     prepared: &mut HashMap<(u32, u16), Arc<[f32]>>,
 ) -> Result<Arc<[f32]>, String> {
+    let shift = u32::try_from(channels).map_err(|_| "Invalid PCM channel count")?;
+    let bits = 1_u32.checked_shl(shift).ok_or("Invalid PCM channel count")? - 1;
+    let layout = symphonia::core::audio::Channels::from_bits(bits).ok_or("Invalid PCM channel count")?;
+    prepare_output_pcm_with_layout(samples, rate, layout, key, prepared)
+}
+
+fn prepare_output_pcm_with_layout(
+    samples: &Arc<[f32]>, rate: u32, layout: symphonia::core::audio::Channels,
+    key: (u32, u16), prepared: &mut HashMap<(u32, u16), Arc<[f32]>>,
+) -> Result<Arc<[f32]>, String> {
+    use symphonia::core::audio::Channels as C;
+    let channels = layout.count();
     let source_channels = u16::try_from(channels).map_err(|_| "Invalid PCM channel count")?;
-    if rate == 0
-        || source_channels == 0
-        || key.0 == 0
-        || key.1 == 0
-        || samples.len() % channels != 0
-    {
+    if rate == 0 || source_channels == 0 || key.0 == 0 || key.1 == 0 || samples.len() % channels != 0 {
         return Err("Invalid PCM sample rate, channel count, or incomplete frame".into());
     }
-    if let Some(pcm) = prepared.get(&key) {
-        return Ok(pcm.clone());
-    }
-    let pcm: Arc<[f32]> = if key == (rate, source_channels) {
+    if let Some(pcm) = prepared.get(&key) { return Ok(pcm.clone()); }
+    let needs_stereo_mix = key.1 == 2 && channels > 1 && layout != (C::FRONT_LEFT | C::FRONT_RIGHT);
+    let pcm: Arc<[f32]> = if key == (rate, source_channels) && !needs_stereo_mix {
         samples.clone()
     } else {
-        convert_channels(
-            &resample_interleaved(samples, rate, key.0, channels)?,
-            channels,
-            key.1 as usize,
-        )?
-        .into()
+        let resampled = resample_interleaved(samples, rate, key.0, channels)?;
+        if needs_stereo_mix { mix_layout_to_stereo(&resampled, layout)?.into() }
+        else { convert_channels(&resampled, channels, key.1 as usize)?.into() }
     };
     prepared.insert(key, pcm.clone());
     Ok(pcm)
@@ -882,7 +889,8 @@ fn run_session_on_host<H: ClipHost>(
     ready: &mut Option<tokio::sync::oneshot::Sender<Result<PlaybackSession, String>>>,
     mut report: impl FnMut(&'static str, f64, f64),
 ) -> Result<(), String> {
-    let (samples, rate, channels) = decode_audio(data)?;
+    let (samples, rate, layout) = decode_audio_with_layout(data)?;
+    let channels = layout.count();
     let duration = samples.len() as f64 / channels as f64 / rate as f64;
     let samples: Arc<[f32]> = samples.into();
     let devices = host
@@ -911,7 +919,7 @@ fn run_session_on_host<H: ClipHost>(
         }
         let (config, format) = host.clip_config(&device)?;
         let key = (config.sample_rate.0, config.channels);
-        let pcm = prepare_output_pcm(&samples, rate, channels, key, &mut prepared)?;
+        let pcm = prepare_output_pcm_with_layout(&samples, rate, layout, key, &mut prepared)?;
         let frames = pcm.len() / config.channels as usize;
         let position = Arc::new(RenderPosition::default());
         let stream = host.build_clip(
@@ -4632,6 +4640,7 @@ mod clip_host_integration_tests {
         errors: Vec<mpsc::Sender<String>>,
         enumerations: usize,
         invalid_config: bool,
+        output_channels: Option<u16>,
     }
     #[derive(Clone)]
     struct Host(Arc<Mutex<State>>);
@@ -4702,7 +4711,7 @@ mod clip_host_integration_tests {
             }
             Ok((
                 StreamConfig {
-                    channels: if state.invalid_config { 0 } else { 1 },
+                    channels: if state.invalid_config { 0 } else { state.output_channels.unwrap_or(1) },
                     sample_rate: cpal::SampleRate(8000),
                     buffer_size: cpal::BufferSize::Default,
                 },
@@ -4787,6 +4796,27 @@ mod clip_host_integration_tests {
             |_, _, _| panic!("failed startup must not emit playback"),
         )
         .unwrap_err()
+    }
+
+    #[test]
+    fn decoded_surround_center_reaches_a_stereo_output_stream() {
+        let host = Host::new(&["A"]);
+        {
+            let mut state = host.0.lock().unwrap();
+            state.output_channels = Some(2);
+            state.cancel_on_build = Some("A".into());
+        }
+        let mut output = std::io::Cursor::new(Vec::new());
+        {
+            let spec = hound::WavSpec { channels: 6, sample_rate: 8000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+            let mut writer = hound::WavWriter::new(&mut output, spec).unwrap();
+            for sample in [0_i16, 0, 16384, 0, 0, 0] { writer.write_sample(sample).unwrap(); }
+            writer.finalize().unwrap();
+        }
+        assert_eq!(failed_start(&host, output.into_inner(), ids(&["A"]), Arc::new(PlaybackControls::new(0.0, 1.0)), false), "Playback cancelled");
+        let state = host.0.lock().unwrap();
+        assert_eq!(state.samples.len(), 1);
+        assert!(state.samples[0][0] > 0.0 && state.samples[0][1] > 0.0, "center channel was lost: {:?}", state.samples[0]);
     }
 
     #[test]
@@ -5380,4 +5410,68 @@ mod decoded_layout_regression_tests {
         }
     }
 
+}
+
+#[cfg(test)]
+mod multichannel_stereo_regression_tests {
+    use super::*;
+
+    fn pcm(samples: &[f32], channels: usize) -> Vec<f32> {
+        let source: Arc<[f32]> = samples.to_vec().into();
+        prepare_output_pcm(&source, 48000, channels, (48000, 2), &mut HashMap::new()).unwrap().to_vec()
+    }
+
+    #[test]
+    fn center_speech_is_audible_in_both_stereo_channels() {
+        let output = pcm(&[0.0, 0.0, 0.5, 0.0, 0.0, 0.0], 6);
+        assert!(output[0] > 0.0 && output[1] > 0.0, "center channel was lost: {output:?}");
+    }
+
+    #[test]
+    fn surround_left_and_right_reach_their_respective_stereo_sides() {
+        let output = pcm(&[0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5], 6);
+        assert!(output[0] > 0.0 && output[1] == 0.0, "rear left was lost or crossed: {output:?}");
+        assert!(output[2] == 0.0 && output[3] > 0.0, "rear right was lost or crossed: {output:?}");
+    }
+
+    #[test]
+    fn low_frequency_channel_is_not_discarded() {
+        let output = pcm(&[0.0, 0.0, 0.0, 0.5, 0.0, 0.0], 6);
+        assert!(output[0] > 0.0 && output[1] > 0.0, "low frequency channel was lost: {output:?}");
+    }
+
+    #[test]
+    fn stereo_clips_keep_their_original_channels() {
+        assert_eq!(pcm(&[0.25, -0.5, 0.75, 0.0], 2), [0.25, -0.5, 0.75, 0.0]);
+    }
+
+    #[test]
+    fn nonstandard_two_channel_layout_is_remapped_instead_of_passed_through() {
+        use symphonia::core::audio::Channels as C;
+        let input: Arc<[f32]> = vec![0.25, 0.5].into();
+        let output = prepare_output_pcm_with_layout(&input, 48000, C::FRONT_LEFT | C::FRONT_CENTRE, (48000, 2), &mut HashMap::new()).unwrap();
+        assert!(output[0] > 0.5 && output[1] > 0.3 && output[1] < 0.4, "center must be mixed into both sides: {output:?}");
+    }
+
+    #[test]
+    fn side_channel_layout_uses_speaker_positions_not_channel_count() {
+        use symphonia::core::audio::Channels as C;
+        let layout = C::FRONT_LEFT | C::FRONT_RIGHT | C::SIDE_LEFT | C::SIDE_RIGHT;
+        let input: Arc<[f32]> = vec![0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.5].into();
+        let output = prepare_output_pcm_with_layout(&input, 48000, layout, (48000, 2), &mut HashMap::new()).unwrap();
+        assert!(output[0] > 0.0 && output[1] == 0.0 && output[2] == 0.0 && output[3] > 0.0, "{output:?}");
+    }
+
+    #[test]
+    fn six_channel_wave_center_survives_decode_and_stereo_preparation() {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = hound::WavWriter::new(&mut bytes, hound::WavSpec { channels: 6, sample_rate: 48000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int }).unwrap();
+            for sample in [0_i16, 0, 16384, 0, 0, 0] { writer.write_sample(sample).unwrap(); }
+            writer.finalize().unwrap();
+        }
+        let (samples, rate, layout) = decode_audio_with_layout(bytes.into_inner()).unwrap();
+        let output = prepare_output_pcm_with_layout(&samples.into(), rate, layout, (48000, 2), &mut HashMap::new()).unwrap();
+        assert!(output[0] > 0.0 && output[1] > 0.0, "decoded center channel was lost: {output:?}");
+    }
 }
