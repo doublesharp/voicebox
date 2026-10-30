@@ -630,10 +630,20 @@ async def qualify(settings, output, *, factory=bench.create_adapter, admit=bench
         gating = [c for c in report["checks"] if c["kind"] == "gating"]
         report["summary"] = {"passed": sum(c["passed"] for c in gating), "failed": sum(not c["passed"] for c in gating),
                              "expected": sum(check_kind(c) == "gating" for c in checks),
-                             "recorded": {c["name"]: c["passed"] for c in report["checks"] if c["kind"] == "recorded"}}
+                             "recorded": {c["name"]: recorded_outcome(c) for c in report["checks"] if c["kind"] == "recorded"}}
         with output.open("results.json") as handle:
             handle.write(json.dumps(report, default=str, indent=2, allow_nan=False).encode() + b"\n")
     return report
+
+
+def recorded_outcome(check):
+    """What a recorded check observed; `passed` only means it ran to completion."""
+    if not check["passed"]:
+        return "error"
+    evidence = check["evidence"]
+    if "bit_exact" in evidence:
+        return {"bit_exact": evidence["bit_exact"]}
+    return {f"{mode}_bit_exact": evidence[mode]["bit_exact"] for mode in ("cached", "bypass")}
 
 
 def parse_args(argv):
@@ -658,7 +668,10 @@ def main(argv=None):
         report = asyncio.run(qualify(settings, output))
         print(str(output.path / "results.json"))
         for check in report["checks"]:
-            verdict = "RECORDED" if check["kind"] == "recorded" else "PASS" if check["passed"] else "FAIL"
+            if check["kind"] == "recorded":
+                verdict = f"RECORDED {json.dumps(recorded_outcome(check))}"
+            else:
+                verdict = "PASS" if check["passed"] else "FAIL"
             print(f"{verdict} {check['name']}", file=sys.stderr)
         if report["status"] != "ok":
             print(json.dumps(report.get("error") or report.get("cleanup_error") or report["summary"]), file=sys.stderr)

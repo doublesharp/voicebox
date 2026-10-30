@@ -132,7 +132,8 @@ def test_every_check_passes_against_the_fake_backend(settings):
     gating = len(qualify.CHECKS) - len(qualify.RECORDED_CHECKS)
     assert report["status"] == "ok" and report["summary"] == {
         "passed": gating, "failed": 0, "expected": gating,
-        "recorded": {"fixed_seed_cache_vs_bypass_parity": True, "same_mode_repeat_reproducibility": True}}
+        "recorded": {"fixed_seed_cache_vs_bypass_parity": {"bit_exact": True},
+                     "same_mode_repeat_reproducibility": {"cached_bit_exact": True, "bypass_bit_exact": True}}}
     assert [c["name"] for c in report["checks"]] == [c.__name__.removeprefix("check_") for c in qualify.CHECKS]
     assert {c["name"] for c in report["checks"] if c["kind"] == "recorded"} == set(report["summary"]["recorded"])
     assert all(c["kind"] == "gating" for c in report["checks"] if c["name"] not in report["summary"]["recorded"])
@@ -261,7 +262,10 @@ def test_main_reports_failed_checks_with_nonzero_exit(settings, monkeypatch, cap
     assert report["status"] == "failed" and report["summary"]["failed"] >= 1
     assert report["provenance"]["runner_sha256"] == hashlib.sha256(SCRIPT.read_bytes()).hexdigest()
     printed = capsys.readouterr().err.splitlines()
-    assert "FAIL memory_hit_skips_prepare" in printed and "RECORDED fixed_seed_cache_vs_bypass_parity" in printed
+    assert "FAIL memory_hit_skips_prepare" in printed
+    recorded = [line for line in printed if line.endswith(" fixed_seed_cache_vs_bypass_parity")]
+    assert len(recorded) == 1 and recorded[0].startswith("RECORDED "), printed
+    assert recorded[0].split(" ", 1)[1].rsplit(" ", 1)[0] == json.dumps(report["summary"]["recorded"]["fixed_seed_cache_vs_bypass_parity"])
     cache.clear_voice_prompt_memory_cache()
     ok_root = settings.output_root.with_name("run-ok")
     assert qualify.main(argv[:5] + [str(ok_root)] + argv[6:] + ["--lifecycle-cycles", "1"]) == 0
@@ -378,6 +382,8 @@ def test_nondeterministic_model_records_parity_cause(settings):
     assert results["fixed_seed_cache_vs_bypass_parity"]["kind"] == "recorded"
     assert results["same_mode_repeat_reproducibility"]["evidence"]["cached"]["bit_exact"] is False
     assert report["status"] == "ok", "non-bit-exact audio is recorded, not gated"
+    assert report["summary"]["recorded"]["fixed_seed_cache_vs_bypass_parity"] == {"bit_exact": False}
+    assert report["summary"]["recorded"]["same_mode_repeat_reproducibility"]["cached_bit_exact"] is False
 
 
 def test_recorded_check_errors_are_reported_without_gating_the_run(settings):
@@ -386,7 +392,7 @@ def test_recorded_check_errors_are_reported_without_gating_the_run(settings):
     assert check["kind"] == "recorded" and check["passed"] is False and "prompt_a" in check["error"]
     assert report["status"] == "ok"
     assert report["summary"] == {"passed": 0, "failed": 0, "expected": 0,
-                                 "recorded": {"fixed_seed_cache_vs_bypass_parity": False}}
+                                 "recorded": {"fixed_seed_cache_vs_bypass_parity": "error"}}
 
 
 @pytest.mark.parametrize("device,carrier", [("cpu", "data_ptr"), ("cuda:0", "device"), ("cuda", "device")])
