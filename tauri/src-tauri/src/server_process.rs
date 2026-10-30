@@ -16,6 +16,36 @@ pub(crate) fn is_windows_server_image(tasklist_csv: &str) -> bool {
     })
 }
 
+#[cfg(any(test, windows))]
+pub(crate) fn windows_listener_pid(
+    output: &str,
+    mut tasklist: impl FnMut(u32) -> Option<String>,
+) -> Option<u32> {
+    let mut lines = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let pid = lines.next()?.parse::<u32>().ok().filter(|pid| *pid > 1)?;
+    // A single health response cannot identify an owner when multiple
+    // distinct (or malformed) listener records exist.
+    if lines.any(|line| line.parse::<u32>().ok() != Some(pid)) {
+        return None;
+    }
+    let rows = tasklist(pid)?;
+    let mut saw_row = false;
+    for row in rows.lines().filter(|line| !line.trim().is_empty()) {
+        saw_row = true;
+        let reported_pid = row
+            .split(',')
+            .nth(1)
+            .and_then(|field| field.trim().trim_matches('"').parse::<u32>().ok());
+        if reported_pid != Some(pid) || !is_windows_server_image(row) {
+            return None;
+        }
+    }
+    saw_row.then_some(pid)
+}
+
 #[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ListenerDecision {
@@ -384,5 +414,125 @@ mod exact_identity_tests {
             ListenerDecision::ReuseExternal
         );
         assert!(legacy_pids(&output, true).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod windows_listener_ownership_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn row(name: &str, pid: u32) -> String {
+        format!("\"{name}\",\"{pid}\",\"Console\",\"1\",\"10,000 K\"")
+    }
+
+    #[test]
+    fn multiple_distinct_listeners_are_never_claimed() {
+        let calls = Cell::new(0);
+        let result = windows_listener_pid("123\n456\n", |pid| {
+            calls.set(calls.get() + 1);
+            Some(row("voicebox-server.exe", pid))
+        });
+        assert_eq!(result, None);
+        assert_eq!(
+            calls.get(),
+            0,
+            "ambiguous listeners must not be classified by one image"
+        );
+    }
+
+    #[test]
+    fn malformed_or_system_pids_make_ownership_ambiguous() {
+        for output in ["123\ninvalid\n", "123\n0\n", "123\n1\n", "123\n-3\n"] {
+            assert_eq!(
+                windows_listener_pid(output, |pid| Some(row("voicebox-server.exe", pid))),
+                None,
+                "{output:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tasklist_must_report_the_requested_pid() {
+        assert_eq!(
+            windows_listener_pid("123\n", |_| Some(row("voicebox-server.exe", 456))),
+            None
+        );
+    }
+
+    #[test]
+    fn conflicting_tasklist_rows_are_not_owned() {
+        let rows = format!(
+            "{}\n{}",
+            row("voicebox-server.exe", 123),
+            row("unrelated.exe", 123)
+        );
+        assert_eq!(windows_listener_pid("123\n", |_| Some(rows.clone())), None);
+    }
+
+    #[test]
+    fn repeated_same_pid_with_exact_image_is_owned_once() {
+        let calls = Cell::new(0);
+        let result = windows_listener_pid("123\r\n123\r\n", |pid| {
+            calls.set(calls.get() + 1);
+            Some(row("VOICEBOX-SERVER-CUDA.EXE", pid))
+        });
+        assert_eq!(result, Some(123));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn missing_or_unrelated_tasklist_output_remains_external() {
+        for rows in [
+            None,
+            Some("INFO: No tasks are running".into()),
+            Some(row("voicebox-server.exe.bak", 123)),
+        ] {
+            assert_eq!(windows_listener_pid("123", |_| rows.clone()), None);
+        }
+        assert_eq!(
+            windows_listener_pid("", |_| panic!("empty output has no PID")),
+            None
+        );
+    }
+
+    #[test]
+    fn all_supported_windows_images_match_only_the_listening_pid() {
+        for name in [
+            "voicebox-server.exe",
+            "voicebox-server-cuda.exe",
+            "voicebox-server-rocm.exe",
+        ] {
+            for pid in [2, 123, u32::MAX] {
+                assert_eq!(
+                    windows_listener_pid(&format!(" {pid} "), |_| Some(row(name, pid))),
+                    Some(pid)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_or_malformed_pid_column_is_not_owned() {
+        for rows in [
+            "\"voicebox-server.exe\"",
+            "\"voicebox-server.exe\",\"invalid\"",
+            "\"voicebox-server.exe\",\"0\"",
+        ] {
+            assert_eq!(windows_listener_pid("123", |_| Some(rows.into())), None);
+        }
+    }
+
+    #[test]
+    fn multiple_rows_for_the_same_matching_process_are_allowed() {
+        let rows = format!(
+            "{}\n{}",
+            row("voicebox-server.exe", 123),
+            row("VOICEBOX-SERVER.EXE", 123)
+        );
+        assert_eq!(
+            windows_listener_pid("123\n123", |_| Some(rows.clone())),
+            Some(123)
+        );
     }
 }

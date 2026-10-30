@@ -195,24 +195,15 @@ fn find_voicebox_pid_on_port(port: u16) -> Option<u32> {
         .args(["-NoProfile", "-Command", &ps_script])
         .output()
     {
+        if !output.status.success() { return None; }
         let output_str = String::from_utf8_lossy(&output.stdout);
-        for line in output_str.lines() {
-            if let Ok(pid) = line.trim().parse::<u32>() {
-                if pid <= 1 {
-                    continue;
-                }
-                // Verify this PID is a voicebox process
-                if let Ok(tasklist_output) = Command::new("tasklist")
-                    .args(["/FI", &format!("PID eq {}", pid), "/FO", "CSV", "/NH"])
-                    .output()
-                {
-                    let tasklist_str = String::from_utf8_lossy(&tasklist_output.stdout);
-                    if server_process::is_windows_server_image(&tasklist_str) {
-                        return Some(pid);
-                    }
-                }
-            }
-        }
+        return server_process::windows_listener_pid(&output_str, |pid| {
+            let tasklist = Command::new("tasklist")
+                .args(["/FI", &format!("PID eq {}", pid), "/FO", "CSV", "/NH"])
+                .output().ok()?;
+            if !tasklist.status.success() { return None; }
+            Some(String::from_utf8_lossy(&tasklist.stdout).into_owned())
+        });
     }
 
     None
