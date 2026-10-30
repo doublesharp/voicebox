@@ -14,6 +14,7 @@ mod input_monitoring;
 #[cfg(desktop)]
 mod key_codes;
 mod keyboard_layout;
+mod paste_pipeline;
 mod publication;
 mod publication_commands;
 mod server_process;
@@ -1309,39 +1310,7 @@ async fn paste_final_text(
     text: String,
     focus: focus_capture::FocusSnapshot,
 ) -> Result<bool, String> {
-    if focus.bundle_id.as_deref() == Some(VOICEBOX_BUNDLE_ID) {
-        return Ok(false);
-    }
-    if !accessibility::is_trusted() {
-        return Err(
-            "Accessibility permission required for auto-paste. Open System Settings → Privacy & Security → Accessibility and enable Voicebox."
-                .into(),
-        );
-    }
-
-    focus_capture::activate_pid(focus.pid)?;
-    tokio::time::sleep(std::time::Duration::from_millis(POST_ACTIVATE_SETTLE_MS)).await;
-
-    let snapshot = clipboard::save_clipboard()?;
-    let after_write = clipboard::write_text(&text)?;
-
-    let paste_result = synthetic_keys::send_paste();
-    tokio::time::sleep(std::time::Duration::from_millis(PASTE_CONSUME_MS)).await;
-
-    let safe_to_restore = matches!(
-        clipboard::current_change_count(),
-        Ok(current) if current == after_write
-    );
-    if safe_to_restore {
-        clipboard::restore_clipboard(&snapshot)?;
-    } else {
-        eprintln!(
-            "[voicebox] clipboard mutated during paste window — skipping restore to preserve newer content"
-        );
-    }
-
-    paste_result?;
-    Ok(true)
+    paste_pipeline::paste_final_text(&text, &focus, &paste_pipeline::NativePaste, tokio::time::sleep).await
 }
 
 /// Inspect the currently focused UI element. Returns the owning app's PID,
