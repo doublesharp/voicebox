@@ -58,15 +58,6 @@ fn suggested_filename(filename: &str, stamp: u128) -> Result<String, String> {
     Ok(format!("{stem}-{stamp}{ext}"))
 }
 
-fn run(
-    app: AppHandle,
-    filename: String,
-    filters: Vec<FileFilter>,
-    input: impl FnOnce() -> Result<Box<dyn Read>, String>,
-) -> Result<SaveResult, String> {
-    run_with(|| choose(&app, &filename, &filters), input)
-}
-
 fn run_with(
     select: impl FnOnce() -> Result<Option<PathBuf>, String>,
     input: impl FnOnce() -> Result<Box<dyn Read>, String>,
@@ -85,6 +76,15 @@ fn run_with(
     })
 }
 
+async fn run_on_worker(
+    select: impl FnOnce() -> Result<Option<PathBuf>, String> + Send + 'static,
+    input: impl FnOnce() -> Result<Box<dyn Read>, String> + Send + 'static,
+) -> Result<SaveResult, String> {
+    tauri::async_runtime::spawn_blocking(move || run_with(select, input))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 pub async fn publish_file_bytes(
     app: AppHandle,
@@ -92,13 +92,11 @@ pub async fn publish_file_bytes(
     filters: Vec<FileFilter>,
     bytes: Vec<u8>,
 ) -> Result<SaveResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        run(app, filename, filters, || {
-            Ok(Box::new(io::Cursor::new(bytes)))
-        })
-    })
+    run_on_worker(
+        move || choose(&app, &filename, &filters),
+        move || Ok(Box::new(io::Cursor::new(bytes))),
+    )
     .await
-    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -108,13 +106,11 @@ pub async fn publish_file_url(
     filters: Vec<FileFilter>,
     url: String,
 ) -> Result<SaveResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        run(app, filename, filters, || {
-            download(&url, std::time::Duration::from_secs(30))
-        })
-    })
+    run_on_worker(
+        move || choose(&app, &filename, &filters),
+        move || download(&url, std::time::Duration::from_secs(30)),
+    )
     .await
-    .map_err(|e| e.to_string())?
 }
 
 fn download(url: &str, timeout: std::time::Duration) -> Result<Box<dyn Read>, String> {
@@ -360,6 +356,127 @@ mod export_flow_tests {
     }
     fn input(bytes: &'static [u8]) -> Box<dyn Read> {
         Box::new(io::Cursor::new(bytes))
+    }
+
+    #[tokio::test]
+    async fn worker_cancel_and_dialog_error_never_open_the_input() {
+        use std::sync::{atomic::AtomicBool, Arc};
+        for cancelled in [true, false] {
+            let called = Arc::new(AtomicBool::new(false));
+            let input_called = called.clone();
+            let result = run_on_worker(
+                move || {
+                    if cancelled {
+                        Ok(None)
+                    } else {
+                        Err("dialog failed".into())
+                    }
+                },
+                move || {
+                    input_called.store(true, Ordering::SeqCst);
+                    Ok(input(b"unused"))
+                },
+            )
+            .await;
+            if cancelled {
+                assert_eq!(result.unwrap().status, "cancelled");
+            } else {
+                assert_eq!(result.err().unwrap(), "dialog failed");
+            }
+            assert!(!called.load(Ordering::SeqCst));
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_publishes_complete_bytes_and_reports_the_destination() {
+        let fixture = Fixture::new();
+        let target = fixture.target();
+        std::fs::write(&target, b"old").unwrap();
+        let selected = target.clone();
+        let result = run_on_worker(
+            move || Ok(Some(selected)),
+            move || Ok(input(b"complete audio")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.status, "saved");
+        assert_eq!(result.path.as_deref(), target.to_str());
+        assert_eq!(std::fs::read(&target).unwrap(), b"complete audio");
+        assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn worker_rejects_truncated_http_body_without_replacing_file() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        let fixture = Fixture::new();
+        let target = fixture.target();
+        std::fs::write(&target, b"original").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/audio", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\npartial",
+                )
+                .unwrap();
+        });
+        let selected = target.clone();
+        let error = run_on_worker(
+            move || Ok(Some(selected)),
+            move || download(&url, std::time::Duration::from_secs(2)),
+        )
+        .await
+        .err()
+        .unwrap();
+        server.join().unwrap();
+        assert!(error.contains("Could not save"));
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn worker_panics_become_errors_and_do_not_leave_staged_files() {
+        struct PanicReader;
+        impl Read for PanicReader {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                panic!("injected stream panic")
+            }
+        }
+        let fixture = Fixture::new();
+        let target = fixture.target();
+        std::fs::write(&target, b"original").unwrap();
+        let selected = target.clone();
+        let result = run_on_worker(move || Ok(Some(selected)), || Ok(Box::new(PanicReader))).await;
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn overlapping_workers_never_publish_mixed_content() {
+        let fixture = Fixture::new();
+        let target = fixture.target();
+        let first_target = target.clone();
+        let second_target = target.clone();
+        let first = run_on_worker(
+            move || Ok(Some(first_target)),
+            || Ok(Box::new(io::Cursor::new(vec![1u8; 16384]))),
+        );
+        let second = run_on_worker(
+            move || Ok(Some(second_target)),
+            || Ok(Box::new(io::Cursor::new(vec![2u8; 16384]))),
+        );
+        let (a, b) = tokio::join!(first, second);
+        assert!(a.is_ok() && b.is_ok());
+        let bytes = std::fs::read(&target).unwrap();
+        assert_eq!(bytes.len(), 16384);
+        assert!(bytes.iter().all(|v| *v == bytes[0]));
+        assert!([1, 2].contains(&bytes[0]));
+        assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 1);
     }
 
     #[test]
