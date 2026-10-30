@@ -192,10 +192,12 @@ pub(crate) async fn wait_for_startup(
     mut log: impl FnMut(&str, &str),
 ) -> Outcome {
     let deadline = tokio::time::Instant::now() + timeout;
-    let mut errors = Vec::new();
+    const MAX_ERRORS: usize = 64;
+    const MAX_ERROR_BYTES: usize = 1024;
+    let mut errors = std::collections::VecDeque::with_capacity(MAX_ERRORS);
     loop {
         let event = match tokio::time::timeout_at(deadline, rx.recv()).await {
-            Err(_) => return Outcome::TimedOut(errors),
+            Err(_) => return Outcome::TimedOut(errors.into_iter().collect()),
             Ok(None) => return Outcome::Exited,
             Ok(Some(event)) => event,
         };
@@ -211,9 +213,27 @@ pub(crate) async fn wait_for_startup(
         if stream == "stderr"
             && (line.contains("ERROR") || line.contains("Error") || line.contains("Failed"))
         {
-            errors.push(line.to_string());
+            if errors.len() == MAX_ERRORS {
+                errors.pop_front();
+            }
+            if line.len() > MAX_ERROR_BYTES {
+                let mut end = MAX_ERROR_BYTES - '…'.len_utf8();
+                while !line.is_char_boundary(end) {
+                    end -= 1;
+                }
+                errors.push_back(format!("{}…", &line[..end]));
+            } else {
+                errors.push_back(line.to_string());
+            }
         }
-        if line.contains("Uvicorn running") {
+        let message = line.trim();
+        let message = message
+            .strip_prefix("INFO:")
+            .map(str::trim_start)
+            .unwrap_or(message);
+        if message.starts_with("Uvicorn running on http://")
+            || message.starts_with("Uvicorn running on https://")
+        {
             return Outcome::Ready;
         }
     }
@@ -1213,6 +1233,116 @@ mod startup_stream_error_tests {
         assert_eq!(
             wait_for_startup(&mut rx, Duration::from_secs(1), |_, _| {}).await,
             Outcome::Exited
+        );
+    }
+}
+
+#[cfg(test)]
+mod startup_log_regression_tests {
+    use super::*;
+    use tauri::async_runtime::channel;
+    use tauri_plugin_shell::process::TerminatedPayload;
+
+    #[tokio::test]
+    async fn error_or_debug_messages_mentioning_uvicorn_do_not_report_ready() {
+        for line in [
+            "ERROR: failed to start: Uvicorn running on http://127.0.0.1:17493",
+            "DEBUG: waiting for Uvicorn running on http://127.0.0.1:17493",
+            "Uvicorn running failed to bind",
+            "preparing Uvicorn running on http://127.0.0.1:17493",
+        ] {
+            let (tx, mut rx) = channel(2);
+            tx.send(CommandEvent::Stderr(line.as_bytes().to_vec()))
+                .await
+                .unwrap();
+            tx.send(CommandEvent::Terminated(TerminatedPayload {
+                code: Some(1),
+                signal: None,
+            }))
+            .await
+            .unwrap();
+            assert_eq!(
+                wait_for_startup(&mut rx, Duration::from_secs(1), |_, _| {}).await,
+                Outcome::Exited,
+                "{line}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn legitimate_listening_messages_work_on_both_streams() {
+        for line in [
+            "Uvicorn running on http://127.0.0.1:17493",
+            "INFO:     Uvicorn running on http://0.0.0.0:17493 (Press CTRL+C to quit)",
+            "INFO: Uvicorn running on https://127.0.0.1:17493",
+        ] {
+            for stdout in [true, false] {
+                let (tx, mut rx) = channel(1);
+                let event = if stdout {
+                    CommandEvent::Stdout(line.as_bytes().to_vec())
+                } else {
+                    CommandEvent::Stderr(line.as_bytes().to_vec())
+                };
+                tx.send(event).await.unwrap();
+                assert_eq!(
+                    wait_for_startup(&mut rx, Duration::from_secs(1), |_, _| {}).await,
+                    Outcome::Ready
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_keeps_a_bounded_tail_of_error_lines() {
+        let (tx, mut rx) = channel(200);
+        for i in 0..150 {
+            tx.send(CommandEvent::Stderr(
+                format!("ERROR item {i}\n").into_bytes(),
+            ))
+            .await
+            .unwrap();
+        }
+        let mut forwarded = 0;
+        let outcome =
+            wait_for_startup(&mut rx, Duration::from_millis(50), |_, _| forwarded += 1).await;
+        let Outcome::TimedOut(errors) = outcome else {
+            panic!("expected timeout");
+        };
+        assert_eq!(forwarded, 150);
+        assert!(
+            errors.len() <= 64,
+            "too many retained errors: {}",
+            errors.len()
+        );
+        assert!(errors.last().unwrap().contains("149"));
+    }
+
+    #[tokio::test]
+    async fn oversized_unicode_error_is_retained_with_a_bounded_valid_string() {
+        let (tx, mut rx) = channel(1);
+        tx.send(CommandEvent::Stderr(
+            format!("ERROR {}", "🎙".repeat(2000)).into_bytes(),
+        ))
+        .await
+        .unwrap();
+        let outcome = wait_for_startup(&mut rx, Duration::from_millis(50), |_, _| {}).await;
+        let Outcome::TimedOut(errors) = outcome else {
+            panic!("expected timeout");
+        };
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].len() <= 1024);
+        assert!(errors[0].starts_with("ERROR "));
+    }
+
+    #[tokio::test]
+    async fn short_error_text_remains_unchanged_for_diagnostics() {
+        let (tx, mut rx) = channel(1);
+        tx.send(CommandEvent::Stderr(b"ERROR model not found\n".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(
+            wait_for_startup(&mut rx, Duration::from_millis(50), |_, _| {}).await,
+            Outcome::TimedOut(vec!["ERROR model not found\n".into()])
         );
     }
 }
