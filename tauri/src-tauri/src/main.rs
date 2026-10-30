@@ -718,6 +718,16 @@ async fn start_server(
         }
     };
 
+    // Until the forwarder takes over, cancellation must not orphan this child.
+    let startup_cleanup = server_startup::StartupCleanup::new(|| {
+        let (process, permit) = state.start_gate.begin_cleanup(|| {
+            server_process::take_process(&state.server_pid, &state.child, Some(process_pid))
+        });
+        if let Some((pid, child)) = process {
+            spawn_server_stop(pid, child, permit);
+        }
+    });
+
     println!("Server process spawned, waiting for ready signal...");
     println!("=================================================================");
 
@@ -770,6 +780,7 @@ async fn start_server(
         }).await;
     });
 
+    startup_cleanup.disarm();
     Ok(format!("http://127.0.0.1:{}", SERVER_PORT))
 }
 
@@ -789,44 +800,46 @@ async fn stop_server_if_owned(
         state.start_gate.begin_cleanup(take_process)
     };
     if let Some((pid, child)) = process {
-        tokio::task::spawn_blocking(move || {
-            // Keep the gate held even if the async caller is cancelled.
-            let _stop_permit = stop_permit;
-            let _child = child;
-            println!("stop_server: Stopping server with PID: {}", pid);
-
-            #[cfg(unix)]
-            {
-                use std::process::Command;
-                // Kill process group with SIGTERM first
-                let _ = Command::new("kill")
-                    .args(["-TERM", "--", &format!("-{}", pid)])
-                    .output();
-
-                // Brief wait then force kill
-                std::thread::sleep(std::time::Duration::from_millis(100));
-
-                let _ = Command::new("kill")
-                    .args(["-9", "--", &format!("-{}", pid)])
-                    .output();
-                let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
-
-                println!("stop_server: Process group kill completed");
-            }
-
-            #[cfg(windows)]
-            {
-                // Terminate the captured process tree, never a replacement
-                // server that may have acquired the fixed HTTP port.
-                let _ = std::process::Command::new("taskkill")
-                    .args(["/PID", &pid.to_string(), "/T", "/F"])
-                    .output();
-            }
-        })
-        .await
-        .map_err(|error| format!("Failed to stop server: {}", error))?;
+        spawn_server_stop(pid, child, stop_permit)
+            .await
+            .map_err(|error| format!("Failed to stop server: {}", error))?;
     }
     Ok(())
+}
+
+fn spawn_server_stop(
+    pid: u32,
+    child: Option<tauri_plugin_shell::process::CommandChild>,
+    stop_permit: server_startup::StopPermit,
+) -> tokio::task::JoinHandle<()> {
+    tokio::task::spawn_blocking(move || {
+        // Keep the gate held even if the async caller is cancelled.
+        let _stop_permit = stop_permit;
+        let _child = child;
+        println!("stop_server: Stopping server with PID: {}", pid);
+
+        #[cfg(unix)]
+        {
+            use std::process::Command;
+            let _ = Command::new("kill")
+                .args(["-TERM", "--", &format!("-{}", pid)])
+                .output();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let _ = Command::new("kill")
+                .args(["-9", "--", &format!("-{}", pid)])
+                .output();
+            let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
+            println!("stop_server: Process group kill completed");
+        }
+
+        #[cfg(windows)]
+        {
+            // Terminate the captured process tree, never a replacement server.
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .output();
+        }
+    })
 }
 
 #[command]
@@ -2244,5 +2257,29 @@ mod launch_fallback_tests {
             |path| std::process::Command::new(path).spawn(),
             || std::process::Command::new("/usr/bin/true").spawn()).unwrap();
         assert!(child.wait_with_output().unwrap().status.success());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod server_stop_worker_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stop_worker_terminates_a_task_owned_real_child() {
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = OwnedChild(std::process::Command::new("/bin/sleep").arg("30").spawn().unwrap());
+        let gate = Arc::new(server_startup::StartGate::default());
+        let (_, stop) = gate.begin_cleanup(|| ());
+        assert!(gate.try_begin().is_none());
+        tokio::time::timeout(std::time::Duration::from_secs(5), spawn_server_stop(child.0.id(), None, stop))
+            .await.unwrap().unwrap();
+        assert!(!child.0.wait().unwrap().success());
+        assert!(gate.try_begin().is_some());
     }
 }

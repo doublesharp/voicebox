@@ -155,6 +155,29 @@ impl Drop for StartPermit<'_> {
     }
 }
 
+pub(crate) struct StartupCleanup<F: FnOnce()> {
+    cleanup: Option<F>,
+}
+
+impl<F: FnOnce()> StartupCleanup<F> {
+    pub(crate) fn new(cleanup: F) -> Self {
+        Self {
+            cleanup: Some(cleanup),
+        }
+    }
+    pub(crate) fn disarm(mut self) {
+        self.cleanup = None;
+    }
+}
+
+impl<F: FnOnce()> Drop for StartupCleanup<F> {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup();
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Outcome {
     Ready,
@@ -958,6 +981,112 @@ mod stop_ownership_tests {
         assert!(caller.await.unwrap_err().is_cancelled());
         assert!(gate.try_begin().is_none());
         release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), gate.wait_until_idle())
+            .await
+            .unwrap();
+        assert!(gate.try_begin().is_some());
+    }
+}
+
+#[cfg(test)]
+mod startup_ownership_regression_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
+
+    #[test]
+    fn startup_failure_runs_cleanup_once() {
+        let calls = AtomicUsize::new(0);
+        {
+            let _guard = StartupCleanup::new(|| {
+                calls.fetch_add(1, Ordering::Relaxed);
+            });
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn successful_handoff_disarms_cleanup() {
+        let calls = AtomicUsize::new(0);
+        StartupCleanup::new(|| {
+            calls.fetch_add(1, Ordering::Relaxed);
+        })
+        .disarm();
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn stale_startup_cleanup_preserves_a_replacement() {
+        let pid = Mutex::new(Some(22));
+        let child = Mutex::new(Some("replacement"));
+        {
+            let _guard = StartupCleanup::new(|| {
+                crate::server_process::take_process(&pid, &child, Some(11));
+            });
+        }
+        assert_eq!(*pid.lock().unwrap(), Some(22));
+        assert_eq!(*child.lock().unwrap(), Some("replacement"));
+    }
+
+    #[test]
+    fn failed_startup_detaches_only_its_own_child() {
+        let pid = Mutex::new(Some(11));
+        let child = Mutex::new(Some("original"));
+        let result = Mutex::new(None);
+        {
+            let _guard = StartupCleanup::new(|| {
+                *result.lock().unwrap() =
+                    crate::server_process::take_process(&pid, &child, Some(11));
+            });
+        }
+        assert_eq!(*result.lock().unwrap(), Some((11, Some("original"))));
+        assert_eq!(*pid.lock().unwrap(), None);
+        assert_eq!(*child.lock().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn aborted_start_detaches_child_and_holds_gate_until_cleanup_finishes() {
+        let gate = Arc::new(StartGate::default());
+        let pid = Arc::new(Mutex::new(Some(11)));
+        let child = Arc::new(Mutex::new(Some("child")));
+        let (started, waiting) = tokio::sync::oneshot::channel();
+        let (cleanup_started, cleanup_waiting) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let worker_gate = gate.clone();
+        let cleanup_gate = gate.clone();
+        let worker_pid = pid.clone();
+        let worker_child = child.clone();
+        let task = tokio::spawn(async move {
+            let _permit = worker_gate.try_begin().unwrap();
+            let _cleanup = StartupCleanup::new(move || {
+                let (process, stop) = cleanup_gate.begin_cleanup(|| {
+                    crate::server_process::take_process(&worker_pid, &worker_child, Some(11))
+                });
+                if process.is_some() {
+                    tokio::task::spawn_blocking(move || {
+                        let _stop = stop;
+                        let _ = cleanup_started.send(());
+                        let _ = blocked.recv();
+                    });
+                }
+            });
+            started.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        waiting.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let notified = tokio::time::timeout(Duration::from_secs(1), cleanup_waiting).await;
+        assert!(
+            matches!(notified, Ok(Ok(()))),
+            "aborted startup did not schedule child cleanup"
+        );
+        assert_eq!(*pid.lock().unwrap(), None);
+        assert_eq!(*child.lock().unwrap(), None);
+        assert!(gate.try_begin().is_none());
+        release.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(1), gate.wait_until_idle())
             .await
             .unwrap();
