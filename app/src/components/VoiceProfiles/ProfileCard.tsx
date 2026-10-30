@@ -1,5 +1,5 @@
 import { Download, Edit, Sparkles, Trash2, Wand2 } from 'lucide-react';
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -15,6 +15,8 @@ import {
 } from '@/components/ui/dialog';
 import type { VoiceProfileResponse } from '@/lib/api/types';
 import { useDeleteProfile, useExportProfile } from '@/lib/hooks/useProfiles';
+import { currentServerScope, type ServerScope } from '@/lib/serverScope';
+import { useToast } from '@/components/ui/use-toast';
 import { cn } from '@/lib/utils/cn';
 import { useUIStore } from '@/stores/uiStore';
 
@@ -32,7 +34,9 @@ interface ProfileCardProps {
 
 export function ProfileCard({ profile, disabled }: ProfileCardProps) {
   const { t } = useTranslation();
+  const { toast } = useToast();
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
+  const deleteScopeRef = useRef<ServerScope | null>(null);
 
   const deleteProfile = useDeleteProfile();
   const exportProfile = useExportProfile();
@@ -59,17 +63,31 @@ export function ProfileCard({ profile, disabled }: ProfileCardProps) {
 
   const handleDeleteClick = (e: React.MouseEvent) => {
     e.stopPropagation();
+    deleteScopeRef.current = currentServerScope();
     setDeleteDialogOpen(true);
   };
 
   const handleDeleteConfirm = () => {
-    deleteProfile.mutate(profile.id);
+    if (!deleteScopeRef.current) return;
+    deleteProfile.mutate({ profileId: profile.id, _serverScope: deleteScopeRef.current }, {
+      onError: (error) => toast({
+        title: t('profiles.card.deleteFailed', { defaultValue: 'Voice deletion failed' }),
+        description: error instanceof Error ? error.message : t('common.error'),
+        variant: 'destructive',
+      }),
+    });
     setDeleteDialogOpen(false);
   };
 
   const handleExport = (e: React.MouseEvent) => {
     e.stopPropagation();
-    exportProfile.mutate(profile.id);
+    exportProfile.mutate({ profileId: profile.id, _serverScope: currentServerScope() }, {
+      onError: (error) => toast({
+        title: t('profiles.card.exportFailed', { defaultValue: 'Voice export failed' }),
+        description: error instanceof Error ? error.message : t('common.error'),
+        variant: 'destructive',
+      }),
+    });
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {

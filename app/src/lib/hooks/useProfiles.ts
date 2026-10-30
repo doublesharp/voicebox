@@ -1,4 +1,4 @@
-import { isCurrentServer, requireCurrentServer, type ServerScope } from '@/lib/serverScope';
+import { currentServerScope, isCurrentServer, requireCurrentServer, type ServerScope } from '@/lib/serverScope';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiClient } from '@/lib/api/client';
 import type { EffectConfig, VoiceProfileCreate, VoiceProfileResponse } from '@/lib/api/types';
@@ -195,11 +195,16 @@ export function useExportProfile() {
   const platform = usePlatform();
 
   return useMutation({
-    mutationFn: async (profileId: string) => {
+    mutationFn: async (value: string | { profileId: string; _serverScope: ServerScope }) => {
+      const profileId = typeof value === 'string' ? value : value.profileId;
+      const scope = typeof value === 'string' ? currentServerScope() : value._serverScope;
+      requireCurrentServer(scope);
       const blob = await apiClient.exportProfile(profileId);
 
-      // Get profile name for filename
+      // Do not fetch metadata from a different server for the downloaded bytes.
+      requireCurrentServer(scope);
       const profile = await apiClient.getProfile(profileId);
+      requireCurrentServer(scope);
       const safeName = profile.name.replace(/[^a-z0-9]/gi, '-').toLowerCase();
       const filename = `profile-${safeName}.voicebox.zip`;
 
