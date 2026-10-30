@@ -33,6 +33,18 @@ pub const DICTATE_WINDOW_LABEL: &str = "dictate";
 const DICTATE_WINDOW_WIDTH: f64 = 420.0;
 const DICTATE_WINDOW_HEIGHT: f64 = 64.0;
 
+#[cfg(desktop)]
+fn dictate_window_position(
+    origin: tauri::PhysicalPosition<i32>,
+    monitor: tauri::PhysicalSize<u32>,
+    window: tauri::PhysicalSize<u32>,
+) -> tauri::PhysicalPosition<i32> {
+    let x = i64::from(origin.x) + (i64::from(monitor.width) - i64::from(window.width)) / 2;
+    let y = i64::from(origin.y) + i64::from(monitor.height) * 4 / 100;
+    let bounded = |value: i64| value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+    tauri::PhysicalPosition::new(bounded(x), bounded(y))
+}
+
 /// Create the floating dictate webview hidden. The HotkeyMonitor shows it on
 /// chord-start; the frontend hides it when the capture pipeline finishes.
 /// Building it at setup avoids a race where the first chord or agent-speech
@@ -59,11 +71,8 @@ fn build_dictate_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::
     .build()?;
 
     if let Some(monitor) = window.current_monitor()? {
-        let monitor_size = monitor.size();
         let win_size = window.outer_size()?;
-        let x = (monitor_size.width as i32 - win_size.width as i32) / 2;
-        let y = (monitor_size.height as f64 * 0.04) as i32;
-        window.set_position(PhysicalPosition::new(x, y))?;
+        window.set_position(dictate_window_position(*monitor.position(), *monitor.size(), win_size))?;
     }
 
     Ok(window)
@@ -112,13 +121,10 @@ pub fn show_dictate_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
         .flatten()
         .or_else(|| window.primary_monitor().ok().flatten());
     if let Some(monitor) = monitor {
-        let monitor_pos = monitor.position();
-        let monitor_size = monitor.size();
         if let Ok(win_size) = window.outer_size() {
-            let x = monitor_pos.x
-                + (monitor_size.width as i32 - win_size.width as i32) / 2;
-            let y = monitor_pos.y + (monitor_size.height as f64 * 0.04) as i32;
-            let _ = window.set_position(PhysicalPosition::new(x, y));
+            let _ = window.set_position(dictate_window_position(
+                *monitor.position(), *monitor.size(), win_size,
+            ));
         }
     }
     // Skip on Linux: tao's CursorIgnoreEvents handler unwraps the GdkWindow,
@@ -4212,5 +4218,55 @@ mod hotkey_window_startup_tests {
             panic!("simulate monitor owner panic");
         });
         assert!(stop_hotkey(&state).is_err());
+    }
+}
+
+#[cfg(all(test, desktop))]
+mod dictate_position_tests {
+    use super::*;
+    use tauri::PhysicalSize;
+
+    #[test]
+    fn overlay_placement_tracks_each_monitor_origin() {
+        let monitor = PhysicalSize::new(1920, 1080);
+        let window = PhysicalSize::new(420, 64);
+        for (origin, expected) in [
+            ((0, 0), (750, 43)),
+            ((1920, 0), (2670, 43)),
+            ((-1920, 0), (-1170, 43)),
+            ((0, -1080), (750, -1037)),
+            ((-1920, -1080), (-1170, -1037)),
+            ((320, 1440), (1070, 1483)),
+        ] {
+            let actual =
+                dictate_window_position(PhysicalPosition::new(origin.0, origin.1), monitor, window);
+            assert_eq!((actual.x, actual.y), expected, "monitor origin {origin:?}");
+        }
+    }
+
+    #[test]
+    fn overlay_is_centered_for_a_wider_window() {
+        let actual = dictate_window_position(
+            PhysicalPosition::new(-1280, 100),
+            PhysicalSize::new(320, 600),
+            PhysicalSize::new(420, 64),
+        );
+        assert_eq!((actual.x, actual.y), (-1330, 124));
+    }
+
+    #[test]
+    fn large_display_values_do_not_overflow() {
+        let actual = dictate_window_position(
+            PhysicalPosition::new(i32::MAX, i32::MAX),
+            PhysicalSize::new(u32::MAX, u32::MAX),
+            PhysicalSize::new(0, 0),
+        );
+        assert_eq!((actual.x, actual.y), (i32::MAX, i32::MAX));
+        let actual = dictate_window_position(
+            PhysicalPosition::new(i32::MIN, 0),
+            PhysicalSize::new(0, 0),
+            PhysicalSize::new(u32::MAX, 0),
+        );
+        assert_eq!((actual.x, actual.y), (i32::MIN, 0));
     }
 }
