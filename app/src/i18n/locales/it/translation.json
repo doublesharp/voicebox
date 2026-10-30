@@ -917,6 +917,8 @@
           "change": "Cambia"
         },
         "chordPicker": {
+          "startFailureTitle": "Scorciatoia di dettatura non disponibile",
+          "startFailureDescription": "Impossibile avviare la scorciatoia globale. Controlla le autorizzazioni di sistema e riprova.",
           "conflictTitle": "Scorciatoia già in uso",
           "conflictDescription": "Scegli scorciatoie diverse per parlare tenendo premuto e per la registrazione continua.",
           "pttTitle": "Imposta la scorciatoia push-to-talk",

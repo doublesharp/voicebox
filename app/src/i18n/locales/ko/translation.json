@@ -917,6 +917,8 @@
           "change": "변경"
         },
         "chordPicker": {
+          "startFailureTitle": "받아쓰기 단축키를 사용할 수 없음",
+          "startFailureDescription": "전역 단축키를 시작하지 못했습니다. 시스템 권한을 확인하고 다시 시도하세요.",
           "conflictTitle": "이미 사용 중인 단축키",
           "conflictDescription": "누르고 말하기와 녹음 전환에 서로 다른 단축키를 선택하세요.",
           "pttTitle": "푸시투톡 단축키 설정",

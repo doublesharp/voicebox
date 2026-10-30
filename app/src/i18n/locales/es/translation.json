@@ -917,6 +917,8 @@
           "change": "Cambiar"
         },
         "chordPicker": {
+          "startFailureTitle": "Atajo de dictado no disponible",
+          "startFailureDescription": "No se pudo activar el atajo global. Comprueba los permisos del sistema e inténtalo de nuevo.",
           "conflictTitle": "Atajo ya en uso",
           "conflictDescription": "Elige atajos diferentes para pulsar para hablar y grabación alternada.",
           "pttTitle": "Definir el atajo de pulsar para hablar",

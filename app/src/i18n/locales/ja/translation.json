@@ -917,6 +917,8 @@
           "change": "変更"
         },
         "chordPicker": {
+          "startFailureTitle": "音声入力のショートカットを使用できません",
+          "startFailureDescription": "グローバルショートカットを開始できませんでした。システムの権限を確認して再試行してください。",
           "conflictTitle": "ショートカットは使用中です",
           "conflictDescription": "プッシュツートークと切り替え録音には異なるショートカットを選んでください。",
           "pttTitle": "プッシュトゥトーク用ショートカットを設定",

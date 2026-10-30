@@ -942,6 +942,8 @@
           "change": "Change"
         },
         "chordPicker": {
+          "startFailureTitle": "Dictation shortcut unavailable",
+          "startFailureDescription": "The global shortcut could not start. Check system permissions and try again.",
           "conflictTitle": "Shortcut already in use",
           "conflictDescription": "Choose different shortcuts for push-to-talk and toggle recording.",
           "pttTitle": "Set push-to-talk shortcut",

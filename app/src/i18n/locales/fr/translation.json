@@ -917,6 +917,8 @@
           "change": "Modifier"
         },
         "chordPicker": {
+          "startFailureTitle": "Raccourci de dictée indisponible",
+          "startFailureDescription": "Le raccourci global n’a pas pu démarrer. Vérifiez les autorisations système et réessayez.",
           "conflictTitle": "Raccourci déjà utilisé",
           "conflictDescription": "Choisissez des raccourcis différents pour parler en maintenant et pour l’enregistrement continu.",
           "pttTitle": "Définir le raccourci push-to-talk",

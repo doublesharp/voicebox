@@ -11,13 +11,14 @@ import { usePlatform } from '@/platform/PlatformContext';
 // native calls already in flight when the component is replaced.
 let nativeQueue: Promise<void> = Promise.resolve();
 
-function enqueueNative(command: string, args: Record<string, unknown>, current: () => boolean = () => true) {
+function enqueueNative(command: string, args: Record<string, unknown>, current: () => boolean = () => true, onError?: () => void) {
   nativeQueue = nativeQueue.then(async () => {
     if (!current()) return;
     try {
       await invoke(command, args);
     } catch (err) {
       console.warn(`[chord-sync] ${command} failed:`, err);
+      if (current()) onError?.();
     }
   });
 }
@@ -78,7 +79,13 @@ export function useChordSync() {
     const current = ++revision.current;
     // Native commands can finish out of order. Keep issued commands ordered,
     // and drop an obsolete command before it reaches the native layer.
-    enqueueNative(command, args, () => revision.current === current);
+    enqueueNative(command, args, () => revision.current === current, shouldArm ? () => {
+      toast({
+        title: t('settings.captures.dictation.chordPicker.startFailureTitle'),
+        description: t('settings.captures.dictation.chordPicker.startFailureDescription'),
+        variant: 'destructive',
+      });
+    } : undefined);
     return () => {
       if (revision.current === current) revision.current++;
     };

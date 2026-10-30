@@ -917,6 +917,8 @@
           "change": "變更"
         },
         "chordPicker": {
+          "startFailureTitle": "聽寫快捷鍵無法使用",
+          "startFailureDescription": "無法啟動全域快捷鍵。請檢查系統權限後再試一次。",
           "conflictTitle": "快捷鍵已被使用",
           "conflictDescription": "請為按住說話和切換錄音選擇不同的快捷鍵。",
           "pttTitle": "設定按住說話快捷鍵",

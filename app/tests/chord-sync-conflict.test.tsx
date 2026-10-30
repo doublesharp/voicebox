@@ -150,3 +150,49 @@ test('a replacement mount enables only after the previous teardown', async () =>
   expect(calls[2].args.pushToTalk).toEqual(['ControlRight']);
   expect(armed).toBe(true);
 });
+
+test('a current hotkey startup failure tells the user dictation is unavailable', async () => {
+  settings = { hotkey_enabled: true, chord_push_to_talk_keys: ['MetaRight'], chord_toggle_to_talk_keys: ['MetaRight', 'Space'] };
+  handler = async (name) => { if (name === 'enable_hotkey') throw new Error('listener unavailable'); };
+  const warn = console.warn;
+  console.warn = () => {};
+  try {
+    await act(async () => { view = create(<App />); });
+    expect(notices).toEqual([expect.objectContaining({
+      title: 'settings.captures.dictation.chordPicker.startFailureTitle',
+      description: 'settings.captures.dictation.chordPicker.startFailureDescription',
+      variant: 'destructive',
+    })]);
+  } finally { console.warn = warn; }
+});
+
+test('an obsolete failed startup does not notify after readiness changes', async () => {
+  settings = { hotkey_enabled: true, chord_push_to_talk_keys: ['MetaRight'], chord_toggle_to_talk_keys: ['MetaRight', 'Space'] };
+  let rejectEnable = (_error: Error) => {};
+  handler = (name) => name === 'enable_hotkey' ? new Promise<void>((_, reject) => { rejectEnable = reject; }) : Promise.resolve();
+  const warn = console.warn;
+  console.warn = () => {};
+  try {
+    await act(async () => { view = create(<App />); });
+    canRecord = false;
+    await act(async () => { view.update(<App />); });
+    await act(async () => { rejectEnable(new Error('unavailable')); await Promise.resolve(); });
+    expect(notices).toHaveLength(0);
+    expect(calls.map((call) => call.name)).toEqual(['enable_hotkey', 'disable_hotkey']);
+  } finally { console.warn = warn; }
+});
+
+test('a failed startup after unmount does not show an obsolete notice', async () => {
+  settings = { hotkey_enabled: true, chord_push_to_talk_keys: ['MetaRight'], chord_toggle_to_talk_keys: ['MetaRight', 'Space'] };
+  let rejectEnable = (_error: Error) => {};
+  handler = (name) => name === 'enable_hotkey' ? new Promise<void>((_, reject) => { rejectEnable = reject; }) : Promise.resolve();
+  const warn = console.warn;
+  console.warn = () => {};
+  try {
+    await act(async () => { view = create(<App />); });
+    act(() => view.unmount());
+    await act(async () => { rejectEnable(new Error('unavailable')); await Promise.resolve(); });
+    expect(notices).toHaveLength(0);
+    expect(calls.map((call) => call.name)).toEqual(['enable_hotkey', 'disable_hotkey']);
+  } finally { console.warn = warn; }
+});

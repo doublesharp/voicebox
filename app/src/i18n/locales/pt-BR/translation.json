@@ -917,6 +917,8 @@
           "change": "Alterar"
         },
         "chordPicker": {
+          "startFailureTitle": "Atalho de ditado indisponível",
+          "startFailureDescription": "Não foi possível iniciar o atalho global. Verifique as permissões do sistema e tente novamente.",
           "conflictTitle": "Atalho já em uso",
           "conflictDescription": "Escolha atalhos diferentes para pressionar para falar e para alternar a gravação.",
           "pttTitle": "Definir atalho de apertar para falar",
