@@ -105,10 +105,9 @@ impl HotkeyMonitor {
         // (≤100ms) and returns; joining waits for that. Dropping the
         // ChordMatcher stops keytap's chord-worker thread and the
         // underlying Tap.
-        if let Some(active) = self.active.take() {
-            active.shutdown.store(true, Ordering::Release);
-            let _ = active.dispatcher.join();
-        }
+        stop_dispatcher(self.active.take(), || {
+            apply_effect(&self.app, Effect::StopRecording(ChordAction::PushToTalk));
+        });
 
         if bindings.values().all(|set| set.is_empty()) {
             return;
@@ -136,6 +135,14 @@ impl HotkeyMonitor {
             dispatcher,
             shutdown,
         });
+    }
+}
+
+fn stop_dispatcher(active: Option<Active>, on_stopped: impl FnOnce()) {
+    if let Some(active) = active {
+        active.shutdown.store(true, Ordering::Release);
+        let _ = active.dispatcher.join();
+        on_stopped();
     }
 }
 
@@ -572,5 +579,44 @@ mod shutdown_tests {
             },
         );
         assert_eq!(effects, [Effect::StopRecording(ChordAction::PushToTalk)]);
+    }
+}
+
+#[cfg(test)]
+mod teardown_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn stopping_an_active_matcher_notifies_after_the_dispatcher_has_exited() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let exited = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = shutdown.clone();
+        let worker_exited = exited.clone();
+        let dispatcher = std::thread::spawn(move || {
+            while !worker_shutdown.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            worker_exited.store(true, Ordering::Release);
+        });
+        let mut notifications = 0;
+        stop_dispatcher(
+            Some(Active {
+                dispatcher,
+                shutdown,
+            }),
+            || {
+                assert!(exited.load(Ordering::Acquire));
+                notifications += 1;
+            },
+        );
+        assert_eq!(notifications, 1);
+    }
+
+    #[test]
+    fn no_matcher_does_not_send_a_spurious_stop() {
+        let mut notifications = 0;
+        stop_dispatcher(None, || notifications += 1);
+        assert_eq!(notifications, 0);
     }
 }
