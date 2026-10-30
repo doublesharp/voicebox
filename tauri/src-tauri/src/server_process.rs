@@ -58,9 +58,30 @@ pub(crate) fn classify_listener(output: &str, healthy: bool) -> ListenerDecision
 
 #[cfg(unix)]
 fn is_server_name(name: &str) -> bool {
-    // An abbreviated name such as "voicebox-" is ambiguous and must not be
-    // claimed; callers ask lsof for an untruncated COMMAND column.
-    name == "voicebox-server" || name.starts_with("voicebox-server-")
+    // Claim only names produced by the bundled CPU and GPU builds. Similar
+    // names can belong to external services and must not be terminated.
+    matches!(
+        name,
+        "voicebox-server" | "voicebox-server-cuda" | "voicebox-server-rocm"
+    )
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn linux_executable_matches(
+    pid: u32,
+    lookup: impl FnOnce(u32) -> Option<std::path::PathBuf>,
+) -> bool {
+    lookup(pid)
+        .and_then(|path| path.file_name().map(|name| name.to_owned()))
+        .and_then(|name| name.to_str().map(is_server_name))
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_server_executable(pid: u32) -> bool {
+    linux_executable_matches(pid, |pid| {
+        std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+    })
 }
 
 #[cfg(unix)]
@@ -271,5 +292,97 @@ mod listener_tests {
             classify_listener(&ambiguous, true),
             ListenerDecision::ReuseExternal
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod exact_identity_tests {
+    use super::{classify_listener, legacy_pids, ListenerDecision};
+
+    fn listener(name: &str, pid: u32) -> String {
+        format!("COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n{name} {pid} user 9u IPv4 1 0t0 TCP localhost:8000 (LISTEN)\n")
+    }
+
+    #[test]
+    fn unrelated_suffixes_are_never_claimed_or_killed() {
+        for name in [
+            "voicebox-server-helper",
+            "voicebox-server-proxy",
+            "voicebox-server-malware",
+            "voicebox-server-cuda-old",
+            "voicebox-server-rocm-debug",
+            "voicebox-server-",
+            "voicebox-server-cuda.exe",
+            "voicebox-server-rocm.exe",
+        ] {
+            let output = listener(name, 123);
+            assert_eq!(
+                classify_listener(&output, true),
+                ListenerDecision::ReuseExternal,
+                "{name}"
+            );
+            assert!(legacy_pids(&output, true).is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn exact_bundled_names_are_owned_only_when_health_is_valid() {
+        for name in [
+            "voicebox-server",
+            "voicebox-server-cuda",
+            "voicebox-server-rocm",
+        ] {
+            let output = listener(name, 123);
+            assert_eq!(
+                classify_listener(&output, true),
+                ListenerDecision::ReuseOwned(123)
+            );
+            assert_eq!(legacy_pids(&output, true), [123]);
+            assert_eq!(
+                classify_listener(&output, false),
+                ListenerDecision::Conflict(name.into())
+            );
+            assert!(legacy_pids(&output, false).is_empty());
+        }
+    }
+
+    #[test]
+    fn linux_truncated_name_requires_the_real_executable_name() {
+        use super::linux_executable_matches;
+        use std::path::PathBuf;
+        for name in [
+            "voicebox-server-helper",
+            "voicebox-server-cuda-old",
+            "unrelated",
+        ] {
+            assert!(
+                !linux_executable_matches(123, |_| Some(PathBuf::from(format!("/opt/{name}")))),
+                "{name}"
+            );
+        }
+        assert!(!linux_executable_matches(123, |_| None));
+        for name in [
+            "voicebox-server",
+            "voicebox-server-cuda",
+            "voicebox-server-rocm",
+        ] {
+            assert!(
+                linux_executable_matches(123, |_| Some(PathBuf::from(format!("/opt/{name}")))),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_exact_and_similar_names_are_not_claimed_even_for_one_pid() {
+        let mut output = listener("voicebox-server", 123);
+        output.push_str(
+            "voicebox-server-helper 123 user 9u IPv4 1 0t0 TCP localhost:8000 (LISTEN)\n",
+        );
+        assert_eq!(
+            classify_listener(&output, true),
+            ListenerDecision::ReuseExternal
+        );
+        assert!(legacy_pids(&output, true).is_empty());
     }
 }

@@ -389,6 +389,11 @@ async fn start_server(
             match server_process::classify_listener(&output_str, healthy) {
                 server_process::ListenerDecision::Unoccupied => {}
                 server_process::ListenerDecision::ReuseOwned(pid) => {
+                    #[cfg(target_os = "linux")]
+                    if !server_process::linux_server_executable(pid) {
+                        println!("Healthy server has an unverified executable; reusing it as external");
+                        return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
+                    }
                     println!("Found healthy voicebox-server on port {} (PID: {}), reusing it", SERVER_PORT, pid);
                     *state.server_pid.lock().unwrap() = Some(pid);
                     return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
@@ -445,6 +450,10 @@ async fn start_server(
             let healthy = output_str.lines().skip(1).any(|line| !line.trim().is_empty())
                 && check_health(LEGACY_PORT);
             for pid in server_process::legacy_pids(&output_str, healthy) {
+                #[cfg(target_os = "linux")]
+                if !server_process::linux_server_executable(pid) {
+                    continue;
+                }
                 println!("Found healthy voicebox-server on legacy port {} (PID: {}), stopping it...", LEGACY_PORT, pid);
                 let _ = Command::new("kill")
                     .args(["-9", "--", &format!("-{}", pid)])
