@@ -1,21 +1,45 @@
 """The shared output guard keeps caller-selected report roots exclusive."""
 
 import os
+import subprocess
 
 import pytest
 
 from scripts.portable_output import Output
 
+WINDOWS = os.name == "nt"
+posix_only = pytest.mark.skipif(WINDOWS, reason="exercises POSIX dirfd/O_NOFOLLOW semantics or os.symlink")
+windows_only = pytest.mark.skipif(not WINDOWS, reason="exercises Win32 junctions and directory pins")
+
 
 def test_new_parent_directories_and_exclusive_utf8_artifacts(tmp_path):
     with Output(tmp_path / "new-parent/run") as output:
         output.write_text("report.txt", "finite audio: ✓")
-        assert (output.path / "report.txt").read_text() == "finite audio: ✓"
+        assert (output.path / "report.txt").read_text(encoding="utf-8") == "finite audio: ✓"
         with pytest.raises(FileExistsError):
             output.write_text("report.txt", "overwrite")
         descriptor = output.fd
     with pytest.raises(OSError):
         os.fstat(descriptor)
+
+
+def test_root_shape_and_existing_run_refusals(tmp_path):
+    with pytest.raises(ValueError, match="absolute"):
+        Output("relative/run")
+    with pytest.raises(ValueError, match="absolute"):
+        Output(tmp_path / ".." / "run")
+    with pytest.raises(ValueError, match="fresh subdirectory"):
+        Output(tmp_path.anchor)
+    Output(tmp_path / "run").close()
+    with pytest.raises(ValueError, match="already exists"):
+        Output(tmp_path / "run")
+
+
+def test_close_twice_raises_like_a_closed_descriptor(tmp_path):
+    output = Output(tmp_path / "run")
+    output.close()
+    with pytest.raises(OSError):
+        output.close()
 
 
 @pytest.mark.parametrize("name", ["", ".", "..", "../escape", "nested/file", "/absolute"])
@@ -25,6 +49,7 @@ def test_artifact_names_cannot_escape_directory(tmp_path, name):
             output.open(name)
 
 
+@posix_only
 def test_artifact_symlinks_cannot_overwrite_external_files(tmp_path):
     outside = tmp_path / "outside"
     outside.write_text("preserve")
@@ -35,6 +60,7 @@ def test_artifact_symlinks_cannot_overwrite_external_files(tmp_path):
     assert outside.read_text() == "preserve"
 
 
+@posix_only
 def test_parent_symlink_refusal_closes_directory_descriptor(tmp_path, monkeypatch):
     target = tmp_path / "outside"
     target.mkdir()
@@ -57,6 +83,7 @@ def test_parent_symlink_refusal_closes_directory_descriptor(tmp_path, monkeypatc
     assert not (target / "run").exists()
 
 
+@posix_only
 def test_open_directory_keeps_artifacts_in_original_after_path_replacement(tmp_path):
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -69,8 +96,101 @@ def test_open_directory_keeps_artifacts_in_original_after_path_replacement(tmp_p
     assert not (outside / "report").exists()
 
 
+@posix_only
 def test_unsupported_safe_io_is_a_clear_refusal(tmp_path, monkeypatch):
     monkeypatch.setattr(os, "supports_dir_fd", set())
     with pytest.raises(ValueError, match="unsupported"):
         Output(tmp_path / "run")
     assert not (tmp_path / "run").exists()
+
+
+def junction(target, link):
+    import _winapi
+
+    _winapi.CreateJunction(str(target), str(link))
+
+
+def symlink_or_skip(target, link, **kwargs):
+    try:
+        link.symlink_to(target, **kwargs)
+    except OSError as exc:
+        pytest.skip(f"this account cannot create symlinks (winerror {exc.winerror})")
+
+
+@windows_only
+def test_junction_in_parent_is_refused_and_pins_are_released(tmp_path):
+    target = tmp_path / "outside"
+    target.mkdir()
+    junction(target, tmp_path / "alias")
+    with pytest.raises(ValueError, match="reparse point"):
+        Output(tmp_path / "alias/run")
+    assert not (target / "run").exists()
+    (tmp_path / "alias").rmdir()
+    tmp_path.rename(tmp_path.with_name(tmp_path.name + "-free"))
+
+
+@windows_only
+def test_symlink_in_parent_is_refused(tmp_path):
+    target = tmp_path / "outside"
+    target.mkdir()
+    symlink_or_skip(target, tmp_path / "alias", target_is_directory=True)
+    with pytest.raises(ValueError, match="reparse point"):
+        Output(tmp_path / "alias/run")
+    assert not (target / "run").exists()
+
+
+@windows_only
+def test_junction_or_file_at_artifact_name_is_neither_followed_nor_overwritten(tmp_path):
+    target = tmp_path / "outside"
+    target.mkdir()
+    with Output(tmp_path / "run") as output:
+        junction(target, output.path / "alias")
+        (output.path / "plain").write_bytes(b"preserve")
+        with pytest.raises(OSError):
+            output.write_text("alias", "overwrite")
+        with pytest.raises(FileExistsError):
+            output.write_text("plain", "overwrite")
+    assert list(target.iterdir()) == []
+    assert (tmp_path / "run/plain").read_bytes() == b"preserve"
+
+
+@windows_only
+def test_dangling_symlink_at_artifact_name_is_not_followed(tmp_path):
+    never = tmp_path / "never"
+    with Output(tmp_path / "run") as output:
+        symlink_or_skip(never, output.path / "dangle")
+        with pytest.raises(OSError):
+            output.write_text("dangle", "owned")
+    assert not never.exists()
+
+
+@windows_only
+def test_open_run_directory_and_ancestors_cannot_be_moved_or_replaced(tmp_path):
+    other = tmp_path / "other"
+    other.mkdir()
+    with Output(tmp_path / "parent/run") as output:
+        with pytest.raises(OSError):
+            output.path.rename(tmp_path / "moved")
+        with pytest.raises(OSError):
+            (tmp_path / "parent").rename(tmp_path / "parent-moved")
+        with pytest.raises(OSError):
+            os.replace(other, output.path)
+        with pytest.raises(OSError):
+            os.replace(other, tmp_path / "parent")
+        output.write_text("report", "owned")
+    assert (tmp_path / "parent/run/report").read_text() == "owned"
+    output.path.rename(tmp_path / "moved")
+    assert (tmp_path / "moved/report").read_text() == "owned"
+
+
+@windows_only
+def test_substituted_drive_is_refused_because_the_pinned_path_resolves_elsewhere(tmp_path):
+    free = next((f"{letter}:" for letter in "ZYXWVUTSRQ" if not os.path.exists(f"{letter}:\\")), None)
+    if free is None or subprocess.run(["subst", free, str(tmp_path)], capture_output=True).returncode != 0:
+        pytest.skip("no free drive letter to subst")
+    try:
+        with pytest.raises(ValueError, match="resolves"):
+            Output(f"{free}\\run")
+    finally:
+        subprocess.run(["subst", free, "/D"], capture_output=True, check=True)
+    tmp_path.rename(tmp_path.with_name(tmp_path.name + "-free"))
