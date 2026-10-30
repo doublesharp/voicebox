@@ -243,20 +243,9 @@ pub async fn stop_capture(state: &AudioCaptureState) -> Result<String, String> {
 }
 
 pub fn is_supported() -> bool {
-    // Check via pactl first (most reliable on modern Linux)
-    if find_monitor_source_via_pactl().is_some() {
-        return true;
-    }
-    // Fallback: check cpal devices
+    let monitor_source = find_monitor_source_via_pactl();
     let host = cpal::default_host();
-    if let Ok(devices) = host.input_devices() {
-        for d in devices {
-            if let Ok(name) = d.name() {
-                if name.to_lowercase().contains("monitor") {
-                    return true;
-                }
-            }
-        }
-    }
-    host.default_input_device().is_some()
+    super::linux_device::capture_supported(monitor_source.as_deref(), |source| {
+        select_capture_device(&host, source)
+    })
 }

@@ -37,9 +37,17 @@ pub(super) fn select_monitor_device<D>(
     None
 }
 
+/// Report whether system audio can be captured on this host.
+pub(super) fn capture_supported<D>(
+    monitor_source: Option<&str>,
+    find_monitor: impl FnOnce(Option<&str>) -> Option<D>,
+) -> bool {
+    find_monitor(monitor_source).is_some()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{monitor_source_from_pactl, select_monitor_device};
+    use super::{capture_supported, monitor_source_from_pactl, select_monitor_device};
 
     #[derive(Debug, PartialEq)]
     struct Device(&'static str, Option<&'static str>);
@@ -176,5 +184,47 @@ mod tests {
     #[test]
     fn pactl_returns_none_for_empty_or_malformed_output() {
         assert_eq!(monitor_source_from_pactl("\nno tabs\n", Some("sink")), None);
+    }
+    fn supported(target: Option<&str>, devices: Vec<Device>) -> bool {
+        capture_supported(target, |source| choose(devices, source))
+    }
+
+    #[test]
+    fn pactl_monitor_without_a_matching_capture_device_is_not_supported() {
+        assert!(!supported(
+            Some("sink.monitor"),
+            vec![Device("mic", Some("Microphone"))]
+        ));
+    }
+
+    #[test]
+    fn default_microphone_without_a_monitor_is_not_supported() {
+        assert!(!supported(None, vec![Device("mic", Some("Microphone"))]));
+    }
+
+    #[test]
+    fn unavailable_device_enumeration_does_not_turn_pactl_into_support() {
+        assert!(!supported(Some("sink.monitor"), vec![]));
+    }
+
+    #[test]
+    fn matching_pactl_monitor_is_supported() {
+        assert!(supported(
+            Some("sink.monitor"),
+            vec![Device("sink", Some("sink.monitor"))]
+        ));
+    }
+
+    #[test]
+    fn fallback_monitor_is_supported_without_pactl() {
+        assert!(supported(
+            None,
+            vec![Device("system", Some("Output MONITOR"))]
+        ));
+    }
+
+    #[test]
+    fn unnamed_devices_do_not_make_capture_supported() {
+        assert!(!supported(None, vec![Device("unknown", None)]));
     }
 }
