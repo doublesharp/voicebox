@@ -2454,6 +2454,7 @@ mod command_ipc_regression_tests {
     fn setup() -> (tauri::App<MockRuntime>, tauri::WebviewWindow<MockRuntime>) {
         let app = mock_builder()
             .manage(audio_output::AudioOutputState::new())
+            .manage(audio_capture::AudioCaptureState::new())
             .manage(HotkeyState::default())
             .manage(ServerState {
                 start_gate: Arc::new(server_startup::StartGate::default()),
@@ -2466,6 +2467,10 @@ mod command_ipc_regression_tests {
             })
             .invoke_handler(tauri::generate_handler![
                 play_audio_to_devices,
+                is_system_audio_supported,
+                list_audio_output_devices,
+                start_system_audio_capture,
+                stop_system_audio_capture,
                 start_audio_pcm_stream,
                 append_audio_pcm_stream,
                 finish_audio_pcm_stream,
@@ -2535,6 +2540,50 @@ mod command_ipc_regression_tests {
             },
         )
         .map(|body| body.deserialize().unwrap())
+    }
+
+    #[test]
+    fn audio_capabilities_and_output_devices_are_serialized_over_ipc() {
+        let (_app, window) = setup();
+        let empty = || InvokeBody::Json(serde_json::json!({}));
+        assert!(invoke(&window, "is_system_audio_supported", empty(), None).unwrap().is_boolean());
+        match invoke(&window, "list_audio_output_devices", empty(), None) {
+            Ok(devices) => for device in devices.as_array().expect("device array") {
+                assert!(device["id"].is_string());
+                assert!(device["name"].is_string());
+                assert!(device["is_default"].is_boolean());
+            },
+            Err(error) => assert!(error.as_str().is_some_and(|value| value.contains("output"))),
+        }
+    }
+
+    #[test]
+    fn malformed_capture_start_is_rejected_before_recording() {
+        let (app, window) = setup();
+        for payload in [serde_json::json!({}), serde_json::json!({"maxDurationSecs":-1}), serde_json::json!({"maxDurationSecs":"60"}), serde_json::json!({"maxDurationSecs":4294967296_u64})] {
+            assert!(invoke(&window, "start_system_audio_capture", InvokeBody::Json(payload), None).is_err());
+        }
+        assert!(app.state::<audio_capture::AudioCaptureState>().samples.lock().unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn capture_stop_returns_decodable_wav_or_reports_failure_over_ipc() {
+        use base64::Engine;
+        let (app, window) = setup();
+        let state = app.state::<audio_capture::AudioCaptureState>();
+        let stop = || invoke(&window, "stop_system_audio_capture", InvokeBody::Json(serde_json::json!({})), None);
+        assert!(stop().unwrap_err().as_str().unwrap().contains("No audio samples"));
+        *state.samples.lock().unwrap() = vec![0.5, -0.5, 1.0, -1.0];
+        *state.sample_rate.lock().unwrap() = 48000;
+        *state.channels.lock().unwrap() = 2;
+        let encoded = stop().unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD.decode(encoded.as_str().unwrap()).unwrap();
+        let mut wav = hound::WavReader::new(std::io::Cursor::new(bytes)).unwrap();
+        assert_eq!((wav.spec().sample_rate, wav.spec().channels), (48000, 2));
+        assert_eq!(wav.samples::<i16>().map(Result::unwrap).collect::<Vec<_>>(), [16383, -16383, 32767, -32767]);
+        *state.error.lock().unwrap() = Some("capture interrupted".into());
+        assert!(stop().unwrap_err().as_str().unwrap().contains("capture interrupted"));
     }
 
     #[test]
