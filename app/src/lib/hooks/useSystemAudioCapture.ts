@@ -13,6 +13,11 @@ interface CaptureSession {
   startedAt: number | null;
 }
 
+function captureErrorMessage(error: unknown, fallback: string): string {
+  const message = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
+  return message.trim() ? message : fallback;
+}
+
 /** Native system audio capture, with one owned start/stop lifecycle at a time. */
 export function useSystemAudioCapture({
   maxDurationSeconds = 29,
@@ -67,7 +72,7 @@ export function useSystemAudioCapture({
           }
         } catch (err) {
           if (started && !session.discard && mountedRef.current) {
-            setError(err instanceof Error ? err.message : 'Failed to stop system audio capture.');
+            setError(captureErrorMessage(err, 'Failed to stop system audio capture.'));
           }
         } finally {
           if (sessionRef.current === session) sessionRef.current = null;
@@ -119,9 +124,10 @@ export function useSystemAudioCapture({
     } catch (err) {
       if (!session.discard && mountedRef.current) {
         setError(
-          err instanceof Error
-            ? err.message
-            : 'Failed to start system audio capture. Please check permissions.',
+          captureErrorMessage(
+            err,
+            'Failed to start system audio capture. Please check permissions.',
+          ),
         );
         setIsRecording(false);
       }

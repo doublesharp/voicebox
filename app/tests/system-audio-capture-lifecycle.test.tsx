@@ -330,3 +330,63 @@ test('web mode does not attempt native capture', async () => {
   expect(start).not.toHaveBeenCalled();
   expect(hook.error).toContain('desktop app');
 });
+
+test('native string startup errors retain their useful message and permit retry', async () => {
+  start.mockImplementationOnce(async () => {
+    throw 'System audio capture requires permission';
+  });
+  await mount();
+  await act(async () => {
+    await hook.startRecording();
+  });
+  expect(hook.error).toBe('System audio capture requires permission');
+  expect(hook.isRecording).toBe(false);
+  expect(stop).not.toHaveBeenCalled();
+  await act(async () => {
+    await hook.startRecording();
+  });
+  expect(hook.isRecording).toBe(true);
+  await act(async () => {
+    await hook.cancelRecording();
+  });
+});
+
+test('native string stop errors retain the reason and do not publish partial audio', async () => {
+  stop.mockImplementationOnce(async () => {
+    throw 'System audio capture worker did not stop in time';
+  });
+  await mount();
+  await act(async () => {
+    await hook.startRecording();
+  });
+  await act(async () => {
+    await hook.stopRecording();
+  });
+  expect(hook.error).toBe('System audio capture worker did not stop in time');
+  expect(complete).not.toHaveBeenCalled();
+  expect(hook.isRecording).toBe(false);
+  await act(async () => {
+    await hook.startRecording();
+  });
+  expect(hook.error).toBeNull();
+  await act(async () => {
+    await hook.cancelRecording();
+  });
+});
+
+test('empty or non-message native failures use useful fallback messages', async () => {
+  for (const reason of ['', '   ', null, {}]) {
+    start.mockImplementationOnce(async () => {
+      throw reason;
+    });
+    await mount();
+    await act(async () => {
+      await hook.startRecording();
+    });
+    expect(hook.error).toBe('Failed to start system audio capture. Please check permissions.');
+    await act(async () => {
+      view?.unmount();
+    });
+    view = undefined;
+  }
+});
