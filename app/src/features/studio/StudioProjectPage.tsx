@@ -121,6 +121,10 @@ function ProjectWorkspace({
   const setPlayhead = useCallback((seconds: number) => playback.seek(seconds), [playback]);
   const [revisionId, setRevisionId] = useState('');
   const [checkpointName, setCheckpointName] = useState('');
+  const checkpointNameRef = useRef('');
+  const checkpointRequestRef = useRef(false);
+  const checkpointDialogEpoch = useRef(0);
+  const [checkpointBusy, setCheckpointBusy] = useState(false);
   const [checkpointOpen, setCheckpointOpen] = useState(false);
   const [captionsOpen, setCaptionsOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -537,7 +541,10 @@ function ProjectWorkspace({
               <Redo2 size={15} />
               <span className="studio-wide-label">Redo</span>
             </StudioButton>
-            <Dialog open={checkpointOpen} onOpenChange={setCheckpointOpen}>
+            <Dialog open={checkpointOpen} onOpenChange={(next) => {
+              if (!next) checkpointDialogEpoch.current += 1;
+              setCheckpointOpen(next);
+            }}>
               <DialogTrigger asChild>
                 <button className="studio-quiet" type="button" disabled={!canMutate}>
                   <Save size={15} />
@@ -556,24 +563,40 @@ function ProjectWorkspace({
                   <Input
                     autoFocus
                     value={checkpointName}
-                    onChange={(e) => setCheckpointName(e.target.value)}
+                    onChange={(e) => {
+                      checkpointNameRef.current = e.target.value;
+                      setCheckpointName(e.target.value);
+                    }}
                     placeholder="Client review 01"
                   />
                 </Field>
                 <StudioButton
                   primary
-                  disabled={!checkpointName.trim() || !canMutate}
-                  onClick={() =>
-                    void session.checkpoint(checkpointName.trim()).then((ok) => {
-                      if (ok) {
+                  disabled={!checkpointName.trim() || !canMutate || checkpointBusy}
+                  onClick={() => {
+                    const scope = { serverUrl: server, serverRevision };
+                    const name = checkpointNameRef.current;
+                    if (checkpointRequestRef.current || !name.trim() || !canMutate || !isCurrentServer(scope)) return;
+                    const epoch = checkpointDialogEpoch.current;
+                    checkpointRequestRef.current = true;
+                    setCheckpointBusy(true);
+                    void session.checkpoint(name.trim()).then((ok) => {
+                      if (ok && alive.current && isCurrentServer(scope) &&
+                          checkpointDialogEpoch.current === epoch && checkpointNameRef.current === name) {
                         setCheckpointOpen(false);
+                        checkpointNameRef.current = '';
                         setCheckpointName('');
                         const revisions = session.getSnapshot().project?.revisions ?? [];
                         const latest = revisions[revisions.length - 1];
                         if (latest) setRevisionId(latest.id);
                       }
-                    })
-                  }
+                    }).catch((error) => {
+                      if (alive.current && isCurrentServer(scope) && checkpointDialogEpoch.current === epoch) setActionError(errorMessage(error));
+                    }).finally(() => {
+                      checkpointRequestRef.current = false;
+                      if (alive.current && isCurrentServer(scope)) setCheckpointBusy(false);
+                    });
+                  }}
                 >
                   Create checkpoint
                 </StudioButton>

@@ -11,6 +11,7 @@ let includeJob = false;
 let initialStatus = 'saved';
 let noProject = false;
 let checkpointResult = true;
+let checkpointHandler: () => Promise<boolean> = async () => checkpointResult;
 let confirmLeave = false;
 const windowListeners = new Map<string, Set<(event: any) => void>>();
 const checkpoints: string[] = [];
@@ -95,7 +96,7 @@ mock.module('../src/features/studio/session', () => ({
     dispose() {
       this.disposed = true;
     }
-    checkpoint(name: string) { checkpoints.push(name); return Promise.resolve(checkpointResult); }
+    checkpoint(name: string) { checkpoints.push(name); return checkpointHandler(); }
     flush() { commands.push(['flush']); return Promise.resolve(); }
     retry() { commands.push(['retry']); return Promise.resolve(); }
     reloadSaved() { commands.push(['reload']); return Promise.resolve(); }
@@ -150,7 +151,7 @@ mock.module('../src/features/studio/playback', () => ({
   },
 }));
 mock.module('../src/components/ui/dialog', () => ({
-  Dialog: pass,
+  Dialog: ({ children, ...props }: any) => <dialog-mock {...props}>{children}</dialog-mock>,
   DialogContent: pass,
   DialogDescription: pass,
   DialogHeader: pass,
@@ -189,6 +190,7 @@ afterEach(() => {
   initialStatus = 'saved';
   noProject = false;
   checkpointResult = true;
+  checkpointHandler = async () => checkpointResult;
   confirmLeave = false;
   checkpoints.length = 0;
   windowListeners.clear();
@@ -528,4 +530,101 @@ test('repeated job retry clicks do not send concurrent requests', async () => {
   expect(button('Retry frozen request').props.disabled).toBe(true);
   await act(async () => { resolve(); });
   expect(button('Retry frozen request').props.disabled).toBe(false);
+});
+
+test('repeated checkpoint clicks while saving create only one checkpoint', async () => {
+  let finish!: (result: boolean) => void;
+  checkpointHandler = () => new Promise((resolve) => { finish = resolve; });
+  await mount();
+  act(() => renderer.root.findByProps({ placeholder: 'Client review 01' }).props.onChange({ target: { value: 'Review' } }));
+  const create = button('Create checkpoint');
+  act(() => { create.props.onClick(); create.props.onClick(); });
+  expect(checkpoints).toEqual(['Review']);
+  await act(async () => { finish(true); });
+});
+
+test('a checkpoint completion does not erase a newer name entered while saving', async () => {
+  let finish!: (result: boolean) => void;
+  checkpointHandler = () => new Promise((resolve) => { finish = resolve; });
+  await mount();
+  const input = () => renderer.root.findByProps({ placeholder: 'Client review 01' });
+  act(() => input().props.onChange({ target: { value: 'First' } }));
+  act(() => button('Create checkpoint').props.onClick());
+  act(() => input().props.onChange({ target: { value: 'Next review' } }));
+  await act(async () => { finish(true); });
+  expect(input().props.value).toBe('Next review');
+});
+
+test('a stale checkpoint button does not submit after the server changes', async () => {
+  await mount();
+  act(() => renderer.root.findByProps({ placeholder: 'Client review 01' }).props.onChange({ target: { value: 'Review' } }));
+  serverUrl = 'other'; serverRevision++;
+  act(() => button('Create checkpoint').props.onClick());
+  expect(checkpoints).toEqual([]);
+});
+
+test('a checkpoint response from an earlier connection does not clear current input', async () => {
+  let finish!: (result: boolean) => void;
+  checkpointHandler = () => new Promise((resolve) => { finish = resolve; });
+  await mount();
+  const input = () => renderer.root.findByProps({ placeholder: 'Client review 01' });
+  act(() => input().props.onChange({ target: { value: 'Review' } }));
+  act(() => button('Create checkpoint').props.onClick());
+  serverRevision++;
+  await act(async () => { finish(true); });
+  expect(input().props.value).toBe('Review');
+});
+
+test('closing and reopening the checkpoint dialog invalidates an earlier completion', async () => {
+  let finish!: (result: boolean) => void;
+  checkpointHandler = () => new Promise((resolve) => { finish = resolve; });
+  await mount();
+  const input = () => renderer.root.findByProps({ placeholder: 'Client review 01' });
+  const dialog = () => renderer.root.findAllByType('dialog-mock' as never)[0];
+  act(() => input().props.onChange({ target: { value: 'Review' } }));
+  act(() => button('Create checkpoint').props.onClick());
+  act(() => dialog().props.onOpenChange(false));
+  act(() => dialog().props.onOpenChange(true));
+  await act(async () => { finish(true); });
+  expect(dialog().props.open).toBe(true);
+  expect(input().props.value).toBe('Review');
+});
+
+test('a failed checkpoint reports an error and allows the same name to be retried', async () => {
+  checkpointHandler = async () => { throw new Error('checkpoint failed'); };
+  await mount();
+  const input = () => renderer.root.findByProps({ placeholder: 'Client review 01' });
+  act(() => input().props.onChange({ target: { value: 'Review' } }));
+  await act(async () => { button('Create checkpoint').props.onClick(); });
+  expect(JSON.stringify(renderer.toJSON())).toContain('checkpoint failed');
+  expect(input().props.value).toBe('Review');
+  expect(button('Create checkpoint').props.disabled).toBe(false);
+  checkpointHandler = async () => true;
+  await act(async () => { button('Create checkpoint').props.onClick(); });
+  expect(checkpoints).toEqual(['Review', 'Review']);
+  expect(input().props.value).toBe('');
+});
+
+test('an old checkpoint failure is not displayed after changing connections', async () => {
+  let fail!: (error: Error) => void;
+  checkpointHandler = () => new Promise((_resolve, reject) => { fail = reject; });
+  await mount();
+  act(() => renderer.root.findByProps({ placeholder: 'Client review 01' }).props.onChange({ target: { value: 'Review' } }));
+  act(() => button('Create checkpoint').props.onClick());
+  serverRevision++;
+  await act(async () => { fail(new Error('old checkpoint failure')); });
+  expect(JSON.stringify(renderer.toJSON())).not.toContain('old checkpoint failure');
+});
+
+test('a checkpoint failure after closing its dialog does not display in the reopened dialog', async () => {
+  let fail!: (error: Error) => void;
+  checkpointHandler = () => new Promise((_resolve, reject) => { fail = reject; });
+  await mount();
+  const dialog = () => renderer.root.findAllByType('dialog-mock' as never)[0];
+  act(() => renderer.root.findByProps({ placeholder: 'Client review 01' }).props.onChange({ target: { value: 'Review' } }));
+  act(() => button('Create checkpoint').props.onClick());
+  act(() => dialog().props.onOpenChange(false));
+  act(() => dialog().props.onOpenChange(true));
+  await act(async () => { fail(new Error('old dialog failure')); });
+  expect(JSON.stringify(renderer.toJSON())).not.toContain('old dialog failure');
 });
