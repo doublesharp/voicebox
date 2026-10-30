@@ -93,12 +93,26 @@ mod ffi {
 /// process the paste before any follow-up (e.g. clipboard restore).
 #[cfg(target_os = "macos")]
 pub fn send_paste() -> Result<(), String> {
-    use ffi::*;
-
-    let v_keycode = crate::keyboard_layout::paste_keycode_v();
-
     unsafe {
-        let source = CGEventSourceCreate(K_CG_EVENT_SOURCE_STATE_HID_SYSTEM_STATE);
+        send_paste_with(
+            crate::keyboard_layout::paste_keycode_v(),
+            || ffi::CGEventSourceCreate(ffi::K_CG_EVENT_SOURCE_STATE_HID_SYSTEM_STATE),
+            |source, key, down| ffi::CGEventCreateKeyboardEvent(source, key, down),
+            |event| ffi::CGEventPost(ffi::K_CG_HID_EVENT_TAP, event),
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn send_paste_with(
+    v_keycode: ffi::CGKeyCode,
+    create_source: impl FnOnce() -> ffi::CGEventSourceRef,
+    mut create: impl FnMut(ffi::CGEventSourceRef, ffi::CGKeyCode, bool) -> ffi::CGEventRef,
+    mut post: impl FnMut(ffi::CGEventRef),
+) -> Result<(), String> {
+    use ffi::*;
+    {
+        let source = create_source();
         if source.is_null() {
             return Err("CGEventSourceCreate returned null".into());
         }
@@ -130,7 +144,7 @@ pub fn send_paste() -> Result<(), String> {
         let mut created = Vec::with_capacity(events.len());
 
         for (key, down, flags) in events {
-            let event = CGEventCreateKeyboardEvent(source, key, down);
+            let event = create(source, key, down);
             if event.is_null() {
                 return Err(format!(
                     "CGEventCreateKeyboardEvent(key={}, down={}) returned null",
@@ -138,15 +152,14 @@ pub fn send_paste() -> Result<(), String> {
                 ));
             }
             let guard = scopeguard::guard(event, |e| CFRelease(e as *const c_void));
-            if flags != 0 {
-                CGEventSetFlags(event, flags);
-            }
+            // Clear inherited flags on key-up as well as setting them on key-down.
+            CGEventSetFlags(event, flags);
             created.push(event);
             guards.push(guard);
         }
 
         for event in created {
-            CGEventPost(K_CG_HID_EVENT_TAP, event);
+            post(event);
         }
 
         drop(guards);
@@ -157,8 +170,7 @@ pub fn send_paste() -> Result<(), String> {
 #[cfg(target_os = "windows")]
 mod win {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
-        VIRTUAL_KEY,
+        INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VIRTUAL_KEY,
     };
 
     pub fn make_key(vk: VIRTUAL_KEY, up: bool) -> INPUT {
@@ -184,9 +196,7 @@ mod win {
 
 #[cfg(target_os = "windows")]
 pub fn send_paste() -> Result<(), String> {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, VK_CONTROL, VK_V,
-    };
+    use windows::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT, VK_CONTROL, VK_V};
 
     // Four-event Ctrl+V sequence. Matches the macOS CGEvent pattern: the
     // modifier brackets the letter so the target app sees a fully formed
@@ -217,4 +227,99 @@ pub fn send_paste() -> Result<(), String> {
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn send_paste() -> Result<(), String> {
     Err("synthetic paste is not yet implemented on this platform".into())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_event_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGEventGetFlags(event: ffi::CGEventRef) -> u64;
+        fn CGEventGetIntegerValueField(event: ffi::CGEventRef, field: u32) -> i64;
+        fn CGEventGetType(event: ffi::CGEventRef) -> u32;
+    }
+
+    #[test]
+    fn created_paste_events_have_ordered_keys_and_clear_the_modifier_on_release() {
+        for v_keycode in [9, 16] {
+            let mut posted = Vec::new();
+            unsafe {
+                send_paste_with(
+                    v_keycode,
+                    || ffi::CGEventSourceCreate(ffi::K_CG_EVENT_SOURCE_STATE_HID_SYSTEM_STATE),
+                    |source, key, down| {
+                        let event = ffi::CGEventCreateKeyboardEvent(source, key, down);
+                        assert!(!event.is_null());
+                        // Simulate an event source carrying an already-held modifier.
+                        ffi::CGEventSetFlags(event, ffi::K_CG_EVENT_FLAG_MASK_COMMAND);
+                        event
+                    },
+                    |event| {
+                        posted.push((
+                            CGEventGetIntegerValueField(event, 9),
+                            CGEventGetType(event),
+                            CGEventGetFlags(event),
+                        ));
+                    },
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                posted.iter().map(|event| event.0).collect::<Vec<_>>(),
+                [55, v_keycode as i64, v_keycode as i64, 55]
+            );
+            assert_eq!(posted[1].1, 10, "V key must go down");
+            assert_eq!(posted[2].1, 11, "V key must go up");
+            for event in &posted[..3] {
+                assert_ne!(event.2 & ffi::K_CG_EVENT_FLAG_MASK_COMMAND, 0);
+            }
+            assert_eq!(
+                posted[3].2 & ffi::K_CG_EVENT_FLAG_MASK_COMMAND,
+                0,
+                "the command key-up event must clear the command flag"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_event_source_cannot_create_or_post_any_events() {
+        let result = unsafe {
+            send_paste_with(
+                9,
+                || std::ptr::null_mut(),
+                |_, _, _| panic!("no event may be created"),
+                |_| panic!("no event may be posted"),
+            )
+        };
+        assert!(result.unwrap_err().contains("CGEventSourceCreate"));
+    }
+
+    #[test]
+    fn an_event_creation_failure_never_posts_a_partial_paste() {
+        for failed_index in 0..4 {
+            let count = Cell::new(0);
+            let posted = Cell::new(0);
+            let result = unsafe {
+                send_paste_with(
+                    9,
+                    || ffi::CGEventSourceCreate(ffi::K_CG_EVENT_SOURCE_STATE_HID_SYSTEM_STATE),
+                    |source, key, down| {
+                        let index = count.get();
+                        count.set(index + 1);
+                        if index == failed_index {
+                            std::ptr::null_mut()
+                        } else {
+                            ffi::CGEventCreateKeyboardEvent(source, key, down)
+                        }
+                    },
+                    |_| posted.set(posted.get() + 1),
+                )
+            };
+            assert!(result.unwrap_err().contains("CGEventCreateKeyboardEvent"));
+            assert_eq!(count.get(), failed_index + 1);
+            assert_eq!(posted.get(), 0);
+        }
+    }
 }
