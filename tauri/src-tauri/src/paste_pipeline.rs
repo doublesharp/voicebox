@@ -966,6 +966,7 @@ mod private_pasteboard_transaction_tests {
         board: PrivatePasteboard,
         fail_write: bool,
         fail_send: bool,
+        change_during_capture: bool,
         sends: Cell<usize>,
     }
     impl Backend {
@@ -976,6 +977,7 @@ mod private_pasteboard_transaction_tests {
                 board,
                 fail_write: false,
                 fail_send: false,
+                change_during_capture: false,
                 sends: Cell::new(0),
             }
         }
@@ -989,7 +991,11 @@ mod private_pasteboard_transaction_tests {
             Ok(())
         }
         fn save(&self) -> Result<Self::Snapshot, String> {
-            Ok(self.board.save())
+            if self.change_during_capture {
+                self.board.save_with_change()
+            } else {
+                Ok(self.board.save())
+            }
         }
         fn write(&self, text: &str) -> Result<i64, clipboard::ClipboardWriteFailure> {
             self.board.write_tracked(text, self.fail_write)
@@ -1009,6 +1015,43 @@ mod private_pasteboard_transaction_tests {
             self.board.restore(snapshot);
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn native_private_dictation_aborts_when_capture_changes() {
+        let mut backend = Backend::new();
+        backend.change_during_capture = true;
+        let focus = focus_capture::FocusSnapshot {
+            pid: 42,
+            bundle_id: None,
+            role: None,
+        };
+        let error = paste_with("dictation", &focus, &backend, |_| async {})
+            .await
+            .unwrap_err();
+        assert!(error.contains("Clipboard changed while capturing"));
+        assert_eq!(backend.board.text().as_deref(), Some("newer"));
+        assert_eq!(backend.sends.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn native_private_diagnostic_aborts_when_capture_changes() {
+        let mut backend = Backend::new();
+        backend.change_during_capture = true;
+        let error = diagnostic_with(
+            "dictation",
+            Duration::ZERO,
+            Duration::ZERO,
+            true,
+            &backend,
+            |_| async {},
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(error.contains("Clipboard changed while capturing"));
+        assert_eq!(backend.board.text().as_deref(), Some("newer"));
+        assert_eq!(backend.sends.get(), 0);
     }
 
     #[tokio::test]

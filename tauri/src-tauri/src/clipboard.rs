@@ -98,6 +98,13 @@ pub(crate) mod private_pasteboard_tests {
         pub(crate) fn save(&self) -> ClipboardSnapshot {
             unsafe { save_clipboard_from(self.board).unwrap() }
         }
+        pub(crate) fn save_with_change(&self) -> Result<ClipboardSnapshot, String> {
+            unsafe {
+                save_clipboard_from_with(self.board, || {
+                    self.write("newer");
+                })
+            }
+        }
         pub(crate) fn write(&self, text: &str) -> i64 {
             unsafe { write_text_to(self.board, text).unwrap() }
         }
@@ -164,6 +171,35 @@ pub(crate) mod private_pasteboard_tests {
             .unwrap()
             .1
             .as_slice()
+    }
+
+    #[test]
+    fn private_snapshot_rejects_a_change_during_capture() {
+        for initially_empty in [false, true] {
+            let board = PrivatePasteboard::new();
+            if !initially_empty {
+                board.write("original");
+            }
+            let result = unsafe {
+                save_clipboard_from_with(board.board, || {
+                    board.write("newer");
+                })
+            };
+            assert!(
+                result.is_err(),
+                "a changed pasteboard must not produce a stale snapshot"
+            );
+            assert_eq!(board.text().as_deref(), Some("newer"));
+        }
+    }
+
+    #[test]
+    fn private_snapshot_accepts_unchanged_content() {
+        let board = PrivatePasteboard::new();
+        board.write("unchanged");
+        let saved = unsafe { save_clipboard_from_with(board.board, || {}) }.unwrap();
+        assert_eq!(saved.change_count(), board.change_count());
+        assert_eq!(data(&saved, 0, "public.utf8-plain-text"), b"unchanged");
     }
 
     #[test]
@@ -407,10 +443,20 @@ pub fn save_clipboard() -> Result<ClipboardSnapshot, String> {
 
 #[cfg(target_os = "macos")]
 unsafe fn save_clipboard_from(pb: Id) -> Result<ClipboardSnapshot, String> {
+    save_clipboard_from_with(pb, || {})
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn save_clipboard_from_with(
+    pb: Id,
+    after_capture: impl FnOnce(),
+) -> Result<ClipboardSnapshot, String> {
     let change_count: i64 = msg_send![pb, changeCount];
 
     let items: Id = msg_send![pb, pasteboardItems];
     if items.is_null() {
+        after_capture();
+        ensure_pasteboard_unchanged(pb, change_count)?;
         return Ok(ClipboardSnapshot {
             items: Vec::new(),
             change_count,
@@ -454,10 +500,21 @@ unsafe fn save_clipboard_from(pb: Id) -> Result<ClipboardSnapshot, String> {
         saved.push(pairs);
     }
 
+    after_capture();
+    ensure_pasteboard_unchanged(pb, change_count)?;
     Ok(ClipboardSnapshot {
         items: saved,
         change_count,
     })
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn ensure_pasteboard_unchanged(pb: Id, captured: i64) -> Result<(), String> {
+    let current: i64 = msg_send![pb, changeCount];
+    if current != captured {
+        return Err("Clipboard changed while capturing its contents; try again".into());
+    }
+    Ok(())
 }
 
 /// Replace the pasteboard contents with a single plain-text string. Returns
