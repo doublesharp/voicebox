@@ -758,7 +758,7 @@ async fn start_server_with<R: tauri::Runtime>(
     let server_args = server_arguments(&data_dir_str, config.port, std::process::id(), is_remote);
 
     // Resolve the custom models directory from the parameter or stored state
-    let effective_models_dir = models_dir.or_else(|| state.models_dir.lock().unwrap().clone());
+    let effective_models_dir = state.models_dir.lock().unwrap().clone();
     if let Some(ref dir) = effective_models_dir {
         println!("Custom models directory: {}", dir);
     }
@@ -3386,6 +3386,46 @@ mod server_start_flow_tests {
             .unwrap()
             .is_none());
         assert!(app.state::<ServerState>().child.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn direct_start_applies_retained_custom_and_reset_model_directories() {
+        for (requested, expected) in [
+            (None, "previous models"),
+            (Some("models/音声 with spaces"), "models/音声 with spaces"),
+            (Some(""), "unset"),
+        ] {
+            let fixture = Fixture::new("printf '%s\\n' \"${VOICEBOX_MODELS_DIR-unset}\" > \"$2/models\"\nprintf 'INFO: Uvicorn running on http://127.0.0.1:%s\\n' \"$4\" >&2\nexec /bin/sleep 5");
+            let app = app();
+            *app.state::<ServerState>().models_dir.lock().unwrap() = Some("previous models".into());
+            let result = start_server_with(
+                app.handle().clone(), app.state(), Some(false),
+                requested.map(str::to_string), fixture.config(),
+            ).await;
+            let observed = std::fs::read_to_string(fixture.dir.join("data/models"));
+            stop_server_if_owned(app.state(), None).await.unwrap();
+            assert!(result.is_ok(), "startup failed: {result:?}");
+            assert_eq!(observed.unwrap().trim_end(), expected, "requested {requested:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_data_directory_does_not_spawn_a_server_and_can_be_retried() {
+        let fixture = Fixture::new("touch \"$2/started\"\nprintf 'INFO: Uvicorn running on http://127.0.0.1:%s\\n' \"$4\" >&2\nexec /bin/sleep 5");
+        let app = app();
+        let blocked = fixture.dir.join("not-a-directory");
+        std::fs::write(&blocked, "file").unwrap();
+        let mut config = fixture.config();
+        config.data_dir = Some(blocked.join("data"));
+        let error = start_server_with(app.handle().clone(), app.state(), None, None, config).await.unwrap_err();
+        assert!(error.contains("Failed to create data dir"), "{error}");
+        assert!(app.state::<ServerState>().server_pid.lock().unwrap().is_none());
+        assert!(app.state::<ServerState>().child.lock().unwrap().is_none());
+        assert!(!fixture.dir.join("data/started").exists());
+        let result = start_server_with(app.handle().clone(), app.state(), None, None, fixture.config()).await;
+        stop_server_if_owned(app.state(), None).await.unwrap();
+        assert!(result.is_ok(), "retry failed: {result:?}");
+        assert!(fixture.dir.join("data/started").exists());
     }
 
     #[tokio::test]
