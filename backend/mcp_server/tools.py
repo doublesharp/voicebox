@@ -152,6 +152,14 @@ def register_tools(mcp: FastMCP) -> None:
                 )
             return await _transcribe_file(path, language, model)
 
+        # Reject oversized encoded inputs before allocating their decoded bytes.
+        # Up to two padding bytes mean the exact decoded size still needs checking.
+        max_encoded_bytes = 4 * ((MAX_TRANSCRIBE_BYTES + 2) // 3)
+        if len(audio_base64) > max_encoded_bytes:
+            raise ValueError(
+                f"Audio exceeds {MAX_TRANSCRIBE_BYTES // (1024 * 1024)} MB limit."
+            )
+
         # Base64 mode: decode into a temp file, transcribe, clean up.
         try:
             raw = b64.b64decode(audio_base64, validate=True)
