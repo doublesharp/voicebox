@@ -918,8 +918,8 @@ fn list_audio_output_devices(
 }
 
 #[command]
-async fn play_audio_to_devices(
-    app: tauri::AppHandle,
+async fn play_audio_to_devices<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, audio_output::AudioOutputState>,
     request: tauri::ipc::Request<'_>,
 ) -> Result<audio_output::PlaybackSession, String> {
@@ -936,8 +936,8 @@ async fn play_audio_to_devices(
 }
 
 #[command]
-async fn start_audio_pcm_stream(
-    app: tauri::AppHandle,
+async fn start_audio_pcm_stream<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, audio_output::AudioOutputState>,
     sample_rate: u32,
     device_ids: Vec<String>,
@@ -2309,6 +2309,8 @@ mod command_ipc_regression_tests {
                 backend_override: Mutex::new(None),
             })
             .invoke_handler(tauri::generate_handler![
+                play_audio_to_devices,
+                start_audio_pcm_stream,
                 append_audio_pcm_stream,
                 finish_audio_pcm_stream,
                 control_audio_playback,
@@ -2316,6 +2318,7 @@ mod command_ipc_regression_tests {
                 disable_hotkey,
                 update_chord_bindings,
                 set_keep_server_running,
+                stop_server,
             ])
             .build(mock_context(noop_assets()))
             .unwrap();
@@ -2348,6 +2351,188 @@ mod command_ipc_regression_tests {
             },
         )
         .map(|body| body.deserialize().unwrap())
+    }
+
+    fn play(
+        window: &tauri::WebviewWindow<MockRuntime>,
+        body: InvokeBody,
+        metadata: Option<&str>,
+    ) -> Result<serde_json::Value, serde_json::Value> {
+        let mut headers = tauri::http::HeaderMap::new();
+        if let Some(value) = metadata {
+            headers.insert("x-voicebox-playback", value.parse().unwrap());
+        }
+        get_ipc_response(
+            window,
+            InvokeRequest {
+                cmd: "play_audio_to_devices".into(),
+                callback: tauri::ipc::CallbackFn(0),
+                error: tauri::ipc::CallbackFn(1),
+                url: "http://tauri.localhost".parse().unwrap(),
+                body,
+                headers,
+                invoke_key: INVOKE_KEY.into(),
+            },
+        )
+        .map(|body| body.deserialize().unwrap())
+    }
+
+    #[test]
+    fn audio_ipc_rejects_malformed_binary_requests_and_invalid_preview_rate() {
+        let (_app, window) = setup();
+        assert_eq!(
+            play(&window, InvokeBody::Raw(vec![]), None).unwrap_err(),
+            "Missing or oversized playback metadata"
+        );
+        assert_eq!(
+            play(&window, InvokeBody::Raw(vec![]), Some("not-json")).unwrap_err(),
+            "Invalid playback metadata"
+        );
+        assert_eq!(
+            play(
+                &window,
+                InvokeBody::Json(serde_json::json!({})),
+                Some(r#"{"deviceIds":[]}"#)
+            )
+            .unwrap_err(),
+            "Playback audio must use a binary request body"
+        );
+        assert_eq!(
+            play(
+                &window,
+                InvokeBody::Raw(vec![]),
+                Some(r#"{"deviceIds":[]}"#)
+            )
+            .unwrap_err(),
+            "No output devices selected"
+        );
+        assert_eq!(
+            invoke(
+                &window,
+                "start_audio_pcm_stream",
+                InvokeBody::Json(serde_json::json!({"sampleRate":0,"deviceIds":[]})),
+                None
+            )
+            .unwrap_err(),
+            "Invalid preview sample rate"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a working native output device; emits silence"]
+    fn native_silent_ipc_preview_and_binary_clip() {
+        use tauri::Listener;
+        let (app, window) = setup();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.listen("native-audio-playback", move |event| {
+            let _ = tx.send(event.payload().to_owned());
+        });
+        let preview = invoke(
+            &window,
+            "start_audio_pcm_stream",
+            InvokeBody::Json(serde_json::json!({"sampleRate":8000,"deviceIds":[]})),
+            None,
+        )
+        .unwrap();
+        let id = preview["session_id"].as_str().unwrap();
+        assert!(invoke(
+            &window,
+            "append_audio_pcm_stream",
+            InvokeBody::Raw(vec![0; 1600]),
+            Some(id)
+        )
+        .is_ok());
+        assert!(invoke(
+            &window,
+            "control_audio_playback",
+            InvokeBody::Json(serde_json::json!({"sessionId":id,"control":{"paused":false}})),
+            None
+        )
+        .is_ok());
+        assert!(invoke(
+            &window,
+            "finish_audio_pcm_stream",
+            InvokeBody::Json(serde_json::json!({"sessionId":id})),
+            None
+        )
+        .is_ok());
+        loop {
+            let event: serde_json::Value =
+                serde_json::from_str(&rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap())
+                    .unwrap();
+            if event["session_id"] == id && event["state"] == "ended" {
+                break;
+            }
+        }
+        let devices = app
+            .state::<audio_output::AudioOutputState>()
+            .list_output_devices()
+            .unwrap();
+        let device = devices
+            .iter()
+            .find(|device| device.is_default)
+            .expect("default output device");
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = hound::WavWriter::new(
+                &mut bytes,
+                hound::WavSpec {
+                    channels: 1,
+                    sample_rate: 8000,
+                    bits_per_sample: 16,
+                    sample_format: hound::SampleFormat::Int,
+                },
+            )
+            .unwrap();
+            for _ in 0..8000 {
+                writer.write_sample(0_i16).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+        let metadata =
+            serde_json::json!({"deviceIds":[device.id],"options":{"volume":0.5}}).to_string();
+        let clip = play(
+            &window,
+            InvokeBody::Raw(bytes.into_inner()),
+            Some(&metadata),
+        )
+        .unwrap();
+        let id = clip["session_id"].as_str().unwrap();
+        assert!(invoke(
+            &window,
+            "stop_audio_playback",
+            InvokeBody::Json(serde_json::json!({"sessionId":id})),
+            None
+        )
+        .is_ok());
+        loop {
+            let event: serde_json::Value =
+                serde_json::from_str(&rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap())
+                    .unwrap();
+            if event["session_id"] == id && event["state"] == "stopped" {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn stop_server_ipc_cancels_pending_start_and_is_idempotent() {
+        let (app, window) = setup();
+        let state = app.state::<ServerState>();
+        let pending = state.start_gate.try_begin().unwrap();
+        for _ in 0..2 {
+            assert!(invoke(
+                &window,
+                "stop_server",
+                InvokeBody::Json(serde_json::json!({})),
+                None
+            )
+            .is_ok());
+        }
+        assert!(pending.commit(|| ()).is_none());
+        drop(pending);
+        assert!(state.start_gate.try_begin().is_some());
+        assert!(state.server_pid.lock().unwrap().is_none());
     }
 
     #[test]
