@@ -3536,6 +3536,110 @@ mod server_start_flow_tests {
     }
 
     #[tokio::test]
+    async fn repeated_start_reuses_healthy_managed_child_without_spawning_again() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock && std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+                    Err(error) => panic!("health request not received: {error}"),
+                }
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = socket.read(&mut chunk).unwrap();
+                assert!(count > 0, "client closed before request headers");
+                request.extend_from_slice(&chunk[..count]);
+                assert!(request.len() < 16 * 1024);
+            }
+            assert!(request.starts_with(b"GET /health "));
+            let body = r#"{"status":"healthy","model_loaded":false,"gpu_available":false}"#;
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let fixture = Fixture::new("echo started >> \"$2/starts\"\nprintf 'INFO: Uvicorn running on http://127.0.0.1:%s\\n' \"$4\" >&2\nexec /bin/sleep 5");
+        let mut config = fixture.config();
+        config.port = port;
+        let app = app();
+        start_server_with(app.handle().clone(), app.state(), None, None, config).await.unwrap();
+        let pid = app.state::<ServerState>().server_pid.lock().unwrap().unwrap();
+        let mut retry_config = fixture.config();
+        retry_config.port = port;
+        let result = start_server_with(app.handle().clone(), app.state(), None, None, retry_config).await;
+        server.join().unwrap();
+        let current_pid = *app.state::<ServerState>().server_pid.lock().unwrap();
+        let starts = std::fs::read_to_string(fixture.dir.join("data/starts")).unwrap();
+        stop_server_if_owned(app.state(), None).await.unwrap();
+        assert_eq!(result.unwrap(), format!("http://127.0.0.1:{port}"));
+        assert_eq!(current_pid, Some(pid));
+        assert_eq!(starts.lines().count(), 1);
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn failed_or_exited_sidecar_reuses_only_a_healthy_manual_server() {
+        use std::io::{Read, Write};
+        for spawn_failure in [true, false] {
+            for healthy in [true, false] {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let port = listener.local_addr().unwrap().port();
+                let server = std::thread::spawn(move || {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    loop {
+                        match listener.accept() {
+                            Ok((mut socket, _)) => {
+                                socket.set_nonblocking(false).unwrap();
+                                socket.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+                                let mut request = Vec::new();
+                                let mut chunk = [0; 1024];
+                                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                                    let count = socket.read(&mut chunk).unwrap();
+                                    assert!(count > 0, "client closed before request headers");
+                                    request.extend_from_slice(&chunk[..count]);
+                                    assert!(request.len() < 16 * 1024);
+                                }
+                                assert!(request.starts_with(b"GET /health "));
+                                let body = if healthy { r#"{"status":"healthy","model_loaded":false,"gpu_available":false}"# } else { "{}" };
+                                write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                                return;
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock && std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+                            Err(error) => panic!("health request not received: {error}"),
+                        }
+                    }
+                });
+                let fixture = Fixture::new("exit 42");
+                let mut config = fixture.config();
+                config.port = port;
+                if spawn_failure { config.cpu_executable = Some(fixture.dir.join("missing-sidecar")); }
+                let app = app();
+                let result = tokio::time::timeout(Duration::from_secs(7), start_server_with(
+                    app.handle().clone(), app.state(), None, None, config,
+                )).await.expect("startup did not finish");
+                server.join().unwrap();
+                if healthy {
+                    assert_eq!(result.unwrap(), format!("http://127.0.0.1:{port}"));
+                } else {
+                    assert!(result.unwrap_err().contains("Start server manually"));
+                }
+                let state = app.state::<ServerState>();
+                assert!(state.server_pid.lock().unwrap().is_none());
+                assert!(state.child.lock().unwrap().is_none());
+                assert!(state.start_gate.try_begin().is_some());
+                stop_server_if_owned(state, None).await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn isolated_sidecar_exit_clears_ownership_and_reports_failure() {
         let fixture = Fixture::new("printf 'ERROR: startup failed\\n' >&2\nexit 42");
         let app = app();
