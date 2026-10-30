@@ -3258,6 +3258,53 @@ mod native_silent_output_tests {
 
     #[test]
     #[ignore = "requires a working native output device; emits silence"]
+    fn native_silent_resampled_extreme_audio_reaches_callback_when_muted() {
+        let (device, config, format) = output();
+        let source_rate = config.sample_rate.0 / 2;
+        assert!(source_rate > 0);
+        let source: Arc<[f32]> = (0..128)
+            .map(|frame| if frame % 4 < 2 { f32::MAX } else { -f32::MAX })
+            .collect::<Vec<_>>()
+            .into();
+        let samples = prepare_output_pcm(
+            &source,
+            source_rate,
+            1,
+            (config.sample_rate.0, config.channels),
+            &mut HashMap::new(),
+        )
+        .unwrap();
+        assert!(samples.iter().all(|sample| sample.is_finite()));
+        let frames = samples.len() / config.channels as usize;
+        let controls = Arc::new(PlaybackControls::new(0.0, 0.0));
+        let position = Arc::new(RenderPosition::default());
+        let (error_tx, errors) = mpsc::channel();
+        let stream = match format {
+            SampleFormat::F32 => build_stream::<f32>(
+                &device, &config, samples, controls.clone(), position.clone(), error_tx,
+            ),
+            SampleFormat::I16 => build_stream::<i16>(
+                &device, &config, samples, controls.clone(), position.clone(), error_tx,
+            ),
+            SampleFormat::U16 => build_stream::<u16>(
+                &device, &config, samples, controls.clone(), position.clone(), error_tx,
+            ),
+            other => panic!("unsupported output format: {other:?}"),
+        }
+        .expect("open native output");
+        stream.play().unwrap();
+        controls.paused.store(false, Ordering::Release);
+        wait_for(
+            || position.frame.load(Ordering::Acquire) == frames,
+            "consume resampled clip",
+        );
+        assert!(errors.try_recv().is_err());
+        controls.stop();
+        drop(stream);
+    }
+
+    #[test]
+    #[ignore = "requires a working native output device; emits silence"]
     fn native_silent_clip_pauses_resumes_seeks_and_stops() {
         let (device, config, format) = output();
         let samples: Arc<[f32]> =
@@ -4870,6 +4917,40 @@ mod clip_host_integration_tests {
             |_, _, _| panic!("failed startup must not emit playback"),
         )
         .unwrap_err()
+    }
+
+    #[test]
+    fn decoded_finite_float_audio_remains_finite_at_output_after_resampling() {
+        let host = Host::new(&["A"]);
+        host.0.lock().unwrap().cancel_on_build = Some("A".into());
+        let mut output = std::io::Cursor::new(Vec::new());
+        {
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: 4000,
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            };
+            let mut writer = hound::WavWriter::new(&mut output, spec).unwrap();
+            for frame in 0..128 {
+                writer
+                    .write_sample(if frame % 4 < 2 { f32::MAX } else { -f32::MAX })
+                    .unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+        assert_eq!(
+            failed_start(
+                &host,
+                output.into_inner(),
+                ids(&["A"]),
+                Arc::new(PlaybackControls::new(0.0, 1.0)),
+                false,
+            ),
+            "Playback cancelled"
+        );
+        let state = host.0.lock().unwrap();
+        assert!(state.samples[0].iter().all(|sample| sample.is_finite()));
     }
 
     #[test]

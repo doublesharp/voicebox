@@ -77,7 +77,10 @@ pub fn resample_interleaved(
                     sum += samples[source_frame as usize * channels + channel] as f64 * weight;
                 }
             }
-            *sample = sum as f32;
+            // Sinc ringing can exceed the f32 range even for finite input.
+            // Keep converted PCM finite before it reaches a device callback.
+            let bound = f64::from(f32::MAX);
+            *sample = sum.clamp(-bound, bound) as f32;
         }
     }
     Ok(output)
@@ -323,6 +326,27 @@ mod tests {
             let result = convert_channels(&input, input.len(), 1).unwrap()[0];
             assert!(result.is_finite(), "downmix overflowed for {input:?}");
             assert!((result / expected - 1.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn finite_high_amplitude_samples_remain_finite_after_resampling() {
+        let max = f32::MAX;
+        for (source, target) in [(24000, 48000), (48000, 24000), (44100, 48000)] {
+            for channels in [1, 2] {
+                let input: Vec<f32> = (0..128)
+                    .flat_map(|frame| {
+                        let value = if frame % 4 < 2 { max } else { -max };
+                        std::iter::repeat(value).take(channels)
+                    })
+                    .collect();
+                let output = resample_interleaved(&input, source, target, channels).unwrap();
+                assert!(!output.is_empty());
+                assert!(
+                    output.iter().all(|sample| sample.is_finite()),
+                    "{source} -> {target}, {channels} channels"
+                );
+            }
         }
     }
 
