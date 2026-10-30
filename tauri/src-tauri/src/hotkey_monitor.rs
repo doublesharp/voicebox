@@ -504,7 +504,9 @@ impl<R: tauri::Runtime> DictationTarget for NativeDictationTarget<'_, R> {
         if let Some(monitor) = monitor {
             if let Ok(win_size) = window.outer_size() {
                 let _ = window.set_position(crate::dictate_window_position(
-                    *monitor.position(), *monitor.size(), win_size,
+                    *monitor.position(),
+                    *monitor.size(),
+                    win_size,
                 ));
             }
         }
@@ -931,6 +933,95 @@ mod tauri_target_integration_tests {
                 ("dictate:restart".into(), serde_json::Value::Null),
             ]
         );
+    }
+
+    #[test]
+    fn chord_dispatch_delivers_upgrade_as_restart_and_later_stop() {
+        use std::time::Instant;
+        let app = tauri::test::mock_app();
+        let window = window(&app);
+        let events = Arc::new(Mutex::new(Vec::<String>::new()));
+        for name in ["dictate:start", "dictate:stop", "dictate:restart"] {
+            let events = events.clone();
+            window.listen(name, move |_| events.lock().unwrap().push(name.into()));
+        }
+        let time = Instant::now();
+        let shutdown = AtomicBool::new(false);
+        process_events_with_shutdown(
+            &shutdown,
+            ChordEvent::Start {
+                id: ChordAction::PushToTalk,
+                time,
+            },
+            || None,
+            |effect| apply_effect(app.handle(), effect),
+        );
+        process_events_with_shutdown(
+            &shutdown,
+            ChordEvent::End {
+                id: ChordAction::PushToTalk,
+                time,
+            },
+            || {
+                Some(ChordEvent::Start {
+                    id: ChordAction::ToggleToTalk,
+                    time,
+                })
+            },
+            |effect| apply_effect(app.handle(), effect),
+        );
+        process_events_with_shutdown(
+            &shutdown,
+            ChordEvent::End {
+                id: ChordAction::ToggleToTalk,
+                time,
+            },
+            || None,
+            |effect| apply_effect(app.handle(), effect),
+        );
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["dictate:start", "dictate:restart", "dictate:stop"]
+        );
+    }
+
+    #[test]
+    fn unrelated_transition_delivers_stop_then_new_start() {
+        use std::time::Instant;
+        let app = tauri::test::mock_app();
+        let window = window(&app);
+        let events = Arc::new(Mutex::new(Vec::<String>::new()));
+        for name in ["dictate:start", "dictate:stop", "dictate:restart"] {
+            let events = events.clone();
+            window.listen(name, move |_| events.lock().unwrap().push(name.into()));
+        }
+        let time = Instant::now();
+        let shutdown = AtomicBool::new(false);
+        process_events_with_shutdown(
+            &shutdown,
+            ChordEvent::End {
+                id: ChordAction::PushToTalk,
+                time,
+            },
+            || {
+                Some(ChordEvent::Start {
+                    id: ChordAction::ToggleToTalk,
+                    time: time + Duration::from_millis(1),
+                })
+            },
+            |effect| apply_effect(app.handle(), effect),
+        );
+        assert_eq!(*events.lock().unwrap(), ["dictate:stop", "dictate:start"]);
+    }
+
+    #[test]
+    fn start_without_a_dictate_window_is_safe() {
+        let app = tauri::test::mock_app();
+        apply_effect(
+            app.handle(),
+            Effect::StartRecording(ChordAction::PushToTalk),
+        );
+        assert!(app.get_webview_window(DICTATE_WINDOW_LABEL).is_none());
     }
 
     #[test]
