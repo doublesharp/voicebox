@@ -1,4 +1,6 @@
 import { useProfiles } from '@/lib/hooks/useProfiles';
+import { currentServerScope, isCurrentServer, requireCurrentServer, type ServerScope } from '@/lib/serverScope';
+import { useServerStore } from '@/stores/serverStore';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link } from '@tanstack/react-router';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
@@ -149,6 +151,13 @@ export function CapturesTab() {
   const [showRefined, setShowRefined] = useState(true);
   const [launchedPlayAsId, setLaunchedPlayAsId] = useState<string | null>(null);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<{ id: string; scope: ServerScope } | null>(null);
+  const serverUrl = useServerStore((state) => state.serverUrl);
+  const serverRevision = useServerStore((state) => state.serverRevision);
+  useEffect(() => {
+    setDeleteDialogOpen(false);
+    setDeleteTarget(null);
+  }, [serverUrl, serverRevision]);
 
   const audioUrl = usePlayerStore((s) => s.audioUrl);
   const playerAudioId = usePlayerStore((s) => s.audioId);
@@ -247,18 +256,25 @@ export function CapturesTab() {
   const playAsVoiceId = playAsVoice?.id ?? null;
 
   const deleteMutation = useMutation({
-    mutationFn: async (captureId: string) => apiClient.deleteCapture(captureId),
-    onSuccess: () => {
+    mutationFn: async ({ id, scope }: { id: string; scope: ServerScope }) => {
+      requireCurrentServer(scope);
+      return apiClient.deleteCapture(id);
+    },
+    onSuccess: (_data, { scope }) => {
+      if (!isCurrentServer(scope)) return;
       setDeleteDialogOpen(false);
+      setDeleteTarget(null);
       queryClient.invalidateQueries({ queryKey: ['captures'] });
     },
-    onError: (err: Error) => {
+    onError: (err: Error, { scope }) => {
+      if (!isCurrentServer(scope)) return;
       toast({ title: t('captures.toast.deleteFailed'), description: err.message, variant: 'destructive' });
     },
   });
 
   const playAsMutation = useMutation({
-    mutationFn: async ({ capture, voice }: { capture: CaptureResponse; voice: VoiceProfileResponse }) => {
+    mutationFn: async ({ capture, voice, scope }: { capture: CaptureResponse; voice: VoiceProfileResponse; scope: ServerScope }) => {
+      requireCurrentServer(scope);
       const text = capture.transcript_refined || capture.transcript_raw;
       if (!text.trim()) throw new Error(t('captures.noTranscriptError'));
       const language = (capture.language || voice.language) as LanguageCode;
@@ -276,14 +292,16 @@ export function CapturesTab() {
         engine,
       });
     },
-    onSuccess: (result) => {
+    onSuccess: (result, { scope }) => {
+      if (!isCurrentServer(scope)) return;
       // /generate is queue-based — it returns a generating row with an empty
       // audio_path. Hand the id to the global SSE handler which polls
       // /generation/{id}/status and triggers autoplay on completion.
       setLaunchedPlayAsId(result.id);
       addPendingGeneration(result.id);
     },
-    onError: (err: Error) => {
+    onError: (err: Error, { scope }) => {
+      if (!isCurrentServer(scope)) return;
       toast({ title: t('captures.toast.playAsFailed'), description: err.message, variant: 'destructive' });
     },
   });
@@ -333,12 +351,14 @@ export function CapturesTab() {
 
   const handleExportAudio = async () => {
     if (!selected) return;
+    const scope = currentServerScope();
     try {
       const dest = await save({
         defaultPath: `capture_${selected.id.slice(0, 8)}.wav`,
         filters: [{ name: 'Audio', extensions: ['wav'] }],
       });
       if (!dest) return;
+      if (!isCurrentServer(scope)) return;
       const res = await fetch(apiClient.getCaptureAudioUrl(selected.id));
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const buf = new Uint8Array(await res.arrayBuffer());
@@ -428,7 +448,7 @@ export function CapturesTab() {
     if (voice && voice.id !== playAsVoiceId) {
       updateCaptureSettings({ default_playback_voice_id: voice.id });
     }
-    playAsMutation.mutate({ capture: selected, voice: target });
+    playAsMutation.mutate({ capture: selected, voice: target, scope: currentServerScope() });
   };
 
   return (
@@ -816,7 +836,7 @@ export function CapturesTab() {
               <Button
                 variant="ghost"
                 size="sm"
-                onClick={() => setDeleteDialogOpen(true)}
+                onClick={() => { setDeleteTarget({ id: selected.id, scope: currentServerScope() }); setDeleteDialogOpen(true); }}
                 disabled={deleteMutation.isPending}
                 className="text-muted-foreground "
               >
@@ -883,7 +903,7 @@ export function CapturesTab() {
         )}
       </div>
 
-      <AlertDialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>
+      <AlertDialog open={deleteDialogOpen} onOpenChange={(open) => { setDeleteDialogOpen(open); if (!open) setDeleteTarget(null); }}>
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>{t('captures.deleteDialog.title')}</AlertDialogTitle>
@@ -893,7 +913,7 @@ export function CapturesTab() {
             <AlertDialogCancel>{t('common.cancel')}</AlertDialogCancel>
             <AlertDialogAction asChild>
               <Button
-                onClick={() => selected && deleteMutation.mutate(selected.id)}
+                onClick={() => deleteTarget && deleteMutation.mutate(deleteTarget)}
                 disabled={deleteMutation.isPending}
                 className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
               >
