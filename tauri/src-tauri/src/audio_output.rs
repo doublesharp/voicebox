@@ -213,9 +213,9 @@ impl AudioOutputState {
     }
 
     /// Start a continuous output using the same process-wide owner as clips.
-    pub async fn start_pcm_stream(
+    pub async fn start_pcm_stream<R: tauri::Runtime>(
         &self,
-        app: tauri::AppHandle,
+        app: tauri::AppHandle<R>,
         rate: u32,
         ids: Vec<String>,
     ) -> Result<PlaybackSession, String> {
@@ -362,9 +362,9 @@ impl AudioOutputState {
             .collect()
     }
 
-    pub async fn play_audio_to_devices(
+    pub async fn play_audio_to_devices<R: tauri::Runtime>(
         &self,
-        app: tauri::AppHandle,
+        app: tauri::AppHandle<R>,
         audio_data: Vec<u8>,
         device_ids: Vec<String>,
         options: Option<PlaybackOptions>,
@@ -496,8 +496,8 @@ fn validate_selected_output_routes(
     Ok(())
 }
 
-fn emit(
-    app: &tauri::AppHandle,
+fn emit<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     id: &str,
     state: &'static str,
     position: f64,
@@ -758,8 +758,8 @@ fn acknowledge_audio_start(
     true
 }
 
-fn run_session(
-    app: &tauri::AppHandle,
+fn run_session<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     id: &str,
     data: Vec<u8>,
     ids: Vec<String>,
@@ -996,8 +996,8 @@ where
         .map_err(|error| format!("Unable to open preview output: {error}"))
 }
 
-fn run_pcm_session(
-    app: &tauri::AppHandle,
+fn run_pcm_session<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     id: &str,
     rate: u32,
     ids: Vec<String>,
@@ -3557,5 +3557,213 @@ mod preview_session_regression_tests {
         assert!(result.unwrap_err().contains("unavailable"));
         assert!(ready.blocking_recv().is_err());
         assert!(events.try_recv().is_err());
+    }
+}
+
+#[cfg(test)]
+mod public_lifecycle_tests {
+    use super::*;
+    use tauri::{Listener, Manager};
+
+    fn silent_wav() -> Vec<u8> {
+        let mut buffer = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = hound::WavWriter::new(
+                &mut buffer,
+                hound::WavSpec {
+                    channels: 1,
+                    sample_rate: 8000,
+                    bits_per_sample: 16,
+                    sample_format: hound::SampleFormat::Int,
+                },
+            )
+            .unwrap();
+            for _ in 0..8000 {
+                writer.write_sample(0_i16).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+        buffer.into_inner()
+    }
+
+    async fn wait_inactive(state: &AudioOutputState) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if state.active.lock().unwrap().is_none() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("worker did not clean up");
+    }
+
+    #[tokio::test]
+    async fn public_start_rejects_invalid_requests_and_cleans_up_failed_workers() {
+        let app = tauri::test::mock_app();
+        let state = AudioOutputState::new();
+        assert!(state
+            .start_pcm_stream(app.handle().clone(), 0, vec![])
+            .await
+            .is_err());
+        assert!(state.active.lock().unwrap().is_none());
+        for options in [
+            PlaybackOptions {
+                start_time: -1.0,
+                volume: 1.0,
+            },
+            PlaybackOptions {
+                start_time: 0.0,
+                volume: f32::NAN,
+            },
+        ] {
+            assert!(state
+                .play_audio_to_devices(
+                    app.handle().clone(),
+                    vec![],
+                    vec!["device".into()],
+                    Some(options)
+                )
+                .await
+                .is_err());
+            assert!(state.active.lock().unwrap().is_none());
+        }
+        assert!(state
+            .play_audio_to_devices(app.handle().clone(), vec![], vec![], None)
+            .await
+            .is_err());
+        assert!(state
+            .play_audio_to_devices(
+                app.handle().clone(),
+                b"not audio".to_vec(),
+                vec!["device".into()],
+                None
+            )
+            .await
+            .is_err());
+        wait_inactive(&state).await;
+    }
+
+    #[tokio::test]
+    async fn public_invalid_audio_reports_worker_error_and_releases_session() {
+        let app = tauri::test::mock_app();
+        let (tx, rx) = mpsc::channel();
+        app.listen("native-audio-playback", move |event| {
+            let _ = tx.send(event.payload().to_owned());
+        });
+        let state = AudioOutputState::new();
+        for _ in 0..2 {
+            let error = state
+                .play_audio_to_devices(
+                    app.handle().clone(),
+                    b"not audio".to_vec(),
+                    vec!["device".into()],
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(!error.is_empty());
+            wait_inactive(&state).await;
+        }
+        let events: Vec<String> = rx.try_iter().collect();
+        assert_eq!(events.len(), 2);
+        assert!(events[0].contains("\"state\":\"error\"") && events[0].contains("native-1"));
+        assert!(events[1].contains("\"state\":\"error\"") && events[1].contains("native-2"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a working native output device; emits silence"]
+    async fn native_silent_public_replacement_stops_old_preview() {
+        let app = tauri::test::mock_app();
+        let state = AudioOutputState::new();
+        let old = state
+            .start_pcm_stream(app.handle().clone(), 8000, vec![])
+            .await
+            .unwrap();
+        let new = state
+            .start_pcm_stream(app.handle().clone(), 8000, vec![])
+            .await
+            .unwrap();
+        assert_ne!(old.session_id, new.session_id);
+        assert!(state
+            .append_pcm_stream(&old.session_id, vec![0, 0])
+            .await
+            .is_err());
+        state.stop_playback(Some(&old.session_id)).unwrap();
+        state
+            .append_pcm_stream(&new.session_id, vec![0; 1600])
+            .await
+            .unwrap();
+        state
+            .control_playback(
+                &new.session_id,
+                PlaybackControl {
+                    paused: Some(false),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        state.finish_pcm_stream(&new.session_id).unwrap();
+        wait_inactive(&state).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a working native output device; emits silence"]
+    async fn native_silent_public_preview_and_clip_lifecycles() {
+        let app = tauri::test::mock_app();
+        let (tx, rx) = mpsc::channel();
+        app.listen("native-audio-playback", move |event| {
+            let _ = tx.send(event.payload().to_owned());
+        });
+        let state = AudioOutputState::new();
+        let preview = state
+            .start_pcm_stream(app.handle().clone(), 8000, vec![])
+            .await
+            .unwrap();
+        state
+            .append_pcm_stream(&preview.session_id, vec![0; 1600])
+            .await
+            .unwrap();
+        state
+            .control_playback(
+                &preview.session_id,
+                PlaybackControl {
+                    paused: Some(false),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        state.finish_pcm_stream(&preview.session_id).unwrap();
+        wait_inactive(&state).await;
+        assert!(rx
+            .try_iter()
+            .any(|event| event.contains("\"state\":\"ended\"")
+                && event.contains(&preview.session_id)));
+        let device = cpal::default_host().default_output_device().unwrap();
+        let clip = state
+            .play_audio_to_devices(
+                app.handle().clone(),
+                silent_wav(),
+                vec![device_id(&device.name().unwrap())],
+                None,
+            )
+            .await
+            .unwrap();
+        state
+            .control_playback(
+                &clip.session_id,
+                PlaybackControl {
+                    paused: Some(false),
+                    position: Some(0.5),
+                    volume: Some(0.5),
+                },
+            )
+            .unwrap();
+        state.stop_playback(Some(&clip.session_id)).unwrap();
+        wait_inactive(&state).await;
+        assert!(rx.try_iter().any(
+            |event| event.contains("\"state\":\"stopped\"") && event.contains(&clip.session_id)
+        ));
     }
 }

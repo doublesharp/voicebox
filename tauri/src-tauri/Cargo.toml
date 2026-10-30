@@ -9,6 +9,9 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[dev-dependencies]
+tauri = { version = "2.0", features = ["test"] }
+
 [build-dependencies]
 tauri-build = { version = "2.0", features = [] }
 
