@@ -525,7 +525,26 @@ async fn start_server_with<R: tauri::Runtime>(
     models_dir: Option<String>,
     config: ServerStartupConfig,
 ) -> Result<String, String> {
-    let _start_permit = state.start_gate.try_begin().ok_or("The bundled server is starting or stopping. Please try again shortly.")?;
+    start_server_with_generation(app, state, remote, models_dir, config, None).await
+}
+
+async fn start_server_with_generation<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, ServerState>,
+    remote: Option<bool>,
+    models_dir: Option<String>,
+    config: ServerStartupConfig,
+    generation: Option<u64>,
+) -> Result<String, String> {
+    let permit = match generation {
+        Some(value) => state.start_gate.try_begin_generation(Some(value)),
+        None => state.start_gate.try_begin(),
+    };
+    let _start_permit = permit.ok_or(if generation.is_some() {
+        "Server restart cancelled or another operation is active"
+    } else {
+        "The bundled server is starting or stopping. Please try again shortly."
+    })?;
     let is_remote = resolve_remote_setting(&state.remote, remote);
     // Store models_dir for use on restart (empty string means reset to default)
     update_models_dir(&state.models_dir, models_dir.as_deref());
@@ -933,18 +952,28 @@ async fn stop_server_if_owned(
     state: State<'_, ServerState>,
     expected: Option<u32>,
 ) -> Result<(), String> {
+    stop_server_if_owned_with_generation(state, expected)
+        .await
+        .map(|_| ())
+}
+
+async fn stop_server_if_owned_with_generation(
+    state: State<'_, ServerState>,
+    expected: Option<u32>,
+) -> Result<u64, String> {
     let take_process = || server_process::take_process(&state.server_pid, &state.child, expected);
     let (process, stop_permit) = if expected.is_none() {
         state.start_gate.begin_stop(take_process)
     } else {
         state.start_gate.begin_cleanup(take_process)
     };
+    let generation = stop_permit.generation();
     if let Some((pid, child)) = process {
         spawn_server_stop(pid, child, stop_permit)
             .await
             .map_err(|error| format!("Failed to stop server: {}", error))?;
     }
-    Ok(())
+    Ok(generation)
 }
 
 fn spawn_server_stop(
@@ -1001,14 +1030,24 @@ async fn restart_server_with<R: tauri::Runtime>(
 ) -> Result<String, String> {
     println!("restart_server: stopping current server...");
     update_models_dir(&state.models_dir, models_dir.as_deref());
-    stop_server(state.clone()).await?;
-    tokio::time::timeout(stop_timeout, state.start_gate.wait_until_idle())
+    let generation = stop_server_if_owned_with_generation(state.clone(), None).await?;
+    state
+        .start_gate
+        .until_generation_cancelled(
+            generation,
+            tokio::time::timeout(stop_timeout, state.start_gate.wait_until_idle()),
+        )
         .await
+        .ok_or("Server restart cancelled")?
         .map_err(|_| "Previous server startup or cleanup did not stop in time".to_string())?;
     println!("restart_server: waiting for port release...");
-    tokio::time::sleep(release_delay).await;
+    state
+        .start_gate
+        .until_generation_cancelled(generation, tokio::time::sleep(release_delay))
+        .await
+        .ok_or("Server restart cancelled")?;
     println!("restart_server: starting server...");
-    start_server_with(app, state, None, None, config).await
+    start_server_with_generation(app, state, None, None, config, Some(generation)).await
 }
 
 #[command]
@@ -3632,6 +3671,95 @@ mod server_start_flow_tests {
         assert!(first.await.unwrap().unwrap_err().contains("cancelled"));
         assert_ne!(old_pid, app.state::<ServerState>().server_pid.lock().unwrap().unwrap());
         stop_server_if_owned(app.state(), None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_during_restart_release_wait_cancels_before_sidecar_launch() {
+        let fixture = Fixture::new("touch \"$2/started\"\nexec /bin/sleep 5");
+        let app = app();
+        let handle = app.handle().clone();
+        let config = fixture.config();
+        let mut restart = tokio::spawn(async move {
+            restart_server_with(handle.clone(), handle.state(), None, config, Duration::from_secs(3), Duration::from_secs(3)).await
+        });
+        tokio::task::yield_now().await;
+        stop_server_if_owned(app.state(), None).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_millis(500), &mut restart).await;
+        if result.is_err() {
+            restart.abort();
+            let _ = restart.await;
+            panic!("restart did not respond to stop during the release wait");
+        }
+        assert!(result.unwrap().unwrap().unwrap_err().contains("cancelled"));
+        assert!(!fixture.dir.join("data/started").exists());
+        assert!(app.state::<ServerState>().server_pid.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn stop_during_restart_delay_never_launches_replacement_afterward() {
+        let fixture = Fixture::new("touch \"$2/started\"\nprintf 'INFO: Uvicorn running on http://127.0.0.1:%s\\n' \"$4\" >&2\nexec /bin/sleep 5");
+        let app = app();
+        let handle = app.handle().clone();
+        let config = fixture.config();
+        let restart = tokio::spawn(async move {
+            restart_server_with(handle.clone(), handle.state(), None, config, Duration::from_secs(3), Duration::from_millis(250)).await
+        });
+        tokio::task::yield_now().await;
+        stop_server_if_owned(app.state(), None).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), restart).await.unwrap().unwrap();
+        let launched = fixture.dir.join("data/started").exists();
+        stop_server_if_owned(app.state(), None).await.unwrap();
+        assert!(result.is_err(), "restart succeeded after stop: {result:?}");
+        assert!(!launched, "restart launched a replacement after stop");
+    }
+
+    #[tokio::test]
+    async fn newer_restart_supersedes_waiting_restart_without_launching_old_sidecar() {
+        let first = Fixture::new("touch \"$2/first\"\nexec /bin/sleep 5");
+        let second = Fixture::new("touch \"$2/second\"\nprintf 'INFO: Uvicorn running on http://127.0.0.1:%s\\n' \"$4\" >&2\nexec /bin/sleep 5");
+        let app = app();
+        let handle = app.handle().clone();
+        let first_config = first.config();
+        let first_restart = tokio::spawn(async move {
+            restart_server_with(handle.clone(), handle.state(), None, first_config, Duration::from_secs(3), Duration::from_secs(3)).await
+        });
+        tokio::task::yield_now().await;
+        let latest = tokio::time::timeout(Duration::from_secs(5), restart_server_with(
+            app.handle().clone(), app.state(), None, second.config(), Duration::from_secs(3), Duration::ZERO,
+        )).await.unwrap();
+        let earlier = tokio::time::timeout(Duration::from_secs(1), first_restart).await.unwrap().unwrap();
+        let first_launched = first.dir.join("data/first").exists();
+        let second_launched = second.dir.join("data/second").exists();
+        stop_server_if_owned(app.state(), None).await.unwrap();
+        assert!(earlier.unwrap_err().contains("cancelled"));
+        assert!(latest.is_ok());
+        assert!(!first_launched);
+        assert!(second_launched);
+    }
+
+    #[tokio::test]
+    async fn stop_during_restart_idle_wait_cancels_without_launch() {
+        let fixture = Fixture::new("touch \"$2/started\"\nexec /bin/sleep 5");
+        let app = app();
+        let state = app.state::<ServerState>();
+        let pending = state.start_gate.try_begin().unwrap();
+        let handle = app.handle().clone();
+        let config = fixture.config();
+        let mut restart = tokio::spawn(async move {
+            restart_server_with(handle.clone(), handle.state(), None, config, Duration::from_secs(3), Duration::ZERO).await
+        });
+        tokio::task::yield_now().await;
+        stop_server_if_owned(state.clone(), None).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_millis(500), &mut restart).await;
+        if result.is_err() {
+            restart.abort();
+            let _ = restart.await;
+            drop(pending);
+            panic!("restart did not respond to stop during the idle wait");
+        }
+        assert!(result.unwrap().unwrap().unwrap_err().contains("cancelled"));
+        assert!(!fixture.dir.join("data/started").exists());
+        drop(pending);
     }
 
     #[tokio::test]

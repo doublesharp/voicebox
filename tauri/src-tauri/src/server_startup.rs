@@ -33,6 +33,13 @@ pub(crate) struct StartPermit<'a> {
 
 pub(crate) struct StopPermit {
     gate: std::sync::Arc<StartGate>,
+    generation: u64,
+}
+
+impl StopPermit {
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
 }
 
 impl Drop for StopPermit {
@@ -68,14 +75,28 @@ impl StartGate {
         }
         state.stopping += 1;
         let result = action();
+        let generation = state.generation;
         drop(state);
         self.changed.send_replace(());
-        (result, StopPermit { gate: self.clone() })
+        (
+            result,
+            StopPermit {
+                gate: self.clone(),
+                generation,
+            },
+        )
     }
 
     pub(crate) fn try_begin(&self) -> Option<StartPermit<'_>> {
+        self.try_begin_generation(None)
+    }
+
+    pub(crate) fn try_begin_generation(&self, expected: Option<u64>) -> Option<StartPermit<'_>> {
         let mut state = self.state.lock().unwrap();
-        if state.starting || state.stopping > 0 {
+        if state.starting
+            || state.stopping > 0
+            || expected.is_some_and(|value| value != state.generation)
+        {
             return None;
         }
         state.starting = true;
@@ -93,6 +114,29 @@ impl StartGate {
         drop(state);
         self.changed.send_replace(());
         result
+    }
+
+    pub(crate) async fn until_generation_cancelled<F: std::future::Future>(
+        &self,
+        generation: u64,
+        work: F,
+    ) -> Option<F::Output> {
+        let mut changed = self.changed.subscribe();
+        let cancelled = async {
+            loop {
+                if self.state.lock().unwrap().generation != generation {
+                    return;
+                }
+                if changed.changed().await.is_err() {
+                    return;
+                }
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = cancelled => None,
+            result = work => Some(result),
+        }
     }
 
     pub(crate) async fn wait_until_idle(&self) {
@@ -129,22 +173,9 @@ impl StartPermit<'_> {
         &self,
         work: F,
     ) -> Option<F::Output> {
-        let mut changed = self.gate.changed.subscribe();
-        let cancelled = async {
-            loop {
-                if self.gate.state.lock().unwrap().generation != self.generation {
-                    return;
-                }
-                if changed.changed().await.is_err() {
-                    return;
-                }
-            }
-        };
-        tokio::select! {
-            biased;
-            _ = cancelled => None,
-            result = work => Some(result),
-        }
+        self.gate
+            .until_generation_cancelled(self.generation, work)
+            .await
     }
 }
 
@@ -592,6 +623,39 @@ mod tests {
 mod start_gate_tests {
     use super::StartGate;
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn restart_generation_is_checked_atomically_when_start_is_acquired() {
+        let gate = Arc::new(StartGate::default());
+        let (_, initial_stop) = gate.begin_stop(|| ());
+        let generation = initial_stop.generation();
+        drop(initial_stop);
+        let (_, cleanup) = gate.begin_cleanup(|| ());
+        drop(cleanup);
+        assert!(gate.try_begin_generation(Some(generation)).is_some());
+        let (_, later_stop) = gate.begin_stop(|| ());
+        drop(later_stop);
+        assert!(gate.try_begin_generation(Some(generation)).is_none());
+        assert!(gate.try_begin().is_some());
+    }
+
+    #[tokio::test]
+    async fn cancelled_generation_wins_even_when_wait_is_already_ready() {
+        let gate = Arc::new(StartGate::default());
+        let (_, first) = gate.begin_stop(|| ());
+        let generation = first.generation();
+        drop(first);
+        assert_eq!(
+            gate.until_generation_cancelled(generation, async { 42 }).await,
+            Some(42)
+        );
+        let (_, second) = gate.begin_stop(|| ());
+        drop(second);
+        assert_eq!(
+            gate.until_generation_cancelled(generation, async { 42 }).await,
+            None
+        );
+    }
 
     #[test]
     fn overlapping_startup_is_rejected_until_the_first_attempt_ends() {
