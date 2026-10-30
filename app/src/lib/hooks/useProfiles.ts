@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiClient } from '@/lib/api/client';
 import type { EffectConfig, VoiceProfileCreate, VoiceProfileResponse } from '@/lib/api/types';
 import { usePlatform } from '@/platform/PlatformContext';
+import { useServerStore } from '@/stores/serverStore';
 
 export function useProfiles() {
   return useQuery({
@@ -99,9 +100,15 @@ export function useUpdateProfileEffects() {
 }
 
 export function useProfileSamples(profileId: string) {
+  const serverUrl = useServerStore((state) => state.serverUrl);
+  const serverRevision = useServerStore((state) => state.serverRevision);
+  const scope = { serverUrl, serverRevision };
   return useQuery({
-    queryKey: ['profiles', profileId, 'samples'],
-    queryFn: () => apiClient.listProfileSamples(profileId),
+    queryKey: ['profiles', profileId, 'samples', serverUrl, serverRevision],
+    queryFn: () => {
+      requireCurrentServer(scope);
+      return apiClient.listProfileSamples(profileId);
+    },
     enabled: !!profileId,
   });
 }
