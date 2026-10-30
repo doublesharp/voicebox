@@ -6,7 +6,7 @@ import os
 import re
 import subprocess
 import sys
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing
 from pathlib import Path
 
 
@@ -294,44 +294,42 @@ async def _run_startup(application: FastAPI) -> None:
     # Mark stale "generating" records as failed -- leftovers from a killed process
     from sqlalchemy import text as sa_text
 
-    db = next(get_db())
-    try:
-        result = db.execute(
-            sa_text(
-                "UPDATE generations SET status = 'failed', "
-                "error = 'Server was shut down during generation' "
-                "WHERE status IN ('generating', 'loading_model')"
+    with closing(get_db()) as session_source:
+        db = next(session_source)
+        try:
+            result = db.execute(
+                sa_text(
+                    "UPDATE generations SET status = 'failed', "
+                    "error = 'Server was shut down during generation' "
+                    "WHERE status IN ('generating', 'loading_model')"
+                )
             )
-        )
-        if result.rowcount > 0:
-            logger.info("Marked %d stale generation(s) as failed", result.rowcount)
+            if result.rowcount > 0:
+                logger.info("Marked %d stale generation(s) as failed", result.rowcount)
 
-        from .database import VoiceProfile as DBVoiceProfile, Generation as DBGeneration
+            from .database import VoiceProfile as DBVoiceProfile, Generation as DBGeneration
 
-        profile_count = db.query(DBVoiceProfile).count()
-        generation_count = db.query(DBGeneration).count()
-        logger.info("Profiles: %d, Generations: %d", profile_count, generation_count)
+            profile_count = db.query(DBVoiceProfile).count()
+            generation_count = db.query(DBGeneration).count()
+            logger.info("Profiles: %d, Generations: %d", profile_count, generation_count)
 
-        db.commit()
-    except Exception as e:
-        db.rollback()
-        logger.warning("Could not clean up stale generations: %s", e)
-    finally:
-        db.close()
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            logger.warning("Could not clean up stale generations: %s", e)
 
     # Seed the LLM backend dispatch from the persisted capture settings so
     # the very first refinement / personality call after startup honours a
     # user-configured custom OpenAI-compatible endpoint without needing a
     # settings-write to flip the module state first.
-    db = next(get_db())
-    try:
-        from .services.settings import bootstrap_llm_backend_config
+    with closing(get_db()) as session_source:
+        db = next(session_source)
+        try:
+            from .services.settings import bootstrap_llm_backend_config
 
-        bootstrap_llm_backend_config(db)
-    except Exception as e:
-        logger.warning("Could not bootstrap custom LLM config: %s", e)
-    finally:
-        db.close()
+            bootstrap_llm_backend_config(db)
+        except Exception as e:
+            logger.warning("Could not bootstrap custom LLM config: %s", e)
 
     backend_type = get_backend_type()
     logger.info("Backend: %s", backend_type.upper())
