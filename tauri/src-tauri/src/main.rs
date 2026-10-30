@@ -259,10 +259,25 @@ fn allow_media_request(uri: &str, audio: bool, video: bool, display: bool) -> bo
     audio && !video && !display && trusted_microphone_origin(uri)
 }
 
+fn resolve_remote_setting(stored: &Mutex<bool>, requested: Option<bool>) -> bool {
+    let mut remote = stored.lock().unwrap();
+    if let Some(requested) = requested {
+        *remote = requested;
+    }
+    *remote
+}
+
+fn update_models_dir(stored: &Mutex<Option<String>>, requested: Option<&str>) {
+    if let Some(dir) = requested {
+        *stored.lock().unwrap() = (!dir.is_empty()).then(|| dir.to_string());
+    }
+}
+
 struct ServerState {
     child: Mutex<Option<tauri_plugin_shell::process::CommandChild>>,
     server_pid: Mutex<Option<u32>>,
     keep_running_on_close: Mutex<bool>,
+    remote: Mutex<bool>,
     models_dir: Mutex<Option<String>>,
     /// Override the backend selection: Some("cpu") forces the CPU sidecar even
     /// when GPU binaries exist (solving the Windows catch-22 where an active
@@ -344,14 +359,9 @@ async fn start_server(
     remote: Option<bool>,
     models_dir: Option<String>,
 ) -> Result<String, String> {
+    let is_remote = resolve_remote_setting(&state.remote, remote);
     // Store models_dir for use on restart (empty string means reset to default)
-    if let Some(ref dir) = models_dir {
-        if dir.is_empty() {
-            *state.models_dir.lock().unwrap() = None;
-        } else {
-            *state.models_dir.lock().unwrap() = Some(dir.clone());
-        }
-    }
+    update_models_dir(&state.models_dir, models_dir.as_deref());
     // Check if server is already running (managed by this app instance)
     let has_managed_child = state.child.lock().unwrap().is_some();
     if has_managed_child {
@@ -478,7 +488,7 @@ async fn start_server(
     println!("=================================================================");
     println!("Starting voicebox-server sidecar");
     println!("Data directory: {:?}", data_dir);
-    println!("Remote mode: {}", remote.unwrap_or(false));
+    println!("Remote mode: {}", is_remote);
 
     // Check for ROCm backend in data directory (onedir layout: backends/rocm/)
     let rocm_binary = {
@@ -616,7 +626,7 @@ async fn start_server(
         .to_str()
         .ok_or_else(|| "Invalid data dir path".to_string())?
         .to_string();
-    let server_args = server_arguments(&data_dir_str, SERVER_PORT, std::process::id(), remote.unwrap_or(false));
+    let server_args = server_arguments(&data_dir_str, SERVER_PORT, std::process::id(), is_remote);
 
     // Resolve the custom models directory from the parameter or stored state
     let effective_models_dir = models_dir.or_else(|| state.models_dir.lock().unwrap().clone());
@@ -851,13 +861,7 @@ async fn restart_server(
     println!("restart_server: stopping current server...");
 
     // Update stored models_dir: empty string means reset to default, non-empty means set
-    if let Some(ref dir) = models_dir {
-        if dir.is_empty() {
-            *state.models_dir.lock().unwrap() = None;
-        } else {
-            *state.models_dir.lock().unwrap() = Some(dir.clone());
-        }
-    }
+    update_models_dir(&state.models_dir, models_dir.as_deref());
 
     // Stop the current server
     stop_server(state.clone()).await?;
@@ -1398,6 +1402,7 @@ pub fn run() {
             child: Mutex::new(None),
             server_pid: Mutex::new(None),
             keep_running_on_close: Mutex::new(false),
+            remote: Mutex::new(false),
             models_dir: Mutex::new(None),
             backend_override: Mutex::new(None),
         })
@@ -2013,5 +2018,55 @@ mod media_permission_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod restart_configuration_tests {
+    use super::{resolve_remote_setting, server_arguments, update_models_dir};
+    use std::sync::Mutex;
+
+    fn args(remote: bool) -> Vec<String> { server_arguments("/data", 17493, 123, remote) }
+
+    #[test]
+    fn remote_binding_survives_restart_without_an_explicit_override() {
+        let state = Mutex::new(false);
+        assert!(args(resolve_remote_setting(&state, Some(true))).contains(&"0.0.0.0".into()));
+        let restarted = args(resolve_remote_setting(&state, None));
+        assert!(restarted.contains(&"0.0.0.0".into()));
+        assert_eq!(restarted.last().unwrap(), "0.0.0.0");
+    }
+
+    #[test]
+    fn explicit_local_mode_replaces_the_previous_remote_choice() {
+        let state = Mutex::new(false);
+        resolve_remote_setting(&state, Some(true));
+        assert!(!args(resolve_remote_setting(&state, Some(false))).contains(&"--host".into()));
+        assert!(!args(resolve_remote_setting(&state, None)).contains(&"--host".into()));
+    }
+
+    #[test]
+    fn models_directory_is_retained_replaced_and_reset_across_restarts() {
+        let models = Mutex::new(None);
+        update_models_dir(&models, Some("/Volumes/Models With Spaces"));
+        assert_eq!(models.lock().unwrap().as_deref(), Some("/Volumes/Models With Spaces"));
+        update_models_dir(&models, None);
+        assert_eq!(models.lock().unwrap().as_deref(), Some("/Volumes/Models With Spaces"));
+        update_models_dir(&models, Some("/Volumes/別の場所"));
+        assert_eq!(models.lock().unwrap().as_deref(), Some("/Volumes/別の場所"));
+        update_models_dir(&models, Some(""));
+        assert_eq!(*models.lock().unwrap(), None);
+        update_models_dir(&models, None);
+        assert_eq!(*models.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn omitted_setting_defaults_to_local_and_each_instance_is_independent() {
+        let first = Mutex::new(false);
+        let second = Mutex::new(false);
+        assert!(!resolve_remote_setting(&first, None));
+        assert!(resolve_remote_setting(&first, Some(true)));
+        assert!(!resolve_remote_setting(&second, None));
+        assert!(resolve_remote_setting(&first, None));
     }
 }
