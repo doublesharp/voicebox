@@ -15,10 +15,10 @@ export function parseChangelog(raw: string): ChangelogEntry[] {
   const entries: ChangelogEntry[] = [];
 
   // Strip trailing link reference definitions (e.g. [0.1.0]: https://...)
-  const cleaned = raw.replace(/^\[[\w.]+\]:.*$/gm, '').trimEnd();
+  const cleaned = raw.replace(/\r\n?/g, '\n').replace(/^\[[^\]\n]+\]:.*$/gm, '').trimEnd();
 
   // Match `## [version]` or `## [version] - date`
-  const headingRe = /^## \[(.+?)\](?:\s*-\s*(.+))?$/gm;
+  const headingRe = /^## \[(.+?)\](?:[ \t]*-[ \t]*(.+))?[ \t]*$/gm;
   const matches = [...cleaned.matchAll(headingRe)];
 
   for (let i = 0; i < matches.length; i++) {
