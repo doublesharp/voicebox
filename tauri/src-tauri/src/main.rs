@@ -3259,6 +3259,73 @@ mod server_start_flow_tests {
         }
     }
 
+    #[tokio::test]
+    async fn saved_gpu_override_selects_backend_after_restart() {
+        for (saved, live, install_rocm, expected, probes) in [
+            ("cpu", None, true, "cpu", (false, false)),
+            ("cuda", None, true, "cuda", (true, true)),
+            ("rocm", None, true, "rocm", (true, true)),
+            ("rocm", None, false, "cuda", (false, true)),
+            ("cuda", Some("cpu"), true, "cpu", (false, false)),
+        ] {
+            let fixture = Fixture::new("printf 'cpu\\n%s\\n' \"$VOICEBOX_MODELS_DIR\" > \"$2/selected\"\nprintf 'INFO: Uvicorn running on http://127.0.0.1:%s\\n' \"$4\" >&2\nexec /bin/sleep 5");
+            let rocm = fixture.dir.join("data/backends/rocm");
+            if install_rocm { install_gpu(&fixture, "rocm", "0.6.0", false); }
+            let cuda = install_gpu(&fixture, "cuda", "0.6.0", false);
+            write_persisted_backend_override(&fixture.dir.join("data"), Some(saved)).unwrap();
+            let app = app();
+            *app.state::<ServerState>().backend_override.lock().unwrap() = live.map(str::to_string);
+            let result = tokio::time::timeout(Duration::from_secs(8), start_server_with(
+                app.handle().clone(), app.state(), None, Some("saved models".into()), fixture.config(),
+            )).await.unwrap().unwrap();
+            assert_eq!(result, format!("http://127.0.0.1:{}", fixture.port));
+            let selected = std::fs::read_to_string(fixture.dir.join("data/selected")).unwrap();
+            let lines: Vec<_> = selected.lines().collect();
+            assert_eq!(lines[0], expected, "saved={saved}, live={live:?}");
+            assert_eq!(lines[1], "saved models");
+            assert_eq!((rocm.join("probe").exists(), cuda.join("probe").exists()), probes);
+            stop_server_if_owned(app.state(), None).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_start_reaps_a_stalled_real_gpu_version_probe() {
+        let fixture = Fixture::new("touch \"$2/cpu-started\"\nexec /bin/sleep 5");
+        let rocm = fixture.dir.join("data/backends/rocm");
+        std::fs::create_dir_all(&rocm).unwrap();
+        let binary = rocm.join("voicebox-server-rocm");
+        std::fs::write(&binary, "#!/bin/sh\nprintf '%s' \"$$\" > probe-pid\nexec /bin/sleep 30\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let app = app();
+        let handle = app.handle().clone();
+        let config = fixture.config();
+        let startup = tokio::spawn(async move {
+            start_server_with(handle.clone(), handle.state(), None, None, config).await
+        });
+        let pid_file = rocm.join("probe-pid");
+        let pid = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+                    if let Ok(pid) = pid.parse::<u32>() { break pid; }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("GPU probe did not start");
+        stop_server_if_owned(app.state(), None).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(3), startup).await.unwrap().unwrap();
+        assert!(result.unwrap_err().contains("cancelled"));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let exists = std::process::Command::new("kill").args(["-0", &pid.to_string()]).output().unwrap().status.success();
+                if !exists { break; }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("cancelled version probe was not reaped");
+        assert!(!fixture.dir.join("data/cpu-started").exists());
+        assert!(app.state::<ServerState>().server_pid.lock().unwrap().is_none());
+        assert!(app.state::<ServerState>().start_gate.try_begin().is_some());
+    }
+
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn stop_interrupts_stalled_current_and_legacy_health_probes() {
