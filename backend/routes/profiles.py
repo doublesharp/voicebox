@@ -260,7 +260,7 @@ async def get_profile_avatar(
         raise HTTPException(status_code=404, detail="No avatar found for this profile")
 
     avatar_path = config.resolve_storage_path(profile.avatar_path)
-    if avatar_path is None or not avatar_path.exists():
+    if avatar_path is None or not avatar_path.is_file():
         raise HTTPException(status_code=404, detail="Avatar file not found")
 
     return FileResponse(avatar_path)

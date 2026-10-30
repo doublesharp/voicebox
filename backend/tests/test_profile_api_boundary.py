@@ -124,3 +124,75 @@ def test_import_reports_processing_errors(client, monkeypatch, error, status):
     result = client.post('/profiles/import', files={'file': ('profile.zip', b'zip bytes')})
     assert result.status_code == status
     assert result.json()['detail'] == str(error)
+
+
+def test_profile_listing_and_duplicate_name_update_preserve_original(client):
+    first = client.post('/profiles', json={'name': 'Second', 'language': 'en'})
+    assert first.status_code == 200
+    profile_id = first.json()['id']
+    names = {profile['name'] for profile in client.get('/profiles').json()}
+    assert names == {'Narrator', 'Second'}
+    result = client.put(f'/profiles/{profile_id}', json={'name': 'Narrator', 'language': 'en'})
+    assert result.status_code == 400
+    assert client.get(f'/profiles/{profile_id}').json()['name'] == 'Second'
+
+
+def test_preset_voice_routes_do_not_conflict_with_profile_lookup(client):
+    kokoro = client.get('/profiles/presets/kokoro')
+    assert kokoro.status_code == 200
+    assert kokoro.json()['engine'] == 'kokoro'
+    assert kokoro.json()['voices']
+    assert all({'voice_id', 'name', 'gender', 'language'} <= voice.keys() for voice in kokoro.json()['voices'])
+    qwen = client.get('/profiles/presets/qwen_custom_voice')
+    assert qwen.status_code == 200
+    assert qwen.json()['engine'] == 'qwen_custom_voice'
+    assert qwen.json()['voices']
+    assert all({'voice_id', 'name', 'gender', 'language'} <= voice.keys() for voice in qwen.json()['voices'])
+    unknown = client.get('/profiles/presets/not-an-engine')
+    assert unknown.json() == {'engine': 'not-an-engine', 'voices': []}
+
+
+def test_channel_assignment_rejects_missing_or_duplicate_ids_without_changing_state(client):
+    assert client.get('/profiles/voice/channels').json() == {'channel_ids': []}
+    for ids in [['missing'], ['missing', 'missing']]:
+        response = client.put('/profiles/voice/channels', json={'channel_ids': ids})
+        assert response.status_code == 400
+        assert client.get('/profiles/voice/channels').json() == {'channel_ids': []}
+    assert client.put('/profiles/missing/channels', json={'channel_ids': []}).status_code == 400
+
+
+def test_avatar_get_returns_bytes_and_reports_missing_files(client, monkeypatch, tmp_path):
+    from backend import config
+    monkeypatch.setattr(config, '_data_dir', tmp_path)
+    avatar = tmp_path / 'avatar.png'
+    avatar.write_bytes(b'image bytes')
+    async def profile(*_args):
+        return SimpleNamespace(avatar_path='avatar.png')
+    monkeypatch.setattr(routes.profiles, 'get_profile', profile)
+    response = client.get('/profiles/voice/avatar')
+    assert response.status_code == 200
+    assert response.content == b'image bytes'
+    avatar.unlink()
+    assert client.get('/profiles/voice/avatar').status_code == 404
+
+
+def test_avatar_directory_is_reported_as_missing_not_internal_error(client, monkeypatch, tmp_path):
+    from backend import config
+    monkeypatch.setattr(config, '_data_dir', tmp_path)
+    (tmp_path / 'avatar.png').mkdir()
+    async def profile(*_args):
+        return SimpleNamespace(avatar_path='avatar.png')
+    monkeypatch.setattr(routes.profiles, 'get_profile', profile)
+    response = client.get('/profiles/voice/avatar')
+    assert response.status_code == 404
+    assert response.json()['detail'] == 'Avatar file not found'
+
+
+@pytest.mark.parametrize('error,status', [(ValueError('invalid archive'), 400), (RuntimeError('disk failed'), 500)])
+def test_profile_export_maps_archive_failures(client, monkeypatch, error, status):
+    def fail(*_args):
+        raise error
+    monkeypatch.setattr(routes.export_import, 'export_profile_to_zip', fail)
+    response = client.get('/profiles/voice/export')
+    assert response.status_code == status
+    assert response.json()['detail'] == str(error)
