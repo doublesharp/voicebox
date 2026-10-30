@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 import traceback
+import weakref
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -72,11 +73,16 @@ class CheckResult:
 
 
 class Spy:
-    """Observe a bound method: count calls, run observers, always call through."""
+    """Observe a bound method: count calls, run observers, always call through.
+
+    The owner is held weakly, so an installed spy never keeps a model alive
+    past unload_model(); a retained model would hide a VRAM leak."""
 
     def __init__(self, owner, attribute, before=None):
-        self.owner, self.attribute, self.before = owner, attribute, before
-        self.original = getattr(owner, attribute)
+        self.attribute, self.before = attribute, before
+        original = getattr(owner, attribute)
+        self.function = getattr(original, "__func__", original)
+        self.owner = weakref.ref(owner) if hasattr(original, "__func__") else None
         self.calls = 0
         self.observations = []
         self.started = threading.Event()
@@ -89,7 +95,12 @@ class Spy:
         if self.before is not None:
             self.observations.append(self.before())
         try:
-            return self.original(*args, **kwargs)
+            if self.owner is None:
+                return self.function(*args, **kwargs)
+            owner = self.owner()
+            if owner is None:
+                raise RuntimeError("spied model was released")
+            return self.function(owner, *args, **kwargs)
         finally:
             self.finished.set()
 
@@ -165,8 +176,9 @@ class Session:
 
     def install_spies(self):
         model = self.adapter.model
+        weak_model = weakref.ref(model)
         self.prepare = Spy(model, "prepare_conditionals")
-        self.generate_spy = Spy(model, "generate", before=lambda: tensor_facts(model.conds))
+        self.generate_spy = Spy(model, "generate", before=lambda: tensor_facts(weak_model().conds))
 
     async def prepare_prompt(self, path, text, *, use_cache=True, label="prepare"):
         with self.stage(label):
@@ -385,22 +397,28 @@ async def check_repeated_requests_reuse_conditioning(s):
 
 
 async def check_unload_releases_vram_and_reload_hits_disk(s):
+    """Problems are collected, not raised, until the model is loaded again so
+    later checks still run against a loaded, spied model."""
     from backend.utils import cache
+    problems = []
+    old_prepare = s.prepare.calls
     allocated_before = s.meter.cuda_allocated_bytes()
     with s.stage("unload"):
         s.adapter.unload_model()
-    expect(not s.adapter.is_loaded(), "adapter still loaded")
+    if s.adapter.is_loaded():
+        problems.append("adapter still loaded")
     allocated_after = s.meter.cuda_allocated_bytes()
-    if allocated_before is not None:
-        expect(allocated_after < allocated_before and allocated_after < allocated_before * 0.05,
-               f"VRAM not released: {allocated_before} -> {allocated_after}")
-    old_prepare = s.prepare.calls
+    if allocated_before is not None and not allocated_after < allocated_before * 0.05:
+        problems.append(f"VRAM not released: {allocated_before} -> {allocated_after}")
     cache.clear_voice_prompt_memory_cache()
     loaded = await s.load()
     _, hit = await s.prepare_prompt(s.work_a, s.settings.reference_a_text, label="prepare_a_after_reload")
-    expect(hit is True and s.prepare.calls == 0, f"disk hit after reload: hit={hit}, prepare calls={s.prepare.calls}")
+    if not (hit is True and s.prepare.calls == 0):
+        problems.append(f"disk hit after reload: hit={hit}, prepare calls={s.prepare.calls}")
     await s.generate("a_after_reload", s.prompt_a, seed=s.settings.seed)
-    expect(s.prepare.calls == 0, "generation after reload re-encoded")
+    if s.prepare.calls != 0:
+        problems.append("generation after reload re-encoded")
+    expect(not problems, "; ".join(problems))
     return {"cuda_allocated_before_unload": allocated_before, "cuda_allocated_after_unload": allocated_after,
             "prepare_calls_before_unload": old_prepare, "disk_hit_after_reload": hit, **loaded}
 

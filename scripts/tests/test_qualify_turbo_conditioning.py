@@ -264,3 +264,20 @@ def test_cli_refuses_missing_cache_before_importing_models(tmp_path, settings):
     assert "not locally ready" in result.stderr
     report = json.loads((tmp_path / "cli-run" / "results.json").read_text())
     assert report["status"] == "failed" and report["checks"] == []
+
+
+def test_spy_does_not_keep_its_owner_alive():
+    import gc
+    import weakref
+
+    class Owner:
+        def method(self, value):
+            return value + 1
+
+    owner = Owner()
+    spy = qualify.Spy(owner, "method")
+    assert owner.method(1) == 2 and spy.calls == 1
+    alive = weakref.ref(owner)
+    del owner
+    gc.collect()
+    assert alive() is None, "spy retained the model it observes"
