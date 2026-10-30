@@ -105,6 +105,9 @@ pub(crate) mod private_pasteboard_tests {
                 })
             }
         }
+        pub(crate) fn save_with_unavailable_format(&self) -> Result<ClipboardSnapshot, String> {
+            unsafe { save_clipboard_from_with_data(self.board, || {}, |_, _| std::ptr::null_mut()) }
+        }
         pub(crate) fn write(&self, text: &str) -> i64 {
             unsafe { write_text_to(self.board, text).unwrap() }
         }
@@ -199,6 +202,75 @@ pub(crate) mod private_pasteboard_tests {
             );
             assert_eq!(board.text().as_deref(), Some("newer"));
         }
+    }
+
+    #[test]
+    fn missing_advertised_format_must_not_produce_partial_snapshot() {
+        let board = PrivatePasteboard::new();
+        board.restore(&snapshot(vec![vec![
+            ("com.voicebox.test.one", b"first"),
+            ("com.voicebox.test.two", b"second"),
+        ]]));
+        let initial_count = board.change_count();
+        let mut read_count = 0;
+        let result = unsafe {
+            save_clipboard_from_with_data(
+                board.board,
+                || {},
+                |item, kind| {
+                    read_count += 1;
+                    if read_count == 2 {
+                        std::ptr::null_mut()
+                    } else {
+                        msg_send![item, dataForType: kind]
+                    }
+                },
+            )
+        };
+        assert!(result.is_err(), "partial snapshots must not be accepted");
+        assert_eq!(read_count, 2);
+        assert_eq!(board.change_count(), initial_count);
+        let still_present = board.save();
+        assert_eq!(data(&still_present, 0, "com.voicebox.test.one"), b"first");
+        assert_eq!(data(&still_present, 0, "com.voicebox.test.two"), b"second");
+    }
+
+    #[test]
+    fn missing_first_format_does_not_capture_later_formats() {
+        let board = PrivatePasteboard::new();
+        board.restore(&snapshot(vec![vec![
+            ("com.voicebox.test.one", b"first"),
+            ("com.voicebox.test.two", b"second"),
+        ]]));
+        let mut reads = 0;
+        let result = unsafe {
+            save_clipboard_from_with_data(
+                board.board,
+                || {},
+                |_, _| {
+                    reads += 1;
+                    std::ptr::null_mut()
+                },
+            )
+        };
+        assert!(result.is_err());
+        assert_eq!(reads, 1);
+        assert_eq!(board.save().item_count(), 1);
+    }
+
+    #[test]
+    fn empty_data_is_not_confused_with_unavailable_format() {
+        let board = PrivatePasteboard::new();
+        board.restore(&snapshot(vec![vec![("com.voicebox.test.empty", b"")]]));
+        let saved = unsafe {
+            save_clipboard_from_with_data(
+                board.board,
+                || {},
+                |item, kind| msg_send![item, dataForType: kind],
+            )
+        }
+        .unwrap();
+        assert_eq!(data(&saved, 0, "com.voicebox.test.empty"), b"");
     }
 
     #[test]
@@ -572,6 +644,19 @@ unsafe fn save_clipboard_from_with(
     pb: Id,
     after_capture: impl FnOnce(),
 ) -> Result<ClipboardSnapshot, String> {
+    save_clipboard_from_with_data(
+        pb,
+        after_capture,
+        |item, kind| msg_send![item, dataForType: kind],
+    )
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn save_clipboard_from_with_data(
+    pb: Id,
+    after_capture: impl FnOnce(),
+    mut read_data: impl FnMut(Id, Id) -> Id,
+) -> Result<ClipboardSnapshot, String> {
     let change_count: i64 = msg_send![pb, changeCount];
 
     let items: Id = msg_send![pb, pasteboardItems];
@@ -603,11 +688,9 @@ unsafe fn save_clipboard_from_with(
             let Some(type_str) = ns_string_to_rust(t) else {
                 continue;
             };
-            let data: Id = msg_send![item, dataForType: t];
+            let data = read_data(item, t);
             if data.is_null() {
-                // Type advertised but no concrete data (lazy provider).
-                // Skipping is safer than trying to force it to materialise.
-                continue;
+                return Err(format!("Unable to capture clipboard format: {type_str}"));
             }
             let length: usize = msg_send![data, length];
             let bytes_ptr: *const u8 = msg_send![data, bytes];

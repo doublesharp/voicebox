@@ -996,6 +996,7 @@ mod private_pasteboard_transaction_tests {
         fail_write: bool,
         fail_send: bool,
         change_during_capture: bool,
+        unavailable_during_capture: bool,
         change_after_capture: bool,
         change_before_restore: bool,
         sends: Cell<usize>,
@@ -1009,6 +1010,7 @@ mod private_pasteboard_transaction_tests {
                 fail_write: false,
                 fail_send: false,
                 change_during_capture: false,
+                unavailable_during_capture: false,
                 change_after_capture: false,
                 change_before_restore: false,
                 sends: Cell::new(0),
@@ -1024,7 +1026,9 @@ mod private_pasteboard_transaction_tests {
             Ok(())
         }
         fn save(&self) -> Result<Self::Snapshot, String> {
-            if self.change_during_capture {
+            if self.unavailable_during_capture {
+                self.board.save_with_unavailable_format()
+            } else if self.change_during_capture {
                 self.board.save_with_change()
             } else {
                 let snapshot = self.board.save();
@@ -1130,6 +1134,48 @@ mod private_pasteboard_transaction_tests {
             "staging should abort after the pasteboard changes"
         );
         assert_eq!(backend.board.text().as_deref(), Some("newer"));
+        assert_eq!(backend.sends.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn unavailable_clipboard_format_aborts_dictation_before_staging_or_paste() {
+        let mut backend = Backend::new();
+        backend.unavailable_during_capture = true;
+        let before = backend.board.change_count();
+        let focus = focus_capture::FocusSnapshot {
+            pid: 42,
+            bundle_id: None,
+            role: None,
+        };
+        let error = paste_with("dictation", &focus, &backend, |_| async {})
+            .await
+            .unwrap_err();
+        assert!(error.contains("Unable to capture clipboard format"));
+        assert_eq!(backend.board.change_count(), before);
+        assert_eq!(backend.board.text().as_deref(), Some("original"));
+        assert_eq!(backend.sends.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn unavailable_clipboard_format_aborts_diagnostic_before_staging_or_paste() {
+        let mut backend = Backend::new();
+        backend.unavailable_during_capture = true;
+        let before = backend.board.change_count();
+        let result = diagnostic_with(
+            "dictation",
+            Duration::ZERO,
+            Duration::ZERO,
+            true,
+            &backend,
+            |_| async {},
+        )
+        .await;
+        assert!(result
+            .err()
+            .unwrap()
+            .contains("Unable to capture clipboard format"));
+        assert_eq!(backend.board.change_count(), before);
+        assert_eq!(backend.board.text().as_deref(), Some("original"));
         assert_eq!(backend.sends.get(), 0);
     }
 
