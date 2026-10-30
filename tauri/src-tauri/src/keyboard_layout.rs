@@ -82,10 +82,7 @@ mod macos {
     #[link(name = "Carbon", kind = "framework")]
     extern "C" {
         fn TISCopyCurrentKeyboardLayoutInputSource() -> TISInputSourceRef;
-        fn TISGetInputSourceProperty(
-            source: TISInputSourceRef,
-            key: CFStringRef,
-        ) -> *mut c_void;
+        fn TISGetInputSourceProperty(source: TISInputSourceRef, key: CFStringRef) -> *mut c_void;
         fn LMGetKbdType() -> u8;
         fn UCKeyTranslate(
             keyboard_layout: *const u8,
@@ -134,7 +131,7 @@ mod macos {
 
             let kbd_type = LMGetKbdType() as u32;
 
-            for keycode in 0..=MAX_KEYCODE {
+            find_v_keycode(|keycode| {
                 let mut dead_key_state: u32 = 0;
                 let mut chars: [u16; 4] = [0; 4];
                 let mut actual_len: usize = 0;
@@ -142,7 +139,7 @@ mod macos {
                     layout_bytes,
                     keycode,
                     K_UC_KEY_ACTION_DOWN,
-                    0, // no modifiers
+                    0,
                     kbd_type,
                     K_UC_KEY_TRANSLATE_NO_DEAD_KEYS_MASK,
                     &mut dead_key_state,
@@ -150,11 +147,75 @@ mod macos {
                     &mut actual_len,
                     chars.as_mut_ptr(),
                 );
-                if status == 0 && actual_len == 1 && chars[0] == TARGET_CHAR {
-                    return Some(keycode);
-                }
+                (status, actual_len, chars[0])
+            })
+        }
+    }
+
+    fn find_v_keycode(mut translate: impl FnMut(u16) -> (i32, usize, u16)) -> Option<u16> {
+        (0..=MAX_KEYCODE).find(|&keycode| {
+            let (status, len, first) = translate(keycode);
+            status == 0 && len == 1 && first == TARGET_CHAR
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn resolves_v_at_different_physical_keys_including_extended_layouts() {
+            for target in [0, 9, 37, 127] {
+                assert_eq!(
+                    find_v_keycode(|key| (
+                        0,
+                        1,
+                        if key == target {
+                            b'v' as u16
+                        } else {
+                            b'x' as u16
+                        }
+                    )),
+                    Some(target)
+                );
             }
-            None
+        }
+
+        #[test]
+        fn ignores_errors_empty_and_multicharacter_translations() {
+            assert_eq!(
+                find_v_keycode(|key| match key {
+                    1 => (-1, 1, TARGET_CHAR),
+                    2 => (0, 0, TARGET_CHAR),
+                    3 => (0, 2, TARGET_CHAR),
+                    4 => (0, 1, TARGET_CHAR),
+                    _ => (0, 1, b'x' as u16),
+                }),
+                Some(4)
+            );
+        }
+
+        #[test]
+        fn returns_none_if_layout_has_no_unmodified_v() {
+            assert_eq!(find_v_keycode(|_| (0, 1, b'V' as u16)), None);
+        }
+
+        #[test]
+        fn chooses_the_first_matching_key_and_stops_scanning() {
+            let mut seen = Vec::new();
+            let key = find_v_keycode(|code| {
+                seen.push(code);
+                (0, 1, if code >= 4 { TARGET_CHAR } else { 0 })
+            });
+            assert_eq!(key, Some(4));
+            assert_eq!(seen, [0, 1, 2, 3, 4]);
+        }
+
+        #[test]
+        fn current_macos_layout_resolution_stays_within_the_scanned_range() {
+            if let Some(key) = resolve_v_keycode() {
+                assert!(key <= MAX_KEYCODE);
+            }
         }
     }
 
