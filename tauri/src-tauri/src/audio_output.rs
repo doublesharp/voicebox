@@ -1006,6 +1006,30 @@ fn run_pcm_session(
     wake: mpsc::Receiver<()>,
     ready: &mut Option<tokio::sync::oneshot::Sender<Result<PlaybackSession, String>>>,
 ) -> Result<(), String> {
+    run_pcm_session_with(
+        id,
+        rate,
+        ids,
+        controls,
+        queues,
+        wake,
+        ready,
+        |state, position, duration| {
+            emit(app, id, state, position, duration, None);
+        },
+    )
+}
+
+fn run_pcm_session_with(
+    id: &str,
+    rate: u32,
+    ids: Vec<String>,
+    controls: Arc<PlaybackControls>,
+    queues: StreamQueues,
+    wake: mpsc::Receiver<()>,
+    ready: &mut Option<tokio::sync::oneshot::Sender<Result<PlaybackSession, String>>>,
+    mut report: impl FnMut(&'static str, f64, f64),
+) -> Result<(), String> {
     let host = cpal::default_host();
     let devices: Vec<Device> = if ids.is_empty() {
         vec![host
@@ -1113,7 +1137,7 @@ fn run_pcm_session(
             }
             Ok(())
         },
-        |state, position, duration| emit(app, id, state, position, duration, None),
+        |state, position, duration| report(state, position, duration),
     )?;
     drop(streams);
     Ok(())
@@ -3370,6 +3394,168 @@ mod clip_session_regression_tests {
         let result = worker.thread.take().unwrap().join().unwrap();
         assert!(result.unwrap_err().contains("unavailable"));
         assert!(receiver.blocking_recv().is_err());
+        assert!(events.try_recv().is_err());
+    }
+}
+
+#[cfg(test)]
+mod preview_session_regression_tests {
+    use super::*;
+
+    struct Worker {
+        state: Arc<AudioOutputState>,
+        controls: Arc<PlaybackControls>,
+        thread: Option<std::thread::JoinHandle<Result<(), String>>>,
+    }
+    impl Drop for Worker {
+        fn drop(&mut self) {
+            let _ = self.state.stop_playback(Some("preview-test"));
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn launch(
+        ids: Vec<String>,
+        sender: tokio::sync::oneshot::Sender<Result<PlaybackSession, String>>,
+    ) -> (Worker, mpsc::Receiver<(&'static str, f64, f64)>) {
+        let state = Arc::new(AudioOutputState::new());
+        let controls = Arc::new(PlaybackControls::new(0.0, 1.0));
+        let queues: StreamQueues = Arc::new(Mutex::new(Vec::new()));
+        let (wake, wake_rx) = mpsc::channel();
+        *state.active.lock().unwrap() = Some(SessionHandle {
+            id: "preview-test".into(),
+            controls: controls.clone(),
+            wake,
+            streaming: Some(queues.clone()),
+        });
+        let (events_tx, events) = mpsc::channel();
+        let worker_controls = controls.clone();
+        let thread = std::thread::spawn(move || {
+            let mut ready = Some(sender);
+            run_pcm_session_with(
+                "preview-test",
+                8000,
+                ids,
+                worker_controls,
+                queues,
+                wake_rx,
+                &mut ready,
+                |state, position, duration| {
+                    let _ = events_tx.send((state, position, duration));
+                },
+            )
+        });
+        (
+            Worker {
+                state,
+                controls,
+                thread: Some(thread),
+            },
+            events,
+        )
+    }
+
+    fn wait_ready(
+        mut ready: tokio::sync::oneshot::Receiver<Result<PlaybackSession, String>>,
+    ) -> PlaybackSession {
+        let deadline = Instant::now() + Duration::from_secs(6);
+        loop {
+            match ready.try_recv() {
+                Ok(result) => return result.unwrap(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    panic!("preview worker exited before ready")
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                    if Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(_) => panic!("preview worker did not become ready"),
+            }
+        }
+    }
+
+    fn selected_id() -> String {
+        let device = cpal::default_host()
+            .default_output_device()
+            .expect("native output device required");
+        device_id(&device.name().unwrap())
+    }
+
+    #[test]
+    #[ignore = "requires a working native output device; emits silence"]
+    fn native_silent_preview_session_streams_and_finishes() {
+        let (sender, ready) = tokio::sync::oneshot::channel();
+        let (mut worker, events) = launch(vec![], sender);
+        assert_eq!(wait_ready(ready).session_id, "preview-test");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime
+            .block_on(
+                worker
+                    .state
+                    .append_pcm_stream("preview-test", vec![0; 8192]),
+            )
+            .unwrap();
+        worker.state.finish_pcm_stream("preview-test").unwrap();
+        loop {
+            let event = events
+                .recv_timeout(Duration::from_secs(6))
+                .expect("preview did not finish");
+            if event.0 == "ended" {
+                assert!((event.1 - 4096.0 / 8000.0).abs() < 0.002);
+                assert_eq!(event.1, event.2);
+                break;
+            }
+        }
+        worker.thread.take().unwrap().join().unwrap().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires a working native output device; emits silence"]
+    fn native_silent_preview_session_selected_output_can_stop() {
+        let (sender, ready) = tokio::sync::oneshot::channel();
+        let (mut worker, events) = launch(vec![selected_id()], sender);
+        assert_eq!(wait_ready(ready).session_id, "preview-test");
+        worker.state.stop_playback(Some("preview-test")).unwrap();
+        loop {
+            let event = events
+                .recv_timeout(Duration::from_secs(6))
+                .expect("preview did not stop");
+            assert_ne!(event.0, "ended");
+            if event.0 == "stopped" {
+                break;
+            }
+        }
+        worker.thread.take().unwrap().join().unwrap().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires a working native output device; emits silence"]
+    fn native_silent_preview_session_abandoned_start_is_cancelled() {
+        let (sender, ready) = tokio::sync::oneshot::channel();
+        drop(ready);
+        let (mut worker, events) = launch(vec![], sender);
+        assert_eq!(
+            worker.thread.take().unwrap().join().unwrap().unwrap_err(),
+            "Preview cancelled"
+        );
+        assert!(worker.controls.stopped.load(Ordering::Acquire));
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    #[ignore = "requires native audio device enumeration"]
+    fn native_silent_preview_session_rejects_unavailable_output() {
+        let (sender, ready) = tokio::sync::oneshot::channel();
+        let (mut worker, events) = launch(vec!["device_that_does_not_exist".into()], sender);
+        let result = worker.thread.take().unwrap().join().unwrap();
+        assert!(result.unwrap_err().contains("unavailable"));
+        assert!(ready.blocking_recv().is_err());
         assert!(events.try_recv().is_err());
     }
 }
