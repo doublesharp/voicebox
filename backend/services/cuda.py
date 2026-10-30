@@ -16,7 +16,9 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -318,7 +320,16 @@ async def _download_cuda_binary_locked(version: Optional[str] = None):
     server_archive = f"voicebox-server-cuda-{plat}.tar.gz"
     libs_archive = f"cuda-libs-{plat}-{CUDA_LIBS_VERSION}.tar.gz"
 
+    staging_dir = None
     try:
+        # Build a complete replacement beside the current backend. A failed
+        # second archive must not leave a new server with old CUDA libraries.
+        staging_dir = Path(tempfile.mkdtemp(prefix='.cuda-staging-', dir=get_backends_dir()))
+        shutil.copytree(cuda_dir, staging_dir, dirs_exist_ok=True, symlinks=True)
+        if need_server:
+            staged_exe = staging_dir / get_cuda_exe_name()
+            if staged_exe.exists() or staged_exe.is_symlink():
+                staged_exe.unlink()
         async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
             # Estimate total download size
             total_size = 0
@@ -345,7 +356,7 @@ async def _download_cuda_binary_locked(version: Optional[str] = None):
                     client,
                     url=f"{base_url}/{server_archive}",
                     sha256_url=f"{base_url}/{server_archive}.sha256",
-                    dest_dir=cuda_dir,
+                    dest_dir=staging_dir,
                     label="CUDA server",
                     progress_offset=offset,
                     total_size=total_size,
@@ -353,7 +364,9 @@ async def _download_cuda_binary_locked(version: Optional[str] = None):
                 offset += server_downloaded
 
                 # Make executable on Unix
-                exe_path = cuda_dir / get_cuda_exe_name()
+                exe_path = staging_dir / get_cuda_exe_name()
+                if not exe_path.is_file():
+                    raise RuntimeError('CUDA server archive did not contain the server executable')
                 if sys.platform != "win32" and exe_path.exists():
                     exe_path.chmod(0o755)
 
@@ -363,7 +376,7 @@ async def _download_cuda_binary_locked(version: Optional[str] = None):
                     client,
                     url=f"{base_url}/{libs_archive}",
                     sha256_url=f"{base_url}/{libs_archive}.sha256",
-                    dest_dir=cuda_dir,
+                    dest_dir=staging_dir,
                     label="CUDA libraries",
                     progress_offset=offset,
                     total_size=total_size,
@@ -371,15 +384,37 @@ async def _download_cuda_binary_locked(version: Optional[str] = None):
 
                 # Write local cuda-libs.json manifest
                 manifest = {"version": CUDA_LIBS_VERSION}
-                get_cuda_libs_manifest_path().write_text(json.dumps(manifest, indent=2) + "\n")
+                (staging_dir / 'cuda-libs.json').write_text(json.dumps(manifest, indent=2) + "\n")
+
+        backup_dir = staging_dir.with_name(staging_dir.name + '-backup')
+        cuda_dir.rename(backup_dir)
+        try:
+            staging_dir.rename(cuda_dir)
+        except BaseException:
+            if backup_dir.exists() and not cuda_dir.exists():
+                backup_dir.rename(cuda_dir)
+            raise
+        try:
+            shutil.rmtree(backup_dir)
+        except OSError:
+            logger.warning('Could not remove previous CUDA backup at %s', backup_dir, exc_info=True)
 
         logger.info(f"CUDA backend ready at {cuda_dir}")
         progress.mark_complete(PROGRESS_KEY)
 
+    except asyncio.CancelledError:
+        progress.mark_error(PROGRESS_KEY, 'CUDA backend download cancelled')
+        raise
     except Exception as e:
         logger.error(f"CUDA backend download failed: {e}")
         progress.mark_error(PROGRESS_KEY, str(e))
         raise
+    finally:
+        if staging_dir is not None and staging_dir.exists():
+            try:
+                shutil.rmtree(staging_dir)
+            except OSError:
+                logger.warning('Could not remove CUDA staging directory at %s', staging_dir, exc_info=True)
 
 
 def get_cuda_binary_version() -> Optional[str]:
