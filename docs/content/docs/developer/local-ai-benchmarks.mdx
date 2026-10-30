@@ -1,6 +1,6 @@
 ---
 title: "Local AI benchmarks"
-description: "Reproducible, offline benchmarks of existing local Qwen TTS adapters"
+description: "Reproducible, offline benchmarks of existing local Qwen and Chatterbox Turbo TTS adapters"
 ---
 
 `scripts/benchmark-local-tts.py` measures one existing Voicebox TTS adapter in a
@@ -15,6 +15,15 @@ Use an explicit local reference you are authorized to use for Base models.
 | `qwen` | `mlx` or `pytorch` | `0.6B`, `1.7B` | `--reference /absolute/reference.wav --reference-text "Transcript"` |
 | `qwen_custom_voice` | `mlx` or `pytorch` | `0.6B`, `1.7B` | `--preset-voice Ryan` (or another built-in Qwen speaker) |
 | `qwen_voice_design` | `mlx` or `pytorch` | `1.7B` | `--design-prompt "A clear voice with natural pacing."` |
+| `chatterbox_turbo` | `pytorch` | `default` | `--reference /absolute/reference.wav --reference-text "Transcript"` (English only) |
+
+`--device` is required: `mlx` with the MLX backend, `cpu` or `cuda` (or
+`cuda:N`) with PyTorch. `cpu` forces CPU and hides every GPU (`CUDA_VISIBLE_DEVICES=-1`) before any
+model library is imported. `cuda` requires an NVIDIA CUDA build of PyTorch and a
+working `nvidia-smi`; ROCm/HIP builds are refused. `cuda:N` exposes only the GPU
+with that `nvidia-smi` index (PCI bus order) to the process. After loading,
+the runner checks that the adapter's real model tensors are on the requested
+device and fails the run otherwise. There is no silent CPU fallback.
 
 Other adapters are refused until their complete offline asset dependencies have
 an admission policy. Language is required: `zh`, `en`, `ja`, `ko`, `de`, `fr`,
@@ -41,7 +50,7 @@ mkdir -p "$VOICEBOX_WORK_DIR/tmp"
 
 PYTHONDONTWRITEBYTECODE=1 TMPDIR="$VOICEBOX_WORK_DIR/tmp" \
 "$VOICEBOX_PYTHON" -B scripts/benchmark-local-tts.py \
-  --engine qwen --backend mlx --model 1.7B --language en \
+  --engine qwen --backend mlx --device mlx --model 1.7B --language en \
   --cache-root "$VOICEBOX_HUB_CACHE" \
   --reference "$VOICEBOX_REFERENCE" \
   --reference-text "The exact transcript of the local reference." \
@@ -54,9 +63,13 @@ Choose a **new absolute** output directory for every attempt, including retries
 after a failure. The CLI refuses existing output roots, `..` components and
 symlink components, including aliases in parent directories. Use a canonical
 storage path. Artifact files use exclusive, directory-relative opens; they cannot
-overwrite existing files or follow artifact symlinks. Safe output currently
-requires POSIX directory-relative and no-follow IO (macOS/Linux); hosts without
-these primitives, including native Windows, are explicitly refused.
+overwrite existing files or follow artifact symlinks. macOS and Linux use
+directory-relative no-follow IO. Native Windows pins every directory from the
+drive root to the run directory with a handle that blocks rename and deletion,
+refuses symlinks, junctions and other reparse points, gives the directories
+it creates and their artifacts an owner-only ACL, and creates artifacts with
+`CREATE_NEW`. Artifact names containing `:` are refused. Other hosts without these primitives are refused. On Windows,
+set `TEMP` and `TMP` as well as `TMPDIR`; the runner redirects all three.
 Runtime data, Python bytecode configuration, library caches and temporary files
 are redirected beneath the run's `runtime/` directory. No model weights are
 copied. Never commit run outputs.
@@ -69,11 +82,21 @@ foreign cache aliases and file escapes are refused before importing an adapter.
 The selected snapshot is pinned on that adapter instance. No cache aliases are
 created and the shared model cache is left unchanged. Admission checks presence
 and shard completeness, not cryptographic integrity of large weight blobs;
-corrupt assets can still fail during loading.
+corrupt assets can still fail during loading. Turbo admission requires every
+file `ChatterboxTurboTTS.from_local()` reads. Because the Turbo adapter resolves
+its own snapshot, the runner instead fails the run if the loaded revision differs
+from the admitted one. Turbo prepares its reference with the encoded-conditioning
+cache enabled against the run's fresh data directory, so the first preparation
+must be a miss; a hit fails the run.
 
 The standalone process sets Hugging Face and Transformers offline flags before
 imports and blocks in-process Internet socket connections, datagrams and DNS
-lookups. A missing lazy dependency fails the run. The CLI does not repair a cache
+lookups. Internet sockets cannot even be created, because asyncio's Windows
+Proactor loop connects and sends without raising audited connect or send
+events. The only exception is CPython's internal `socketpair` fallback, which
+Windows event loops use for their loopback self-pipe. The hook does not cover
+child processes, native extensions or UNC paths; the offline environment
+variables are the defense there. A missing lazy dependency fails the run. The CLI does not repair a cache
 or retry online. It is intended for a fresh process; importing the module is
 inert, while calling `main()` installs a permanent process audit hook.
 
@@ -96,6 +119,13 @@ construction have a separate `adapter_init` duration.
 - Stage durations use `perf_counter_ns`, a monotonic clock. Load, reference
   preparation and each generation are measured separately. WAV IO and output
   validation are excluded from these stage timings.
+- Schema 2 adds `device` (OS, architecture, GPU name/count/VRAM/compute
+  capability, driver, torch CUDA/HIP versions, BF16 support, requested and
+  visible device, selected GPU), `residency` (tensor devices and dtypes per
+  model root) and a `stages` record per stage: wall and process CPU time, RSS
+  and peak RSS, and CUDA allocated/reserved current and peak. CUDA work is
+  synchronized only at stage boundaries, never inside generation. Process CPU
+  time well above wall time means host work ran on several threads at once.
 - MLX Base prepares reference metadata in its prompt method. Its actual reference
   encoding happens inside generation and is included in generation time.
 - `duration_s = samples / sample_rate` measures the returned mono audio, including
@@ -136,7 +166,8 @@ The deterministic suite uses safe adapters and small generated PCM references:
 PYTHONDONTWRITEBYTECODE=1 TMPDIR="$VOICEBOX_WORK_DIR/tmp" \
 "$VOICEBOX_PYTHON" -B -m pytest -q -p no:cacheprovider \
   --basetemp="$VOICEBOX_WORK_DIR/tmp/pytest-benchmark" \
-  scripts/tests/test_benchmark_local_tts.py scripts/tests/test_portable_output.py
+  scripts/tests/test_benchmark_local_tts.py scripts/tests/test_portable_output.py \
+  scripts/tests/test_device_telemetry.py scripts/tests/test_qualify_turbo_conditioning.py
 ```
 
 It verifies calculations, configuration/asset admission, snapshot pinning, WAV
@@ -147,6 +178,16 @@ speech quality, frozen builds and cross-platform performance require separate
 qualification with existing local weights. No model-quality claim follows from
 these tests. Instrumented runner coverage likewise does not qualify the adapters
 or their model libraries.
+
+## Turbo conditioning qualification
+
+`scripts/qualify-turbo-conditioning.py` uses the same admission, offline guard,
+device rules and output policy to run the real Turbo backend through ordered
+cache, speaker, bypass, lifecycle, cancellation and parity checks with two
+explicit references. Gating checks decide the exit status; parity and repeat
+reproducibility are recorded with their bit-exact outcome rather than assumed.
+`--lifecycle-cycles N` adds N gated load/prepare/generate/unload cycles. The
+NVIDIA results are in `docs/cuda-c0-qualification-2026-10-30.md`.
 
 ## Recorded integration smoke
 

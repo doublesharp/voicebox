@@ -58,3 +58,20 @@ performance: process/kernel warmup and run order were not controlled. CUDA/XPU,
 other references, listening fidelity and frozen packaging remain unqualified.
 Raw provenance, timings and audio were retained outside Git; the backend was
 unloaded afterward.
+
+## Real CUDA verification
+
+The same revision and Chatterbox version passed all 17 gating checks of
+`scripts/qualify-turbo-conditioning.py --lifecycle-cycles 10` on an RTX 5070
+Laptop GPU (torch 2.11.0+cu128, float32, Windows 11), with two synthetic Kokoro
+references. Hits skipped
+the encoder; cached tensors stayed on CPU; restored tensors were on `cuda:0`
+with no storage shared with the cache; content, transcript and model identity
+changes missed; bypass left the cache untouched; the queued request started
+only after the cancelled worker finished; unload released VRAM and reload hit
+disk. Recorded, not gated: cached and bypassed generation at seed 42 were
+bit-exact on CUDA, as were repeats. Ten load/generate/unload cycles released
+VRAM each time, while host RSS after unload grew by about 15 to 19 MiB per
+cycle. Details and limits are in
+[cuda-c0-qualification-2026-10-30.md](cuda-c0-qualification-2026-10-30.md).
+Listening fidelity, other GPUs and frozen packaging remain unqualified.

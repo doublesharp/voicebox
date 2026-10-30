@@ -51,13 +51,14 @@ does not change Mac playback, MLX adapters or the CPU-engine backlog. Shared
 registry, dependency, scheduler and benchmark edits must remain small and in
 separate commits to make integration reviewable.
 
-The current benchmark admits only Qwen Base, CustomVoice and VoiceDesign. It
-uses the complete-array API and does not measure first-model-frame latency.
-Its output/cache roots are explicit caller choices. Safe output requires POSIX
-directory-relative no-follow IO; native Windows currently fails explicitly and
-needs a separately verified safe-write implementation. Preserve exclusive writes
-and symlink protections when extending platform support.
-Turbo benchmarking needs its own admitted asset policy, not a validation bypass.
+C0 status (2026-10-30, RTX 5070 Laptop GPU on native Windows): done. See
+[../cuda-c0-qualification-2026-10-30.md](../cuda-c0-qualification-2026-10-30.md).
+The benchmark admits Qwen Base, CustomVoice, VoiceDesign and Chatterbox Turbo,
+requires an explicit `--device`, records device identity and per-stage memory,
+and runs on native Windows with exclusive, alias-refusing output. It still uses
+the complete-array API and does not measure first-model-frame latency. Turbo
+conditioning reuse passed every gating CUDA check without backend changes. C1
+and C2 have not started.
 
 ## Dependency and capability decisions
 
