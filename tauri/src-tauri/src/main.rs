@@ -212,7 +212,6 @@ fn check_health(port: u16) -> bool {
     }
 }
 
-#[cfg(debug_assertions)]
 async fn manual_server_available(port: u16) -> bool {
     tokio::task::spawn_blocking(move || check_health(port))
         .await
@@ -404,6 +403,33 @@ async fn start_server<R: tauri::Runtime>(
     remote: Option<bool>,
     models_dir: Option<String>,
 ) -> Result<String, String> {
+    start_server_with(app, state, remote, models_dir, ServerStartupConfig::default()).await
+}
+
+struct ServerStartupConfig {
+    port: u16,
+    legacy_port: Option<u16>,
+    data_dir: Option<std::path::PathBuf>,
+    cpu_executable: Option<std::path::PathBuf>,
+}
+impl Default for ServerStartupConfig {
+    fn default() -> Self {
+        Self {
+            port: SERVER_PORT,
+            legacy_port: Some(LEGACY_PORT),
+            data_dir: None,
+            cpu_executable: None,
+        }
+    }
+}
+
+async fn start_server_with<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, ServerState>,
+    remote: Option<bool>,
+    models_dir: Option<String>,
+    config: ServerStartupConfig,
+) -> Result<String, String> {
     let _start_permit = state.start_gate.try_begin().ok_or("The bundled server is starting or stopping. Please try again shortly.")?;
     let is_remote = resolve_remote_setting(&state.remote, remote);
     // Store models_dir for use on restart (empty string means reset to default)
@@ -411,12 +437,13 @@ async fn start_server<R: tauri::Runtime>(
     // Check if server is already running (managed by this app instance)
     let has_managed_child = state.child.lock().unwrap().is_some();
     if has_managed_child {
-        let ready = tokio::task::spawn_blocking(|| check_health(SERVER_PORT))
+        let port = config.port;
+        let ready = tokio::task::spawn_blocking(move || check_health(port))
             .await
             .unwrap_or(false);
         if ready {
             _start_permit.commit(|| ()).ok_or("Server startup cancelled")?;
-            return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
+            return Ok(format!("http://127.0.0.1:{}", config.port));
         }
         return Err("The bundled server is starting or stopping. Please try again shortly.".to_string());
     }
@@ -427,12 +454,12 @@ async fn start_server<R: tauri::Runtime>(
     {
         use std::process::Command;
         if let Ok(output) = Command::new("lsof")
-            .args(["+c", "0", "-i", &format!(":{}", SERVER_PORT), "-sTCP:LISTEN"])
+            .args(["+c", "0", "-i", &format!(":{}", config.port), "-sTCP:LISTEN"])
             .output()
         {
             let output_str = String::from_utf8_lossy(&output.stdout);
             let healthy = output_str.lines().skip(1).any(|line| !line.trim().is_empty())
-                && check_health(SERVER_PORT);
+                && manual_server_available(config.port).await;
             match server_process::classify_listener(&output_str, healthy) {
                 server_process::ListenerDecision::Unoccupied => {}
                 server_process::ListenerDecision::ReuseOwned(pid) => {
@@ -440,23 +467,23 @@ async fn start_server<R: tauri::Runtime>(
                     if !server_process::linux_server_executable(pid) {
                         println!("Healthy server has an unverified executable; reusing it as external");
                         _start_permit.commit(|| ()).ok_or("Server startup cancelled")?;
-                        return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
+                        return Ok(format!("http://127.0.0.1:{}", config.port));
                     }
-                    println!("Found healthy voicebox-server on port {} (PID: {}), reusing it", SERVER_PORT, pid);
+                    println!("Found healthy voicebox-server on port {} (PID: {}), reusing it", config.port, pid);
                     _start_permit.commit(|| *state.server_pid.lock().unwrap() = Some(pid))
                         .ok_or("Server startup cancelled")?;
-                    return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
+                    return Ok(format!("http://127.0.0.1:{}", config.port));
                 }
                 server_process::ListenerDecision::ReuseExternal => {
-                    println!("Health check passed — reusing external server on port {}", SERVER_PORT);
+                    println!("Health check passed — reusing external server on port {}", config.port);
                     _start_permit.commit(|| ()).ok_or("Server startup cancelled")?;
-                    return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
+                    return Ok(format!("http://127.0.0.1:{}", config.port));
                 }
                 server_process::ListenerDecision::Conflict(command) => {
                     return Err(format!(
                         "Port {} is already in use by another application ({}). \
                          Close it or change the Voicebox server port.",
-                        SERVER_PORT, command
+                        config.port, command
                     ));
                 }
             }
@@ -467,24 +494,24 @@ async fn start_server<R: tauri::Runtime>(
     {
         use std::net::TcpStream;
         if TcpStream::connect_timeout(
-            &format!("127.0.0.1:{}", SERVER_PORT).parse().unwrap(),
+            &format!("127.0.0.1:{}", config.port).parse().unwrap(),
             std::time::Duration::from_secs(1),
         ).is_ok() {
-            if check_health(SERVER_PORT) {
-                if let Some(pid) = find_voicebox_pid_on_port(SERVER_PORT) {
-                    println!("Found healthy voicebox-server on port {} (PID: {}), reusing it", SERVER_PORT, pid);
+            if manual_server_available(config.port).await {
+                if let Some(pid) = find_voicebox_pid_on_port(config.port) {
+                    println!("Found healthy voicebox-server on port {} (PID: {}), reusing it", config.port, pid);
                     _start_permit.commit(|| *state.server_pid.lock().unwrap() = Some(pid))
                         .ok_or("Server startup cancelled")?;
                 } else {
-                    println!("Health check passed — reusing external server on port {}", SERVER_PORT);
+                    println!("Health check passed — reusing external server on port {}", config.port);
                     _start_permit.commit(|| ()).ok_or("Server startup cancelled")?;
                 }
-                return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
+                return Ok(format!("http://127.0.0.1:{}", config.port));
             }
             return Err(format!(
                 "Port {} is already in use by another application. \
                  Close the other application or change the Voicebox port.",
-                SERVER_PORT
+                config.port
             ));
         }
     }
@@ -492,22 +519,22 @@ async fn start_server<R: tauri::Runtime>(
     // Kill any orphaned voicebox-server from previous session on legacy port 8000
     // This handles upgrades from older versions that used a fixed port
     #[cfg(unix)]
-    {
+    if let Some(legacy_port) = config.legacy_port {
         use std::process::Command;
         if let Ok(output) = Command::new("lsof")
-            .args(["+c", "0", "-i", &format!(":{}", LEGACY_PORT), "-sTCP:LISTEN"])
+            .args(["+c", "0", "-i", &format!(":{}", legacy_port), "-sTCP:LISTEN"])
             .output()
         {
             let output_str = String::from_utf8_lossy(&output.stdout);
             let healthy = output_str.lines().skip(1).any(|line| !line.trim().is_empty())
-                && check_health(LEGACY_PORT);
+                && manual_server_available(legacy_port).await;
             for pid in server_process::legacy_pids(&output_str, healthy) {
                 #[cfg(target_os = "linux")]
                 if !server_process::linux_server_executable(pid) {
                     continue;
                 }
                 _start_permit.commit(|| {
-                    println!("Found healthy voicebox-server on legacy port {} (PID: {}), stopping it...", LEGACY_PORT, pid);
+                    println!("Found healthy voicebox-server on legacy port {} (PID: {}), stopping it...", legacy_port, pid);
                     let _ = Command::new("kill")
                         .args(["-9", "--", &format!("-{}", pid)])
                         .output();
@@ -520,15 +547,15 @@ async fn start_server<R: tauri::Runtime>(
     }
     
     #[cfg(windows)]
-    {
+    if let Some(legacy_port) = config.legacy_port {
         use std::net::TcpStream;
         if TcpStream::connect_timeout(
-            &format!("127.0.0.1:{}", LEGACY_PORT).parse().unwrap(),
+            &format!("127.0.0.1:{}", legacy_port).parse().unwrap(),
             std::time::Duration::from_secs(1),
-        ).is_ok() && check_health(LEGACY_PORT) {
-            if let Some(pid) = find_voicebox_pid_on_port(LEGACY_PORT) {
+        ).is_ok() && manual_server_available(legacy_port).await {
+            if let Some(pid) = find_voicebox_pid_on_port(legacy_port) {
                 _start_permit.commit(|| {
-                    println!("Found orphaned voicebox-server on legacy port {} (PID: {}), killing it...", LEGACY_PORT, pid);
+                    println!("Found orphaned voicebox-server on legacy port {} (PID: {}), killing it...", legacy_port, pid);
                     let _ = std::process::Command::new("taskkill")
                         .args(["/PID", &pid.to_string(), "/T", "/F"])
                         .output();
@@ -541,10 +568,10 @@ async fn start_server<R: tauri::Runtime>(
     std::thread::sleep(std::time::Duration::from_millis(200));
 
     // Get app data directory
-    let data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
+    let data_dir = match config.data_dir.clone() {
+        Some(path) => path,
+        None => app.path().app_data_dir().map_err(|e| format!("Failed to get app data dir: {}", e))?,
+    };
 
     // Ensure data directory exists
     std::fs::create_dir_all(&data_dir)
@@ -575,7 +602,12 @@ async fn start_server<R: tauri::Runtime>(
         &_start_permit, || probe_binary_version(&cuda_path, &cuda_dir),
     ).await?;
 
-    let sidecar_result = app.shell().sidecar("voicebox-server");
+    #[cfg(target_os = "macos")]
+    let custom_cpu = config.cpu_executable.is_some();
+    let sidecar_result = match config.cpu_executable {
+        Some(path) => Ok(app.shell().command(path)),
+        None => app.shell().sidecar("voicebox-server"),
+    };
 
     let mut sidecar = match sidecar_result {
         Ok(s) => s,
@@ -585,18 +617,18 @@ async fn start_server<R: tauri::Runtime>(
             // In dev mode, check if the server is already running (started manually)
             #[cfg(debug_assertions)]
             {
-                eprintln!("Dev mode: Checking if server is already running on port {}...", SERVER_PORT);
+                eprintln!("Dev mode: Checking if server is already running on port {}...", config.port);
 
                 // Try to connect to the server port
-                if manual_server_available(SERVER_PORT).await {
-                    println!("Found server already running on port {}", SERVER_PORT);
+                if manual_server_available(config.port).await {
+                    println!("Found server already running on port {}", config.port);
                     _start_permit.commit(|| ()).ok_or("Server startup cancelled")?;
-                    return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
+                    return Ok(format!("http://127.0.0.1:{}", config.port));
                 }
 
                 eprintln!("");
                 eprintln!("=================================================================");
-                eprintln!("DEV MODE: No server found on port {}", SERVER_PORT);
+                eprintln!("DEV MODE: No server found on port {}", config.port);
                 eprintln!("");
                 eprintln!("Start the Python server in a separate terminal:");
                 eprintln!("  bun run dev:server");
@@ -612,7 +644,7 @@ async fn start_server<R: tauri::Runtime>(
     // beside its support files instead of extracting a onefile archive on
     // every launch. Older bundles and development stubs retain the sidecar.
     #[cfg(target_os = "macos")]
-    {
+    if !custom_cpu {
         let backend_dir = app
             .path()
             .resource_dir()
@@ -632,7 +664,7 @@ async fn start_server<R: tauri::Runtime>(
         .to_str()
         .ok_or_else(|| "Invalid data dir path".to_string())?
         .to_string();
-    let server_args = server_arguments(&data_dir_str, SERVER_PORT, std::process::id(), is_remote);
+    let server_args = server_arguments(&data_dir_str, config.port, std::process::id(), is_remote);
 
     // Resolve the custom models directory from the parameter or stored state
     let effective_models_dir = models_dir.or_else(|| state.models_dir.lock().unwrap().clone());
@@ -689,10 +721,10 @@ async fn start_server<R: tauri::Runtime>(
             // In dev mode, check if a manually-started server is available
             #[cfg(debug_assertions)]
             {
-                if manual_server_available(SERVER_PORT).await {
-                    println!("Found manually-started server on port {}", SERVER_PORT);
+                if manual_server_available(config.port).await {
+                    println!("Found manually-started server on port {}", config.port);
                     _start_permit.commit(|| ()).ok_or("Server startup cancelled")?;
-                    return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
+                    return Ok(format!("http://127.0.0.1:{}", config.port));
                 }
 
                 eprintln!("");
@@ -741,11 +773,11 @@ async fn start_server<R: tauri::Runtime>(
             eprintln!("Server startup timeout after 120 seconds");
             for line in errors { eprintln!("  {line}"); }
             #[cfg(debug_assertions)]
-            let healthy = manual_server_available(SERVER_PORT).await;
+            let healthy = manual_server_available(config.port).await;
             #[cfg(not(debug_assertions))]
             let healthy = false;
             if healthy {
-                println!("Found healthy server on port {}", SERVER_PORT);
+                println!("Found healthy server on port {}", config.port);
             } else {
                 stop_server_if_owned(state.clone(), Some(process_pid)).await?;
                 return Err("Server startup timed out. Please retry; check Console.app if the problem persists.".to_string());
@@ -758,10 +790,10 @@ async fn start_server<R: tauri::Runtime>(
             server_process::take_process(&state.server_pid, &state.child, Some(process_pid));
             #[cfg(debug_assertions)]
             {
-                if manual_server_available(SERVER_PORT).await {
-                    println!("Found manually-started server on port {}", SERVER_PORT);
+                if manual_server_available(config.port).await {
+                    println!("Found manually-started server on port {}", config.port);
                     _start_permit.commit(|| ()).ok_or("Server startup cancelled")?;
-                    return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
+                    return Ok(format!("http://127.0.0.1:{}", config.port));
                 }
                 return Err("Dev mode: Start server manually with 'bun run dev:server'".to_string());
             }
@@ -784,7 +816,7 @@ async fn start_server<R: tauri::Runtime>(
     });
 
     startup_cleanup.disarm();
-    Ok(format!("http://127.0.0.1:{}", SERVER_PORT))
+    Ok(format!("http://127.0.0.1:{}", config.port))
 }
 
 #[command]
@@ -2837,5 +2869,271 @@ mod window_lifecycle_integration_tests {
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         handle_window_event(&window, &WindowEvent::Destroyed, closing.clone());
         assert_eq!(closing.load(Ordering::SeqCst), CLOSE_IDLE);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod server_start_flow_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    struct Fixture {
+        dir: std::path::PathBuf,
+        port: u16,
+        exe: std::path::PathBuf,
+    }
+    impl Fixture {
+        fn new(script: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "voicebox-start-flow-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let exe = dir.join("fake-sidecar");
+            std::fs::write(&exe, format!("#!/bin/sh\n{script}\n")).unwrap();
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            Self { dir, port, exe }
+        }
+        fn config(&self) -> ServerStartupConfig {
+            ServerStartupConfig {
+                port: self.port,
+                legacy_port: None,
+                data_dir: Some(self.dir.join("data")),
+                cpu_executable: Some(self.exe.clone()),
+            }
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+    fn app() -> tauri::App<tauri::test::MockRuntime> {
+        tauri::test::mock_builder()
+            .plugin(tauri_plugin_shell::init())
+            .manage(ServerState {
+                start_gate: Arc::new(server_startup::StartGate::default()),
+                child: Mutex::new(None),
+                server_pid: Mutex::new(None),
+                keep_running_on_close: Mutex::new(false),
+                remote: Mutex::new(false),
+                models_dir: Mutex::new(None),
+                backend_override: Mutex::new(None),
+            })
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap()
+    }
+
+    #[test]
+    fn production_defaults_keep_fixed_ports_and_packaged_paths() {
+        let config = ServerStartupConfig::default();
+        assert_eq!(config.port, SERVER_PORT);
+        assert_eq!(config.legacy_port, Some(LEGACY_PORT));
+        assert!(config.data_dir.is_none());
+        assert!(config.cpu_executable.is_none());
+    }
+
+    #[tokio::test]
+    async fn isolated_sidecar_starts_reports_logs_and_stops() {
+        let fixture = Fixture::new(
+            "printf '%s\\n' \"$VOICEBOX_MODELS_DIR\" \"$@\" > \"$2/invocation\"\nprintf 'INFO: Uvicorn running on http://127.0.0.1:1\\n' >&2\nexec /bin/sleep 5",
+        );
+        let app = app();
+        let logs = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observed = logs.clone();
+        app.listen("server-log", move |event| {
+            observed.lock().unwrap().push(event.payload().into())
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            start_server_with(
+                app.handle().clone(),
+                app.state(),
+                Some(false),
+                Some("custom models".into()),
+                fixture.config(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result, format!("http://127.0.0.1:{}", fixture.port));
+        let invocation = std::fs::read_to_string(fixture.dir.join("data/invocation")).unwrap();
+        let args: Vec<&str> = invocation.lines().collect();
+        assert_eq!(args[0], "custom models");
+        assert_eq!(args[1], "--data-dir");
+        assert_eq!(args[2], fixture.dir.join("data").to_str().unwrap());
+        assert_eq!(args[3], "--port");
+        assert_eq!(args[4], fixture.port.to_string());
+        assert_eq!(args[5], "--parent-pid");
+        assert!(app
+            .state::<ServerState>()
+            .server_pid
+            .lock()
+            .unwrap()
+            .is_some());
+        assert!(logs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.contains("Uvicorn running")));
+        stop_server_if_owned(app.state(), None).await.unwrap();
+        assert!(app
+            .state::<ServerState>()
+            .server_pid
+            .lock()
+            .unwrap()
+            .is_none());
+        assert!(app.state::<ServerState>().child.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn isolated_sidecar_exit_clears_ownership_and_reports_failure() {
+        let fixture = Fixture::new("printf 'ERROR: startup failed\\n' >&2\nexit 42");
+        let app = app();
+        let logs = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observed = logs.clone();
+        app.listen("server-log", move |event| {
+            observed.lock().unwrap().push(event.payload().into())
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            start_server_with(
+                app.handle().clone(),
+                app.state(),
+                None,
+                None,
+                fixture.config(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(result.unwrap_err().contains("Start server manually"));
+        assert!(logs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.contains("startup failed")));
+        assert!(app
+            .state::<ServerState>()
+            .server_pid
+            .lock()
+            .unwrap()
+            .is_none());
+        assert!(app.state::<ServerState>().child.lock().unwrap().is_none());
+        assert!(app.state::<ServerState>().start_gate.try_begin().is_some());
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_an_isolated_inflight_sidecar_start() {
+        let fixture = Fixture::new("exec /bin/sleep 5");
+        let app = app();
+        let handle = app.handle().clone();
+        let config = fixture.config();
+        let startup = tokio::spawn(async move {
+            start_server_with(handle.clone(), handle.state(), None, None, config).await
+        });
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while app
+                .state::<ServerState>()
+                .server_pid
+                .lock()
+                .unwrap()
+                .is_none()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("sidecar did not start");
+        stop_server_if_owned(app.state(), None).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(3), startup)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.unwrap_err().contains("cancelled"));
+        assert!(app
+            .state::<ServerState>()
+            .server_pid
+            .lock()
+            .unwrap()
+            .is_none());
+        assert!(app.state::<ServerState>().child.lock().unwrap().is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn isolated_listener_reuses_healthy_server_and_rejects_conflicts() {
+        use std::io::{Read, Write};
+        for healthy in [true, false] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(4);
+                loop {
+                    match listener.accept() {
+                        Ok((mut socket, _)) => {
+                            socket
+                                .set_read_timeout(Some(Duration::from_secs(1)))
+                                .unwrap();
+                            let mut request = Vec::new();
+                            let mut chunk = [0; 1024];
+                            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                                let count = socket.read(&mut chunk).unwrap();
+                                assert!(count > 0, "client closed before completing request headers");
+                                request.extend_from_slice(&chunk[..count]);
+                                assert!(request.len() < 16 * 1024, "request headers too large");
+                            }
+                            assert!(request.starts_with(b"GET /health "));
+                            let body = if healthy {
+                                r#"{"status":"healthy","model_loaded":false,"gpu_available":false}"#
+                            } else {
+                                "{}"
+                            };
+                            write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                            break;
+                        }
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(5))
+                        }
+                        Err(error) => panic!("health request not received: {error}"),
+                    }
+                }
+            });
+            let fixture = Fixture::new("exit 42");
+            let mut config = fixture.config();
+            config.port = port;
+            let app = app();
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                start_server_with(app.handle().clone(), app.state(), None, None, config),
+            )
+            .await
+            .unwrap();
+            if healthy {
+                assert_eq!(result.unwrap(), format!("http://127.0.0.1:{port}"));
+            } else {
+                assert!(result.unwrap_err().contains("already in use"));
+            }
+            assert!(app
+                .state::<ServerState>()
+                .server_pid
+                .lock()
+                .unwrap()
+                .is_none());
+            assert!(app.state::<ServerState>().child.lock().unwrap().is_none());
+            server.join().unwrap();
+        }
     }
 }
