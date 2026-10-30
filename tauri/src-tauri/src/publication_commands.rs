@@ -23,29 +23,12 @@ fn choose(
     filename: &str,
     filters: &[FileFilter],
 ) -> Result<Option<PathBuf>, String> {
-    let name = Path::new(filename)
-        .file_name()
-        .and_then(|v| v.to_str())
-        .filter(|v| !v.is_empty())
-        .ok_or("Invalid filename")?;
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| e.to_string())?
         .as_millis();
-    let name_path = Path::new(name);
-    let stem = name_path
-        .file_stem()
-        .and_then(|v| v.to_str())
-        .unwrap_or("export");
-    let ext = name_path
-        .extension()
-        .and_then(|v| v.to_str())
-        .map(|v| format!(".{v}"))
-        .unwrap_or_default();
-    let mut dialog = app
-        .dialog()
-        .file()
-        .set_file_name(format!("{stem}-{stamp}{ext}"));
+    let suggested = suggested_filename(filename, stamp)?;
+    let mut dialog = app.dialog().file().set_file_name(suggested);
     for filter in filters {
         let extensions: Vec<&str> = filter.extensions.iter().map(String::as_str).collect();
         dialog = dialog.add_filter(&filter.name, &extensions);
@@ -56,13 +39,39 @@ fn choose(
         .transpose()
 }
 
+fn suggested_filename(filename: &str, stamp: u128) -> Result<String, String> {
+    let name = Path::new(filename)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .ok_or("Invalid filename")?;
+    let name_path = Path::new(name);
+    let stem = name_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("export");
+    let ext = name_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| format!(".{value}"))
+        .unwrap_or_default();
+    Ok(format!("{stem}-{stamp}{ext}"))
+}
+
 fn run(
     app: AppHandle,
     filename: String,
     filters: Vec<FileFilter>,
     input: impl FnOnce() -> Result<Box<dyn Read>, String>,
 ) -> Result<SaveResult, String> {
-    let Some(path) = choose(&app, &filename, &filters)? else {
+    run_with(|| choose(&app, &filename, &filters), input)
+}
+
+fn run_with(
+    select: impl FnOnce() -> Result<Option<PathBuf>, String>,
+    input: impl FnOnce() -> Result<Box<dyn Read>, String>,
+) -> Result<SaveResult, String> {
+    let Some(path) = select()? else {
         return Ok(SaveResult {
             status: "cancelled",
             path: None,
@@ -243,5 +252,170 @@ mod tests {
             Duration::from_millis(400),
             b"rest",
         );
+    }
+}
+
+#[cfg(test)]
+mod export_flow_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "voicebox-export-flow-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn target(&self) -> PathBuf {
+            self.0.join("export.wav")
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn input(bytes: &'static [u8]) -> Box<dyn Read> {
+        Box::new(io::Cursor::new(bytes))
+    }
+
+    #[test]
+    fn cancelled_dialog_does_not_read_or_create_a_file() {
+        let called = Cell::new(false);
+        let result = run_with(
+            || Ok(None),
+            || {
+                called.set(true);
+                Ok(input(b"unused"))
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(result).unwrap(),
+            serde_json::json!({"status":"cancelled"})
+        );
+        assert!(!called.get());
+    }
+    #[test]
+    fn dialog_error_is_propagated_before_input_is_opened() {
+        let called = Cell::new(false);
+        let error = run_with(
+            || Err("dialog failed".into()),
+            || {
+                called.set(true);
+                Ok(input(b"unused"))
+            },
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error, "dialog failed");
+        assert!(!called.get());
+    }
+    #[test]
+    fn selected_destination_is_written_and_returned_to_the_frontend() {
+        let fixture = Fixture::new();
+        let target = fixture.target();
+        let result = run_with(|| Ok(Some(target.clone())), || Ok(input(b"new audio"))).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"new audio");
+        assert_eq!(
+            serde_json::to_value(result).unwrap(),
+            serde_json::json!({"status":"saved", "path":target.to_str().unwrap()})
+        );
+        assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 1);
+    }
+    #[test]
+    fn input_failure_leaves_existing_file_untouched() {
+        let fixture = Fixture::new();
+        let target = fixture.target();
+        std::fs::write(&target, b"original").unwrap();
+        let error = run_with(
+            || Ok(Some(target.clone())),
+            || Err("download failed".into()),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error, "download failed");
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 1);
+    }
+    struct Broken;
+    impl Read for Broken {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::Other, "stream failed"))
+        }
+    }
+    #[test]
+    fn interrupted_stream_preserves_existing_file_and_reports_destination() {
+        let fixture = Fixture::new();
+        let target = fixture.target();
+        std::fs::write(&target, b"original").unwrap();
+        let error = run_with(|| Ok(Some(target.clone())), || Ok(Box::new(Broken)))
+            .err()
+            .unwrap();
+        assert!(
+            error.contains("Could not save")
+                && error.contains("stream failed")
+                && error.contains(target.to_str().unwrap())
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 1);
+    }
+    #[test]
+    fn missing_destination_parent_reports_failure_without_creating_files() {
+        let fixture = Fixture::new();
+        let target = fixture.0.join("missing").join("export.wav");
+        let error = run_with(|| Ok(Some(target)), || Ok(input(b"audio")))
+            .err()
+            .unwrap();
+        assert!(error.contains("Could not save"));
+        assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 0);
+    }
+    #[test]
+    fn downloaded_export_reaches_the_selected_file() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        let fixture = Fixture::new();
+        let target = fixture.target();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/audio", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+                )
+                .unwrap();
+        });
+        let result = run_with(
+            || Ok(Some(target.clone())),
+            || download(&url, std::time::Duration::from_secs(2)),
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(result.status, "saved");
+        assert_eq!(std::fs::read(target).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn suggested_name_removes_directory_and_keeps_extension() {
+        for (input, expected) in [
+            ("audio.wav", "audio-123.wav"),
+            ("folder/audio.final.mp3", "audio.final-123.mp3"),
+            ("hello", "hello-123"),
+            ("音声.wav", "音声-123.wav"),
+        ] {
+            assert_eq!(suggested_filename(input, 123).unwrap(), expected);
+        }
+        assert!(suggested_filename("", 123).is_err());
+        assert!(suggested_filename("/", 123).is_err());
     }
 }
