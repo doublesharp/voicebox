@@ -18,6 +18,7 @@ mod paste_pipeline;
 mod publication;
 mod publication_commands;
 mod server_process;
+mod server_startup;
 mod speak_monitor;
 mod sse_frames;
 mod synthetic_keys;
@@ -719,116 +720,38 @@ async fn start_server(
         *managed_child = Some(child);
     }
 
-    // Wait for server to be ready by listening for startup log
-    // PyInstaller bundles can be slow on first import, especially torch/transformers
-    let timeout = tokio::time::Duration::from_secs(120);
-    let start_time = tokio::time::Instant::now();
-    let mut error_output = Vec::new();
-
-    loop {
-        if start_time.elapsed() > timeout {
+    let startup = server_startup::wait_for_startup(&mut rx, std::time::Duration::from_secs(120), |stream, line| {
+        if stream == "stderr" { eprintln!("Server: {line}"); } else { println!("Server output: {line}"); }
+        let _ = app.emit("server-log", serde_json::json!({ "stream": stream, "line": line }));
+    }).await;
+    match startup {
+        server_startup::Outcome::Ready => println!("Server is ready!"),
+        server_startup::Outcome::TimedOut(errors) => {
             eprintln!("Server startup timeout after 120 seconds");
-            if !error_output.is_empty() {
-                eprintln!("Collected error output:");
-                for line in &error_output {
-                    eprintln!("  {}", line);
-                }
+            for line in errors { eprintln!("  {line}"); }
+            #[cfg(debug_assertions)]
+            let healthy = manual_server_available(SERVER_PORT).await;
+            #[cfg(not(debug_assertions))]
+            let healthy = false;
+            if healthy {
+                println!("Found healthy server on port {}", SERVER_PORT);
+            } else {
+                stop_server_if_owned(state.clone(), Some(process_pid)).await?;
+                return Err("Server startup timed out. Please retry; check Console.app if the problem persists.".to_string());
             }
-
-            // In dev mode, check if a manual server came up during the wait
+        }
+        server_startup::Outcome::Exited => {
+            server_process::take_process(&state.server_pid, &state.child, Some(process_pid));
             #[cfg(debug_assertions)]
             {
                 if manual_server_available(SERVER_PORT).await {
-                    // Kill the placeholder process
-                    let _ = state.child.lock().unwrap().take();
                     println!("Found manually-started server on port {}", SERVER_PORT);
                     return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
                 }
+                return Err("Dev mode: Start server manually with 'bun run dev:server'".to_string());
             }
-
-            // Do not retain a failed startup as a managed, ready server.
-            // Stop only this launch if it still owns the stored process.
-            stop_server_if_owned(state.clone(), Some(process_pid)).await?;
-            return Err("Server startup timed out. Please retry; check Console.app if the problem persists.".to_string());
-        }
-
-        match tokio::time::timeout(tokio::time::Duration::from_millis(100), rx.recv()).await {
-            Ok(Some(event)) => {
-                match event {
-                    tauri_plugin_shell::process::CommandEvent::Stdout(line) => {
-                        let line_str = String::from_utf8_lossy(&line);
-                        println!("Server output: {}", line_str);
-                        let _ = app.emit("server-log", serde_json::json!({
-                            "stream": "stdout",
-                            "line": line_str.trim_end(),
-                        }));
-
-                        if line_str.contains("Uvicorn running") || line_str.contains("Application startup complete") {
-                            println!("Server is ready!");
-                            break;
-                        }
-                    }
-                    tauri_plugin_shell::process::CommandEvent::Stderr(line) => {
-                        let line_str = String::from_utf8_lossy(&line).to_string();
-                        eprintln!("Server: {}", line_str);
-                        let _ = app.emit("server-log", serde_json::json!({
-                            "stream": "stderr",
-                            "line": line_str.trim_end(),
-                        }));
-
-                        // Collect error lines for debugging
-                        if line_str.contains("ERROR") || line_str.contains("Error") || line_str.contains("Failed") {
-                            error_output.push(line_str.clone());
-                        }
-
-                        // Uvicorn logs to stderr, so check there too
-                        if line_str.contains("Uvicorn running") || line_str.contains("Application startup complete") {
-                            println!("Server is ready!");
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Ok(None) => {
-                // In dev mode, this is expected when using the placeholder binary
-                #[cfg(debug_assertions)]
-                {
-                    eprintln!("Server process ended (dev mode placeholder detected)");
-
-                    // Check if a manually-started server is available
-                    if manual_server_available(SERVER_PORT).await {
-                        // Clean up state
-                        let _ = state.child.lock().unwrap().take();
-                        let _ = state.server_pid.lock().unwrap().take();
-                        println!("Found manually-started server on port {}", SERVER_PORT);
-                        return Ok(format!("http://127.0.0.1:{}", SERVER_PORT));
-                    }
-
-                    eprintln!("");
-                    eprintln!("=================================================================");
-                    eprintln!("DEV MODE: No bundled server binary available");
-                    eprintln!("");
-                    eprintln!("Start the Python server in a separate terminal:");
-                    eprintln!("  bun run dev:server");
-                    eprintln!("=================================================================");
-                    eprintln!("");
-                    return Err("Dev mode: Start server manually with 'bun run dev:server'".to_string());
-                }
-
-                #[cfg(not(debug_assertions))]
-                {
-                    eprintln!("Server process ended unexpectedly during startup!");
-                    eprintln!("The server binary may have crashed or exited with an error.");
-                    eprintln!("Check Console.app logs for more details (search for 'voicebox')");
-                    server_process::take_process(&state.server_pid, &state.child, Some(process_pid));
-                    return Err("Server process ended unexpectedly".to_string());
-                }
-            }
-            Err(_) => {
-                // Timeout on this recv, continue loop
-                continue;
-            }
+            #[cfg(not(debug_assertions))]
+            return Err("Server process ended unexpectedly".to_string());
         }
     }
 
