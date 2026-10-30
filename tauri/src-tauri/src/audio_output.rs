@@ -333,11 +333,12 @@ impl AudioOutputState {
     pub fn finish_pcm_stream(&self, id: &str) -> Result<(), String> {
         let (queues, _) = self.stream_queues(id)?;
         let queues = queues.lock().map_err(|_| "Preview queue unavailable")?;
-        for queue in queues.iter() {
-            queue
-                .lock()
-                .map_err(|_| "Preview queue unavailable")?
-                .finished = true;
+        let mut locked = queues
+            .iter()
+            .map(|queue| queue.lock().map_err(|_| "Preview queue unavailable"))
+            .collect::<Result<Vec<_>, _>>()?;
+        for queue in &mut locked {
+            queue.finished = true;
         }
         Ok(())
     }
@@ -5190,5 +5191,102 @@ mod preview_callback_tests {
         )
         .unwrap_err();
         assert_eq!(error, "Preview queue unavailable");
+    }
+}
+
+#[cfg(test)]
+mod multi_output_failure_tests {
+    use super::*;
+    use crate::audio_stream::PcmQueue;
+
+    fn preview() -> (AudioOutputState, Vec<Arc<Mutex<PcmQueue>>>) {
+        let state = AudioOutputState::new();
+        let queues: Vec<_> = (0..3)
+            .map(|_| Arc::new(Mutex::new(PcmQueue::new(8000).unwrap())))
+            .collect();
+        let (wake, _receiver) = mpsc::channel();
+        *state.active.lock().unwrap() = Some(SessionHandle {
+            id: "multi-output".into(),
+            controls: Arc::new(PlaybackControls::new(0.0, 1.0)),
+            wake,
+            streaming: Some(Arc::new(Mutex::new(queues.clone()))),
+        });
+        (state, queues)
+    }
+
+    fn poison(queue: Arc<Mutex<PcmQueue>>) {
+        assert!(std::thread::spawn(move || {
+            let _guard = queue.lock().unwrap();
+            panic!("simulate output queue failure");
+        })
+        .join()
+        .is_err());
+    }
+
+    #[test]
+    fn failed_finish_never_finishes_only_some_outputs() {
+        for broken in 0..3 {
+            let (state, queues) = preview();
+            poison(queues[broken].clone());
+            assert_eq!(
+                state.finish_pcm_stream("multi-output").unwrap_err(),
+                "Preview queue unavailable"
+            );
+            for (index, queue) in queues.iter().enumerate() {
+                let guard = queue.lock().unwrap_or_else(|error| error.into_inner());
+                assert!(
+                    !guard.finished,
+                    "output {index} finished despite failure on {broken}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_append_never_delivers_a_block_to_only_some_outputs() {
+        for broken in 0..3 {
+            let (state, queues) = preview();
+            poison(queues[broken].clone());
+            assert_eq!(
+                state
+                    .append_pcm_stream("multi-output", vec![0, 64, 0, 192])
+                    .await
+                    .unwrap_err(),
+                "Preview queue unavailable"
+            );
+            for queue in &queues {
+                let guard = queue.lock().unwrap_or_else(|error| error.into_inner());
+                assert_eq!(guard.samples_len_for_test(), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_append_and_finish_reach_every_output() {
+        let (state, queues) = preview();
+        state
+            .append_pcm_stream("multi-output", vec![0, 64, 0, 192])
+            .await
+            .unwrap();
+        state.finish_pcm_stream("multi-output").unwrap();
+        for queue in queues {
+            let mut guard = queue.lock().unwrap();
+            let mut output = [0.0; 2];
+            guard.render(&mut output, 8000, 1, |sample| sample);
+            assert_eq!(output, [0.5, -0.5]);
+            assert!(guard.ended());
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_session_cannot_finish_or_append_to_outputs() {
+        let (state, queues) = preview();
+        assert!(state.finish_pcm_stream("older").is_err());
+        assert!(state.append_pcm_stream("older", vec![0, 0]).await.is_err());
+        for queue in queues {
+            let guard = queue.lock().unwrap();
+            assert!(!guard.finished);
+            assert_eq!(guard.samples_len_for_test(), 0);
+        }
     }
 }
