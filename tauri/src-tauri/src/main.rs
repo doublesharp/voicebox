@@ -90,7 +90,7 @@ pub fn ensure_dictate_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
 }
 
 #[cfg(desktop)]
-pub fn show_dictate_window(app: &tauri::AppHandle) {
+pub fn show_dictate_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     // Build on demand so agent-initiated speech works before the user has
     // enabled the global hotkey (the hotkey path is the other place this
     // window gets built, see `enable_hotkey`).
@@ -127,6 +127,42 @@ pub fn show_dictate_window(app: &tauri::AppHandle) {
     #[cfg(not(target_os = "linux"))]
     let _ = window.set_ignore_cursor_events(false);
     let _ = window.show();
+}
+
+/// Register the app-wide overlay show and hide event bridge.
+#[cfg(desktop)]
+fn install_dictate_window_handlers<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    // The frontend emits `dictate:hide` whenever the pill cycle
+    // finishes (rest-fade → hidden). `hide()` alone has been
+    // unreliable for transparent always-on-top windows on macOS
+    // — the NSWindow lingers as an invisible click target that
+    // steals focus to the Voicebox app when the user clicks
+    // where it used to be. Park the window off-screen and mark
+    // it click-through as well, so even if `hide()` no-ops the
+    // user sees and interacts with nothing.
+    let handle_for_hide = app.clone();
+    app.listen("dictate:hide", move |_event| {
+        if let Some(window) = handle_for_hide.get_webview_window(DICTATE_WINDOW_LABEL) {
+            // Skip on Linux: aborts if the window was never realized
+            // (see show_dictate_window).
+            #[cfg(not(target_os = "linux"))]
+            let _ = window.set_ignore_cursor_events(true);
+            let _ = window.set_position(PhysicalPosition::new(-10_000, -10_000));
+            let _ = window.hide();
+        }
+    });
+
+    // Agent-initiated speech (voicebox_speak over MCP or POST /speak)
+    // pops the pill up so the user can see what's coming out of their
+    // machine. The `dictate:show` listener is kept for any frontend
+    // caller that wants to force-surface the pill directly, but the
+    // primary source is `speak_monitor` below — Rust subscribes to
+    // the backend /events/speak SSE stream so the pill surfaces even
+    // when no JS window is active.
+    let handle_for_show = app.clone();
+    app.listen("dictate:show", move |_event| {
+        show_dictate_window(&handle_for_show);
+    });
 }
 
 const LEGACY_PORT: u16 = 8000;
@@ -1583,38 +1619,7 @@ pub fn run() {
                 // keyboard tap or trigger the macOS Input Monitoring prompt.
                 app.manage(HotkeyState::default());
 
-                // The frontend emits `dictate:hide` whenever the pill cycle
-                // finishes (rest-fade → hidden). `hide()` alone has been
-                // unreliable for transparent always-on-top windows on macOS
-                // — the NSWindow lingers as an invisible click target that
-                // steals focus to the Voicebox app when the user clicks
-                // where it used to be. Park the window off-screen and mark
-                // it click-through as well, so even if `hide()` no-ops the
-                // user sees and interacts with nothing.
-                let handle_for_hide = app.handle().clone();
-                app.handle().listen("dictate:hide", move |_event| {
-                    if let Some(window) = handle_for_hide.get_webview_window(DICTATE_WINDOW_LABEL) {
-                        // Skip on Linux: aborts if the window was never realized
-                        // (see show_dictate_window).
-                        #[cfg(not(target_os = "linux"))]
-                        let _ = window.set_ignore_cursor_events(true);
-                        let _ = window.set_position(PhysicalPosition::new(-10_000, -10_000));
-                        let _ = window.hide();
-                    }
-                });
-
-                // Agent-initiated speech (voicebox_speak over MCP or POST /speak)
-                // pops the pill up so the user can see what's coming out of their
-                // machine. The `dictate:show` listener is kept for any frontend
-                // caller that wants to force-surface the pill directly, but the
-                // primary source is `speak_monitor` below — Rust subscribes to
-                // the backend /events/speak SSE stream so the pill surfaces even
-                // when no JS window is active.
-                let handle_for_show = app.handle().clone();
-                app.handle().listen("dictate:show", move |_event| {
-                    show_dictate_window(&handle_for_show);
-                });
-
+                install_dictate_window_handlers(app.handle());
                 ensure_dictate_window(app.handle());
                 speak_monitor::spawn_speak_monitor(app.handle().clone());
             }
@@ -2780,6 +2785,53 @@ mod command_ipc_regression_tests {
                 keep
             );
         }
+    }
+}
+
+#[cfg(all(test, desktop))]
+mod dictate_overlay_integration_tests {
+    use super::*;
+
+    #[test]
+    fn hide_before_first_show_does_not_create_an_overlay() {
+        let app = tauri::test::mock_app();
+        install_dictate_window_handlers(app.handle());
+        app.emit("dictate:hide", ()).unwrap();
+        assert!(app.get_webview_window(DICTATE_WINDOW_LABEL).is_none());
+        assert!(app.webview_windows().is_empty());
+    }
+
+    #[test]
+    fn show_creates_one_overlay_and_repeated_events_reuse_it() {
+        let app = tauri::test::mock_app();
+        install_dictate_window_handlers(app.handle());
+        for event in ["dictate:show", "dictate:hide", "dictate:show", "dictate:show"] {
+            app.emit(event, ()).unwrap();
+            assert!(app.get_webview_window(DICTATE_WINDOW_LABEL).is_some());
+            assert_eq!(app.webview_windows().len(), 1);
+        }
+    }
+
+    #[test]
+    fn ensure_and_show_reuse_the_existing_overlay_without_touching_main_window() {
+        let app = tauri::test::mock_app();
+        let _main = tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
+        install_dictate_window_handlers(app.handle());
+        ensure_dictate_window(app.handle());
+        ensure_dictate_window(app.handle());
+        app.emit("dictate:hide", ()).unwrap();
+        app.emit("dictate:show", ()).unwrap();
+        assert!(app.get_webview_window("main").is_some());
+        assert!(app.get_webview_window(DICTATE_WINDOW_LABEL).is_some());
+        assert_eq!(app.webview_windows().len(), 2);
+    }
+
+    #[test]
+    fn unrelated_event_does_not_create_the_overlay() {
+        let app = tauri::test::mock_app();
+        install_dictate_window_handlers(app.handle());
+        app.emit("dictate:unrelated", ()).unwrap();
+        assert!(app.get_webview_window(DICTATE_WINDOW_LABEL).is_none());
     }
 }
 
