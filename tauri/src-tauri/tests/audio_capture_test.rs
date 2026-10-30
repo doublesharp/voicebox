@@ -88,3 +88,147 @@ async fn test_system_audio_capture() {
         assert!(!decoded.is_empty());
     }
 }
+
+#[cfg(target_os = "macos")]
+mod native_silent_lifecycle_tests {
+    use super::*;
+    use std::process::{Child, Command, Stdio};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    struct SilentPlayback {
+        child: Child,
+        dir: std::path::PathBuf,
+    }
+
+    impl SilentPlayback {
+        fn start() -> Self {
+            let root = std::env::var_os("VOICEBOX_AUDIO_FIXTURE_DIR")
+                .expect("set VOICEBOX_AUDIO_FIXTURE_DIR to a task-owned Scratch directory");
+            let dir = std::path::PathBuf::from(root).join(format!(
+                "native-capture-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("silence.wav");
+            {
+                let spec = hound::WavSpec {
+                    channels: 1,
+                    sample_rate: 16000,
+                    bits_per_sample: 16,
+                    sample_format: hound::SampleFormat::Int,
+                };
+                let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+                for _ in 0..(16000 * 8) {
+                    writer.write_sample(0_i16).unwrap();
+                }
+                writer.finalize().unwrap();
+            }
+            let child = Command::new("/usr/bin/afplay")
+                .arg(&path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("native silent playback must start");
+            Self { child, dir }
+        }
+    }
+
+    impl Drop for SilentPlayback {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    async fn wait_for_samples(state: &AudioCaptureState) {
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while state.samples.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("silent system audio did not reach the capture callback");
+    }
+
+    fn assert_recording(encoded: &str) {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        let reader = hound::WavReader::new(std::io::Cursor::new(bytes)).unwrap();
+        assert_eq!(
+            (reader.spec().sample_rate, reader.spec().channels),
+            (48000, 2)
+        );
+        assert!(reader.duration() > 0, "recording must contain audio frames");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires macOS screen capture permission and a working output device"]
+    async fn automatic_timeout_stops_callbacks_and_manual_stop_collects_audio() {
+        let _playback = SilentPlayback::start();
+        let state = AudioCaptureState::new();
+        start_capture(&state, 2).await.unwrap();
+        wait_for_samples(&state).await;
+        tokio::time::sleep(Duration::from_millis(2400)).await;
+        let count_after_timeout = state.samples.lock().unwrap().len();
+        assert!(count_after_timeout > 0);
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert_eq!(
+            state.samples.lock().unwrap().len(),
+            count_after_timeout,
+            "audio callbacks continued after timeout"
+        );
+        assert_recording(&stop_capture(&state).await.unwrap());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires macOS screen capture permission and a working output device"]
+    async fn manual_stop_collects_audio_and_capture_can_restart() {
+        let _playback = SilentPlayback::start();
+        let state = AudioCaptureState::new();
+        for _ in 0..2 {
+            start_capture(&state, 5).await.unwrap();
+            wait_for_samples(&state).await;
+            assert_recording(&stop_capture(&state).await.unwrap());
+        }
+    }
+    #[tokio::test]
+    #[ignore = "requires macOS screen capture permission and a working output device"]
+    async fn an_old_timeout_cannot_stop_a_replacement_capture() {
+        let _playback = SilentPlayback::start();
+        let state = AudioCaptureState::new();
+        start_capture(&state, 2).await.unwrap();
+        wait_for_samples(&state).await;
+        assert_recording(&stop_capture(&state).await.unwrap());
+        start_capture(&state, 5).await.unwrap();
+        wait_for_samples(&state).await;
+        tokio::time::sleep(Duration::from_millis(1800)).await;
+        let before = state.samples.lock().unwrap().len();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let after = state.samples.lock().unwrap().len();
+        assert!(after > before, "old capture timer stopped its replacement");
+        assert_recording(&stop_capture(&state).await.unwrap());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires macOS screen capture permission and a working output device"]
+    async fn overlapping_stops_return_one_recording_and_allow_restart() {
+        let _playback = SilentPlayback::start();
+        let state = AudioCaptureState::new();
+        start_capture(&state, 5).await.unwrap();
+        wait_for_samples(&state).await;
+        let (first, second) = tokio::join!(stop_capture(&state), stop_capture(&state));
+        let recording = first.expect("first stop must collect the recording");
+        assert!(second.unwrap_err().contains("starting or stopping"));
+        assert_recording(&recording);
+        start_capture(&state, 5).await.unwrap();
+        wait_for_samples(&state).await;
+        assert_recording(&stop_capture(&state).await.unwrap());
+    }
+}
