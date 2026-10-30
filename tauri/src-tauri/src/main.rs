@@ -1581,6 +1581,46 @@ fn handle_window_event_with_timeout<R: tauri::Runtime>(
     }
 }
 
+fn handle_server_exit_with(
+    state: &ServerState,
+    keep_alive: impl FnOnce(),
+    stop: impl FnOnce(u32),
+) {
+    let keep_running = *state.keep_running_on_close.lock().unwrap();
+    let has_pid = state.server_pid.lock().unwrap().is_some();
+    println!("RunEvent::Exit — keep_running={}, has_pid={}", keep_running, has_pid);
+    if keep_running {
+        if has_pid { keep_alive(); }
+    } else {
+        #[cfg(unix)]
+        if let Some(pid) = state.server_pid.lock().unwrap().take() { stop(pid); }
+        #[cfg(not(unix))]
+        let _ = stop;
+    }
+}
+
+fn keep_server_running_on_exit(data_dir: Option<&std::path::Path>, port: u16) {
+    println!("Keep server running: disabling watchdog...");
+    if let Some(data_dir) = data_dir {
+        let sentinel = data_dir.join(".keep-running");
+        if let Err(e) = std::fs::write(&sentinel, b"1") {
+            eprintln!("Failed to write keep-running sentinel: {}", e);
+        } else {
+            println!("Wrote keep-running sentinel to {:?}", sentinel);
+        }
+    } else {
+        eprintln!("Failed to locate the data directory for the keep-running sentinel");
+    }
+    let client = match reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(2)).build() {
+        Ok(client) => client,
+        Err(error) => { eprintln!("Failed to create watchdog client: {}", error); return; }
+    };
+    match client.post(&format!("http://127.0.0.1:{}/watchdog/disable", port)).send() {
+        Ok(resp) => println!("Watchdog disable response: {}", resp.status()),
+        Err(e) => eprintln!("Failed to disable watchdog: {}", e),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1723,64 +1763,21 @@ pub fn run() {
             match &event {
                 RunEvent::Exit => {
                     let state = app.state::<ServerState>();
-                    let keep_running = *state.keep_running_on_close.lock().unwrap();
-                    let has_pid = state.server_pid.lock().unwrap().is_some();
-                    println!("RunEvent::Exit — keep_running={}, has_pid={}", keep_running, has_pid);
-
-                    if keep_running {
-                        // Tell the server to disable its watchdog so it survives
-                        // after this process exits.
-                        println!("Keep server running: disabling watchdog...");
-
-                        // Write a sentinel file as a reliable fallback. On Windows
-                        // the HTTP request below can race with process exit, leaving
-                        // the watchdog unaware it should stay alive. The sentinel
-                        // file is checked during the watchdog grace period.
-                        let data_dir = app
-                            .path()
-                            .app_data_dir()
-                            .unwrap_or_default();
-                        let sentinel = data_dir.join(".keep-running");
-                        if let Err(e) = std::fs::write(&sentinel, b"1") {
-                            eprintln!("Failed to write keep-running sentinel: {}", e);
-                        } else {
-                            println!("Wrote keep-running sentinel to {:?}", sentinel);
-                        }
-
-                        let client = reqwest::blocking::Client::builder()
-                            .timeout(std::time::Duration::from_secs(2))
-                            .build()
-                            .unwrap();
-                        match client
-                            .post(&format!("http://127.0.0.1:{}/watchdog/disable", SERVER_PORT))
-                            .send()
-                        {
-                            Ok(resp) => println!("Watchdog disable response: {}", resp.status()),
-                            Err(e) => eprintln!("Failed to disable watchdog: {}", e),
-                        }
-                    } else {
-                        // Server will self-terminate via parent-pid watchdog when
-                        // this process exits. On Unix, also send SIGTERM for
-                        // immediate cleanup.
-                        println!("RunEvent::Exit - server will self-terminate via watchdog");
-
+                    handle_server_exit_with(&state, || {
+                        let data_dir = app.path().app_data_dir().ok();
+                        keep_server_running_on_exit(data_dir.as_deref(), SERVER_PORT);
+                    }, |pid| {
                         #[cfg(unix)]
                         {
-                            if let Some(pid) = state.server_pid.lock().unwrap().take() {
-                                use std::process::Command;
-                                let _ = Command::new("kill")
-                                    .args(["-TERM", "--", &format!("-{}", pid)])
-                                    .output();
-                                std::thread::sleep(std::time::Duration::from_millis(100));
-                                let _ = Command::new("kill")
-                                    .args(["-9", "--", &format!("-{}", pid)])
-                                    .output();
-                                let _ = Command::new("kill")
-                                    .args(["-9", &pid.to_string()])
-                                    .output();
-                            }
+                            use std::process::Command;
+                            let _ = Command::new("kill").args(["-TERM", "--", &format!("-{}", pid)]).output();
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                            let _ = Command::new("kill").args(["-9", "--", &format!("-{}", pid)]).output();
+                            let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
                         }
-                    }
+                        #[cfg(not(unix))]
+                        let _ = pid;
+                    });
                 }
                 RunEvent::ExitRequested { api, .. } => {
                     println!("RunEvent::ExitRequested received");
@@ -2874,6 +2871,97 @@ mod dictate_overlay_integration_tests {
         install_dictate_window_handlers(app.handle());
         app.emit("dictate:unrelated", ()).unwrap();
         assert!(app.get_webview_window(DICTATE_WINDOW_LABEL).is_none());
+    }
+}
+
+#[cfg(test)]
+mod exit_ownership_regression_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn state(keep: bool, pid: Option<u32>) -> ServerState {
+        ServerState {
+            start_gate: Arc::new(server_startup::StartGate::default()),
+            child: Mutex::new(None),
+            server_pid: Mutex::new(pid),
+            keep_running_on_close: Mutex::new(keep),
+            remote: Mutex::new(false),
+            models_dir: Mutex::new(None),
+            backend_override: Mutex::new(None),
+        }
+    }
+
+    #[test]
+    fn keep_running_without_a_recorded_server_has_no_external_side_effects() {
+        let state = state(true, None);
+        let keep_called = Cell::new(false);
+        handle_server_exit_with(&state, || keep_called.set(true), |_| panic!("no server should be stopped"));
+        assert!(!keep_called.get(), "must not disable an unrelated server's watchdog");
+    }
+
+    #[test]
+    fn keep_running_for_a_recorded_server_preserves_its_pid() {
+        let state = state(true, Some(42));
+        let keep_called = Cell::new(false);
+        handle_server_exit_with(&state, || keep_called.set(true), |_| panic!("server should not be stopped"));
+        assert!(keep_called.get());
+        assert_eq!(*state.server_pid.lock().unwrap(), Some(42));
+    }
+
+    #[test]
+    fn unrecorded_server_neither_receives_a_request_nor_a_sentinel() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dir = std::env::temp_dir().join(format!("voicebox-exit-unowned-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let state = state(true, None);
+        handle_server_exit_with(&state, || keep_server_running_on_exit(Some(&dir), port), |_| panic!("unexpected stop"));
+        assert!(!dir.join(".keep-running").exists());
+        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn recorded_server_gets_sentinel_and_loopback_watchdog_request() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = socket.read(&mut buffer).unwrap();
+                assert!(count > 0 && request.len() < 16384);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            request
+        });
+        let dir = std::env::temp_dir().join(format!("voicebox-exit-owned-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let state = state(true, Some(42));
+        handle_server_exit_with(&state, || keep_server_running_on_exit(Some(&dir), port), |_| panic!("unexpected stop"));
+        let request = server.join().unwrap();
+        assert!(request.starts_with(b"POST /watchdog/disable "));
+        assert_eq!(std::fs::read(dir.join(".keep-running")).unwrap(), b"1");
+        assert_eq!(*state.server_pid.lock().unwrap(), Some(42));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normal_exit_stops_only_the_recorded_process_once() {
+        let state = state(false, Some(42));
+        let stopped = Cell::new(None);
+        handle_server_exit_with(&state, || panic!("watchdog must remain enabled"), |pid| stopped.set(Some(pid)));
+        assert_eq!(stopped.get(), Some(42));
+        assert_eq!(*state.server_pid.lock().unwrap(), None);
+        handle_server_exit_with(&state, || panic!("watchdog must remain enabled"), |_| panic!("process already detached"));
     }
 }
 
