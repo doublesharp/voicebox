@@ -124,6 +124,7 @@ pub async fn start_capture(
 
     // Create tokio channel and spawn a task to bridge it to the AtomicBool
     let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+    let timeout_tx = tx.downgrade();
     *stop_tx.lock().unwrap() = Some(tx);
 
     tokio::spawn(async move {
@@ -283,24 +284,18 @@ pub async fn start_capture(
         eprintln!("Linux audio capture: Stream stopped");
     });
 
-    // Spawn timeout task
-    let stop_tx_clone = state.stop_tx.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(tokio::time::Duration::from_secs(max_duration_secs as u64)).await;
-        let tx = stop_tx_clone.lock().unwrap().take();
-        if let Some(tx) = tx {
-            let _ = tx.send(()).await;
-        }
-    });
+    // Each timer only owns a weak reference to its own capture's stop signal.
+    super::schedule_capture_timeout(
+        timeout_tx,
+        std::time::Duration::from_secs(max_duration_secs as u64),
+    );
 
     Ok(())
 }
 
 pub async fn stop_capture(state: &AudioCaptureState) -> Result<String, String> {
     // Signal stop
-    if let Some(tx) = state.stop_tx.lock().unwrap().take() {
-        let _ = tx.send(());
-    }
+    super::signal_capture_stop(&state.stop_tx);
 
     // Wait a bit for capture to stop
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
