@@ -47,7 +47,7 @@ windows = { version = "0.62", features = [
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-webkit2gtk = "2.0"
+webkit2gtk = { version = "2.0", features = ["v2_34"] }
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-updater = "2.0"

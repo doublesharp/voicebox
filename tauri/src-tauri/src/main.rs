@@ -253,6 +253,11 @@ fn trusted_microphone_origin(uri: &str) -> bool {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn allow_media_request(uri: &str, audio: bool, video: bool, display: bool) -> bool {
+    audio && !video && !display && trusted_microphone_origin(uri)
+}
+
 struct ServerState {
     child: Mutex<Option<tauri_plugin_shell::process::CommandChild>>,
     server_pid: Mutex<Option<u32>>,
@@ -1477,8 +1482,9 @@ pub fn run() {
                 use tauri::Manager;
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.with_webview(|webview| {
-                        use webkit2gtk::{WebViewExt, SettingsExt, PermissionRequestExt};
-                        use webkit2gtk::glib::ObjectExt;
+                        use webkit2gtk::{WebViewExt, SettingsExt, PermissionRequestExt, UserMediaPermissionRequestExt};
+                        use webkit2gtk::glib::prelude::Cast;
+                        use webkit2gtk::glib::translate::ToGlibPtr;
                         let wk_webview = webview.inner();
 
                         // Enable media stream support in WebKitGTK settings
@@ -1489,10 +1495,13 @@ pub fn run() {
                         // Auto-grant UserMediaPermissionRequest (microphone access)
                         // Only for trusted local origins (Tauri dev server or custom protocol)
                         wk_webview.connect_permission_request(move |webview, request: &webkit2gtk::PermissionRequest| {
-                            if request.is::<webkit2gtk::UserMediaPermissionRequest>() {
+                            if let Some(media) = request.downcast_ref::<webkit2gtk::UserMediaPermissionRequest>() {
                                 let uri = WebViewExt::uri(webview).unwrap_or_default();
-                                let is_trusted = trusted_microphone_origin(&uri);
-                                if is_trusted {
+                                // The high-level bindings do not expose this WebKit query.
+                                let display = unsafe {
+                                    webkit2gtk::ffi::webkit_user_media_permission_is_for_display_device(media.to_glib_none().0) != 0
+                                };
+                                if allow_media_request(&uri, media.is_for_audio_device(), media.is_for_video_device(), display) {
                                     request.allow();
                                     return true;
                                 }
@@ -1973,6 +1982,34 @@ mod microphone_origin_tests {
     fn rejects_malformed_and_unsafe_schemes() {
         for uri in ["", "http://localhost:invalid/", "http://localhost:99999/", "https://localhost/", "http://tauri.localhost/", "javascript:alert(1)"] {
             assert!(!trusted_microphone_origin(uri), "{uri}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod media_permission_tests {
+    use super::allow_media_request;
+
+    #[test]
+    fn trusted_origins_only_allow_microphone_requests() {
+        for uri in ["tauri://localhost/", "https://tauri.localhost/", "http://localhost:5173/"] {
+            assert!(allow_media_request(uri, true, false, false), "{uri}");
+            for (audio, video, display) in [(false, true, false), (true, true, false), (false, false, true), (true, false, true), (true, true, true), (false, false, false)] {
+                assert!(!allow_media_request(uri, audio, video, display), "{uri}: {audio} {video} {display}");
+            }
+        }
+    }
+
+    #[test]
+    fn untrusted_origins_cannot_receive_any_media_permission() {
+        for uri in ["http://localhost.evil.example/", "https://evil.example/", "file:///example/index.html", ""] {
+            for audio in [false, true] {
+                for video in [false, true] {
+                    for display in [false, true] {
+                        assert!(!allow_media_request(uri, audio, video, display), "{uri}: {audio} {video} {display}");
+                    }
+                }
+            }
         }
     }
 }
