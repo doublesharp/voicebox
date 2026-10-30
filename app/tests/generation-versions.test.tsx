@@ -5,6 +5,7 @@ import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import type { GenerationVersionResponse, HistoryResponse } from '../src/lib/api/types';
 import { useGenerationStore } from '../src/stores/generationStore';
 import { usePlayerStore } from '../src/stores/playerStore';
+import { useServerStore } from '../src/stores/serverStore';
 
 const { apiClient: actualApiClient } = await import('../src/lib/api/client');
 
@@ -56,6 +57,9 @@ const update = mock(
 const remove = mock(async () => [{ ...original, is_default: true }]);
 const setDefault = mock(async () => ({ ...original, is_default: true }));
 const toast = mock(() => {});
+const retryGeneration = mock(async (_id: string) => ({ id: 'retry-id' }));
+const regenerateGeneration = mock(async (_id: string) => ({}));
+const toggleFavorite = mock(async (_id: string) => ({}));
 
 mock.module('../src/lib/hooks/useHistory', () => ({
   useHistory: (query: { offset: number; cursor?: string; include_total?: boolean }) => {
@@ -80,6 +84,9 @@ mock.module('../src/lib/api/client', () => ({
       `/audio/version/${id}?revision=${revision}`,
     getAudioUrl: (id: string) => `/audio/${id}`,
     setDefaultVersion: setDefault,
+    retryGeneration,
+    regenerateGeneration,
+    toggleFavorite,
   },
 }));
 mock.module('react-i18next', () => ({
@@ -122,12 +129,14 @@ mock.module('../src/components/ui/dropdown-menu', () => ({
     children,
     disabled,
     onSelect,
+    onClick,
   }: {
     children: ReactNode;
     disabled?: boolean;
     onSelect?: () => void;
+    onClick?: () => void;
   }) => (
-    <button type="button" disabled={disabled} onClick={onSelect}>
+    <button type="button" disabled={disabled} onClick={onClick ?? onSelect}>
       {children}
     </button>
   ),
@@ -146,7 +155,7 @@ Object.defineProperty(globalThis, 'IntersectionObserver', {
 const { HistoryTable } = await import('../src/components/History/HistoryTable');
 let renderer: ReactTestRenderer;
 let client: QueryClient;
-function mount(items = [generation], total = items.length, nextCursor?: string) {
+function mount(items = [generation], total = items.length, nextCursor?: string, expand = true) {
   historyData = { items, total, ...(nextCursor ? { next_cursor: nextCursor } : {}) };
   laterPage = undefined;
   client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -158,8 +167,10 @@ function mount(items = [generation], total = items.length, nextCursor?: string) 
   const toggle = renderer.root
     .findAllByType('button')
     .find((button) => button.props['aria-label'] === 'Toggle versions');
-  expect(toggle).toBeDefined();
-  act(() => toggle!.props.onClick());
+  if (expand) {
+    expect(toggle).toBeDefined();
+    act(() => toggle!.props.onClick());
+  }
 }
 function button(label: string) {
   function text(children: ReactNode): string {
@@ -169,9 +180,9 @@ function button(label: string) {
   }
   const found = renderer.root
     .findAllByType('button')
-    .find(
+    .filter(
       (node) => text(node.props.children) === label && typeof node.props.onClick === 'function',
-    );
+    ).at(label === 'common.delete' ? -1 : 0);
   expect(found).toBeDefined();
   return found!;
 }
@@ -184,6 +195,12 @@ afterEach(() => {
   remove.mockImplementation(async () => [{ ...original, is_default: true }]);
   setDefault.mockClear();
   toast.mockClear();
+  retryGeneration.mockReset(); retryGeneration.mockImplementation(async () => ({ id: 'retry-id' }));
+  regenerateGeneration.mockReset(); regenerateGeneration.mockImplementation(async () => ({}));
+  toggleFavorite.mockReset(); toggleFavorite.mockImplementation(async () => ({}));
+  useServerStore.setState({ serverUrl: 'http://server-a', serverRevision: 0 });
+  useGenerationStore.getState().removePendingGeneration('retry-id');
+  useGenerationStore.getState().removePendingGeneration('gen');
   deleteMutation.isSuccess = false;
   clearMutation.isSuccess = false;
   importMutation.isSuccess = false;
@@ -530,4 +547,90 @@ test('older history pages use the server cursor without a deep offset or repeate
   expect(renderer.root.findAllByType('textarea').map((node) => node.props.value)).toContain(
     'Older take',
   );
+});
+
+test('retrying a failed generation tracks the newly created task', async () => {
+  mount([{ ...generation, status: 'failed' }], 1, undefined, false);
+  await act(async () => { renderer.root.findByProps({ 'aria-label': 'Retry generation' }).props.onClick(); await Promise.resolve(); });
+  expect(retryGeneration).toHaveBeenCalledWith('gen');
+  expect(useGenerationStore.getState().pendingGenerationIds.has('retry-id')).toBe(true);
+});
+
+test('failed retry reports the error without adding a pending task', async () => {
+  retryGeneration.mockImplementationOnce(async () => { throw new Error('retry unavailable'); });
+  mount([{ ...generation, status: 'failed' }], 1, undefined, false);
+  await act(async () => { renderer.root.findByProps({ 'aria-label': 'Retry generation' }).props.onClick(); await Promise.resolve(); });
+  expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Retry failed', description: 'retry unavailable' }));
+  expect(useGenerationStore.getState().pendingGenerationIds.has('retry-id')).toBe(false);
+});
+
+test('late retry completion does not add a task from the previous server', async () => {
+  let resolve!: (value: { id: string }) => void;
+  retryGeneration.mockImplementationOnce(() => new Promise((r) => { resolve = r; }));
+  mount([{ ...generation, status: 'failed' }], 1, undefined, false);
+  await act(async () => { renderer.root.findByProps({ 'aria-label': 'Retry generation' }).props.onClick(); });
+  act(() => useServerStore.setState({ serverUrl: 'http://server-b', serverRevision: 1 }));
+  await act(async () => { resolve({ id: 'retry-id' }); });
+  expect(useGenerationStore.getState().pendingGenerationIds.has('retry-id')).toBe(false);
+});
+
+test('regeneration tracks the original task and reports failures', async () => {
+  mount();
+  await act(async () => { button('history.actions.regenerate').props.onClick(); await Promise.resolve(); });
+  expect(regenerateGeneration).toHaveBeenCalledWith('gen');
+  expect(useGenerationStore.getState().pendingGenerationIds.has('gen')).toBe(true);
+  act(() => useGenerationStore.getState().removePendingGeneration('gen'));
+  regenerateGeneration.mockImplementationOnce(async () => { throw new Error('regenerate unavailable'); });
+  await act(async () => { button('history.actions.regenerate').props.onClick(); await Promise.resolve(); });
+  expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Regenerate failed', description: 'regenerate unavailable' }));
+  expect(useGenerationStore.getState().pendingGenerationIds.has('gen')).toBe(false);
+});
+
+test('a favorite failure is reported without altering playback', async () => {
+  toggleFavorite.mockImplementationOnce(async () => { throw new Error('favorite unavailable'); });
+  mount();
+  await act(async () => { renderer.root.findByProps({ 'aria-label': 'Favorite' }).props.onClick(); await Promise.resolve(); });
+  expect(toggleFavorite).toHaveBeenCalledWith('gen');
+  expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Failed to update favorite', description: 'favorite unavailable' }));
+  expect(usePlayerStore.getState().audioUrl).toBeNull();
+});
+
+test('a previous server favorite failure is not displayed on the new server', async () => {
+  let reject!: (error: Error) => void;
+  toggleFavorite.mockImplementationOnce(() => new Promise((_resolve, r) => { reject = r; }));
+  mount();
+  await act(async () => { renderer.root.findByProps({ 'aria-label': 'Favorite' }).props.onClick(); });
+  act(() => useServerStore.setState({ serverUrl: 'http://server-b', serverRevision: 1 }));
+  await act(async () => { reject(new Error('old server failure')); });
+  expect(toast).not.toHaveBeenCalled();
+});
+
+test('late regeneration completion does not track a task on the new server', async () => {
+  let resolve!: (value: object) => void;
+  regenerateGeneration.mockImplementationOnce(() => new Promise((r) => { resolve = r; }));
+  mount();
+  await act(async () => { button('history.actions.regenerate').props.onClick(); });
+  act(() => useServerStore.setState({ serverUrl: 'http://server-b', serverRevision: 1 }));
+  await act(async () => { resolve({}); });
+  expect(useGenerationStore.getState().pendingGenerationIds.has('gen')).toBe(false);
+});
+
+test('late retry failure is silent after switching servers', async () => {
+  let reject!: (error: Error) => void;
+  retryGeneration.mockImplementationOnce(() => new Promise((_resolve, r) => { reject = r; }));
+  mount([{ ...generation, status: 'failed' }], 1, undefined, false);
+  await act(async () => { renderer.root.findByProps({ 'aria-label': 'Retry generation' }).props.onClick(); });
+  act(() => useServerStore.setState({ serverUrl: 'http://server-b', serverRevision: 1 }));
+  await act(async () => { reject(new Error('old retry failed')); });
+  expect(toast).not.toHaveBeenCalled();
+});
+
+test('late regeneration failure is silent after switching servers', async () => {
+  let reject!: (error: Error) => void;
+  regenerateGeneration.mockImplementationOnce(() => new Promise((_resolve, r) => { reject = r; }));
+  mount();
+  await act(async () => { button('history.actions.regenerate').props.onClick(); });
+  act(() => useServerStore.setState({ serverUrl: 'http://server-b', serverRevision: 1 }));
+  await act(async () => { reject(new Error('old regeneration failed')); });
+  expect(toast).not.toHaveBeenCalled();
 });

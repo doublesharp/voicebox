@@ -60,6 +60,7 @@ import {
   useImportGeneration,
 } from '@/lib/hooks/useHistory';
 import { cn } from '@/lib/utils/cn';
+import { currentServerScope, isCurrentServer } from '@/lib/serverScope';
 import { formatDate, formatDuration, formatEngineName } from '@/lib/utils/format';
 import { useGenerationStore } from '@/stores/generationStore';
 import { usePlayerStore } from '@/stores/playerStore';
@@ -278,11 +279,14 @@ export function HistoryTable({ embedded = false }: { embedded?: boolean }) {
   };
 
   const handleRetry = async (generationId: string) => {
+    const scope = currentServerScope();
     try {
       const result = await apiClient.retryGeneration(generationId);
+      if (!isCurrentServer(scope)) return;
       addPendingGeneration(result.id);
       queryClient.invalidateQueries({ queryKey: ['history'] });
     } catch (error) {
+      if (!isCurrentServer(scope)) return;
       toast({
         title: 'Retry failed',
         description: error instanceof Error ? error.message : 'Could not retry generation',
@@ -292,11 +296,14 @@ export function HistoryTable({ embedded = false }: { embedded?: boolean }) {
   };
 
   const handleRegenerate = async (generationId: string) => {
+    const scope = currentServerScope();
     try {
       await apiClient.regenerateGeneration(generationId);
+      if (!isCurrentServer(scope)) return;
       addPendingGeneration(generationId);
       queryClient.invalidateQueries({ queryKey: ['history'] });
     } catch (error) {
+      if (!isCurrentServer(scope)) return;
       toast({
         title: 'Regenerate failed',
         description: error instanceof Error ? error.message : 'Could not regenerate',
@@ -306,10 +313,13 @@ export function HistoryTable({ embedded = false }: { embedded?: boolean }) {
   };
 
   const handleToggleFavorite = async (generationId: string) => {
+    const scope = currentServerScope();
     try {
       await apiClient.toggleFavorite(generationId);
+      if (!isCurrentServer(scope)) return;
       queryClient.invalidateQueries({ queryKey: ['history'] });
     } catch (error) {
+      if (!isCurrentServer(scope)) return;
       toast({
         title: 'Failed to update favorite',
         description: error instanceof Error ? error.message : 'Unknown error',
