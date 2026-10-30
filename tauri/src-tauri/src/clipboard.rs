@@ -111,6 +111,13 @@ pub(crate) mod private_pasteboard_tests {
         pub(crate) fn restore(&self, snapshot: &ClipboardSnapshot) {
             unsafe { restore_clipboard_to(self.board, snapshot).unwrap() }
         }
+        pub(crate) fn restore_if_unchanged(
+            &self,
+            snapshot: &ClipboardSnapshot,
+            expected: i64,
+        ) -> Result<(), String> {
+            unsafe { restore_clipboard_to_if_unchanged(self.board, snapshot, expected) }
+        }
         pub(crate) fn write_if_unchanged(
             &self,
             text: &str,
@@ -615,6 +622,30 @@ pub fn restore_clipboard(snapshot: &ClipboardSnapshot) -> Result<(), String> {
 }
 
 #[cfg(target_os = "macos")]
+pub(crate) fn restore_clipboard_if_unchanged(
+    snapshot: &ClipboardSnapshot,
+    expected: i64,
+) -> Result<(), String> {
+    unsafe {
+        let _pool = AutoreleasePool::new();
+        restore_clipboard_to_if_unchanged(general_pasteboard()?, snapshot, expected)
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn restore_clipboard_to_if_unchanged(
+    pb: Id,
+    snapshot: &ClipboardSnapshot,
+    expected: i64,
+) -> Result<(), String> {
+    let current: i64 = msg_send![pb, changeCount];
+    if current != expected {
+        return Ok(());
+    }
+    restore_clipboard_to(pb, snapshot)
+}
+
+#[cfg(target_os = "macos")]
 unsafe fn restore_clipboard_to(pb: Id, snapshot: &ClipboardSnapshot) -> Result<(), String> {
     let _: i64 = msg_send![pb, clearContents];
 
@@ -1087,6 +1118,23 @@ pub(crate) fn write_text_tracked_if_unchanged(
 #[cfg(target_os = "windows")]
 pub fn restore_clipboard(snapshot: &ClipboardSnapshot) -> Result<(), String> {
     let _guard = win::ClipboardGuard::open()?;
+    restore_clipboard_open(snapshot)
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn restore_clipboard_if_unchanged(
+    snapshot: &ClipboardSnapshot,
+    expected: i64,
+) -> Result<(), String> {
+    let _guard = win::ClipboardGuard::open()?;
+    if win::sequence_number() as i64 != expected {
+        return Ok(());
+    }
+    restore_clipboard_open(snapshot)
+}
+
+#[cfg(target_os = "windows")]
+fn restore_clipboard_open(snapshot: &ClipboardSnapshot) -> Result<(), String> {
     win::empty()?;
 
     for pairs in &snapshot.items {
@@ -1134,6 +1182,14 @@ pub(crate) fn write_text_tracked_if_unchanged(
     Err(ClipboardWriteFailure::before_mutation(
         "clipboard snapshot is not yet implemented on this platform".into(),
     ))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub(crate) fn restore_clipboard_if_unchanged(
+    _snapshot: &ClipboardSnapshot,
+    _expected: i64,
+) -> Result<(), String> {
+    Err("clipboard snapshot is not yet implemented on this platform".into())
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]

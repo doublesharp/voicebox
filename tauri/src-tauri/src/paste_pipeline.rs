@@ -20,7 +20,7 @@ trait PasteBackend {
     ) -> Result<i64, clipboard::ClipboardWriteFailure>;
     fn send(&self) -> Result<(), String>;
     fn change_count(&self) -> Result<i64, String>;
-    fn restore(&self, snapshot: &Self::Snapshot) -> Result<(), String>;
+    fn restore(&self, snapshot: &Self::Snapshot, expected: i64) -> Result<(), String>;
 }
 
 // Restore while still holding the process-wide paste lock, including when the
@@ -39,8 +39,10 @@ impl<B: PasteBackend> ClipboardRestore<'_, B> {
         }
         self.armed = false;
         if matches!(self.backend.change_count(), Ok(current) if current == self.after_write) {
-            self.backend
-                .restore(self.snapshot.as_ref().expect("armed clipboard snapshot"))
+            self.backend.restore(
+                self.snapshot.as_ref().expect("armed clipboard snapshot"),
+                self.after_write,
+            )
         } else {
             eprintln!("[voicebox] clipboard mutated during paste window — skipping restore to preserve newer content");
             Ok(())
@@ -81,8 +83,8 @@ impl PasteBackend for NativePaste {
     fn change_count(&self) -> Result<i64, String> {
         clipboard::current_change_count()
     }
-    fn restore(&self, snapshot: &Self::Snapshot) -> Result<(), String> {
-        clipboard::restore_clipboard(snapshot)
+    fn restore(&self, snapshot: &Self::Snapshot, expected: i64) -> Result<(), String> {
+        clipboard::restore_clipboard_if_unchanged(snapshot, expected)
     }
 }
 
@@ -298,7 +300,7 @@ mod tests {
             self.call("count")?;
             self.count.ok_or("unknown".into())
         }
-        fn restore(&self, snapshot: &Self::Snapshot) -> Result<(), String> {
+        fn restore(&self, snapshot: &Self::Snapshot, _expected: i64) -> Result<(), String> {
             assert_eq!(*snapshot, "original");
             self.call("restore")
         }
@@ -468,7 +470,7 @@ mod concurrent_paste_tests {
         fn change_count(&self) -> Result<i64, String> {
             Ok(self.0.borrow().revision)
         }
-        fn restore(&self, snapshot: &String) -> Result<(), String> {
+        fn restore(&self, snapshot: &String, _expected: i64) -> Result<(), String> {
             let mut clipboard = self.0.borrow_mut();
             clipboard.text = snapshot.clone();
             clipboard.revision += 1;
@@ -872,7 +874,7 @@ mod staging_failure_regression_tests {
         fn change_count(&self) -> Result<i64, String> {
             Ok(self.state.borrow().revision)
         }
-        fn restore(&self, snapshot: &String) -> Result<(), String> {
+        fn restore(&self, snapshot: &String, _expected: i64) -> Result<(), String> {
             if self.restore_fails {
                 return Err("restore failed".into());
             }
@@ -988,6 +990,7 @@ mod private_pasteboard_transaction_tests {
         fail_send: bool,
         change_during_capture: bool,
         change_after_capture: bool,
+        change_before_restore: bool,
         sends: Cell<usize>,
     }
     impl Backend {
@@ -1000,6 +1003,7 @@ mod private_pasteboard_transaction_tests {
                 fail_send: false,
                 change_during_capture: false,
                 change_after_capture: false,
+                change_before_restore: false,
                 sends: Cell::new(0),
             }
         }
@@ -1042,10 +1046,45 @@ mod private_pasteboard_transaction_tests {
         fn change_count(&self) -> Result<i64, String> {
             Ok(self.board.change_count())
         }
-        fn restore(&self, snapshot: &Self::Snapshot) -> Result<(), String> {
-            self.board.restore(snapshot);
-            Ok(())
+        fn restore(&self, snapshot: &Self::Snapshot, expected: i64) -> Result<(), String> {
+            if self.change_before_restore {
+                self.board.write("newer");
+            }
+            self.board.restore_if_unchanged(snapshot, expected)
         }
+    }
+
+    #[tokio::test]
+    async fn native_private_dictation_preserves_change_at_restore() {
+        let mut backend = Backend::new();
+        backend.change_before_restore = true;
+        let focus = focus_capture::FocusSnapshot {
+            pid: 42,
+            bundle_id: None,
+            role: None,
+        };
+        assert_eq!(
+            paste_with("dictation", &focus, &backend, |_| async {}).await,
+            Ok(true)
+        );
+        assert_eq!(backend.board.text().as_deref(), Some("newer"));
+    }
+
+    #[tokio::test]
+    async fn native_private_diagnostic_preserves_change_at_restore() {
+        let mut backend = Backend::new();
+        backend.change_before_restore = true;
+        assert!(diagnostic_with(
+            "dictation",
+            Duration::ZERO,
+            Duration::ZERO,
+            true,
+            &backend,
+            |_| async {}
+        )
+        .await
+        .is_ok());
+        assert_eq!(backend.board.text().as_deref(), Some("newer"));
     }
 
     #[tokio::test]
