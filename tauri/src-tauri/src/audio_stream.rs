@@ -131,3 +131,114 @@ mod tests {
         assert!(PcmQueue::new(192001).is_err());
     }
 }
+
+#[cfg(test)]
+mod stream_resampling_regression_tests {
+    use super::PcmQueue;
+
+    fn collect_complete(mut queue: PcmQueue, target: u32) -> Vec<f32> {
+        let mut out = Vec::new();
+        while !queue.ended() {
+            assert!(out.len() < 100_000, "stream never completed");
+            let mut frame = [0.0];
+            queue.render(&mut frame, target, 1, |sample| sample);
+            out.push(frame[0]);
+        }
+        out
+    }
+
+    #[test]
+    fn uneven_appends_preserve_the_same_audio_across_sample_rates() {
+        let input: Vec<f32> = (0..211).map(|i| 0.25 + (i % 23) as f32 / 100.0).collect();
+        for (source, target) in [
+            (8000, 192000),
+            (16000, 44100),
+            (24000, 48000),
+            (44100, 48000),
+            (48000, 24000),
+            (192000, 8000),
+        ] {
+            let mut whole = PcmQueue::new(source).unwrap();
+            whole.append(&input).unwrap();
+            whole.finished = true;
+            let expected = collect_complete(whole, target);
+            for chunk_size in [1, 3, 7, 19, 64] {
+                let mut stream = PcmQueue::new(source).unwrap();
+                let mut actual = Vec::new();
+                for chunk in input.chunks(chunk_size) {
+                    stream.append(chunk).unwrap();
+                    loop {
+                        let mut frame = [0.0];
+                        stream.render(&mut frame, target, 1, |sample| sample);
+                        if frame[0] == 0.0 {
+                            break;
+                        }
+                        actual.push(frame[0]);
+                        assert!(
+                            actual.len() <= expected.len(),
+                            "stream produced too much audio"
+                        );
+                    }
+                }
+                stream.finished = true;
+                actual.extend(collect_complete(stream, target));
+                assert_eq!(actual, expected, "{source} -> {target}, chunk {chunk_size}");
+            }
+        }
+    }
+
+    #[test]
+    fn upsampling_interpolates_and_finishes_the_final_sample() {
+        let mut queue = PcmQueue::new(8000).unwrap();
+        queue.append(&[0.25, 0.75]).unwrap();
+        queue.finished = true;
+        assert_eq!(collect_complete(queue, 16000), [0.25, 0.5, 0.75, 0.75]);
+    }
+
+    #[test]
+    fn downsampling_advances_by_whole_source_frames() {
+        let mut queue = PcmQueue::new(16000).unwrap();
+        queue.append(&[0.1, 0.2, 0.3, 0.4]).unwrap();
+        queue.finished = true;
+        assert_eq!(collect_complete(queue, 8000), [0.1, 0.3]);
+    }
+
+    #[test]
+    fn invalid_output_format_is_silent_and_does_not_consume_audio() {
+        let mut queue = PcmQueue::new(8000).unwrap();
+        queue.append(&[0.25, 0.5]).unwrap();
+        for (rate, channels) in [(0, 1), (8000, 0)] {
+            let mut output = [1.0; 4];
+            queue.render(&mut output, rate, channels, |sample| sample);
+            assert_eq!(output, [0.0; 4]);
+            assert_eq!(queue.position(), 0.0);
+        }
+        queue.finished = true;
+        assert_eq!(collect_complete(queue, 8000), [0.25, 0.5]);
+    }
+
+    #[test]
+    fn output_channels_receive_the_same_sample_and_underrun_is_silence() {
+        let mut queue = PcmQueue::new(8000).unwrap();
+        queue.append(&[0.25, 0.5]).unwrap();
+        let mut output = [1.0; 9];
+        queue.render(&mut output, 8000, 3, |sample| sample);
+        assert_eq!(output, [0.25, 0.25, 0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        assert!(!queue.ended());
+        queue.finished = true;
+        assert_eq!(collect_complete(queue, 8000), [0.5]);
+    }
+
+    #[test]
+    fn position_tracks_consumed_source_frames_across_rate_changes() {
+        let mut queue = PcmQueue::new(16000).unwrap();
+        queue.append(&[0.1; 8]).unwrap();
+        queue.finished = true;
+        queue.render(&mut [0.0; 2], 8000, 1, |sample| sample);
+        assert_eq!(queue.rendered, 4);
+        assert_eq!(queue.position(), 4.0 / 16000.0);
+        queue.render(&mut [0.0; 8], 32000, 1, |sample| sample);
+        assert!(queue.ended());
+        assert_eq!(queue.position(), 8.0 / 16000.0);
+    }
+}
