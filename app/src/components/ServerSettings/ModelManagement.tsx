@@ -161,7 +161,9 @@ export function ModelManagement() {
     filename?: string;
     status: string;
   } | null>(null);
-  const [pendingMigrateDir, setPendingMigrateDir] = useState<string | null>(null);
+  const [pendingMigrateDir, setPendingMigrateDir] = useState<{ path: string; server: { url: string; revision: number } } | null>(null);
+  const migrationRevision = useRef(0);
+  const cancelMigrationStream = useRef<(() => void) | null>(null);
   const [downloadingModel, setDownloadingModel] = useState<string | null>(null);
   const [downloadingDisplayName, setDownloadingDisplayName] = useState<string | null>(null);
   const [consoleOpen, setConsoleOpen] = useState(false);
@@ -296,6 +298,14 @@ export function ModelManagement() {
     modelRevisions.current.clear();
     nextDownloadRequest.current = 0;
     latestSuccessfulDownload.current = 0;
+    setPendingMigrateDir(null);
+    setMigrating(false);
+    setMigrationProgress(null);
+    return () => {
+      migrationRevision.current += 1;
+      cancelMigrationStream.current?.();
+      cancelMigrationStream.current = null;
+    };
   }, [serverUrl, serverRevision]);
 
   const handleDownload = async (modelName: string) => {
@@ -578,13 +588,16 @@ export function ModelManagement() {
                 size="sm"
                 className="text-xs text-muted-foreground h-7 px-2"
                 onClick={async () => {
+                  const server = currentServer();
+                  const revision = migrationRevision.current;
                   try {
                     const newDir = await platform.filesystem.pickDirectory(
                       t('models.storage.pickerTitle'),
                     );
-                    if (!newDir) return;
-                    setPendingMigrateDir(newDir);
+                    if (!newDir || !isCurrentServer(server) || migrationRevision.current !== revision) return;
+                    setPendingMigrateDir({ path: newDir, server });
                   } catch {
+                    if (!isCurrentServer(server) || migrationRevision.current !== revision) return;
                     toast({ title: t('models.toast.pickerFailed'), variant: 'destructive' });
                   }
                 }}
@@ -1101,16 +1114,19 @@ export function ModelManagement() {
           </AlertDialogHeader>
           <div
             className="text-xs font-mono text-muted-foreground bg-muted/50 rounded px-3 py-2 truncate"
-            title={pendingMigrateDir ?? ''}
+            title={pendingMigrateDir?.path ?? ''}
           >
-            {pendingMigrateDir}
+            {pendingMigrateDir?.path}
           </div>
           <AlertDialogFooter>
             <AlertDialogCancel>{t('common.cancel')}</AlertDialogCancel>
             <AlertDialogAction
               onClick={async () => {
                 if (!pendingMigrateDir) return;
-                const newDir = pendingMigrateDir;
+                const { path: newDir, server } = pendingMigrateDir;
+                const revision = migrationRevision.current;
+                const isActive = () => isCurrentServer(server) && migrationRevision.current === revision;
+                if (!isActive()) return;
                 setPendingMigrateDir(null);
                 setMigrating(true);
                 setMigrationProgress({
@@ -1123,6 +1139,7 @@ export function ModelManagement() {
                 try {
                   // Start the migration (background task)
                   const migrationResult = await apiClient.migrateModels(newDir);
+                  if (!isActive()) return;
 
                   // If no models to migrate, warn user and skip the change
                   if (migrationResult.moved === 0) {
@@ -1139,15 +1156,23 @@ export function ModelManagement() {
                   // Connect to SSE for progress
                   await new Promise<void>((resolve, reject) => {
                     const es = new EventSource(apiClient.getMigrationProgressUrl());
+                    const cancel = () => {
+                      es.close();
+                      reject(new Error('Server connection changed'));
+                    };
+                    cancelMigrationStream.current = cancel;
                     es.onmessage = (event) => {
+                      if (!isActive()) { cancel(); return; }
                       try {
                         const data = JSON.parse(event.data);
                         setMigrationProgress(data);
                         if (data.status === 'complete') {
                           es.close();
+                          if (cancelMigrationStream.current === cancel) cancelMigrationStream.current = null;
                           resolve();
                         } else if (data.status === 'error') {
                           es.close();
+                          if (cancelMigrationStream.current === cancel) cancelMigrationStream.current = null;
                           reject(new Error(data.error || t('models.toast.migrationFailed')));
                         }
                       } catch {
@@ -1156,10 +1181,12 @@ export function ModelManagement() {
                     };
                     es.onerror = () => {
                       es.close();
+                      if (cancelMigrationStream.current === cancel) cancelMigrationStream.current = null;
                       reject(new Error(t('models.toast.migrationConnectionLost')));
                     };
                   });
 
+                  if (!isActive()) return;
                   setCustomModelsDir(newDir);
                   setMigrationProgress({
                     current: 1,
@@ -1169,9 +1196,11 @@ export function ModelManagement() {
                     filename: t('models.migrateDialog.restartingServer'),
                   });
                   await platform.lifecycle.restartServer(newDir);
+                  if (!isActive()) return;
                   queryClient.invalidateQueries();
                   toast({ title: t('models.toast.migrated') });
                 } catch (e) {
+                  if (!isActive()) return;
                   toast({
                     title: t('models.toast.migrationFailed'),
                     description:
@@ -1179,8 +1208,10 @@ export function ModelManagement() {
                     variant: 'destructive',
                   });
                 } finally {
-                  setMigrating(false);
-                  setMigrationProgress(null);
+                  if (isActive()) {
+                    setMigrating(false);
+                    setMigrationProgress(null);
+                  }
                 }
               }}
             >

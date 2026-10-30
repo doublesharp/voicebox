@@ -7,6 +7,13 @@ const cancel = mock(async (_name: string) => {});
 const clearAll = mock(async () => {});
 const deleteModel = mock(async (_name: string) => {});
 const unloadModel = mock(async (_name: string) => {});
+const migrate = mock(async (_path: string) => ({ moved: 1 }));
+const pickDirectory = mock(async (_title: string) => '/new-models');
+const openPath = mock(async (_path: string) => {});
+const restartServer = mock(async (_path: string) => {});
+const setCustomModelsDir = mock((_path: string | null) => {});
+let desktop = false;
+let customModelsDir: string | null = null;
 const toast = mock((_value: unknown) => {});
 let downloadCallbacks: any;
 let serverUrl = 'http://server-a';
@@ -21,6 +28,8 @@ mock.module('../src/lib/api/client', () => ({
     clearAllTasks: clearAll,
     deleteModel,
     unloadModel,
+    migrateModels: migrate,
+    getMigrationProgressUrl: () => `${serverUrl}/models/migrate/progress`,
   },
 }));
 mock.module('../src/lib/hooks/useModelDownloadToast', () => ({
@@ -29,9 +38,9 @@ mock.module('../src/lib/hooks/useModelDownloadToast', () => ({
   },
 }));
 mock.module('../src/platform/PlatformContext', () => ({
-  usePlatform: () => ({ metadata: { isTauri: false } }),
+  usePlatform: () => ({ metadata: { isTauri: desktop }, filesystem: { pickDirectory, openPath }, lifecycle: { restartServer } }),
 }));
-const serverState = () => ({ customModelsDir: null, setCustomModelsDir: () => {}, serverUrl, serverRevision });
+const serverState = () => ({ customModelsDir, setCustomModelsDir, serverUrl, serverRevision });
 const useServerStore = Object.assign((selector: any) => selector(serverState()), { getState: serverState });
 mock.module('../src/stores/serverStore', () => ({ useServerStore }));
 mock.module('../src/components/ui/use-toast', () => ({ useToast: () => ({ toast }) }));
@@ -666,4 +675,172 @@ test('a clear-all response from an earlier visit cannot clear a newer download',
     s.finish(); serverUrl = 'http://server-a'; serverRevision = 0;
     clearAll.mockImplementation(async () => {});
   }
+});
+
+class MigrationEvents {
+  static instances: MigrationEvents[] = [];
+  onmessage: ((event: { data: string }) => void) | null = null;
+  onerror: (() => void) | null = null;
+  closed = false;
+  constructor(public url: string) { MigrationEvents.instances.push(this); }
+  close() { this.closed = true; }
+  send(data: unknown) { this.onmessage?.({ data: JSON.stringify(data) }); }
+}
+
+async function migrationSetup() {
+  desktop = true;
+  customModelsDir = null;
+  MigrationEvents.instances = [];
+  migrate.mockClear(); pickDirectory.mockClear(); restartServer.mockClear(); setCustomModelsDir.mockClear();
+  const previousEventSource = globalThis.EventSource;
+  globalThis.EventSource = MigrationEvents as unknown as typeof EventSource;
+  const s = await setup();
+  const choose = async () => { await act(async () => { await s.button('models.storage.change').props.onClick(); }); };
+  const start = async () => {
+    let pending!: Promise<void>;
+    await act(async () => { pending = s.button('models.migrateDialog.action').props.onClick(); await Promise.resolve(); });
+    return { pending };
+  };
+  const finish = () => {
+    s.finish(); desktop = false; customModelsDir = null; serverUrl = 'http://server-a'; serverRevision = 0;
+    globalThis.EventSource = previousEventSource;
+    migrate.mockImplementation(async () => ({ moved: 1 }));
+    pickDirectory.mockImplementation(async () => '/new-models');
+    restartServer.mockImplementation(async () => {});
+  };
+  return { ...s, choose, start, finish };
+}
+
+test('migration waits for completion before changing storage and restarting', async () => {
+  const s = await migrationSetup();
+  try {
+    await s.choose();
+    const { pending } = await s.start();
+    expect(migrate).toHaveBeenCalledWith('/new-models');
+    const source = MigrationEvents.instances[0];
+    expect(source.url).toBe('http://server-a/models/migrate/progress');
+    expect(restartServer).not.toHaveBeenCalled();
+    act(() => source.send({ status: 'downloading', current: 512, total: 1024, progress: 50, filename: 'model.bin' }));
+    expect(JSON.stringify(s.view.toJSON())).toContain('model.bin');
+    await act(async () => { source.send({ status: 'complete' }); await pending; });
+    expect(source.closed).toBe(true);
+    expect(setCustomModelsDir).toHaveBeenCalledWith('/new-models');
+    expect(restartServer).toHaveBeenCalledWith('/new-models');
+    expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'models.toast.migrated' }));
+  } finally { s.finish(); }
+});
+
+test('migration with no models does not change storage or restart', async () => {
+  migrate.mockImplementation(async () => ({ moved: 0 }));
+  const s = await migrationSetup();
+  try {
+    await s.choose();
+    const { pending } = await s.start();
+    await act(async () => { await pending; });
+    expect(MigrationEvents.instances).toHaveLength(0);
+    expect(setCustomModelsDir).not.toHaveBeenCalled();
+    expect(restartServer).not.toHaveBeenCalled();
+    expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'models.toast.noModelsToMigrate' }));
+  } finally { s.finish(); }
+});
+
+test.each(['error', 'connection'])('migration %s leaves storage unchanged and reports failure', async (failure) => {
+  const s = await migrationSetup();
+  try {
+    await s.choose();
+    const { pending } = await s.start();
+    const source = MigrationEvents.instances[0];
+    await act(async () => {
+      if (failure === 'error') source.send({ status: 'error', error: 'copy failed' });
+      else source.onerror?.();
+      await pending;
+    });
+    expect(source.closed).toBe(true);
+    expect(setCustomModelsDir).not.toHaveBeenCalled();
+    expect(restartServer).not.toHaveBeenCalled();
+    expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'models.toast.migrationFailed' }));
+  } finally { s.finish(); }
+});
+
+test('directory picker result from an old server cannot open migration on the new server', async () => {
+  let resolve!: (path: string) => void;
+  pickDirectory.mockImplementation(() => new Promise((done) => { resolve = done; }));
+  const s = await migrationSetup();
+  try {
+    let pending!: Promise<void>;
+    act(() => { pending = s.button('models.storage.change').props.onClick(); });
+    serverUrl = 'http://server-b'; serverRevision++;
+    await act(async () => { resolve('/new-models'); await pending; });
+    expect(s.view.root.findAllByType('button').some((button) => button.children.includes('models.migrateDialog.action'))).toBe(false);
+    expect(migrate).not.toHaveBeenCalled();
+  } finally { s.finish(); }
+});
+
+test('migration response after a server switch cannot attach to the new server or restart it', async () => {
+  let resolve!: (value: { moved: number }) => void;
+  migrate.mockImplementation(() => new Promise((done) => { resolve = done; }));
+  const s = await migrationSetup();
+  try {
+    await s.choose();
+    const { pending } = await s.start();
+    serverUrl = 'http://server-b'; serverRevision++;
+    await act(async () => { resolve({ moved: 1 }); await Promise.resolve(); });
+    expect(MigrationEvents.instances).toHaveLength(0);
+    expect(restartServer).not.toHaveBeenCalled();
+    await pending;
+  } finally { s.finish(); }
+});
+
+test('server switch closes an active migration stream and prevents a stale restart', async () => {
+  const s = await migrationSetup();
+  try {
+    await s.choose();
+    const { pending } = await s.start();
+    const source = MigrationEvents.instances[0];
+    serverUrl = 'http://server-b'; serverRevision++;
+    await act(async () => { s.view.update(<QueryClientProvider client={s.client}><ModelManagement /></QueryClientProvider>); });
+    expect(source.closed).toBe(true);
+    await act(async () => { source.send({ status: 'complete' }); await pending; });
+    expect(setCustomModelsDir).not.toHaveBeenCalled();
+    expect(restartServer).not.toHaveBeenCalled();
+  } finally { s.finish(); }
+});
+
+test('completion delivered before a server-switch rerender cannot restart the wrong server', async () => {
+  const s = await migrationSetup();
+  try {
+    await s.choose();
+    const { pending } = await s.start();
+    const source = MigrationEvents.instances[0];
+    serverUrl = 'http://server-b'; serverRevision++;
+    await act(async () => { source.send({ status: 'complete' }); await pending; });
+    expect(source.closed).toBe(true);
+    expect(setCustomModelsDir).not.toHaveBeenCalled();
+    expect(restartServer).not.toHaveBeenCalled();
+    expect(toast).not.toHaveBeenCalled();
+  } finally { s.finish(); }
+});
+
+test('migration confirmation cannot dispatch after the originating server changes', async () => {
+  const s = await migrationSetup();
+  try {
+    await s.choose();
+    serverUrl = 'http://server-b'; serverRevision++;
+    await act(async () => { await s.button('models.migrateDialog.action').props.onClick(); });
+    expect(migrate).not.toHaveBeenCalled();
+    expect(restartServer).not.toHaveBeenCalled();
+  } finally { s.finish(); }
+});
+
+test('unmounting closes an active migration stream without changing storage', async () => {
+  const s = await migrationSetup();
+  try {
+    await s.choose();
+    const { pending } = await s.start();
+    const source = MigrationEvents.instances[0];
+    await act(async () => { s.view.unmount(); await pending; });
+    expect(source.closed).toBe(true);
+    expect(setCustomModelsDir).not.toHaveBeenCalled();
+    expect(restartServer).not.toHaveBeenCalled();
+  } finally { s.finish(); }
 });
