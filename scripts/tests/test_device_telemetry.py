@@ -1,6 +1,7 @@
 """Device identity, CUDA refusal, stage telemetry and residency with labelled fakes."""
 
 from contextlib import contextmanager
+from dataclasses import asdict
 from types import SimpleNamespace
 
 import pytest
@@ -35,7 +36,7 @@ def test_identity_is_frozen_and_records_smi_and_torch_facts():
     assert identity.compute_capability == "12.0"
     with pytest.raises(AttributeError):
         identity.selected_device = "cpu"
-    record = telemetry.as_record(identity)
+    record = asdict(identity)
     assert record["gpus"][0]["name"].startswith("NVIDIA") and record["os"]
 
 
@@ -123,7 +124,7 @@ def test_stage_meter_syncs_only_at_boundaries_and_resets_peak_at_start():
         cuda_allocated_start_bytes=10, cuda_allocated_bytes=30, cuda_allocated_peak_bytes=50,
         cuda_reserved_bytes=40, cuda_reserved_peak_bytes=60,
     )
-    assert telemetry.as_record(stage)["wall_s"] == 2.0
+    assert asdict(stage)["wall_s"] == 2.0
 
 
 def test_stage_meter_records_failed_stage_and_reraises():
@@ -132,6 +133,25 @@ def test_stage_meter_records_failed_stage_and_reraises():
         with meter.stage("generation_0"):
             raise RuntimeError("boom")
     assert meter.stages["generation_0"].wall_s == 1.0
+
+
+class FailingSyncCuda(FakeCuda):
+    def synchronize(self, device):
+        super().synchronize(device)
+        if len([e for e in self.events if e[0] == "sync"]) > 1:
+            raise RuntimeError("device sync failed")
+
+
+def test_failed_stage_keeps_its_own_exception_when_the_closing_sync_also_fails():
+    meter = telemetry.StageMeter("cuda:0", cuda=FailingSyncCuda(), process=FakeProcess(), clock=iter([0, 10**9]).__next__)
+    with pytest.raises(RuntimeError, match="boom") as raised:
+        with meter.stage("generation_0"):
+            raise RuntimeError("boom")
+    assert any("device sync failed" in note for note in getattr(raised.value, "__notes__", []))
+    meter = telemetry.StageMeter("cuda:0", cuda=FailingSyncCuda(), process=FakeProcess(), clock=iter([0, 10**9]).__next__)
+    with pytest.raises(RuntimeError, match="device sync failed"):
+        with meter.stage("load"):
+            pass
 
 
 def test_cpu_meter_has_no_cuda_fields_and_never_touches_cuda():

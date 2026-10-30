@@ -7,6 +7,7 @@ network audit guard before importing adapters. See the developer benchmark guide
 
 import argparse
 import asyncio
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -23,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from typing import Literal
 import wave
 
 
@@ -211,16 +213,16 @@ def turbo_loaded_revision(adapter, admitted):
 
 @dataclass(frozen=True)
 class EngineSpec:
-    backends: tuple
-    models: tuple
-    languages: tuple
-    voice: str  # reference | preset | design
-    admit: object
-    adapters: dict  # backend -> (module, class)
+    backends: tuple[str, ...]
+    models: tuple[str, ...]
+    languages: tuple[str, ...]
+    voice: Literal["reference", "preset", "design"]
+    admit: Callable[[Settings], dict]
+    adapters: dict[str, tuple[str, str]]  # backend -> (module, class)
     constructor_takes_model: bool
     reference_use_cache: bool
-    inference_roots: object
-    loaded_revision: object = None
+    inference_roots: Callable[[object], dict]
+    loaded_revision: Callable[[object, dict], str] | None = None
 
 
 ENGINES = {
@@ -333,7 +335,7 @@ def device_identity(settings):
     identity = telemetry.collect_identity(torch_device(settings))
     if settings.device.startswith("cuda"):
         telemetry.require_cuda(identity)
-    return {**telemetry.as_record(identity), "requested_device": settings.device,
+    return {**asdict(identity), "requested_device": settings.device,
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES")}
 
 
@@ -429,7 +431,7 @@ async def benchmark(settings, output, *, factory=create_adapter, clock=time.perf
               "provenance": get_provenance(), "stages_s": {}, "stages": {}, "runs": [], "warm": None,
               "timing_scope": "adapter calls; WAV IO/validation excluded; first load in fresh process, not cold disk cache; "
                               "CUDA synchronized at stage boundaries only"}
-    adapter = None
+    adapter = meter = None
     stage = "admission"
     try:
         report["model"] = spec.admit(settings)
@@ -500,8 +502,8 @@ async def benchmark(settings, output, *, factory=create_adapter, clock=time.perf
             except Exception as exc:
                 report["status"] = "failed"
                 report["cleanup_error"] = {"type": type(exc).__name__, "message": str(exc)[:2000]}
-        if "meter" in locals():
-            report["stages"] = {name: telemetry.as_record(m) for name, m in meter.stages.items()}
+        if meter is not None:
+            report["stages"] = {name: asdict(m) for name, m in meter.stages.items()}
             report["stages_s"] = {name: m.wall_s for name, m in meter.stages.items()}
         with output.open("results.json") as handle:
             handle.write(json.dumps(report, default=str, indent=2, allow_nan=False).encode() + b"\n")

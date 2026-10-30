@@ -538,7 +538,7 @@ async def qualify(settings, output, *, factory=bench.create_adapter, admit=bench
     finally:
         if session is not None:
             report["audio"], report["wavs"] = session.audio, session.wavs
-            report["stages"] = {name: telemetry.as_record(m) for name, m in session.meter.stages.items()}
+            report["stages"] = {name: asdict(m) for name, m in session.meter.stages.items()}
             if session.adapter is not None:
                 try:
                     session.adapter.unload_model()

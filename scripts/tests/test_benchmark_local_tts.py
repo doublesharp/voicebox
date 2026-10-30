@@ -2,7 +2,7 @@
 
 import os
 import asyncio
-from dataclasses import replace
+from dataclasses import asdict, replace
 import importlib.util
 import json
 from pathlib import Path
@@ -735,15 +735,18 @@ def test_device_refusal_happens_before_adapter_construction(settings):
 def test_device_identity_requires_nvidia_for_cuda_and_skips_torch_for_mlx(settings, monkeypatch):
     calls = []
 
+    rocm = bench.telemetry.DeviceIdentity("os", "x", "2.9", None, "6.2", False, 0, (), "no smi", None, "cuda:0", None, None)
+
     def identity(device, **kwargs):
         calls.append(device)
-        return SimpleNamespace(torch_hip="6.2", torch_cuda=None, cuda_available=False, gpus=())
+        return replace(rocm, selected_device=device)
 
     monkeypatch.setattr(bench.telemetry, "collect_identity", identity)
-    monkeypatch.setattr(bench.telemetry, "as_record", lambda identity: {"recorded": True})
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     assert bench.device_identity(replace(settings, backend="mlx", device="mlx"))["selected_device"] == "mlx"
     assert calls == []
-    assert bench.device_identity(settings) == {"recorded": True, "requested_device": "cpu", "cuda_visible_devices": None}
+    assert bench.device_identity(settings) == {**asdict(rocm), "selected_device": "cpu", "requested_device": "cpu",
+                                               "cuda_visible_devices": None}
     with pytest.raises(bench.telemetry.DeviceRefused, match="ROCm"):
         bench.device_identity(replace(settings, device="cuda:1"))
     assert calls == ["cpu", "cuda:0"]

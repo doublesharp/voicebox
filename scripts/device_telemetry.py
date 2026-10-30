@@ -6,7 +6,7 @@ device string. CUDA is synchronized only at stage boundaries.
 """
 
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, replace
 import platform
 import subprocess
 import time
@@ -58,10 +58,6 @@ class StageMeasurement:
     cuda_allocated_peak_bytes: int | None
     cuda_reserved_bytes: int | None
     cuda_reserved_peak_bytes: int | None
-
-
-def as_record(value):
-    return asdict(value)
 
 
 SMI_QUERY = ["nvidia-smi", "--query-gpu=index,name,memory.total,driver_version,compute_cap",
@@ -183,11 +179,20 @@ class StageMeter:
             self.cuda.reset_peak_memory_stats(self.device)
             start_allocated = self.cuda.memory_allocated(self.device)
         start, cpu_start = self.clock(), self.cpu_clock()
+        failure = None
         try:
             yield
+        except BaseException as exc:
+            failure = exc
+            raise
         finally:
             if self.cuda is not None:
-                self.cuda.synchronize(self.device)
+                try:
+                    self.cuda.synchronize(self.device)
+                except Exception as exc:
+                    if failure is None:
+                        raise
+                    failure.add_note(f"stage {name}: closing synchronize also failed: {exc!r}")
             wall_s = (self.clock() - start) / 1e9
             # Process CPU time across all threads: close to wall_s means the host
             # was busy submitting work, far below it means waiting on the device.
