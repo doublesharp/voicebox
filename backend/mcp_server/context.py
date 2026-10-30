@@ -10,6 +10,7 @@ object through every service call.
 import asyncio
 import ipaddress
 import logging
+from contextlib import closing
 from contextvars import ContextVar
 from datetime import datetime, timezone
 
@@ -129,24 +130,27 @@ def _stamp_last_seen(client_id: str) -> None:
     except Exception:
         return
     try:
-        db = next(get_db())
+        session_source = get_db()
     except Exception:
         return
-    try:
-        row = (
-            db.query(MCPClientBinding)
-            .filter(MCPClientBinding.client_id == client_id)
-            .first()
-        )
-        if row is None:
-            row = MCPClientBinding(client_id=client_id)
-            db.add(row)
-        row.last_seen_at = datetime.now(timezone.utc)
-        db.commit()
-    except Exception:
-        logger.debug(
-            "Could not stamp last_seen_at for %s", client_id, exc_info=True
-        )
-        db.rollback()
-    finally:
-        db.close()
+    with closing(session_source):
+        try:
+            db = next(session_source)
+        except Exception:
+            return
+        try:
+            row = (
+                db.query(MCPClientBinding)
+                .filter(MCPClientBinding.client_id == client_id)
+                .first()
+            )
+            if row is None:
+                row = MCPClientBinding(client_id=client_id)
+                db.add(row)
+            row.last_seen_at = datetime.now(timezone.utc)
+            db.commit()
+        except Exception:
+            logger.debug(
+                "Could not stamp last_seen_at for %s", client_id, exc_info=True
+            )
+            db.rollback()
