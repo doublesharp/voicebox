@@ -57,6 +57,10 @@ async fn run(app: AppHandle) {
         }
     };
 
+    run_with(app, client, url).await;
+}
+
+async fn run_with<R: tauri::Runtime>(app: AppHandle<R>, client: reqwest::Client, url: String) {
     let mut retry = Retry::default();
 
     loop {
@@ -648,6 +652,94 @@ mod event_delivery_integration_tests {
             socket.write_all(body).await.unwrap();
         });
         (url, task)
+    }
+
+    #[tokio::test]
+    async fn monitor_reconnects_after_failure_and_delivers_later_events() {
+        let app = tauri::test::mock_app();
+        let events = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        for name in ["dictate:speak-start", "dictate:speak-end"] {
+            let events = events.clone();
+            app.listen(name, move |event| {
+                let payload: String = serde_json::from_str(event.payload()).unwrap();
+                events.lock().unwrap().push((name.into(), payload));
+            });
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/events/speak", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for response in [
+                b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\nevent: speak-start\ndata: hello\n\n".as_slice(),
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\nevent: speak-end\ndata: done\n\n".as_slice(),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 1024];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                socket.write_all(response).await.unwrap();
+            }
+        });
+        let monitor = tokio::spawn(run_with(
+            app.handle().clone(),
+            monitor_client().unwrap(),
+            url,
+        ));
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while events.lock().unwrap().len() < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("events were not delivered");
+        monitor.abort();
+        let _ = monitor.await;
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                ("dictate:speak-start".into(), "hello".into()),
+                ("dictate:speak-end".into(), "done".into())
+            ]
+        );
+        assert_eq!(app.webview_windows().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn aborting_monitor_closes_a_stalled_connection() {
+        let app = tauri::test::mock_app();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/events/speak", listener.local_addr().unwrap());
+        let monitor = tokio::spawn(run_with(
+            app.handle().clone(),
+            monitor_client().unwrap(),
+            url,
+        ));
+        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut request = [0; 1024];
+        let mut headers = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !headers.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = socket.read(&mut request).await.unwrap();
+                assert!(count > 0);
+                headers.extend_from_slice(&request[..count]);
+                assert!(headers.len() < 16 * 1024);
+            }
+        })
+        .await
+        .expect("request headers did not arrive");
+        monitor.abort();
+        let _ = monitor.await;
+        let closed = tokio::time::timeout(Duration::from_secs(2), socket.read(&mut request))
+            .await
+            .unwrap();
+        assert_eq!(closed.unwrap(), 0);
+        assert!(app.webview_windows().is_empty());
     }
 
     #[tokio::test]
