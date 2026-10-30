@@ -1332,11 +1332,9 @@ fn open_input_monitoring_settings(app: tauri::AppHandle) -> Result<(), String> {
 /// - `focus.bundle_id` is Voicebox itself — step 6 will inject directly
 ///   into our own webview; pasting would just double-insert or miss the
 ///   real target.
-/// - Accessibility is not trusted — `CGEventPost` would silently drop the
-///   keystroke, leaving the user's clipboard clobbered with nothing to
-///   show for it.
 ///
-/// Returns `true` when the paste sequence completed end-to-end.
+/// Missing Accessibility trust returns an error before touching the clipboard;
+/// otherwise returns `true` when the paste sequence completes end-to-end.
 #[command]
 async fn paste_final_text(
     text: String,
@@ -2439,6 +2437,9 @@ mod command_ipc_regression_tests {
                 set_keep_server_running,
                 stop_server,
                 start_server,
+                check_accessibility_permission,
+                check_input_monitoring_permission,
+                paste_final_text,
             ])
             .build(mock_context(noop_assets()))
             .unwrap();
@@ -2495,6 +2496,46 @@ mod command_ipc_regression_tests {
             },
         )
         .map(|body| body.deserialize().unwrap())
+    }
+
+    #[test]
+    fn dictation_permission_checks_return_boolean_over_ipc() {
+        let (_app, window) = setup();
+        for command in ["check_accessibility_permission", "check_input_monitoring_permission"] {
+            let result = invoke(&window, command, InvokeBody::Json(serde_json::json!({})), None).unwrap();
+            assert!(result.is_boolean(), "{command} must return the current permission state");
+        }
+    }
+
+    #[test]
+    fn self_focused_paste_is_skipped_over_ipc_without_native_side_effects() {
+        let (_app, window) = setup();
+        for (text, role) in [("hello", Some("AXTextField")), ("", None), ("世界\n🎙", Some("AXTextArea"))] {
+            let body = InvokeBody::Json(serde_json::json!({"text":text, "focus":{"pid":-1, "bundle_id":VOICEBOX_BUNDLE_ID, "role":role}}));
+            assert_eq!(invoke(&window, "paste_final_text", body, None).unwrap(), serde_json::json!(false));
+        }
+    }
+
+    #[test]
+    fn malformed_paste_ipc_requests_are_rejected_before_native_operations() {
+        let (_app, window) = setup();
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({"text":"a", "focus":null}),
+            serde_json::json!({"text":"a", "focus":{"pid":"invalid", "bundle_id":VOICEBOX_BUNDLE_ID}}),
+            serde_json::json!({"text":"a", "focus":{"pid":2147483648_i64, "bundle_id":VOICEBOX_BUNDLE_ID}}),
+            serde_json::json!({"text":false, "focus":{"pid":-1, "bundle_id":VOICEBOX_BUNDLE_ID}}),
+        ] {
+            assert!(invoke(&window, "paste_final_text", InvokeBody::Json(body), None).is_err());
+        }
+        assert!(invoke(&window, "paste_final_text", InvokeBody::Raw(vec![]), None).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn self_paste_identifier_matches_the_bundled_application_identifier() {
+        let config: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert_eq!(config["identifier"], VOICEBOX_BUNDLE_ID);
     }
 
     #[test]
