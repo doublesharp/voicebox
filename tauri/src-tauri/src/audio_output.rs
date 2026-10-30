@@ -2965,3 +2965,132 @@ mod output_route_regression_tests {
         assert!(events.is_empty());
     }
 }
+
+#[cfg(test)]
+mod native_silent_output_tests {
+    use super::*;
+    use crate::audio_stream::PcmQueue;
+
+    fn output() -> (Device, StreamConfig, SampleFormat) {
+        let device = cpal::default_host()
+            .default_output_device()
+            .expect("native output device required");
+        let supported = device
+            .default_output_config()
+            .expect("native output configuration required");
+        let format = supported.sample_format();
+        (device, supported.into(), format)
+    }
+
+    fn wait_for(mut condition: impl FnMut() -> bool, label: &str) {
+        let start = Instant::now();
+        while !condition() && start.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(condition(), "native audio callback did not {label}");
+    }
+
+    #[test]
+    #[ignore = "requires a working native output device; emits silence"]
+    fn native_silent_clip_pauses_resumes_seeks_and_stops() {
+        let (device, config, format) = output();
+        let samples: Arc<[f32]> =
+            vec![0.0; config.sample_rate.0 as usize * config.channels as usize * 2].into();
+        let controls = Arc::new(PlaybackControls::new(0.0, 1.0));
+        let position = Arc::new(RenderPosition::default());
+        let (error_tx, errors) = mpsc::channel();
+        let stream = match format {
+            SampleFormat::F32 => build_stream::<f32>(
+                &device,
+                &config,
+                samples,
+                controls.clone(),
+                position.clone(),
+                error_tx,
+            ),
+            SampleFormat::I16 => build_stream::<i16>(
+                &device,
+                &config,
+                samples,
+                controls.clone(),
+                position.clone(),
+                error_tx,
+            ),
+            SampleFormat::U16 => build_stream::<u16>(
+                &device,
+                &config,
+                samples,
+                controls.clone(),
+                position.clone(),
+                error_tx,
+            ),
+            other => panic!("unsupported output format: {other:?}"),
+        }
+        .expect("open native output");
+        start_output_streams(&[&stream], &controls, "cancelled", |stream| {
+            stream.play().map_err(|error| error.to_string())
+        })
+        .unwrap();
+        wait_for(
+            || position.revision.load(Ordering::Acquire) == controls.revision(),
+            "acknowledge initial position",
+        );
+        assert_eq!(position.frame.load(Ordering::Acquire), 0);
+        controls.paused.store(false, Ordering::Release);
+        wait_for(
+            || position.frame.load(Ordering::Acquire) > 0,
+            "advance after resume",
+        );
+        controls.seek(1.0);
+        wait_for(
+            || {
+                position.revision.load(Ordering::Acquire) == controls.revision()
+                    && position.frame.load(Ordering::Acquire) >= config.sample_rate.0 as usize
+            },
+            "apply seek",
+        );
+        controls.stop();
+        std::thread::sleep(Duration::from_millis(100));
+        let stopped = position.frame.load(Ordering::Acquire);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(position.frame.load(Ordering::Acquire), stopped);
+        assert!(errors.try_recv().is_err());
+        drop(stream);
+    }
+
+    #[test]
+    #[ignore = "requires a working native output device; emits silence"]
+    fn native_silent_preview_waits_while_paused_and_drains_after_resume() {
+        let (device, config, format) = output();
+        let queue = Arc::new(Mutex::new(PcmQueue::new(8000).unwrap()));
+        queue.lock().unwrap().append(&vec![0.0; 8000]).unwrap();
+        queue.lock().unwrap().finished = true;
+        let controls = Arc::new(PlaybackControls::new(0.0, 1.0));
+        let (error_tx, errors) = mpsc::channel();
+        let stream = match format {
+            SampleFormat::F32 => {
+                build_pcm_stream::<f32>(&device, &config, queue.clone(), controls.clone(), error_tx)
+            }
+            SampleFormat::I16 => {
+                build_pcm_stream::<i16>(&device, &config, queue.clone(), controls.clone(), error_tx)
+            }
+            SampleFormat::U16 => {
+                build_pcm_stream::<u16>(&device, &config, queue.clone(), controls.clone(), error_tx)
+            }
+            other => panic!("unsupported output format: {other:?}"),
+        }
+        .expect("open native preview output");
+        stream.play().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(queue.lock().unwrap().samples_len_for_test(), 8000);
+        controls.paused.store(false, Ordering::Release);
+        wait_for(
+            || queue.lock().unwrap().position() > 0.0,
+            "consume preview samples",
+        );
+        wait_for(|| queue.lock().unwrap().ended(), "drain finished preview");
+        assert!(errors.try_recv().is_err());
+        controls.stop();
+        drop(stream);
+    }
+}
